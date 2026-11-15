@@ -39,6 +39,10 @@ pub struct VTabDeclaredSchema {
     pub hidden_cols: Vec<bool>,
     pub config_risk_flags: Option<VTabRiskFlags>,
     pub constraint_support: bool,
+    /// The module implements xFindFunction (FTS5's auxiliary functions).
+    pub find_function: bool,
+    /// `VTabConfigOption::NochangeUnread`.
+    pub nochange_unread: bool,
 }
 
 impl VTabDeclaredSchema {
@@ -147,6 +151,8 @@ pub struct ConnectedVTabEntry {
     pub module_risk_flags: VTabRiskFlags,
     pub is_eponymous: bool,
     pub is_eponymous_only: bool,
+    /// The module has no `xUpdate` (`VirtualTableModule::is_read_only`).
+    pub is_read_only: bool,
     pub shadow_suffixes: Vec<String>,
     pub declared: Arc<VTabDeclaredSchema>,
     pub state: VTabInstanceState,
@@ -248,8 +254,8 @@ impl VTabRegistry {
         reg.register_module(Arc::new(JsonTreeModule));
         reg.register_module(Arc::new(JsonbEachModule));
         reg.register_module(Arc::new(JsonbTreeModule));
+        reg.register_module(Arc::new(Fts5VocabModule::new(Arc::clone(&fts5_aux))));
         reg.register_module(Arc::new(Fts5Module::new(fts5_aux)));
-        reg.register_module(Arc::new(Fts5VocabModule));
         reg.register_module(Arc::new(RTreeModule::new_f32()));
         reg.register_module(Arc::new(RTreeModule::new_i32()));
         reg
@@ -366,7 +372,7 @@ impl VTabRegistry {
     #[inline]
     pub fn is_connected_read_only(&self, db_name: &str, table_name: &str) -> bool {
         self.get_connected(db_name, table_name)
-            .is_some_and(|entry| entry.is_eponymous_only)
+            .is_some_and(|entry| entry.is_eponymous_only || entry.is_read_only)
     }
 
     /// Returns a mutable reference to a connected virtual table entry if present.
@@ -696,6 +702,8 @@ pub struct CoreVTabHostContext<'a, 'b, 'c> {
     pub declared: Option<VTabDeclaredSchema>,
     pub config_risk_flags: Option<VTabRiskFlags>,
     pub constraint_support: bool,
+    pub find_function: bool,
+    pub nochange_unread: bool,
     pub conflict_mode: VTabConflictMode,
     /// For an UPDATE: `true` for every column the statement does not assign
     /// (`sqlite3_value_nochange`).
@@ -712,6 +720,8 @@ impl<'a, 'b, 'c> CoreVTabHostContext<'a, 'b, 'c> {
             declared: None,
             config_risk_flags: None,
             constraint_support: false,
+            find_function: false,
+            nochange_unread: false,
             conflict_mode: VTabConflictMode::Abort,
             nochange_cols: Vec::new(),
         }
@@ -734,9 +744,16 @@ impl CoreVTabHostContext<'_, '_, '_> {
     /// vdbe.c `OP_Transaction`: a statement that writes (the ones a module steps on its shadow
     /// tables, an incremental-blob handle opened for writing) is refused with SQLITE_CORRUPT
     /// while `SQLITE_CorruptRdOnly` is set.
+    ///
+    /// `counted`: the statement is an INSERT / REPLACE / DELETE (`changeCntOn`); it halts with
+    /// its statement transaction rolled back, so `sqlite3VdbeHalt` stores 0 in `db->nChange`
+    /// (`sqlite3VdbeSetChanges(db, 0)`). The VDBE of an incremental-blob handle counts nothing.
     #[inline]
-    fn refuse_write_after_corruption(&self) -> Result<()> {
+    fn refuse_write_after_corruption(&mut self, counted: bool) -> Result<()> {
         if self.ctx.db_set.corrupt_rdonly() {
+            if counted {
+                self.ctx.runtime.last_changes = 0;
+            }
             return Err(SqliteError::new(
                 ErrorCode::Corrupt,
                 "database disk image is malformed",
@@ -747,6 +764,16 @@ impl CoreVTabHostContext<'_, '_, '_> {
 }
 
 impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
+    fn with_table(
+        &mut self,
+        db_name: &str,
+        table_name: &str,
+        f: &mut dyn FnMut(&mut dyn VTabHostContext) -> Result<()>,
+    ) -> Result<()> {
+        let mut sub = CoreVTabHostContext::new(&mut *self.ctx, db_name, table_name);
+        f(&mut sub)
+    }
+
     fn db_name(&self) -> &str {
         self.db_name
     }
@@ -763,6 +790,8 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
             hidden_cols,
             config_risk_flags: self.config_risk_flags,
             constraint_support: self.constraint_support,
+            find_function: self.find_function,
+            nochange_unread: self.nochange_unread,
         });
         Ok(())
     }
@@ -778,10 +807,18 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
             VTabConfigOption::DirectOnly => {
                 self.config_risk_flags = Some(VTabRiskFlags::DirectOnly);
             }
+            VTabConfigOption::FindFunction => {
+                self.find_function = true;
+            }
+            VTabConfigOption::NochangeUnread => {
+                self.nochange_unread = true;
+            }
         }
         if let Some(ref mut decl) = self.declared {
             decl.config_risk_flags = self.config_risk_flags;
             decl.constraint_support = self.constraint_support;
+            decl.find_function = self.find_function;
+            decl.nochange_unread = self.nochange_unread;
         }
         Ok(())
     }
@@ -806,6 +843,35 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
         crate::engine::shadow_get_rowid_direct(self.ctx, self.db_name, shadow_table, rowid)
     }
 
+    fn shadow_blob_get(
+        &mut self,
+        shadow_table: &str,
+        hint: &mut sqliters_types::ShadowHint,
+        rowid: i64,
+        col_idx: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<bool> {
+        crate::engine::shadow_blob_get_direct(
+            self.ctx,
+            self.db_name,
+            shadow_table,
+            hint,
+            rowid,
+            col_idx,
+            out,
+        )
+    }
+
+    fn shadow_wr_seek(
+        &mut self,
+        shadow_table: &str,
+        k0: i64,
+        k1: &[u8],
+        le: bool,
+    ) -> Result<Option<Option<Vec<Value>>>> {
+        crate::engine::shadow_wr_seek_direct(self.ctx, self.db_name, shadow_table, k0, k1, le)
+    }
+
     fn shadow_put_rowid(
         &mut self,
         shadow_table: &str,
@@ -813,7 +879,7 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
         cols: &[Value],
         or_replace: bool,
     ) -> Result<()> {
-        self.refuse_write_after_corruption()?;
+        self.refuse_write_after_corruption(true)?;
         crate::engine::shadow_put_rowid_direct(
             self.ctx,
             self.db_name,
@@ -825,7 +891,7 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
     }
 
     fn shadow_delete_rowid(&mut self, shadow_table: &str, rowid: i64) -> Result<bool> {
-        self.refuse_write_after_corruption()?;
+        self.refuse_write_after_corruption(true)?;
         crate::engine::shadow_delete_rowid_direct(self.ctx, self.db_name, shadow_table, rowid)
     }
 
@@ -857,6 +923,12 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
     fn flush_vtab_pending(&mut self, db_name: Option<&str>, table: &str) -> Result<()> {
         let db = db_name.unwrap_or(self.db_name).to_owned();
         vtab_flush_one(self.ctx, &db, table)
+    }
+
+    fn sql_function_exists(&self, name: &str) -> bool {
+        self.ctx.functions.has_scalar_name(name)
+            || self.ctx.functions.has_aggregate_name(name)
+            || sqliters_vdbe::builtin_scalar_flags(name, true).is_some()
     }
 
     fn last_insert_rowid(&mut self) -> i64 {
@@ -904,7 +976,7 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
         offset: usize,
         data: &[u8],
     ) -> Result<bool> {
-        self.refuse_write_after_corruption()?;
+        self.refuse_write_after_corruption(false)?;
         crate::engine::shadow_blob_write_direct(
             self.ctx,
             self.db_name,
@@ -943,7 +1015,7 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
         values: &[Value],
         replace: bool,
     ) -> Result<i64> {
-        self.refuse_write_after_corruption()?;
+        self.refuse_write_after_corruption(true)?;
         crate::engine::shadow_insert_row_direct(
             self.ctx,
             self.db_name,
@@ -963,7 +1035,7 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
         rowid: Option<i64>,
         blob: &[u8],
     ) -> Result<i64> {
-        self.refuse_write_after_corruption()?;
+        self.refuse_write_after_corruption(true)?;
         crate::engine::shadow_replace_blob_direct(
             self.ctx,
             self.db_name,
@@ -981,7 +1053,7 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
         rowid: Option<i64>,
         value: Option<i64>,
     ) -> Result<i64> {
-        self.refuse_write_after_corruption()?;
+        self.refuse_write_after_corruption(true)?;
         crate::engine::shadow_replace_int_direct(
             self.ctx,
             self.db_name,
@@ -998,7 +1070,7 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
         hint: &mut sqliters_types::ShadowHint,
         rowid: i64,
     ) -> Result<()> {
-        self.refuse_write_after_corruption()?;
+        self.refuse_write_after_corruption(true)?;
         crate::engine::shadow_delete_counted_direct(
             self.ctx,
             self.db_name,
@@ -1091,6 +1163,7 @@ pub fn ensure_vtab_connected(
             module_risk_flags: module.risk_flags(),
             is_eponymous: module.is_eponymous(),
             is_eponymous_only: module.is_eponymous_only(),
+            is_read_only: module.is_read_only(),
             shadow_suffixes,
             declared: Arc::clone(&declared),
             state: VTabInstanceState::Available(vt_box),
@@ -1132,6 +1205,7 @@ pub fn ensure_vtab_connected(
                 module_risk_flags: module.risk_flags(),
                 is_eponymous: module.is_eponymous(),
                 is_eponymous_only: module.is_eponymous_only(),
+            is_read_only: module.is_read_only(),
                 shadow_suffixes,
                 declared: Arc::clone(&declared),
                 state: VTabInstanceState::Available(vt_box),
@@ -2615,6 +2689,11 @@ impl VirtualTableModule for DbStatModule {
         true
     }
 
+    /// (`dbstat` has no `xUpdate`)
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn is_eponymous_only(&self) -> bool {
         false
     }
@@ -3784,12 +3863,15 @@ mod tests {
             module_risk_flags: VTabRiskFlags::Normal,
             is_eponymous: false,
             is_eponymous_only: false,
+            is_read_only: false,
             shadow_suffixes: Vec::new(),
             declared: Arc::new(VTabDeclaredSchema {
                 table_schema,
                 hidden_cols,
                 config_risk_flags: None,
                 constraint_support: false,
+                find_function: false,
+                nochange_unread: false,
             }),
             state: VTabInstanceState::Available(Box::new(NullTable)),
             in_tx: false,

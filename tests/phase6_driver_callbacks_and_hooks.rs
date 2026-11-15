@@ -45,7 +45,7 @@ fn test_group54_regexp_match_unregistered_and_custom_registration() {
         .unwrap_err();
     assert_eq!(err_match.code, ErrorCode::Error);
     assert!(
-        err_match.message.contains("no such function: match"),
+        err_match.message.contains("unable to use function MATCH in the requested context"),
         "unexpected error: {err_match}"
     );
 

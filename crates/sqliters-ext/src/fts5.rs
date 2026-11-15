@@ -2,13 +2,11 @@
 //! virtual table modules (`sqlite/ext/fts5/`).
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::fts5_index::{
     Detail as IndexDetail, FTS5_CORRUPT, FTS5_CURRENT_VERSION, Fts5Index, IndexConfig,
-    get_varint as fts5_get_varint, get_varint32 as fts5_get_varint32,
+    get_varint32 as fts5_get_varint32,
     put_varint as fts5_put_varint, rc_only,
 };
 use crate::fts5_tokenize::{FTS5_MAX_TOKEN_SIZE, Tokenizer, TokenizerError, TokenizerPattern};
@@ -17,27 +15,14 @@ use sqliters_types::real_to_text;
 use sqliters_types::{
     ErrorCode, Result, SqliteError, VTabConfigOption, VTabConflictMode, VTabConstraintOp,
     VTabHostContext, VTabIndexInfo, VTabRiskFlags, VTabUpdateOperation, Value, VirtualCursor,
-    VirtualTable, VirtualTableModule, get_varint,
+    VirtualTable, VirtualTableModule,
 };
 
-const FTS5_AVERAGES_ROWID: i64 = 1;
-const FTS5_STRUCTURE_ROWID: i64 = 10;
 const FTS5_MAX_EXPR_DEPTH: usize = 256;
-const FTS5_AUX_RING_SLOTS: usize = 64;
 const FTS5_SOURCE_ID: &str =
     "fts5: 2026-10-16 14:45:20 555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6ca76";
 
 const SHADOW_SUFFIXES: &[&str] = &["data", "idx", "content", "docsize", "config"];
-
-#[inline]
-const fn fts5_segment_rowid(segid: u64, pgno: u64) -> i64 {
-    ((segid as i64) << 37) + (pgno as i64)
-}
-
-#[inline]
-const fn fts5_tombstone_rowid(segid: u64, ipg: u64) -> i64 {
-    (((segid + (1 << 16)) as i64) << 37) + (ipg as i64)
-}
 
 // ============================================================================
 // Quote Helpers & SQLite FTS5 Varint Codec (`fts5_varint.c`)
@@ -51,588 +36,6 @@ fn quote_single(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-fn get_uvarint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
-    if *pos >= bytes.len() {
-        return None;
-    }
-    let (v, n) = get_varint(&bytes[*pos..]).ok()?;
-    *pos += n;
-    Some(v)
-}
-
-fn decode_varint_list(bytes: &[u8]) -> Option<Vec<u64>> {
-    let mut pos = 0usize;
-    let mut out = Vec::new();
-    while pos < bytes.len() {
-        out.push(get_uvarint(bytes, &mut pos)?);
-    }
-    Some(out)
-}
-
-// ============================================================================
-// Auxiliary Function Registry (`bm25`, `highlight`, `snippet`)
-// ============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PhraseInstance {
-    phrase_idx: u32,
-    col_idx: u32,
-    token_offset: u32,
-}
-
-#[derive(Debug, Clone)]
-enum PhraseHits {
-    Inline { len: u8, items: [PhraseInstance; 4] },
-    Heap(Vec<PhraseInstance>),
-}
-
-impl Default for PhraseHits {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PhraseHits {
-    #[inline]
-    const fn new() -> Self {
-        Self::Inline {
-            len: 0,
-            items: [PhraseInstance {
-                phrase_idx: 0,
-                col_idx: 0,
-                token_offset: 0,
-            }; 4],
-        }
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        match self {
-            Self::Inline { len, .. } => *len as usize,
-            Self::Heap(v) => v.len(),
-        }
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[inline]
-    fn as_slice(&self) -> &[PhraseInstance] {
-        match self {
-            Self::Inline { len, items } => &items[..(*len as usize)],
-            Self::Heap(v) => v.as_slice(),
-        }
-    }
-
-    #[inline]
-    fn as_mut_slice(&mut self) -> &mut [PhraseInstance] {
-        match self {
-            Self::Inline { len, items } => &mut items[..(*len as usize)],
-            Self::Heap(v) => v.as_mut_slice(),
-        }
-    }
-
-    #[inline]
-    fn push(&mut self, item: PhraseInstance) {
-        match self {
-            Self::Inline { len, items } => {
-                let n = *len as usize;
-                if n < 4 {
-                    items[n] = item;
-                    *len = (n + 1) as u8;
-                } else {
-                    let mut v = Vec::with_capacity(8);
-                    v.extend_from_slice(items);
-                    v.push(item);
-                    *self = Self::Heap(v);
-                }
-            }
-            Self::Heap(v) => v.push(item),
-        }
-    }
-
-    #[inline]
-    fn extend_from(&mut self, other: &Self) {
-        let add = other.as_slice();
-        if add.is_empty() {
-            return;
-        }
-        match self {
-            Self::Inline { len, items } => {
-                let n = *len as usize;
-                if n + add.len() <= 4 {
-                    items[n..n + add.len()].copy_from_slice(add);
-                    *len = (n + add.len()) as u8;
-                } else {
-                    let mut v = Vec::with_capacity(n + add.len());
-                    v.extend_from_slice(&items[..n]);
-                    v.extend_from_slice(add);
-                    *self = Self::Heap(v);
-                }
-            }
-            Self::Heap(v) => v.extend_from_slice(add),
-        }
-    }
-
-    #[inline]
-    fn retain(&mut self, mut f: impl FnMut(&PhraseInstance) -> bool) {
-        match self {
-            Self::Inline { len, items } => {
-                let n = *len as usize;
-                let mut w = 0usize;
-                for r in 0..n {
-                    if f(&items[r]) {
-                        items[w] = items[r];
-                        w += 1;
-                    }
-                }
-                *len = w as u8;
-            }
-            Self::Heap(v) => v.retain(f),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum DocColSizes {
-    Inline { len: u8, vals: [u32; 6] },
-    Heap(Arc<[usize]>),
-}
-
-impl DocColSizes {
-    #[inline]
-    fn from_u64_slice(slice: &[u64]) -> Self {
-        if slice.len() <= 6 && slice.iter().all(|&x| x <= u64::from(u32::MAX)) {
-            let mut vals = [0u32; 6];
-            for (i, &x) in slice.iter().enumerate() {
-                vals[i] = x as u32;
-            }
-            Self::Inline {
-                len: slice.len() as u8,
-                vals,
-            }
-        } else {
-            Self::Heap(slice.iter().map(|&x| x as usize).collect())
-        }
-    }
-
-    #[inline]
-    fn from_usize_vec(vec: Vec<usize>) -> Self {
-        if vec.len() <= 6 && vec.iter().all(|&x| x <= u32::MAX as usize) {
-            let mut vals = [0u32; 6];
-            for (i, &x) in vec.iter().enumerate() {
-                vals[i] = x as u32;
-            }
-            Self::Inline {
-                len: vec.len() as u8,
-                vals,
-            }
-        } else {
-            Self::Heap(vec.into())
-        }
-    }
-
-    #[inline]
-    fn zeros(n_cols: usize) -> Self {
-        if n_cols <= 6 {
-            Self::Inline {
-                len: n_cols as u8,
-                vals: [0u32; 6],
-            }
-        } else {
-            Self::Heap(vec![0usize; n_cols].into())
-        }
-    }
-
-    #[inline]
-    fn total_len(&self) -> usize {
-        match self {
-            Self::Inline { len, vals } => {
-                let mut sum = 0usize;
-                for &v in &vals[..(*len as usize)] {
-                    sum += v as usize;
-                }
-                sum
-            }
-            Self::Heap(a) => a.iter().sum(),
-        }
-    }
-
-    #[inline]
-    fn get(&self, idx: usize) -> usize {
-        match self {
-            Self::Inline { len, vals } => {
-                if idx < (*len as usize) {
-                    vals[idx] as usize
-                } else {
-                    0
-                }
-            }
-            Self::Heap(a) => a.get(idx).copied().unwrap_or(0),
-        }
-    }
-}
-
-/// Text of every user column of one result row as `xColumnText` returns it (`None` for a
-/// NULL value or a column the table does not store).
-#[derive(Debug, Clone)]
-struct AuxRowTexts {
-    col_texts: Vec<Option<Vec<u8>>>,
-}
-
-#[derive(Debug, Clone)]
-struct AuxRowEntry {
-    /// Tokens per column (`xColumnSize`); see `AuxQueryContext::unknown_size_cols`.
-    col_sizes: DocColSizes,
-    /// The phrase instances of the row in `xInst` order (column, offset, phrase).
-    instances: PhraseHits,
-    texts: Option<Box<AuxRowTexts>>,
-    /// The row is in the index but not in the content source (`fts5SeekCursor` fails): the
-    /// functions that need its text report SQLITE_CORRUPT.
-    missing_content: bool,
-    /// The table keeps a `%_docsize` row per document and this one has none (or one that does
-    /// not decode): `sqlite3Fts5StorageDocsize` reports FTS5_CORRUPT when a function asks for
-    /// the size of the row (`xColumnSize`: bm25, snippet).
-    missing_docsize: bool,
-}
-
-/// Per-query state of the auxiliary functions (the `Fts5Cursor` side of `Fts5ExtensionApi`).
-#[derive(Debug)]
-struct AuxQueryContext {
-    num_cols: usize,
-    tokenizer: TokenizerSpec,
-    /// `xPhraseSize` of every phrase of the query.
-    phrase_lengths: Vec<usize>,
-    /// `Fts5Bm25Data.aIDF`.
-    phrase_idfs: Vec<f64>,
-    /// `Fts5Bm25Data.avgdl` (not finite for an empty index, like in C).
-    avgdl: f64,
-    /// `xRowCount`: the row count of the averages record.
-    total_rows: u64,
-    /// Columns whose size `xColumnSize` reports as `-1`: the indexed columns of a table that
-    /// stores neither the sizes nor the content. Empty when every size is known.
-    unknown_size_cols: Vec<bool>,
-    /// `bm25()` reads the row text (column sizes without %_docsize, or the phrase instances
-    /// of a detail=column / detail=none table).
-    bm25_needs_content: bool,
-    rows: Vec<AuxRowEntry>,
-}
-
-impl AuxQueryContext {
-    /// `fts5Bm25GetData`: `phrase_doc_hits[i]` is the number of rows phrase `i` matches on
-    /// its own (`xQueryPhrase`), `total_rows` / `total_tokens` come from the averages record.
-    #[allow(clippy::too_many_arguments)]
-    fn build(
-        num_cols: usize,
-        tokenizer: TokenizerSpec,
-        phrase_lengths: Vec<usize>,
-        phrase_doc_hits: &[usize],
-        total_rows: u64,
-        total_tokens: u64,
-        unknown_size_cols: Vec<bool>,
-        rows: Vec<AuxRowEntry>,
-    ) -> Self {
-        // (`sqlite3_int64 nRow, nToken`: the totals of a contentless table go below zero when
-        // 'delete' commands take out more than was put in)
-        let n_row = (total_rows as i64) as f64;
-        let avgdl = ((total_tokens as i64) as f64) / n_row;
-        let phrase_idfs = phrase_doc_hits
-            .iter()
-            .map(|&hit| {
-                let n_hit = hit as f64;
-                let idf = ((n_row - n_hit + 0.5) / (n_hit + 0.5)).ln();
-                if idf <= 0.0 { 1.0e-6 } else { idf }
-            })
-            .collect();
-        Self {
-            num_cols,
-            tokenizer,
-            phrase_lengths,
-            phrase_idfs,
-            avgdl,
-            total_rows,
-            unknown_size_cols,
-            bm25_needs_content: false,
-            rows,
-        }
-    }
-
-    /// `xColumnSize(iCol)` of a row.
-    #[inline]
-    fn col_size(&self, row: &AuxRowEntry, col: usize) -> i64 {
-        if self.unknown_size_cols.get(col).copied().unwrap_or(false) {
-            -1
-        } else {
-            row.col_sizes.get(col) as i64
-        }
-    }
-
-    /// `xColumnSize(-1)`: the size of a row in tokens.
-    #[inline]
-    fn row_size(&self, row: &AuxRowEntry) -> f64 {
-        if self.unknown_size_cols.is_empty() {
-            row.col_sizes.total_len() as f64
-        } else {
-            (0..self.num_cols)
-                .map(|i| self.col_size(row, i))
-                .sum::<i64>() as f64
-        }
-    }
-}
-
-#[derive(Debug)]
-struct AuxRegistryInner {
-    next_qid: u32,
-    slots: [Option<(u32, Arc<AuxQueryContext>)>; FTS5_AUX_RING_SLOTS],
-}
-
-impl Default for AuxRegistryInner {
-    fn default() -> Self {
-        Self {
-            next_qid: 0,
-            slots: std::array::from_fn(|_| None),
-        }
-    }
-}
-
-/// Connection-scoped registry mapping FTS5 hidden table-column row handles to active match state
-/// for `bm25()`, `highlight()`, and `snippet()`.
-#[derive(Debug)]
-pub struct Fts5AuxRegistry {
-    inner: Mutex<AuxRegistryInner>,
-    aux_text_depth: AtomicUsize,
-    /// Shared state of rows that carry none (a scan without auxiliary text functions).
-    rowless: Arc<AuxQueryContext>,
-}
-
-impl Default for Fts5AuxRegistry {
-    fn default() -> Self {
-        Self {
-            inner: Mutex::default(),
-            aux_text_depth: AtomicUsize::new(0),
-            rowless: Arc::new(AuxQueryContext::build(
-                0,
-                TokenizerSpec::default(),
-                Vec::new(),
-                &[],
-                0,
-                0,
-                Vec::new(),
-                Vec::new(),
-            )),
-        }
-    }
-}
-
-/// Table-column value of a row that has no per-row auxiliary state. The query id part is
-/// never handed out by `register_query`.
-const FTS5_AUX_ROWLESS_HANDLE: i64 = 0x7fff_ffff_i64 << 32;
-
-fn aux_context_error(func: &str) -> SqliteError {
-    SqliteError::new(
-        ErrorCode::Error,
-        format!("unable to use function {func} in the requested context"),
-    )
-}
-
-impl Fts5AuxRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[inline]
-    pub fn enter_text_aux_scope(&self) {
-        self.aux_text_depth.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn exit_text_aux_scope(&self) {
-        self.aux_text_depth.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn needs_aux_text(&self) -> bool {
-        self.aux_text_depth.load(Ordering::Relaxed) > 0
-    }
-
-    /// Row handles are `(query id << 32) | (row index + 1)`.
-    #[inline]
-    fn encode_handle(qid: u32, row_idx: usize) -> i64 {
-        ((qid as i64) << 32) | (((row_idx + 1) as u32) as i64)
-    }
-
-    fn register_query(&self, qctx: Arc<AuxQueryContext>) -> u32 {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let qid = if guard.next_qid >= 0x7fff_fffe {
-            1
-        } else {
-            guard.next_qid + 1
-        };
-        guard.next_qid = qid;
-        guard.slots[(qid as usize) & (FTS5_AUX_RING_SLOTS - 1)] = Some((qid, qctx));
-        qid
-    }
-
-    /// Resolves the value of the table-name column. `Ok(None)` for NULL (no current row);
-    /// the row index is `None` for a row without per-row state.
-    #[inline]
-    fn lookup(
-        &self,
-        val: &Value,
-        func: &str,
-    ) -> Result<Option<(Arc<AuxQueryContext>, Option<usize>)>> {
-        let handle = match val {
-            Value::Null => return Ok(None),
-            Value::Integer(h) if *h > 0 => *h,
-            _ => return Err(aux_context_error(func)),
-        };
-        let qid = ((handle as u64) >> 32) as u32;
-        let row_part = (handle as u32) as usize;
-        if qid == 0 {
-            return Err(aux_context_error(func));
-        }
-        if handle == FTS5_AUX_ROWLESS_HANDLE {
-            return Ok(Some((Arc::clone(&self.rowless), None)));
-        }
-        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((slot_qid, ref qctx)) = guard.slots[(qid as usize) & (FTS5_AUX_RING_SLOTS - 1)]
-            && slot_qid == qid
-            && row_part <= qctx.rows.len()
-        {
-            return Ok(Some((Arc::clone(qctx), row_part.checked_sub(1))));
-        }
-        Err(aux_context_error(func))
-    }
-
-    #[inline]
-    pub fn eval_bm25_fast(&self, handle_val: &Value, weights: &[f64]) -> Result<Value> {
-        let handle = match handle_val {
-            Value::Null => return Ok(Value::Null),
-            Value::Integer(h) if *h > 0 => *h,
-            _ => return Err(aux_context_error("bm25")),
-        };
-        if handle == FTS5_AUX_ROWLESS_HANDLE {
-            return Ok(Value::real(-0.0));
-        }
-        let qid = ((handle as u64) >> 32) as u32;
-        let row_part = (handle as u32) as usize;
-        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if qid != 0
-            && let Some((slot_qid, ref qctx)) =
-                guard.slots[(qid as usize) & (FTS5_AUX_RING_SLOTS - 1)]
-            && slot_qid == qid
-            && row_part <= qctx.rows.len()
-        {
-            let score = compute_bm25_for_row(qctx, row_part.checked_sub(1), weights)?;
-            return Ok(real_result(score));
-        }
-        Err(aux_context_error("bm25"))
-    }
-
-    pub fn eval_bm25(&self, args: &[Value]) -> Result<Value> {
-        let Some(first) = args.first() else {
-            return Err(SqliteError::new(
-                ErrorCode::Error,
-                "wrong number of arguments to function bm25()",
-            ));
-        };
-        if args.len() == 1 {
-            return self.eval_bm25_fast(first, &[]);
-        }
-        let weights: Vec<f64> = args[1..].iter().map(Value::to_real_lossy).collect();
-        self.eval_bm25_fast(first, &weights)
-    }
-
-    /// `fts5HighlightFunction`.
-    pub fn eval_highlight(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 4 {
-            return Err(SqliteError::new(
-                ErrorCode::Error,
-                "wrong number of arguments to function highlight()",
-            ));
-        }
-        let Some((qctx, row_idx)) = self.lookup(&args[0], "highlight")? else {
-            return Ok(Value::Null);
-        };
-        let col = args[1].to_integer_lossy().clamp(-1, 0x7fff_ffff);
-        if col < 0 || (col as usize) >= qctx.num_cols {
-            return Ok(Value::Text(String::new()));
-        }
-        let col = col as usize;
-        let open = fts5_value_bytes(&args[2]);
-        let close = fts5_value_bytes(&args[3]);
-        let Some(row) = row_idx.and_then(|i| qctx.rows.get(i)) else {
-            return Ok(Value::Null);
-        };
-        if row.missing_content {
-            return Err(SqliteError::with_extended(
-                FTS5_CORRUPT,
-                "database disk image is malformed",
-            ));
-        }
-        let Some(text) = row
-            .texts
-            .as_ref()
-            .and_then(|t| t.col_texts.get(col))
-            .and_then(|t| t.as_deref())
-        else {
-            return Ok(Value::Null);
-        };
-        let mut hl = HighlightCtx::new(
-            &qctx,
-            row,
-            col,
-            text,
-            open.as_deref().unwrap_or(b""),
-            close.as_deref().unwrap_or(b""),
-        );
-        hl.run();
-        if hl.open_now {
-            hl.out.extend_from_slice(hl.close);
-        }
-        hl.append_tail();
-        Ok(Value::Text(String::from_utf8_lossy(&hl.out).into_owned()))
-    }
-
-    /// `fts5SnippetFunction`.
-    pub fn eval_snippet(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 6 {
-            return Err(SqliteError::new(
-                ErrorCode::Error,
-                "wrong number of arguments to function snippet()",
-            ));
-        }
-        let Some((qctx, row_idx)) = self.lookup(&args[0], "snippet")? else {
-            return Ok(Value::Null);
-        };
-        let Some(row) = row_idx.and_then(|i| qctx.rows.get(i)) else {
-            return Ok(Value::Null);
-        };
-        if row.missing_content {
-            return Err(SqliteError::with_extended(
-                FTS5_CORRUPT,
-                "database disk image is malformed",
-            ));
-        }
-        let i_col = args[1].to_integer_lossy().clamp(-1, 0x7fff_ffff);
-        let open = fts5_value_bytes(&args[2]).unwrap_or_default();
-        let close = fts5_value_bytes(&args[3]).unwrap_or_default();
-        let ellipsis = fts5_value_bytes(&args[4]).unwrap_or_default();
-        let n_token = args[5].to_integer_lossy().clamp(0, 64);
-        render_snippet(&qctx, row, i_col, &open, &close, &ellipsis, n_token)
-    }
-
-    pub fn eval_fts5_source_id() -> Value {
-        Value::Text(FTS5_SOURCE_ID.to_owned())
-    }
-
-    pub fn eval_fts5_ptr_func(_arg: &Value) -> Value {
-        Value::Null
-    }
-}
-
 /// `sqlite3_result_double`: NaN becomes NULL.
 fn real_result(r: f64) -> Value {
     if r.is_nan() {
@@ -640,437 +43,6 @@ fn real_result(r: f64) -> Value {
     } else {
         Value::real(r)
     }
-}
-
-/// `fts5Bm25Function`. `row_idx` is `None` for a row without match state (no phrases).
-fn compute_bm25_for_row(
-    qctx: &AuxQueryContext,
-    row_idx: Option<usize>,
-    weights: &[f64],
-) -> Result<f64> {
-    const K1: f64 = 1.2;
-    const B: f64 = 0.75;
-    let n_phrase = qctx.phrase_idfs.len();
-    let Some(row) = row_idx.and_then(|i| qctx.rows.get(i)) else {
-        return Ok(-0.0);
-    };
-    // `sqlite3Fts5StorageRowCount`: an index that claims to hold no rows is corrupt; so is a
-    // row whose text is needed but missing from the content source.
-    if (qctx.total_rows as i64) <= 0
-        || (row.missing_content && qctx.bm25_needs_content)
-        || row.missing_docsize
-    {
-        return Err(SqliteError::with_extended(
-            FTS5_CORRUPT,
-            "database disk image is malformed",
-        ));
-    }
-    let mut freq_stack = [0.0f64; 8];
-    let mut freq_heap: Option<Vec<f64>> = (n_phrase > 8).then(|| vec![0.0f64; n_phrase]);
-    let freq: &mut [f64] = match freq_heap.as_mut() {
-        Some(v) => v.as_mut_slice(),
-        None => &mut freq_stack[..n_phrase],
-    };
-    for inst in row.instances.as_slice() {
-        let pidx = inst.phrase_idx as usize;
-        if pidx < n_phrase {
-            let w = weights.get(inst.col_idx as usize).copied().unwrap_or(1.0);
-            freq[pidx] += w;
-        }
-    }
-    // The total size of the current row in tokens (`xColumnSize(-1)`).
-    let d: f64 = qctx.row_size(row);
-    let mut score = 0.0f64;
-    for (i, &f) in freq.iter().enumerate() {
-        score +=
-            qctx.phrase_idfs[i] * ((f * (K1 + 1.0)) / (f + K1 * (1.0 - B + B * d / qctx.avgdl)));
-    }
-    Ok(-score)
-}
-
-/// `CInstIter` (fts5_aux.c): iterates the phrase instances of one column, coalescing
-/// instances that overlap (adjacent instances stay separate).
-struct CInstIter<'a> {
-    insts: &'a [PhraseInstance],
-    phrase_lengths: &'a [usize],
-    col: u32,
-    next_inst: usize,
-    /// First / last token of the current coalesced instance, `-1` when exhausted.
-    start: i64,
-    end: i64,
-}
-
-impl<'a> CInstIter<'a> {
-    fn new(qctx: &'a AuxQueryContext, row: &'a AuxRowEntry, col: usize) -> Self {
-        let mut it = Self {
-            insts: row.instances.as_slice(),
-            phrase_lengths: &qctx.phrase_lengths,
-            col: col as u32,
-            next_inst: 0,
-            start: -1,
-            end: -1,
-        };
-        it.next();
-        it
-    }
-
-    /// `fts5CInstIterNext`.
-    fn next(&mut self) {
-        self.start = -1;
-        self.end = -1;
-        while self.next_inst < self.insts.len() {
-            let inst = self.insts[self.next_inst];
-            if inst.col_idx == self.col {
-                let io = i64::from(inst.token_offset);
-                let size = self
-                    .phrase_lengths
-                    .get(inst.phrase_idx as usize)
-                    .copied()
-                    .unwrap_or(0) as i64;
-                let i_end = io - 1 + size;
-                if self.start < 0 {
-                    self.start = io;
-                    self.end = i_end;
-                } else if io <= self.end {
-                    if i_end > self.end {
-                        self.end = i_end;
-                    }
-                } else {
-                    break;
-                }
-            }
-            self.next_inst += 1;
-        }
-    }
-}
-
-/// `HighlightContext` + `fts5HighlightCb`.
-struct HighlightCtx<'a> {
-    tokenizer: &'a TokenizerSpec,
-    range_start: i64,
-    /// Last token to include, `-1` for no range.
-    range_end: i64,
-    open: &'a [u8],
-    close: &'a [u8],
-    text: &'a [u8],
-    iter: CInstIter<'a>,
-    pos: i64,
-    off: usize,
-    open_now: bool,
-    out: Vec<u8>,
-}
-
-impl<'a> HighlightCtx<'a> {
-    fn new(
-        qctx: &'a AuxQueryContext,
-        row: &'a AuxRowEntry,
-        col: usize,
-        text: &'a [u8],
-        open: &'a [u8],
-        close: &'a [u8],
-    ) -> Self {
-        Self {
-            tokenizer: &qctx.tokenizer,
-            range_start: 0,
-            range_end: -1,
-            open,
-            close,
-            text,
-            iter: CInstIter::new(qctx, row, col),
-            pos: 0,
-            off: 0,
-            open_now: false,
-            out: Vec::with_capacity(text.len() + 16),
-        }
-    }
-
-    /// `fts5HighlightAppend(&zIn[iOff], n)`: a negative length copies the rest of the text.
-    fn append_text(&mut self, end: usize) {
-        let from = self.off.min(self.text.len());
-        let to = if end < self.off {
-            self.text.len()
-        } else {
-            end.min(self.text.len())
-        };
-        self.out.extend_from_slice(&self.text[from..to]);
-    }
-
-    fn append_tail(&mut self) {
-        let from = self.off.min(self.text.len());
-        self.out.extend_from_slice(&self.text[from..]);
-    }
-
-    fn run(&mut self) {
-        let tokenizer = self.tokenizer;
-        let text = self.text;
-        tokenizer.tok.tokenize(text, &mut |_, start_off, end_off| {
-            self.token(start_off, end_off);
-        });
-    }
-
-    /// `fts5HighlightCb`.
-    fn token(&mut self, start_off: usize, end_off: usize) {
-        let pos = self.pos;
-        self.pos += 1;
-        if self.range_end >= 0 {
-            if pos < self.range_start || pos > self.range_end {
-                return;
-            }
-            if self.range_start != 0 && pos == self.range_start {
-                self.off = start_off;
-            }
-        }
-        // Close the highlight when this token is not part of the current phrase and starts
-        // past the text copied so far.
-        if self.open_now && (pos <= self.iter.start || self.iter.start < 0) && start_off > self.off
-        {
-            self.out.extend_from_slice(self.close);
-            self.open_now = false;
-        }
-        // The start of a new phrase: copy the text up to it and open the highlight.
-        if pos == self.iter.start && !self.open_now {
-            self.append_text(start_off);
-            self.out.extend_from_slice(self.open);
-            self.off = start_off;
-            self.open_now = true;
-        }
-        if pos == self.iter.end {
-            if !self.open_now {
-                self.out.extend_from_slice(self.open);
-                self.open_now = true;
-            }
-            self.append_text(end_off);
-            self.off = end_off;
-            self.iter.next();
-        }
-        if pos == self.range_end {
-            if self.open_now {
-                if self.iter.start >= 0 && pos >= self.iter.start {
-                    self.append_text(end_off);
-                    self.off = end_off;
-                }
-                self.out.extend_from_slice(self.close);
-                self.open_now = false;
-            }
-            self.append_text(end_off);
-            self.off = end_off;
-        }
-    }
-}
-
-/// `fts5SnippetScore`.
-#[allow(clippy::too_many_arguments)]
-fn snippet_score(
-    qctx: &AuxQueryContext,
-    row: &AuxRowEntry,
-    n_docsize: i64,
-    seen: &mut [bool],
-    col: usize,
-    pos: i64,
-    n_token: i64,
-    want_adjusted: bool,
-) -> (i64, i64) {
-    let mut first: i64 = -1;
-    let mut last: i64 = 0;
-    let mut score: i64 = 0;
-    let end = pos + n_token;
-    for inst in row.instances.as_slice() {
-        let off = i64::from(inst.token_offset);
-        let ip = inst.phrase_idx as usize;
-        if inst.col_idx as usize == col && off >= pos && off < end {
-            score += if seen.get(ip).copied().unwrap_or(false) {
-                1
-            } else {
-                1000
-            };
-            if let Some(s) = seen.get_mut(ip) {
-                *s = true;
-            }
-            if first < 0 {
-                first = off;
-            }
-            last = off + qctx.phrase_lengths.get(ip).copied().unwrap_or(0) as i64;
-        }
-    }
-    let mut adj = 0i64;
-    if want_adjusted {
-        adj = first - (n_token - (last - first)) / 2;
-        if adj + n_token > n_docsize {
-            adj = n_docsize - n_token;
-        }
-        if adj < 0 {
-            adj = 0;
-        }
-    }
-    (score, adj)
-}
-
-/// `fts5SnippetFunction` (after argument decoding).
-fn render_snippet(
-    qctx: &AuxQueryContext,
-    row: &AuxRowEntry,
-    i_col: i64,
-    open: &[u8],
-    close: &[u8],
-    ellipsis: &[u8],
-    n_token: i64,
-) -> Result<Value> {
-    let n_col = qctx.num_cols;
-    let n_phrase = qctx.phrase_lengths.len();
-    let mut best_col: usize = if i_col >= 0 { i_col as usize } else { 0 };
-    let mut best_start: i64 = 0;
-    let mut best_score: i64 = 0;
-    let mut n_col_size: i64 = 0;
-    let mut seen = vec![false; n_phrase];
-    let col_text = |c: usize| -> Option<&[u8]> {
-        row.texts
-            .as_ref()
-            .and_then(|t| t.col_texts.get(c))
-            .and_then(|t| t.as_deref())
-    };
-
-    // `rc` of the C function: an instance beyond the column size sets FTS5_CORRUPT and stops
-    // the scan of that column, but the next column starts over with a fresh `rc`.
-    let mut corrupt = false;
-    for i in 0..n_col {
-        if i_col >= 0 && i_col as usize != i {
-            continue;
-        }
-        corrupt = false;
-        // `fts5SentenceFinderCb`: the first token of every sentence of the column.
-        let mut first_tokens: Vec<i64> = Vec::new();
-        if let Some(doc) = col_text(i) {
-            let mut pos = 0i64;
-            qctx.tokenizer.tok.tokenize(doc, &mut |_, start_off, _| {
-                if pos > 0 {
-                    let mut k = start_off as i64 - 1;
-                    let mut c = 0u8;
-                    while k >= 0 {
-                        c = doc[k as usize];
-                        if !matches!(c, b' ' | b'\t' | b'\n' | b'\r') {
-                            break;
-                        }
-                        k -= 1;
-                    }
-                    if k != start_off as i64 - 1 && (c == b'.' || c == b':') {
-                        first_tokens.push(pos);
-                    }
-                } else {
-                    first_tokens.push(0);
-                }
-                pos += 1;
-            });
-        }
-        if row.missing_docsize {
-            return Err(SqliteError::with_extended(
-                FTS5_CORRUPT,
-                "database disk image is malformed",
-            ));
-        }
-        let n_docsize = qctx.col_size(row, i);
-        for inst in row.instances.as_slice() {
-            if inst.col_idx as usize != i {
-                continue;
-            }
-            let io = i64::from(inst.token_offset);
-            if io > n_docsize {
-                corrupt = true;
-                break;
-            }
-            seen.fill(false);
-            let (score, adj) = snippet_score(qctx, row, n_docsize, &mut seen, i, io, n_token, true);
-            if score > best_score {
-                best_score = score;
-                best_col = i;
-                best_start = adj;
-                n_col_size = n_docsize;
-            }
-            if !first_tokens.is_empty() && n_docsize > n_token {
-                let mut jj = 0usize;
-                while jj + 1 < first_tokens.len() {
-                    if first_tokens[jj + 1] > io {
-                        break;
-                    }
-                    jj += 1;
-                }
-                if first_tokens[jj] < io {
-                    seen.fill(false);
-                    let (mut score, _) = snippet_score(
-                        qctx,
-                        row,
-                        n_docsize,
-                        &mut seen,
-                        i,
-                        first_tokens[jj],
-                        n_token,
-                        false,
-                    );
-                    score += if first_tokens[jj] == 0 { 120 } else { 100 };
-                    if score > best_score {
-                        best_score = score;
-                        best_col = i;
-                        best_start = first_tokens[jj];
-                        n_col_size = n_docsize;
-                    }
-                }
-            }
-        }
-    }
-
-    if corrupt {
-        return Err(SqliteError::with_extended(
-            FTS5_CORRUPT,
-            "database disk image is malformed",
-        ));
-    }
-    if best_col >= n_col {
-        // xColumnText() reports SQLITE_RANGE for the requested column.
-        return Err(SqliteError::new(
-            ErrorCode::Range,
-            "column index out of range",
-        ));
-    }
-    if n_col_size == 0 {
-        if row.missing_docsize {
-            return Err(SqliteError::with_extended(
-                FTS5_CORRUPT,
-                "database disk image is malformed",
-            ));
-        }
-        n_col_size = qctx.col_size(row, best_col);
-    }
-    let Some(text) = col_text(best_col) else {
-        return Ok(Value::Null);
-    };
-    let mut hl = HighlightCtx::new(qctx, row, best_col, text, open, close);
-    hl.range_start = best_start;
-    hl.range_end = best_start + n_token - 1;
-    if best_start > 0 {
-        hl.out.extend_from_slice(ellipsis);
-    }
-    // Advance to the first coalesced instance at or after the snippet start.
-    while hl.iter.start >= 0 && hl.iter.start < best_start {
-        hl.iter.next();
-    }
-    hl.run();
-    if hl.open_now {
-        hl.out.extend_from_slice(hl.close);
-    }
-    if hl.range_end >= n_col_size - 1 {
-        hl.append_tail();
-    } else {
-        hl.out.extend_from_slice(ellipsis);
-    }
-    Ok(Value::Text(String::from_utf8_lossy(&hl.out).into_owned()))
-}
-
-// ============================================================================
-// Tokenizers (`unicode61`, `ascii`, `porter`, `trigram`)
-// ============================================================================
-
-#[derive(Debug, Clone)]
-struct EmittedToken {
-    term: String,
 }
 
 /// The tokenizer of one FTS5 table (`Fts5Config.t`): a C-exact built-in tokenizer plus the
@@ -1103,32 +75,12 @@ impl TokenizerSpec {
         }
     }
 
-    fn tokenize(&self, text: &str, _for_query: bool) -> Vec<EmittedToken> {
-        let mut out = Vec::new();
-        self.tok.tokenize(text.as_bytes(), &mut |tok, _, _| {
-            out.push(EmittedToken {
-                term: token_bytes_to_string(tok),
-            });
-        });
-        out
-    }
-
     /// Invokes `cb` with the bytes of every token of a document column, truncated like
     /// `fts5StorageInsertCallback` does.
     fn for_each_doc_token(&self, text: &[u8], mut cb: impl FnMut(&[u8])) {
         self.tok.tokenize(text, &mut |tok, _, _| {
             cb(&tok[..tok.len().min(FTS5_MAX_TOKEN_SIZE)]);
         });
-    }
-}
-
-/// Converts a token to the `String` form used by the query side, applying the
-/// `FTS5_MAX_TOKEN_SIZE` truncation.
-fn token_bytes_to_string(tok: &[u8]) -> String {
-    let tok = &tok[..tok.len().min(FTS5_MAX_TOKEN_SIZE)];
-    match std::str::from_utf8(tok) {
-        Ok(s) => s.to_owned(),
-        Err(e) => String::from_utf8_lossy(&tok[..e.valid_up_to()]).into_owned(),
     }
 }
 
@@ -1168,6 +120,10 @@ struct Fts5Config {
     unindexed_content: bool,
     /// `locale=1`: `%_content` carries one `l<N>` column per indexed column.
     locale: bool,
+    /// `tokendata=1` (`bTokendata`).
+    tokendata: bool,
+    /// `pGlobal->aLocaleHdr` of the connection the table belongs to.
+    locale_hdr: [u8; 16],
 }
 
 /// `FTS5_MAX_PREFIX_INDEXES`.
@@ -1318,6 +274,7 @@ struct Fts5ConfigBuilder {
     contentless_delete: bool,
     contentless_unindexed: bool,
     locale: bool,
+    tokendata: bool,
 }
 
 impl Fts5ConfigBuilder {
@@ -1446,7 +403,8 @@ impl Fts5ConfigBuilder {
         }
 
         if cfg_is_option("tokendata", cmd) {
-            cfg_bool_arg(arg).ok_or_else(|| cfg_err("malformed tokendata=... directive"))?;
+            self.tokendata = cfg_bool_arg(arg)
+                .ok_or_else(|| cfg_err("malformed tokendata=... directive"))?;
             return Ok(());
         }
 
@@ -1578,7 +536,44 @@ impl Fts5Config {
             contentless_delete: b.contentless_delete,
             unindexed_content,
             locale: b.locale,
+            tokendata: b.tokendata,
+            locale_hdr: [0; 16],
         })
+    }
+
+    /// `sqlite3Fts5IsLocaleValue`: a blob longer than the header that starts with it.
+    fn is_locale_value(&self, v: &Value) -> bool {
+        matches!(v, Value::Blob(b) if b.len() > 16 && b[..16] == self.locale_hdr)
+    }
+
+    /// `sqlite3Fts5DecodeLocaleValue`: (text, locale) of an `fts5_locale()` blob;
+    /// SQLITE_MISMATCH when no 0x00 ends the locale before the last byte.
+    fn decode_locale_value<'a>(&self, blob: &'a [u8]) -> Result<(&'a [u8], &'a [u8])> {
+        let n = blob.len();
+        let mut n_loc = 16usize;
+        while blob.get(n_loc).is_some_and(|&b| b != 0) {
+            if n_loc == n - 1 {
+                return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
+            }
+            n_loc += 1;
+        }
+        if n_loc >= n {
+            return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
+        }
+        Ok((&blob[n_loc + 1..], &blob[16..n_loc]))
+    }
+
+    /// The text a column value is tokenized as (`sqlite3_value_text`, or the text part of
+    /// an `fts5_locale()` value on a locale=1 table).
+    fn doc_text<'a>(&self, v: &'a Value) -> Result<Option<std::borrow::Cow<'a, [u8]>>> {
+        if self.locale
+            && self.is_locale_value(v)
+            && let Value::Blob(b) = v
+        {
+            let (text, _) = self.decode_locale_value(b)?;
+            return Ok(Some(std::borrow::Cow::Borrowed(text)));
+        }
+        Ok(fts5_value_bytes(v))
     }
 
     fn declare_sql(&self, table_name: &str) -> String {
@@ -1615,38 +610,39 @@ impl Fts5Config {
         defn
     }
 
-    /// The `%_content` row for `col_vals` (`FTS5_STMT_INSERT_CONTENT` bindings).
-    fn content_row(&self, rowid: i64, col_vals: &[Value]) -> Vec<Value> {
+    /// The `%_content` row for `col_vals` (`FTS5_STMT_INSERT_CONTENT` bindings in
+    /// `sqlite3Fts5StorageContentInsert`): an `fts5_locale()` value is stored as its text
+    /// in `c<N>` and its locale in `l<N>`; `locs` are the `l<N>` values of the columns
+    /// taken from the saved row of an UPDATE.
+    fn content_row(&self, rowid: i64, col_vals: &[Value], locs: &[Value]) -> Result<Vec<Value>> {
         let n = self.columns.len();
         let mut row = Vec::with_capacity(1 + 2 * n);
+        let mut row_locs: Vec<Value> = (0..n)
+            .map(|i| locs.get(i).cloned().unwrap_or(Value::Null))
+            .collect();
         row.push(Value::Integer(rowid));
         for i in 0..n {
             if self.content_mode == ContentMode::Normal || self.unindexed[i] {
-                row.push(col_vals.get(i).cloned().unwrap_or(Value::Null));
-            }
-        }
-        if self.locale {
-            for i in 0..n {
-                if !self.unindexed[i] {
-                    row.push(Value::Null);
+                match col_vals.get(i) {
+                    Some(v) if self.is_locale_value(v) => {
+                        let Value::Blob(b) = v else { unreachable!() };
+                        let (text, loc) = self.decode_locale_value(b)?;
+                        row.push(Value::Text(String::from_utf8_lossy(text).into_owned()));
+                        row_locs[i] = Value::Text(String::from_utf8_lossy(loc).into_owned());
+                    }
+                    Some(v) => row.push(v.clone()),
+                    None => row.push(Value::Null),
                 }
             }
         }
-        row
-    }
-
-    /// The SELECT list that reads the user columns back from `%_content`
-    /// (`fts5ConfigMakeExprlist`, without the locale columns).
-    fn content_select_list(&self) -> String {
-        let mut cols = vec!["id".to_owned()];
-        for i in 0..self.columns.len() {
-            if self.content_mode == ContentMode::Normal || self.unindexed[i] {
-                cols.push(format!("c{i}"));
-            } else {
-                cols.push("NULL".to_owned());
+        if self.locale {
+            for (i, l) in row_locs.into_iter().enumerate() {
+                if !self.unindexed[i] {
+                    row.push(l);
+                }
             }
         }
-        cols.join(", ")
+        Ok(row)
     }
 
     /// Maps a raw `%_content` row (as returned by `SELECT *`) to one value per user column.
@@ -1674,534 +670,13 @@ impl Fts5Config {
 }
 
 // ============================================================================
-// C SQLite 3.54.1 FTS5 Segment B-Tree Wire Codec (`sqlite/ext/fts5/fts5_index.c`)
-// ============================================================================
-
-type MergedIndexMap = BTreeMap<Vec<u8>, BTreeMap<i64, BTreeMap<usize, Vec<usize>>>>;
-#[derive(Clone)]
-enum SmallBytes22 {
-    Inline { len: u8, buf: [u8; 22] },
-    Heap(Box<[u8]>),
-}
-
-impl SmallBytes22 {
-    #[inline]
-    fn from_slice(s: &[u8]) -> Self {
-        if s.len() <= 22 {
-            let mut buf = [0u8; 22];
-            buf[..s.len()].copy_from_slice(s);
-            Self::Inline {
-                len: s.len() as u8,
-                buf,
-            }
-        } else {
-            Self::Heap(s.into())
-        }
-    }
-
-    #[inline]
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Inline { len, buf } => &buf[..(*len as usize)],
-            Self::Heap(b) => b,
-        }
-    }
-}
-
-impl PartialEq for SmallBytes22 {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.as_slice() == other.as_slice()
-    }
-}
-
-impl Eq for SmallBytes22 {}
-
-impl PartialOrd for SmallBytes22 {
-    #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for SmallBytes22 {
-    #[inline]
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.as_slice().cmp(other.as_slice())
-    }
-}
-
-impl std::hash::Hash for SmallBytes22 {
-    #[inline]
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.as_slice().hash(state);
-    }
-}
-
-impl std::borrow::Borrow<[u8]> for SmallBytes22 {
-    #[inline]
-    fn borrow(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
-
-impl std::fmt::Debug for SmallBytes22 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(self.as_slice(), f)
-    }
-}
-
-fn decode_poslist_body(detail: DetailMode, body: &[u8]) -> Result<BTreeMap<usize, Vec<usize>>> {
-    let err_corrupt =
-        || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
-    let mut out: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    match detail {
-        DetailMode::None => {
-            out.insert(0, Vec::new());
-        }
-        DetailMode::Col => {
-            let mut pos = 0usize;
-            let mut cur_col = 0usize;
-            let mut first = true;
-            while pos < body.len() {
-                let v = get_uvarint(body, &mut pos).ok_or_else(err_corrupt)? as usize;
-                if v < 2 {
-                    return Err(err_corrupt());
-                }
-                if first {
-                    cur_col = v - 2;
-                    first = false;
-                } else {
-                    cur_col = cur_col.checked_add(v - 2).ok_or_else(err_corrupt)?;
-                }
-                out.insert(cur_col, Vec::new());
-            }
-        }
-        DetailMode::Full => {
-            let mut pos = 0usize;
-            let mut cur_col = 0usize;
-            let mut cur_off = 0usize;
-            let mut first_in_col = true;
-            while pos < body.len() {
-                let v = get_uvarint(body, &mut pos).ok_or_else(err_corrupt)? as usize;
-                if v == 1 {
-                    let next_col = get_uvarint(body, &mut pos).ok_or_else(err_corrupt)? as usize;
-                    cur_col = next_col;
-                    cur_off = 0;
-                    first_in_col = true;
-                    continue;
-                }
-                if v == 0 {
-                    break;
-                }
-                if first_in_col {
-                    cur_off = v - 2;
-                    first_in_col = false;
-                } else {
-                    cur_off = cur_off.checked_add(v - 2).ok_or_else(err_corrupt)?;
-                }
-                out.entry(cur_col).or_default().push(cur_off);
-            }
-        }
-    }
-    Ok(out)
-}
-
-#[derive(Debug, Clone)]
-struct Fts5SegRecord {
-    segid: u64,
-    pgno_first: u64,
-    pgno_last: u64,
-    n_tombstone_pages: u64,
-}
-
-/// The segments of a structure record, oldest first (`fts5StructureDecode`; the levels
-/// from the last to the first, each level in its stored order).
-fn decode_structure_segments(blob: &[u8]) -> Result<Vec<Fts5SegRecord>> {
-    let (_, st) = crate::fts5_index::structure_decode(blob)?;
-    let mut out = Vec::with_capacity(st.n_segment.max(0) as usize);
-    for lvl in st.a_level.iter().rev() {
-        for seg in &lvl.a_seg {
-            out.push(Fts5SegRecord {
-                segid: seg.i_segid.max(0) as u64,
-                pgno_first: seg.pgno_first.max(0) as u64,
-                pgno_last: seg.pgno_last.max(0) as u64,
-                n_tombstone_pages: seg.n_pg_tombstone.max(0) as u64,
-            });
-        }
-    }
-    Ok(out)
-}
-
-fn load_segment_tombstones(
-    ctx: &mut dyn VTabHostContext,
-    data_shadow: &str,
-    segid: u64,
-    n_pages: u64,
-) -> Result<BTreeSet<i64>> {
-    let err_corrupt =
-        || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
-    let mut out = BTreeSet::new();
-    for ipg in 0..n_pages {
-        let tid = fts5_tombstone_rowid(segid, ipg);
-        let row = ctx.shadow_get_rowid(data_shadow, tid)?;
-        let Some(Value::Blob(b)) = row.as_ref().and_then(|r| r.get(1)) else {
-            return Err(err_corrupt());
-        };
-        if b.len() < 8 {
-            return Err(err_corrupt());
-        }
-        let key_sz = b[0] as usize;
-        if ipg == 0 && b[1] != 0 {
-            out.insert(0);
-        }
-        match key_sz {
-            4 => {
-                for chunk in b[8..].as_chunks::<4>().0 {
-                    let v = u32::from_be_bytes(*chunk);
-                    if v != 0 {
-                        out.insert(i64::from(v));
-                    }
-                }
-            }
-            8 => {
-                for chunk in b[8..].as_chunks::<8>().0 {
-                    let v = u64::from_be_bytes(*chunk) as i64;
-                    if v != 0 {
-                        out.insert(v);
-                    }
-                }
-            }
-            _ => return Err(err_corrupt()),
-        }
-    }
-    Ok(out)
-}
-
-#[derive(Debug, Clone)]
-struct ParsedLeafPage {
-    raw: Vec<u8>,
-    first_rowid_off: usize,
-    leading_end: usize,
-    terms: Vec<(Vec<u8>, usize, usize)>,
-}
-
-impl ParsedLeafPage {
-    fn parse(raw: Vec<u8>, is_first_seg_page: bool) -> Result<Self> {
-        let err_corrupt =
-            || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
-        if raw.len() < 4 {
-            return Err(err_corrupt());
-        }
-        let first_rowid_off = u16::from_be_bytes([raw[0], raw[1]]) as usize;
-        let footer_off = u16::from_be_bytes([raw[2], raw[3]]) as usize;
-        if footer_off < 4 || footer_off > raw.len() {
-            return Err(err_corrupt());
-        }
-        let mut term_offsets = Vec::new();
-        let mut fpos = footer_off;
-        let mut acc_off = 0usize;
-        while fpos < raw.len() {
-            let d = get_uvarint(&raw, &mut fpos).ok_or_else(err_corrupt)? as usize;
-            if d == 0 && !term_offsets.is_empty() {
-                return Err(err_corrupt());
-            }
-            acc_off = acc_off.checked_add(d).ok_or_else(err_corrupt)?;
-            if acc_off < 4 || acc_off >= footer_off {
-                return Err(err_corrupt());
-            }
-            term_offsets.push(acc_off);
-        }
-        let leading_end = term_offsets.first().copied().unwrap_or(footer_off);
-        if is_first_seg_page && leading_end > 4 {
-            return Err(err_corrupt());
-        }
-
-        let mut terms = Vec::with_capacity(term_offsets.len());
-        let mut prev_page_term: Vec<u8> = Vec::new();
-        for (k, &toff) in term_offsets.iter().enumerate() {
-            let tend = term_offsets.get(k + 1).copied().unwrap_or(footer_off);
-            if toff > tend {
-                return Err(err_corrupt());
-            }
-            let mut pos = toff;
-            let term_bytes = if k == 0 {
-                let tlen = get_uvarint(&raw, &mut pos).ok_or_else(err_corrupt)? as usize;
-                if tlen > tend.saturating_sub(pos) {
-                    return Err(err_corrupt());
-                }
-                let tb = raw[pos..pos + tlen].to_vec();
-                pos += tlen;
-                tb
-            } else {
-                let npref = get_uvarint(&raw, &mut pos).ok_or_else(err_corrupt)? as usize;
-                let nsuf = get_uvarint(&raw, &mut pos).ok_or_else(err_corrupt)? as usize;
-                if npref > prev_page_term.len() || nsuf > tend.saturating_sub(pos) {
-                    return Err(err_corrupt());
-                }
-                let total_len = npref.checked_add(nsuf).ok_or_else(err_corrupt)?;
-                let mut tb = Vec::with_capacity(total_len.min(65_536));
-                tb.extend_from_slice(&prev_page_term[..npref]);
-                tb.extend_from_slice(&raw[pos..pos + nsuf]);
-                pos += nsuf;
-                tb
-            };
-            prev_page_term.clone_from(&term_bytes);
-            terms.push((term_bytes, pos, tend));
-        }
-
-        Ok(Self {
-            raw,
-            first_rowid_off,
-            leading_end,
-            terms,
-        })
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn parse_doclist_slice_on_block<F>(
-    block: &[u8],
-    first_rowid_off: usize,
-    slice_start: usize,
-    slice_end: usize,
-    continues_to_next_page: bool,
-    detail: DetailMode,
-    cur_rowid: &mut i64,
-    first_in_doclist: &mut bool,
-    pending_poslist: &mut Option<(bool, usize, Vec<u8>)>,
-    apply_posting: &mut F,
-) -> Result<()>
-where
-    F: FnMut(i64, bool, &[u8]) -> Result<()>,
-{
-    let err_corrupt =
-        || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
-    let mut pos = slice_start;
-    if let Some((del, rem, mut pbuf)) = pending_poslist.take() {
-        let avail = slice_end.saturating_sub(pos);
-        let take = rem.min(avail);
-        pbuf.extend_from_slice(&block[pos..pos + take]);
-        pos += take;
-        if rem > take {
-            if !continues_to_next_page {
-                return Err(err_corrupt());
-            }
-            *pending_poslist = Some((del, rem - take, pbuf));
-            return Ok(());
-        }
-        apply_posting(*cur_rowid, del, &pbuf)?;
-    }
-
-    while pos < slice_end {
-        let is_page_first_rowid = first_rowid_off > 0 && pos == first_rowid_off;
-        let raw_rv = get_uvarint(block, &mut pos).ok_or_else(err_corrupt)?;
-        if *first_in_doclist || is_page_first_rowid {
-            *cur_rowid = raw_rv as i64;
-            *first_in_doclist = false;
-        } else {
-            *cur_rowid = (*cur_rowid).wrapping_add(raw_rv as i64);
-        }
-
-        // `fts5SegIterLoadNPos` (fts5_index.c): the size field is `nPos*2 + bDel`. An entry
-        // always replaces the entries for the same (term, rowid) in older segments; it only
-        // removes the row from the term when it carries no positions (`nPos == 0`). The
-        // delete flag on an entry that does have positions (delete + re-insert of a rowid
-        // inside one flush, i.e. every UPDATE / REPLACE written by C) does not hide it.
-        match detail {
-            DetailMode::None => {
-                // detail=none: no byte = present, `00` = deleted, `00 00` = deleted and
-                // re-inserted (present).
-                let mut empty = false;
-                if pos < slice_end && block[pos] == 0 {
-                    pos += 1;
-                    if pos < slice_end && block[pos] == 0 {
-                        pos += 1;
-                    } else {
-                        empty = true;
-                    }
-                }
-                apply_posting(*cur_rowid, empty, &[])?;
-            }
-            DetailMode::Col | DetailMode::Full => {
-                let sz_flags = get_uvarint(block, &mut pos).ok_or_else(err_corrupt)? as usize;
-                let plen = sz_flags >> 1;
-                let empty = plen == 0;
-                let avail = slice_end.saturating_sub(pos);
-                if plen <= avail {
-                    let pbody = &block[pos..pos + plen];
-                    pos += plen;
-                    apply_posting(*cur_rowid, empty, pbody)?;
-                } else {
-                    if !continues_to_next_page {
-                        return Err(err_corrupt());
-                    }
-                    let mut pbuf = Vec::with_capacity(plen.min(65_536));
-                    pbuf.extend_from_slice(&block[pos..slice_end]);
-                    *pending_poslist = Some((empty, plen - avail, pbuf));
-                    pos = slice_end;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Merges all active C SQLite 3.54.1 FTS5 segments in chronological order into `MergedIndexMap`.
-fn load_merged_index(
-    ctx: &mut dyn VTabHostContext,
-    _db_q: &str,
-    tbl_name: &str,
-    detail: DetailMode,
-) -> Result<MergedIndexMap> {
-    let err_corrupt =
-        || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
-    let data_shadow = format!("{tbl_name}_data");
-    let srow = ctx.shadow_get_rowid(&data_shadow, FTS5_STRUCTURE_ROWID)?;
-    let Some(Value::Blob(struct_blob)) = srow.as_ref().and_then(|r| r.get(1)) else {
-        return Err(err_corrupt());
-    };
-    let segments = decode_structure_segments(struct_blob)?;
-    let mut merged: MergedIndexMap = BTreeMap::new();
-
-    for seg in segments {
-        if seg.pgno_first == 0 || seg.pgno_last < seg.pgno_first {
-            continue;
-        }
-        let tombstones = if seg.n_tombstone_pages > 0 {
-            load_segment_tombstones(ctx, &data_shadow, seg.segid, seg.n_tombstone_pages)?
-        } else {
-            BTreeSet::new()
-        };
-
-        let mut cur_term: Option<Vec<u8>> = None;
-        let mut cur_rowid: i64 = 0;
-        let mut first_in_doclist = true;
-        let mut pending_poslist: Option<(bool, usize, Vec<u8>)> = None;
-
-        for pg in seg.pgno_first..=seg.pgno_last {
-            let lrid = fts5_segment_rowid(seg.segid, pg);
-            let lrow = ctx.shadow_get_rowid(&data_shadow, lrid)?;
-            let Some(Value::Blob(block_vec)) = lrow.and_then(|mut r| {
-                if r.len() >= 2 {
-                    Some(r.swap_remove(1))
-                } else {
-                    None
-                }
-            }) else {
-                return Err(err_corrupt());
-            };
-            let leaf = ParsedLeafPage::parse(block_vec, pg == seg.pgno_first)?;
-
-            if leaf.leading_end > 4 {
-                let Some(tbytes) = cur_term.as_deref() else {
-                    return Err(err_corrupt());
-                };
-                let entry = merged.entry(tbytes.to_vec()).or_default();
-                parse_doclist_slice_on_block(
-                    &leaf.raw,
-                    leaf.first_rowid_off,
-                    4,
-                    leaf.leading_end,
-                    leaf.terms.is_empty() && pg < seg.pgno_last,
-                    detail,
-                    &mut cur_rowid,
-                    &mut first_in_doclist,
-                    &mut pending_poslist,
-                    &mut |rid, del, body| {
-                        if del || tombstones.contains(&rid) {
-                            entry.remove(&rid);
-                        } else {
-                            let hits = decode_poslist_body(detail, body)?;
-                            entry.insert(rid, hits);
-                        }
-                        Ok(())
-                    },
-                )?;
-            }
-
-            for (k, (term_bytes, ds, de)) in leaf.terms.iter().enumerate() {
-                if pending_poslist.is_some() {
-                    return Err(err_corrupt());
-                }
-                cur_term = Some(term_bytes.clone());
-                first_in_doclist = true;
-                let entry = merged.entry(term_bytes.clone()).or_default();
-                parse_doclist_slice_on_block(
-                    &leaf.raw,
-                    leaf.first_rowid_off,
-                    *ds,
-                    *de,
-                    k + 1 == leaf.terms.len() && pg < seg.pgno_last,
-                    detail,
-                    &mut cur_rowid,
-                    &mut first_in_doclist,
-                    &mut pending_poslist,
-                    &mut |rid, del, body| {
-                        if del || tombstones.contains(&rid) {
-                            entry.remove(&rid);
-                        } else {
-                            let hits = decode_poslist_body(detail, body)?;
-                            entry.insert(rid, hits);
-                        }
-                        Ok(())
-                    },
-                )?;
-            }
-        }
-
-        if pending_poslist.is_some() {
-            return Err(err_corrupt());
-        }
-    }
-
-    merged.retain(|_, docs| !docs.is_empty());
-    Ok(merged)
-}
-
-/// `sqlite3Fts5IndexCharlenToBytelen`: number of bytes taken by the first `n_char`
-/// characters of `p`, or 0 if `p` has fewer characters.
-fn charlen_to_bytelen(p: &[u8], n_char: usize) -> usize {
-    let n_byte = p.len();
-    let mut n = 0usize;
-    for i in 0..n_char {
-        if n >= n_byte {
-            return 0;
-        }
-        let c = p[n];
-        n += 1;
-        if c >= 0xc0 {
-            if n >= n_byte {
-                return 0;
-            }
-            while (p[n] & 0xc0) == 0x80 {
-                n += 1;
-                if n >= n_byte {
-                    if i + 1 == n_char {
-                        break;
-                    }
-                    return 0;
-                }
-            }
-        }
-    }
-    n
-}
-
-fn make_term_key(prefix_slot: u8, term: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(1 + term.len());
-    key.push(b'0' + prefix_slot);
-    key.extend_from_slice(term.as_bytes());
-    key
-}
-
-// ============================================================================
 // FTS5 Query AST & Bounded-Depth Recursive-Descent Parser
 // ============================================================================
 
 #[derive(Debug, Clone)]
 struct QueryPhraseToken {
-    term: String,
+    /// The token as the tokenizer produced it (at most `FTS5_MAX_TOKEN_SIZE` bytes).
+    raw: Vec<u8>,
     is_prefix: bool,
 }
 
@@ -2339,14 +814,20 @@ struct QueryParser<'a> {
     /// Number of grammar symbols on the stack of the equivalent LALR parser; the generated
     /// C parser has room for 99 (`fts5: parser stack overflow`).
     stack: usize,
+    /// `Fts5Parse.bPhraseToAnd`: "a+b" becomes "a AND b" (LIKE / GLOB patterns on a
+    /// trigram table without detail=full).
+    b_phrase_to_and: bool,
 }
 
 /// Symbols the lemon-generated FTS5 parser can hold (`YYSTACKDEPTH` 100 minus the base entry).
 const FTS5_PARSER_STACK_MAX: usize = 99;
 
 impl<'a> QueryParser<'a> {
-    /// `sqlite3Fts5ExprNew`: parses `text` and numbers its phrases.
-    fn parse_query(cfg: &'a Fts5Config, text: &'a str) -> Result<(FtsQueryExpr, Vec<QueryPhrase>)> {
+    fn parse_query_opt(
+        cfg: &'a Fts5Config,
+        text: &'a str,
+        b_phrase_to_and: bool,
+    ) -> Result<(FtsQueryExpr, Vec<QueryPhrase>)> {
         let mut p = Self {
             cfg,
             z: text.as_bytes(),
@@ -2354,6 +835,7 @@ impl<'a> QueryParser<'a> {
             tok: QTok::Eof,
             tok_text: b"",
             stack: 0,
+            b_phrase_to_and,
         };
         p.advance()?;
         let mut expr = if p.tok == QTok::Eof {
@@ -2541,6 +1023,7 @@ impl<'a> QueryParser<'a> {
             tok: self.tok,
             tok_text: self.tok_text,
             stack: 0,
+            b_phrase_to_and: self.b_phrase_to_and,
         };
         look.advance().is_ok() && look.tok == QTok::Colon
     }
@@ -2723,7 +1206,7 @@ impl<'a> QueryParser<'a> {
             self.stack = base + 1;
             self.cfg.tokenizer.tok.tokenize(&text, &mut |tok, _, _| {
                 phrase.tokens.push(QueryPhraseToken {
-                    term: token_bytes_to_string(tok),
+                    raw: tok[..tok.len().min(FTS5_MAX_TOKEN_SIZE)].to_vec(),
                     is_prefix: false,
                 });
             });
@@ -2767,6 +1250,7 @@ impl<'a> QueryParser<'a> {
                 tok: self.tok,
                 tok_text: self.tok_text,
                 stack: 0,
+                b_phrase_to_and: self.b_phrase_to_and,
             };
             look.advance().is_ok() && look.tok == QTok::Lp
         } {
@@ -2846,7 +1330,9 @@ impl<'a> QueryParser<'a> {
 
         // `sqlite3Fts5ParseNode(FTS5_STRING)`
         near.eof = near.phrases.iter().any(|p| p.tokens.is_empty());
-        if self.cfg.detail != DetailMode::Full {
+        if self.cfg.detail != DetailMode::Full
+            && !(self.b_phrase_to_and && near.phrases[0].tokens.len() > 1)
+        {
             let first = &near.phrases[0];
             if near.phrases.len() != 1
                 || first.tokens.len() > 1
@@ -2866,721 +1352,6 @@ impl<'a> QueryParser<'a> {
         self.stack = base + 1;
         Ok(FtsQueryExpr::Near(near))
     }
-}
-
-// ============================================================================
-// Postings Evaluation Engine
-// ============================================================================
-
-/// Per-document match list sorted strictly ascending by `rowid`: `(rowid, PhraseHits)`.
-type EvalDocSet = Vec<(i64, PhraseHits)>;
-type TermDocHitsMap = BTreeMap<i64, BTreeMap<usize, Vec<usize>>>;
-
-#[derive(Debug, Clone)]
-enum SmallOffsets {
-    Inline { len: u8, vals: [u32; 4] },
-    Heap(Vec<u32>),
-}
-
-impl Default for SmallOffsets {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SmallOffsets {
-    #[inline]
-    const fn new() -> Self {
-        Self::Inline {
-            len: 0,
-            vals: [0u32; 4],
-        }
-    }
-
-    #[inline]
-    fn from_usize_vec(v: Vec<usize>) -> Self {
-        if v.len() <= 4 {
-            let mut vals = [0u32; 4];
-            for (i, &x) in v.iter().enumerate() {
-                vals[i] = x as u32;
-            }
-            Self::Inline {
-                len: v.len() as u8,
-                vals,
-            }
-        } else {
-            Self::Heap(v.into_iter().map(|x| x as u32).collect())
-        }
-    }
-
-    #[inline]
-    fn as_slice(&self) -> &[u32] {
-        match self {
-            Self::Inline { len, vals } => &vals[..(*len as usize)],
-            Self::Heap(v) => v.as_slice(),
-        }
-    }
-
-    #[inline]
-    fn push(&mut self, val: u32) {
-        match self {
-            Self::Inline { len, vals } => {
-                let n = *len as usize;
-                if n < 4 {
-                    vals[n] = val;
-                    *len = (n + 1) as u8;
-                } else {
-                    let mut v = Vec::with_capacity(8);
-                    v.extend_from_slice(vals);
-                    v.push(val);
-                    *self = Self::Heap(v);
-                }
-            }
-            Self::Heap(v) => v.push(val),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum DocColHits {
-    Inline {
-        len: u8,
-        cols: [(u32, SmallOffsets); 2],
-    },
-    Heap(Vec<(u32, SmallOffsets)>),
-}
-
-impl DocColHits {
-    #[inline]
-    const fn new() -> Self {
-        Self::Inline {
-            len: 0,
-            cols: [(0, SmallOffsets::new()), (0, SmallOffsets::new())],
-        }
-    }
-
-    #[inline]
-    fn as_slice(&self) -> &[(u32, SmallOffsets)] {
-        match self {
-            Self::Inline { len, cols } => &cols[..(*len as usize)],
-            Self::Heap(v) => v.as_slice(),
-        }
-    }
-
-    #[inline]
-    fn ensure_col(&mut self, col_idx: u32) -> &mut SmallOffsets {
-        if let Self::Inline { len, cols } = self
-            && *len == 2
-            && cols[0].0 != col_idx
-            && cols[1].0 != col_idx
-        {
-            let mut v = Vec::with_capacity(4);
-            v.push(std::mem::take(&mut cols[0]));
-            v.push(std::mem::take(&mut cols[1]));
-            *self = Self::Heap(v);
-        }
-        match self {
-            Self::Inline { len, cols } => {
-                let n = *len as usize;
-                if n > 0 && cols[n - 1].0 == col_idx {
-                    return &mut cols[n - 1].1;
-                }
-                if n > 1 && cols[0].0 == col_idx {
-                    return &mut cols[0].1;
-                }
-                cols[n] = (col_idx, SmallOffsets::new());
-                *len = (n + 1) as u8;
-                &mut cols[n].1
-            }
-            Self::Heap(v) => {
-                let existing = if v.last().is_some_and(|x| x.0 == col_idx) {
-                    Some(v.len() - 1)
-                } else {
-                    v.iter().position(|x| x.0 == col_idx)
-                };
-                if let Some(idx) = existing {
-                    return &mut v[idx].1;
-                }
-                v.push((col_idx, SmallOffsets::new()));
-                &mut v.last_mut().unwrap().1
-            }
-        }
-    }
-
-    fn sort_cols_if_needed(&mut self) {
-        match self {
-            Self::Inline { len, cols } => {
-                if *len == 2 && cols[0].0 > cols[1].0 {
-                    cols.swap(0, 1);
-                }
-            }
-            Self::Heap(v) => {
-                if v.windows(2).any(|w| w[0].0 > w[1].0) {
-                    v.sort_unstable_by_key(|x| x.0);
-                }
-            }
-        }
-    }
-}
-
-/// Flat sorted postings for a single term: `(rowid, DocColHits)`.
-type TermPostings = Vec<(i64, DocColHits)>;
-
-fn decode_poslist_body_compact(detail: DetailMode, body: &[u8]) -> Result<DocColHits> {
-    let err_corrupt =
-        || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
-    let mut out = DocColHits::new();
-    match detail {
-        DetailMode::None => {
-            let _ = out.ensure_col(0);
-        }
-        DetailMode::Col => {
-            let mut pos = 0usize;
-            let mut cur_col = 0usize;
-            let mut first = true;
-            while pos < body.len() {
-                let v = get_uvarint(body, &mut pos).ok_or_else(err_corrupt)? as usize;
-                if v < 2 {
-                    return Err(err_corrupt());
-                }
-                if first {
-                    cur_col = v - 2;
-                    first = false;
-                } else {
-                    cur_col = cur_col.checked_add(v - 2).ok_or_else(err_corrupt)?;
-                }
-                let _ = out.ensure_col(cur_col as u32);
-            }
-        }
-        DetailMode::Full => {
-            let mut pos = 0usize;
-            let mut cur_col = 0usize;
-            let mut cur_off = 0usize;
-            let mut first_in_col = true;
-            while pos < body.len() {
-                let v = get_uvarint(body, &mut pos).ok_or_else(err_corrupt)? as usize;
-                if v == 1 {
-                    let next_col = get_uvarint(body, &mut pos).ok_or_else(err_corrupt)? as usize;
-                    cur_col = next_col;
-                    cur_off = 0;
-                    first_in_col = true;
-                    continue;
-                }
-                if v == 0 {
-                    break;
-                }
-                if first_in_col {
-                    cur_off = v - 2;
-                    first_in_col = false;
-                } else {
-                    cur_off = cur_off.checked_add(v - 2).ok_or_else(err_corrupt)?;
-                }
-                out.ensure_col(cur_col as u32).push(cur_off as u32);
-            }
-        }
-    }
-    out.sort_cols_if_needed();
-    Ok(out)
-}
-
-fn flatten_term_doc_hits(map: TermDocHitsMap) -> TermPostings {
-    map.into_iter()
-        .map(|(rid, cols)| {
-            let mut dch = DocColHits::new();
-            for (c, offs) in cols {
-                *dch.ensure_col(c as u32) = SmallOffsets::from_usize_vec(offs);
-            }
-            (rid, dch)
-        })
-        .collect()
-}
-
-fn eval_phrase_from_token_hits(
-    phrase_idx: usize,
-    phrase: &QueryPhrase,
-    cfg: &Fts5Config,
-    token_hits: &[Arc<TermPostings>],
-) -> EvalDocSet {
-    if phrase.tokens.is_empty() || token_hits.is_empty() {
-        return Vec::new();
-    }
-
-    let first_docs = token_hits[0].as_slice();
-    let mut result = Vec::with_capacity(first_docs.len());
-    let pidx_u32 = phrase_idx as u32;
-
-    if phrase.tokens.len() == 1 && !phrase.anchored_start {
-        for &(rowid, ref first_cols) in first_docs {
-            let mut instances = PhraseHits::new();
-            for &(col_idx, ref first_offs) in first_cols.as_slice() {
-                if cfg.detail == DetailMode::Full {
-                    for &start_off in first_offs.as_slice() {
-                        instances.push(PhraseInstance {
-                            phrase_idx: pidx_u32,
-                            col_idx,
-                            token_offset: start_off,
-                        });
-                    }
-                } else {
-                    instances.push(PhraseInstance {
-                        phrase_idx: pidx_u32,
-                        col_idx,
-                        token_offset: 0,
-                    });
-                }
-            }
-            if !instances.is_empty() {
-                result.push((rowid, instances));
-            }
-        }
-        return result;
-    }
-
-    let mut cursors = vec![0usize; token_hits.len()];
-
-    'doc_loop: for &(rowid, ref first_cols) in first_docs {
-        for (ti, other) in token_hits.iter().enumerate().skip(1) {
-            let slice = other.as_slice();
-            let cur = &mut cursors[ti];
-            while *cur < slice.len() && slice[*cur].0 < rowid {
-                *cur += 1;
-            }
-            if *cur >= slice.len() {
-                break 'doc_loop;
-            }
-            if slice[*cur].0 != rowid {
-                continue 'doc_loop;
-            }
-        }
-
-        let mut instances = PhraseHits::new();
-        for &(col_idx, ref first_offs) in first_cols.as_slice() {
-            if cfg.detail == DetailMode::Full {
-                for &start_off in first_offs.as_slice() {
-                    if phrase.anchored_start && start_off != 0 {
-                        continue;
-                    }
-                    let mut all_present = true;
-                    for (delta, other) in token_hits.iter().enumerate().skip(1) {
-                        let ocols = other[cursors[delta]].1.as_slice();
-                        let target_off = start_off.saturating_add(delta as u32);
-                        let has = ocols
-                            .binary_search_by_key(&col_idx, |&(c, _)| c)
-                            .ok()
-                            .is_some_and(|ci| {
-                                ocols[ci].1.as_slice().binary_search(&target_off).is_ok()
-                            });
-                        if !has {
-                            all_present = false;
-                            break;
-                        }
-                    }
-                    if all_present {
-                        instances.push(PhraseInstance {
-                            phrase_idx: pidx_u32,
-                            col_idx,
-                            token_offset: start_off,
-                        });
-                    }
-                }
-            } else {
-                let mut all_present = !phrase.anchored_start && phrase.tokens.len() == 1;
-                if phrase.tokens.len() > 1 {
-                    all_present = token_hits.iter().enumerate().skip(1).all(|(ti, other)| {
-                        other[cursors[ti]]
-                            .1
-                            .as_slice()
-                            .binary_search_by_key(&col_idx, |&(c, _)| c)
-                            .is_ok()
-                    });
-                }
-                if all_present {
-                    instances.push(PhraseInstance {
-                        phrase_idx: pidx_u32,
-                        col_idx,
-                        token_offset: 0,
-                    });
-                }
-            }
-        }
-
-        if !instances.is_empty() {
-            result.push((rowid, instances));
-        }
-    }
-
-    result
-}
-
-/// `FTS5_LOOKAHEAD_EOF`.
-const FTS5_LOOKAHEAD_EOF: i64 = 1 << 62;
-
-/// `Fts5LookaheadReader` over a sorted position list.
-struct LookaheadReader<'a> {
-    a: &'a [i64],
-    i: usize,
-    pos: i64,
-    lookahead: i64,
-}
-
-impl<'a> LookaheadReader<'a> {
-    fn new(a: &'a [i64]) -> Self {
-        let mut r = Self {
-            a,
-            i: 0,
-            pos: 0,
-            lookahead: 0,
-        };
-        r.next();
-        r.next();
-        r
-    }
-
-    /// `fts5LookaheadReaderNext`: true when the reader is exhausted.
-    fn next(&mut self) -> bool {
-        self.pos = self.lookahead;
-        if self.i < self.a.len() {
-            self.lookahead = self.a[self.i];
-            self.i += 1;
-        } else {
-            self.lookahead = FTS5_LOOKAHEAD_EOF;
-        }
-        self.pos == FTS5_LOOKAHEAD_EOF
-    }
-}
-
-/// `fts5ExprNearIsMatch`: `lists[i]` holds the positions (`column << 32 | offset`) of phrase
-/// `i` in one row. Returns the positions that take part in a NEAR match, one list per
-/// phrase, or `None` if the row does not match.
-fn near_is_match(lists: &[Vec<i64>], n_terms: &[i64], n_near: i64) -> Option<Vec<Vec<i64>>> {
-    let n = lists.len();
-    let mut readers: Vec<LookaheadReader<'_>> =
-        lists.iter().map(|l| LookaheadReader::new(l)).collect();
-    let mut out: Vec<Vec<i64>> = vec![Vec::new(); n];
-    'outer: loop {
-        // Advance the phrase iterators until they point to a set of entries that together
-        // comprise a match.
-        let mut i_max = readers[0].pos;
-        loop {
-            let mut is_match = true;
-            for i in 0..n {
-                let i_min = i_max - n_terms[i] - n_near;
-                if readers[i].pos < i_min || readers[i].pos > i_max {
-                    is_match = false;
-                    while readers[i].pos < i_min {
-                        if readers[i].next() {
-                            break 'outer;
-                        }
-                    }
-                    if readers[i].pos > i_max {
-                        i_max = readers[i].pos;
-                    }
-                }
-            }
-            if is_match {
-                break;
-            }
-        }
-        // Add an entry to each output position list.
-        for i in 0..n {
-            let pos = readers[i].pos;
-            if out[i].last() != Some(&pos) {
-                out[i].push(pos);
-            }
-        }
-        let mut i_adv = 0usize;
-        let mut i_min = readers[0].lookahead;
-        for (i, r) in readers.iter().enumerate() {
-            if r.lookahead < i_min {
-                i_min = r.lookahead;
-                i_adv = i;
-            }
-        }
-        if readers[i_adv].next() {
-            break;
-        }
-    }
-    (!out[0].is_empty()).then_some(out)
-}
-
-/// Evaluates a query tree against the per-phrase match sets (`fts5ExprNodeTest_*`).
-///
-/// `precomputed_phrases[i]` holds the rows phrase `i` matches with every phrase position;
-/// `phrase_doc_hits[i]` receives the number of rows the phrase matches on its own within
-/// the column set of its group (`xQueryPhrase`, used by `bm25()`). A returned row carries
-/// the positions of the phrases whose node is positioned on it (`sqlite3Fts5ExprPoslist`).
-fn eval_query_expr_precomputed(
-    expr: &FtsQueryExpr,
-    phrases: &[QueryPhrase],
-    precomputed_phrases: &mut [EvalDocSet],
-    phrase_doc_hits: &mut [usize],
-) -> EvalDocSet {
-    match expr {
-        FtsQueryExpr::Near(near) => {
-            let mut per_phrase: Vec<EvalDocSet> = Vec::with_capacity(near.phrases.len());
-            for k in 0..near.phrases.len() {
-                let pi = near.first_phrase + k;
-                let mut docs = precomputed_phrases
-                    .get_mut(pi)
-                    .map(std::mem::take)
-                    .unwrap_or_default();
-                if let Some(allowed) = &near.colset {
-                    docs.retain_mut(|(_, insts)| {
-                        insts.retain(|inst| allowed.contains(&(inst.col_idx as usize)));
-                        !insts.is_empty()
-                    });
-                }
-                if let Some(slot) = phrase_doc_hits.get_mut(pi) {
-                    *slot = docs.len();
-                }
-                per_phrase.push(docs);
-            }
-            if near.eof || per_phrase.iter().any(Vec::is_empty) {
-                return Vec::new();
-            }
-            if per_phrase.len() == 1 {
-                return per_phrase.pop().unwrap_or_default();
-            }
-            let n_terms: Vec<i64> = near.phrases.iter().map(|p| p.tokens.len() as i64).collect();
-            let Some((first, rest)) = per_phrase.split_first() else {
-                return Vec::new();
-            };
-            let _ = phrases;
-            let mut out = EvalDocSet::new();
-            let mut cursors = vec![0usize; rest.len()];
-            'near_doc: for &(rowid, ref first_insts) in first {
-                for (ri, pm) in rest.iter().enumerate() {
-                    let cur = &mut cursors[ri];
-                    while *cur < pm.len() && pm[*cur].0 < rowid {
-                        *cur += 1;
-                    }
-                    if *cur >= pm.len() {
-                        break 'near_doc;
-                    }
-                    if pm[*cur].0 != rowid {
-                        continue 'near_doc;
-                    }
-                }
-                let to_list = |insts: &PhraseHits| -> Vec<i64> {
-                    let mut v: Vec<i64> = insts
-                        .as_slice()
-                        .iter()
-                        .map(|i| (i64::from(i.col_idx) << 32) + i64::from(i.token_offset))
-                        .collect();
-                    v.sort_unstable();
-                    v
-                };
-                let mut lists = Vec::with_capacity(1 + rest.len());
-                lists.push(to_list(first_insts));
-                for (ri, pm) in rest.iter().enumerate() {
-                    lists.push(to_list(&pm[cursors[ri]].1));
-                }
-                if let Some(matched) = near_is_match(&lists, &n_terms, near.distance) {
-                    let mut hits = PhraseHits::new();
-                    for (k, list) in matched.iter().enumerate() {
-                        for &pos in list {
-                            hits.push(PhraseInstance {
-                                phrase_idx: (near.first_phrase + k) as u32,
-                                col_idx: (pos >> 32) as u32,
-                                token_offset: (pos & 0x7fff_ffff) as u32,
-                            });
-                        }
-                    }
-                    out.push((rowid, hits));
-                }
-            }
-            out
-        }
-        FtsQueryExpr::And(children) => {
-            let mut acc: Option<EvalDocSet> = None;
-            let mut dead = false;
-            for child in children {
-                // Every child is evaluated: the per-phrase hit counts are needed even when
-                // the conjunction is already known to be empty.
-                let r = eval_query_expr_precomputed(
-                    child,
-                    phrases,
-                    precomputed_phrases,
-                    phrase_doc_hits,
-                );
-                if dead {
-                    continue;
-                }
-                acc = Some(match acc {
-                    None => r,
-                    Some(l) => {
-                        let mut out = Vec::with_capacity(l.len().min(r.len()));
-                        let mut l_iter = l.into_iter().peekable();
-                        let mut r_iter = r.into_iter().peekable();
-                        while let (Some(&(l_rid, _)), Some(&(r_rid, _))) =
-                            (l_iter.peek(), r_iter.peek())
-                        {
-                            match l_rid.cmp(&r_rid) {
-                                std::cmp::Ordering::Less => {
-                                    l_iter.next();
-                                }
-                                std::cmp::Ordering::Greater => {
-                                    r_iter.next();
-                                }
-                                std::cmp::Ordering::Equal => {
-                                    if let (Some((rid, mut l_insts)), Some((_, r_insts))) =
-                                        (l_iter.next(), r_iter.next())
-                                    {
-                                        l_insts.extend_from(&r_insts);
-                                        out.push((rid, l_insts));
-                                    }
-                                }
-                            }
-                        }
-                        out
-                    }
-                });
-                if acc.as_ref().is_some_and(Vec::is_empty) {
-                    dead = true;
-                }
-            }
-            acc.unwrap_or_default()
-        }
-        FtsQueryExpr::Or(children) => {
-            let mut acc: EvalDocSet = Vec::new();
-            for child in children {
-                let r = eval_query_expr_precomputed(
-                    child,
-                    phrases,
-                    precomputed_phrases,
-                    phrase_doc_hits,
-                );
-                if r.is_empty() {
-                    continue;
-                }
-                if acc.is_empty() {
-                    acc = r;
-                    continue;
-                }
-                let l = std::mem::take(&mut acc);
-                let mut out = Vec::with_capacity(l.len() + r.len());
-                let mut l_iter = l.into_iter().peekable();
-                let mut r_iter = r.into_iter().peekable();
-                loop {
-                    match (l_iter.peek(), r_iter.peek()) {
-                        (Some(&(l_rid, _)), Some(&(r_rid, _))) => match l_rid.cmp(&r_rid) {
-                            std::cmp::Ordering::Less => out.extend(l_iter.next()),
-                            std::cmp::Ordering::Greater => out.extend(r_iter.next()),
-                            std::cmp::Ordering::Equal => {
-                                if let (Some((rid, mut l_insts)), Some((_, r_insts))) =
-                                    (l_iter.next(), r_iter.next())
-                                {
-                                    l_insts.extend_from(&r_insts);
-                                    out.push((rid, l_insts));
-                                }
-                            }
-                        },
-                        (Some(_), None) => {
-                            out.extend(l_iter);
-                            break;
-                        }
-                        (None, Some(_)) => {
-                            out.extend(r_iter);
-                            break;
-                        }
-                        (None, None) => break,
-                    }
-                }
-                acc = out;
-            }
-            acc
-        }
-        FtsQueryExpr::Not(lhs, rhs) => {
-            let mut l =
-                eval_query_expr_precomputed(lhs, phrases, precomputed_phrases, phrase_doc_hits);
-            let r = eval_query_expr_precomputed(rhs, phrases, precomputed_phrases, phrase_doc_hits);
-            if l.is_empty() || r.is_empty() {
-                return l;
-            }
-            let mut ri = 0usize;
-            l.retain(|&(l_rid, _)| {
-                while ri < r.len() && r[ri].0 < l_rid {
-                    ri += 1;
-                }
-                ri >= r.len() || r[ri].0 != l_rid
-            });
-            l
-        }
-    }
-}
-
-/// The phrase group (column filter) every phrase of the query belongs to, by phrase number.
-fn collect_phrase_colsets(expr: &FtsQueryExpr, out: &mut Vec<Option<Vec<usize>>>) {
-    match expr {
-        FtsQueryExpr::Near(n) => {
-            for _ in &n.phrases {
-                out.push(n.colset.clone());
-            }
-        }
-        FtsQueryExpr::And(ch) | FtsQueryExpr::Or(ch) => {
-            for c in ch {
-                collect_phrase_colsets(c, out);
-            }
-        }
-        FtsQueryExpr::Not(l, r) => {
-            collect_phrase_colsets(l, out);
-            collect_phrase_colsets(r, out);
-        }
-    }
-}
-
-/// `sqlite3Fts5ExprPopulatePoslists` for detail=column / detail=none tables: the index does
-/// not store token offsets, so the instances of the phrases positioned on a row are found
-/// by tokenizing the row's text again. `active` lists those phrases.
-fn populate_instances_from_text(
-    cfg: &Fts5Config,
-    phrases: &[QueryPhrase],
-    colsets: &[Option<Vec<usize>>],
-    active: &[bool],
-    col_texts: &[Option<Vec<u8>>],
-) -> PhraseHits {
-    let mut hits = PhraseHits::new();
-    for (col, text) in col_texts.iter().enumerate() {
-        let Some(text) = text else {
-            continue;
-        };
-        let ok: Vec<bool> = (0..phrases.len())
-            .map(|i| {
-                active.get(i).copied().unwrap_or(false)
-                    && colsets
-                        .get(i)
-                        .and_then(|c| c.as_ref())
-                        .is_none_or(|c| c.contains(&col))
-            })
-            .collect();
-        if !ok.iter().any(|&b| b) {
-            continue;
-        }
-        let mut off = 0u32;
-        cfg.tokenizer.tok.tokenize(text, &mut |tok, _, _| {
-            let tok = &tok[..tok.len().min(FTS5_MAX_TOKEN_SIZE)];
-            for (i, phrase) in phrases.iter().enumerate() {
-                if !ok[i] {
-                    continue;
-                }
-                let Some(term) = phrase.tokens.first() else {
-                    continue;
-                };
-                let t = term.term.as_bytes();
-                if (t.len() == tok.len() || (t.len() < tok.len() && term.is_prefix))
-                    && &tok[..t.len()] == t
-                {
-                    hits.push(PhraseInstance {
-                        phrase_idx: i as u32,
-                        col_idx: col as u32,
-                        token_offset: off,
-                    });
-                }
-            }
-            off += 1;
-        });
-    }
-    hits
 }
 
 // ============================================================================
@@ -3610,87 +1381,13 @@ impl Fts5ShadowNames {
     }
 }
 
-type SegIdxEntries = Vec<(Vec<u8>, u64)>;
-
-const FTS5_EXACT_TERM_CACHE_MAX: usize = 4096;
-const FTS5_DENSE_DOCSIZE_MAX: usize = 262_144;
-
-#[derive(Debug, Default)]
-struct Fts5ReadCache {
-    structure_blob: Option<Vec<u8>>,
-    segments: Vec<Fts5SegRecord>,
-    averages: Option<Vec<u64>>,
-    seg_tombstones: HashMap<u64, Arc<BTreeSet<i64>>>,
-    seg_idx: HashMap<u64, Arc<SegIdxEntries>>,
-    leaf_pages: HashMap<(u64, u64), Arc<ParsedLeafPage>>,
-    exact_terms: HashMap<SmallBytes22, Arc<TermPostings>>,
-    dense_docsize: Vec<Option<DocColSizes>>,
-    docsize_cache: HashMap<i64, DocColSizes>,
-}
-
-impl Fts5ReadCache {
-    #[inline]
-    fn get_docsize(&self, rowid: i64) -> Option<DocColSizes> {
-        if rowid > 0 && (rowid as usize) <= FTS5_DENSE_DOCSIZE_MAX {
-            let idx = rowid as usize;
-            if idx < self.dense_docsize.len() {
-                return self.dense_docsize[idx].clone();
-            }
-            return None;
-        }
-        self.docsize_cache.get(&rowid).cloned()
-    }
-
-    #[inline]
-    fn insert_docsize(&mut self, rowid: i64, sz: DocColSizes) {
-        if rowid > 0 && (rowid as usize) <= FTS5_DENSE_DOCSIZE_MAX {
-            let idx = rowid as usize;
-            if idx >= self.dense_docsize.len() {
-                self.dense_docsize.resize(
-                    (idx + 1)
-                        .next_power_of_two()
-                        .min(FTS5_DENSE_DOCSIZE_MAX + 1),
-                    None,
-                );
-            }
-            self.dense_docsize[idx] = Some(sz);
-        } else {
-            self.docsize_cache.insert(rowid, sz);
-        }
-    }
-
-    #[inline]
-    fn remove_docsize(&mut self, rowid: i64) {
-        if rowid > 0 && (rowid as usize) <= FTS5_DENSE_DOCSIZE_MAX {
-            let idx = rowid as usize;
-            if idx < self.dense_docsize.len() {
-                self.dense_docsize[idx] = None;
-            }
-        } else {
-            self.docsize_cache.remove(&rowid);
-        }
-    }
-
-    #[inline]
-    fn clear_docsize(&mut self) {
-        self.dense_docsize.clear();
-        self.docsize_cache.clear();
-    }
-
-    fn clear_all(&mut self) {
-        self.clear_segment_maps();
-        self.clear_docsize();
-    }
-
-    fn clear_segment_maps(&mut self) {
-        self.structure_blob = None;
-        self.segments.clear();
-        self.averages = None;
-        self.seg_tombstones.clear();
-        self.seg_idx.clear();
-        self.leaf_pages.clear();
-        self.exact_terms.clear();
-    }
+/// A row of the content source as `FTS5_STMT_LOOKUP` returns it.
+#[derive(Debug, Clone)]
+struct SavedRow {
+    /// One value per user column.
+    cols: Vec<Value>,
+    /// The `l<N>` values (NULL where there is none).
+    locs: Vec<Value>,
 }
 
 /// The state of one FTS5 table: C's `Fts5Index` (pending-terms hash, cached structure,
@@ -3706,9 +1403,6 @@ struct Fts5SharedState {
     a_total_size: Vec<i64>,
     /// `Fts5FullTable.iSavepoint`.
     i_savepoint: i64,
-    read_cache: Fts5ReadCache,
-    /// Value of `Fts5Index::write_gen` the read cache was filled at.
-    read_gen: u64,
     docsize_hint: ShadowHint,
     /// What parameter 3 (`origin`) of the module's cached `REPLACE INTO %_docsize VALUES(?,?,?)`
     /// statement is bound to. `fts5StorageInsertDocsize` binds it, `fts5StorageNewRowid` binds
@@ -3716,6 +1410,14 @@ struct Fts5SharedState {
     /// the previous docsize row (`sqlite3_reset` keeps bindings); NULL until the first one.
     docsize_origin_binding: Option<i64>,
     content_hint: ShadowHint,
+    /// `Fts5FullTable.pSortCsr`: the cursor whose sorter statement is being run.
+    p_sort_csr: Option<main::SortCsr>,
+    /// `Fts5Storage.pSavedRow`: the old row of the UPDATE being applied.
+    saved_row: Option<SavedRow>,
+    /// The next row lookup of a delete keeps its row in `saved_row` (`bSaveRow`).
+    want_saved_row: bool,
+    /// The number of cursors open on the table (`fts5NewTransaction`).
+    n_open_csr: usize,
     sql_replace_docsize3: String,
     sql_replace_config: String,
     sql_insert_content: String,
@@ -3732,12 +1434,13 @@ fn index_detail(d: DetailMode) -> IndexDetail {
 
 impl Fts5SharedState {
     fn new(db_name: &str, tbl_name: &str, cfg: &Fts5Config) -> Self {
-        let icfg = IndexConfig::new(
+        let mut icfg = IndexConfig::new(
             index_detail(cfg.detail),
             cfg.prefixes.clone(),
             cfg.contentless_delete,
             cfg.columns.len(),
         );
+        icfg.b_tokendata = cfg.tokendata;
         let mut st = Self {
             shadows: Fts5ShadowNames::new(tbl_name),
             index: Fts5Index::new(db_name, tbl_name, icfg),
@@ -3745,11 +1448,13 @@ impl Fts5SharedState {
             n_total_row: 0,
             a_total_size: vec![0; cfg.columns.len()],
             i_savepoint: 0,
-            read_cache: Fts5ReadCache::default(),
-            read_gen: 0,
             docsize_hint: ShadowHint::NONE,
             docsize_origin_binding: None,
             content_hint: ShadowHint::NONE,
+            p_sort_csr: None,
+            saved_row: None,
+            want_saved_row: false,
+            n_open_csr: 0,
             sql_replace_docsize3: String::new(),
             sql_replace_config: String::new(),
             sql_insert_content: String::new(),
@@ -3774,47 +1479,13 @@ impl Fts5SharedState {
         self.sql_replace_docsize3 = format!("REPLACE INTO {db_q}.{docsize_q} VALUES(?,?,?)");
         self.sql_replace_config = format!("REPLACE INTO {db_q}.{config_q} VALUES(?,?)");
         let n_content = cfg
-            .content_row(0, &vec![Value::Null; cfg.columns.len()])
+            .content_row(0, &vec![Value::Null; cfg.columns.len()], &[])
+            .unwrap_or_default()
             .len();
         let binds: Vec<String> = (1..=n_content).map(|i| format!("?{i}")).collect();
         let binds = binds.join(",");
         self.sql_insert_content = format!("INSERT INTO {db_q}.{content_q} VALUES({binds})");
         self.sql_replace_content = format!("REPLACE INTO {db_q}.{content_q} VALUES({binds})");
-    }
-
-    fn ensure_structure_coherent(&mut self, ctx: &mut dyn VTabHostContext) -> Result<()> {
-        // Anything the index wrote since the cache was filled (leaves edited in place,
-        // tombstone pages, merges) makes the cached pages stale.
-        if self.read_gen != self.index.write_gen {
-            self.read_cache.clear_segment_maps();
-            self.read_gen = self.index.write_gen;
-        }
-        if let Some(ref cur_sblob) = self.read_cache.structure_blob
-            && ctx.shadow_rowid_blob_eq(&self.shadows.data, FTS5_STRUCTURE_ROWID, 1, cur_sblob)?
-                == Some(true)
-        {
-            return Ok(());
-        }
-        let err_corrupt =
-            || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
-        let srow = ctx.shadow_get_rowid(&self.shadows.data, FTS5_STRUCTURE_ROWID)?;
-        let Some(Value::Blob(sblob)) = srow.and_then(|mut r| {
-            if r.len() >= 2 {
-                Some(r.swap_remove(1))
-            } else {
-                None
-            }
-        }) else {
-            return Err(err_corrupt());
-        };
-        if self.read_cache.structure_blob.as_deref() == Some(sblob.as_slice()) {
-            return Ok(());
-        }
-        let segments = decode_structure_segments(&sblob)?;
-        self.read_cache.clear_all();
-        self.read_cache.structure_blob = Some(sblob);
-        self.read_cache.segments = segments;
-        Ok(())
     }
 
     /// `fts5StorageLoadTotals(p, 1)`.
@@ -3835,7 +1506,6 @@ impl Fts5SharedState {
         for &sz in &self.a_total_size {
             fts5_put_varint(&mut buf, sz as u64);
         }
-        self.read_cache.averages = None;
         self.index.set_averages(ctx, &buf)
     }
 
@@ -3860,7 +1530,6 @@ impl Fts5SharedState {
     fn storage_rollback(&mut self) {
         self.b_totals_valid = false;
         self.index.rollback();
-        self.read_cache.clear_all();
     }
 
     /// `sqlite3Fts5StorageConfigValue`.
@@ -3885,683 +1554,6 @@ impl Fts5SharedState {
             self.index.config.i_cookie = i_new;
         }
         Ok(())
-    }
-
-    /// The row count and per-column token totals as queries see them
-    /// (`fts5StorageLoadTotals(p, 0)`): the totals of the open transaction when it has
-    /// written, the averages record otherwise.
-    fn read_averages(
-        &mut self,
-        cfg: &Fts5Config,
-        ctx: &mut dyn VTabHostContext,
-    ) -> Result<Vec<u64>> {
-        let n_expected = 1 + cfg.columns.len();
-        if self.b_totals_valid {
-            let mut out = Vec::with_capacity(n_expected);
-            out.push(self.n_total_row as u64);
-            out.extend(self.a_total_size.iter().map(|&v| v as u64));
-            out.resize(n_expected, 0);
-            return Ok(out);
-        }
-        if let Some(ref avgs) = self.read_cache.averages {
-            return Ok(avgs.clone());
-        }
-        let row = ctx.shadow_get_rowid(&self.shadows.data, FTS5_AVERAGES_ROWID)?;
-        let avgs = if let Some(Value::Blob(b)) = row.as_ref().and_then(|r| r.get(1))
-            && let Some(mut list) = decode_varint_list(b)
-        {
-            list.resize(n_expected, 0);
-            list
-        } else {
-            vec![0u64; n_expected]
-        };
-        self.read_cache.averages = Some(avgs.clone());
-        Ok(avgs)
-    }
-
-    /// The weights of the configured `rank` function (`Fts5Config.zRankArgs`).
-    fn get_configured_rank_weights(&mut self, ctx: &mut dyn VTabHostContext) -> Result<Vec<f64>> {
-        self.index.load_config(ctx)?;
-        match self.index.config.rank.as_deref() {
-            Some(s) => parse_rank_expression(s),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    /// Applies the pending doclist of a key (`fts5SegIterHashInit`: the hash is the newest
-    /// source of a query) on top of the postings read from the segments.
-    fn apply_hash_doclist(
-        detail: DetailMode,
-        doclist: &[u8],
-        mut apply: impl FnMut(i64, bool, &[u8]) -> Result<()>,
-    ) -> Result<()> {
-        let n = doclist.len();
-        let mut i_off = 0usize;
-        let mut rowid: i64 = 0;
-        while i_off < n {
-            let (delta, nb) = fts5_get_varint(doclist, i_off);
-            i_off += nb;
-            rowid = rowid.wrapping_add(delta as i64);
-            if detail == DetailMode::None {
-                // `00` = delete marker, `00 00` = deleted and inserted again.
-                let mut del = false;
-                let mut content = true;
-                if i_off < n && doclist[i_off] == 0 {
-                    del = true;
-                    i_off += 1;
-                    if i_off < n && doclist[i_off] == 0 {
-                        i_off += 1;
-                    } else {
-                        content = false;
-                    }
-                }
-                let _ = del;
-                apply(rowid, !content, &[])?;
-            } else {
-                let (n_sz, nb) = fts5_get_varint32(doclist, i_off);
-                i_off += nb;
-                let n_pos = (n_sz / 2).max(0) as usize;
-                let end = (i_off + n_pos).min(n);
-                apply(rowid, n_pos == 0, &doclist[i_off..end])?;
-                i_off = end;
-            }
-        }
-        Ok(())
-    }
-
-    fn get_or_load_tombstones(
-        &mut self,
-        ctx: &mut dyn VTabHostContext,
-        segid: u64,
-        n_pages: u64,
-    ) -> Result<Option<Arc<BTreeSet<i64>>>> {
-        if n_pages == 0 {
-            return Ok(None);
-        }
-        if let Some(ts) = self.read_cache.seg_tombstones.get(&segid) {
-            return Ok(Some(Arc::clone(ts)));
-        }
-        let ts = Arc::new(load_segment_tombstones(
-            ctx,
-            &self.shadows.data,
-            segid,
-            n_pages,
-        )?);
-        self.read_cache
-            .seg_tombstones
-            .insert(segid, Arc::clone(&ts));
-        Ok(Some(ts))
-    }
-
-    fn get_or_load_seg_idx(
-        &mut self,
-        ctx: &mut dyn VTabHostContext,
-        segid: u64,
-    ) -> Result<Arc<SegIdxEntries>> {
-        if let Some(entries) = self.read_cache.seg_idx.get(&segid) {
-            return Ok(Arc::clone(entries));
-        }
-        let db_q = quote_ident(ctx.db_name());
-        let idx_q = quote_ident(&self.shadows.idx);
-        let rows = ctx.query_sql(
-            &format!("SELECT term, pgno FROM {db_q}.{idx_q} WHERE segid = ?1 ORDER BY term ASC"),
-            &[Value::Integer(segid as i64)],
-        )?;
-        let mut parsed = Vec::with_capacity(rows.len());
-        for mut r in rows {
-            if r.len() < 2 {
-                continue;
-            }
-            let pg_i64 = r[1].to_integer_lossy();
-            let pg_u64 = (pg_i64 >> 1).max(1) as u64;
-            let key_bytes = match r.swap_remove(0) {
-                Value::Blob(b) => b,
-                Value::Text(s) => s.into_bytes(),
-                other => other.to_text_lossy().into_bytes(),
-            };
-            parsed.push((key_bytes, pg_u64));
-        }
-        let arc = Arc::new(parsed);
-        self.read_cache.seg_idx.insert(segid, Arc::clone(&arc));
-        Ok(arc)
-    }
-
-    fn get_or_load_leaf_page(
-        &mut self,
-        ctx: &mut dyn VTabHostContext,
-        segid: u64,
-        pgno: u64,
-        is_first_seg_page: bool,
-    ) -> Result<Arc<ParsedLeafPage>> {
-        if let Some(lp) = self.read_cache.leaf_pages.get(&(segid, pgno)) {
-            return Ok(Arc::clone(lp));
-        }
-        let lrid = fts5_segment_rowid(segid, pgno);
-        let lrow = ctx.shadow_get_rowid(&self.shadows.data, lrid)?;
-        let Some(Value::Blob(raw)) = lrow.and_then(|mut r| {
-            if r.len() >= 2 {
-                Some(r.swap_remove(1))
-            } else {
-                None
-            }
-        }) else {
-            // `fts5DataRead` -> FTS5_CORRUPT_ROWID
-            return Err(SqliteError::with_extended(
-                FTS5_CORRUPT,
-                format!(
-                    "fts5: corruption found reading blob {lrid} from table \"{}\"",
-                    self.shadows.table_name
-                ),
-            ));
-        };
-        let parsed = Arc::new(ParsedLeafPage::parse(raw, is_first_seg_page)?);
-        self.read_cache
-            .leaf_pages
-            .insert((segid, pgno), Arc::clone(&parsed));
-        Ok(parsed)
-    }
-
-    /// Decodes the doclist of `leaf.terms[term_idx]` starting on `start_pg` (following any
-    /// cross-page continuations onto `start_pg + 1 ..= seg.pgno_last`) into `target_docs`,
-    /// returning the last pure-continuation page consumed (`>= start_pg`).
-    #[allow(clippy::too_many_arguments)]
-    fn decode_term_doclist_across_pages(
-        &mut self,
-        ctx: &mut dyn VTabHostContext,
-        detail: DetailMode,
-        seg: &Fts5SegRecord,
-        tombstones: Option<&BTreeSet<i64>>,
-        start_pg: u64,
-        leaf: &ParsedLeafPage,
-        term_idx: usize,
-        target_docs: &mut BTreeMap<i64, BTreeMap<usize, Vec<usize>>>,
-    ) -> Result<u64> {
-        let err_corrupt =
-            || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
-        let (_, ds, de) = leaf.terms[term_idx];
-        let mut cur_rowid = 0i64;
-        let mut first_in_doclist = true;
-        let mut pending_poslist: Option<(bool, usize, Vec<u8>)> = None;
-        let is_last_on_page = term_idx + 1 == leaf.terms.len();
-
-        parse_doclist_slice_on_block(
-            &leaf.raw,
-            leaf.first_rowid_off,
-            ds,
-            de,
-            is_last_on_page && start_pg < seg.pgno_last,
-            detail,
-            &mut cur_rowid,
-            &mut first_in_doclist,
-            &mut pending_poslist,
-            &mut |rid, del, body| {
-                if del || tombstones.is_some_and(|ts| ts.contains(&rid)) {
-                    target_docs.remove(&rid);
-                } else {
-                    let hits = decode_poslist_body(detail, body)?;
-                    target_docs.insert(rid, hits);
-                }
-                Ok(())
-            },
-        )?;
-
-        let mut last_pure_cont_pg = start_pg;
-        if is_last_on_page && start_pg < seg.pgno_last {
-            for cont_pg in (start_pg + 1)..=seg.pgno_last {
-                let cont_leaf =
-                    self.get_or_load_leaf_page(ctx, seg.segid, cont_pg, cont_pg == seg.pgno_first)?;
-                if cont_leaf.leading_end > 4 {
-                    parse_doclist_slice_on_block(
-                        &cont_leaf.raw,
-                        cont_leaf.first_rowid_off,
-                        4,
-                        cont_leaf.leading_end,
-                        cont_leaf.terms.is_empty() && cont_pg < seg.pgno_last,
-                        detail,
-                        &mut cur_rowid,
-                        &mut first_in_doclist,
-                        &mut pending_poslist,
-                        &mut |rid, del, body| {
-                            if del || tombstones.is_some_and(|ts| ts.contains(&rid)) {
-                                target_docs.remove(&rid);
-                            } else {
-                                let hits = decode_poslist_body(detail, body)?;
-                                target_docs.insert(rid, hits);
-                            }
-                            Ok(())
-                        },
-                    )?;
-                }
-                if !cont_leaf.terms.is_empty() {
-                    if pending_poslist.is_some() {
-                        return Err(err_corrupt());
-                    }
-                    break;
-                }
-                last_pure_cont_pg = cont_pg;
-            }
-        }
-
-        if pending_poslist.is_some() {
-            return Err(err_corrupt());
-        }
-        Ok(last_pure_cont_pg)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn decode_term_doclist_into_vec(
-        &mut self,
-        ctx: &mut dyn VTabHostContext,
-        detail: DetailMode,
-        seg: &Fts5SegRecord,
-        tombstones: Option<&BTreeSet<i64>>,
-        start_pg: u64,
-        leaf: &ParsedLeafPage,
-        term_idx: usize,
-        target_vec: &mut TermPostings,
-    ) -> Result<()> {
-        let err_corrupt =
-            || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
-        let (_, ds, de) = leaf.terms[term_idx];
-        let mut cur_rowid = 0i64;
-        let mut first_in_doclist = true;
-        let mut pending_poslist: Option<(bool, usize, Vec<u8>)> = None;
-        let is_last_on_page = term_idx + 1 == leaf.terms.len();
-
-        let mut push_doc = |rid: i64, del: bool, body: &[u8]| -> Result<()> {
-            if del || tombstones.is_some_and(|ts| ts.contains(&rid)) {
-                if target_vec.last().is_some_and(|&(r, _)| r == rid) {
-                    target_vec.pop();
-                } else if let Ok(pos) = target_vec.binary_search_by_key(&rid, |&(r, _)| r) {
-                    target_vec.remove(pos);
-                }
-            } else {
-                let hits = decode_poslist_body_compact(detail, body)?;
-                if target_vec.last().is_none_or(|&(r, _)| rid > r) {
-                    target_vec.push((rid, hits));
-                } else {
-                    match target_vec.binary_search_by_key(&rid, |&(r, _)| r) {
-                        Ok(pos) => target_vec[pos].1 = hits,
-                        Err(pos) => target_vec.insert(pos, (rid, hits)),
-                    }
-                }
-            }
-            Ok(())
-        };
-
-        parse_doclist_slice_on_block(
-            &leaf.raw,
-            leaf.first_rowid_off,
-            ds,
-            de,
-            is_last_on_page && start_pg < seg.pgno_last,
-            detail,
-            &mut cur_rowid,
-            &mut first_in_doclist,
-            &mut pending_poslist,
-            &mut push_doc,
-        )?;
-
-        if is_last_on_page && start_pg < seg.pgno_last {
-            for cont_pg in (start_pg + 1)..=seg.pgno_last {
-                let cont_leaf =
-                    self.get_or_load_leaf_page(ctx, seg.segid, cont_pg, cont_pg == seg.pgno_first)?;
-                if cont_leaf.leading_end > 4 {
-                    parse_doclist_slice_on_block(
-                        &cont_leaf.raw,
-                        cont_leaf.first_rowid_off,
-                        4,
-                        cont_leaf.leading_end,
-                        cont_leaf.terms.is_empty() && cont_pg < seg.pgno_last,
-                        detail,
-                        &mut cur_rowid,
-                        &mut first_in_doclist,
-                        &mut pending_poslist,
-                        &mut push_doc,
-                    )?;
-                }
-                if !cont_leaf.terms.is_empty() {
-                    if pending_poslist.is_some() {
-                        return Err(err_corrupt());
-                    }
-                    break;
-                }
-            }
-        }
-
-        if pending_poslist.is_some() {
-            return Err(err_corrupt());
-        }
-        Ok(())
-    }
-
-    /// The postings of one index key as a query sees them: the segments plus the pending
-    /// doclist of the key (`fts5MultiIterNew` adds the hash as the newest source).
-    fn lookup_exact_term(
-        &mut self,
-        cfg: &Fts5Config,
-        ctx: &mut dyn VTabHostContext,
-        target_key: &[u8],
-    ) -> Result<Arc<TermPostings>> {
-        let base = self.lookup_exact_term_segments(cfg, ctx, target_key)?;
-        let Some(doclist) = self.index.hash_query(target_key) else {
-            return Ok(base);
-        };
-        let mut out: TermPostings = (*base).clone();
-        Self::apply_hash_doclist(cfg.detail, &doclist, |rid, empty, body| {
-            if empty {
-                if let Ok(pos) = out.binary_search_by_key(&rid, |&(r, _)| r) {
-                    out.remove(pos);
-                }
-            } else {
-                let hits = decode_poslist_body_compact(cfg.detail, body)?;
-                match out.binary_search_by_key(&rid, |&(r, _)| r) {
-                    Ok(pos) => out[pos].1 = hits,
-                    Err(pos) => out.insert(pos, (rid, hits)),
-                }
-            }
-            Ok(())
-        })?;
-        Ok(Arc::new(out))
-    }
-
-    fn lookup_exact_term_segments(
-        &mut self,
-        cfg: &Fts5Config,
-        ctx: &mut dyn VTabHostContext,
-        target_key: &[u8],
-    ) -> Result<Arc<TermPostings>> {
-        if let Some(cached) = self.read_cache.exact_terms.get(target_key) {
-            return Ok(Arc::clone(cached));
-        }
-        let err_corrupt =
-            || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
-        let segments = self.read_cache.segments.clone();
-
-        let postings = if segments.len() == 1 {
-            let seg = &segments[0];
-            let mut vec_out = TermPostings::new();
-            if seg.pgno_first > 0 && seg.pgno_last >= seg.pgno_first {
-                let tombstones =
-                    self.get_or_load_tombstones(ctx, seg.segid, seg.n_tombstone_pages)?;
-                let idx_entries = self.get_or_load_seg_idx(ctx, seg.segid)?;
-                let pos = idx_entries.partition_point(|(k, _)| k.as_slice() <= target_key);
-                let start_pg = if pos > 0 {
-                    idx_entries[pos - 1].1.max(seg.pgno_first)
-                } else {
-                    seg.pgno_first
-                };
-                if start_pg > seg.pgno_last {
-                    return Err(err_corrupt());
-                }
-                'single_seg: for pg in start_pg..=seg.pgno_last {
-                    let leaf =
-                        self.get_or_load_leaf_page(ctx, seg.segid, pg, pg == seg.pgno_first)?;
-                    for (k, (t, _, _)) in leaf.terms.iter().enumerate() {
-                        match t.as_slice().cmp(target_key) {
-                            std::cmp::Ordering::Less => {}
-                            std::cmp::Ordering::Greater => break 'single_seg,
-                            std::cmp::Ordering::Equal => {
-                                self.decode_term_doclist_into_vec(
-                                    ctx,
-                                    cfg.detail,
-                                    seg,
-                                    tombstones.as_deref(),
-                                    pg,
-                                    &leaf,
-                                    k,
-                                    &mut vec_out,
-                                )?;
-                                break 'single_seg;
-                            }
-                        }
-                    }
-                }
-            }
-            vec_out
-        } else {
-            // `fts5MultiIterNew` opens the segment iterators from the newest segment to the
-            // oldest, each on the leaf its term may be on: a page that cannot be read is
-            // reported in that order.
-            for seg in segments.iter().rev() {
-                if seg.pgno_first == 0 || seg.pgno_last < seg.pgno_first {
-                    continue;
-                }
-                let idx_entries = self.get_or_load_seg_idx(ctx, seg.segid)?;
-                let pos = idx_entries.partition_point(|(k, _)| k.as_slice() <= target_key);
-                let start_pg = if pos > 0 {
-                    idx_entries[pos - 1].1.max(seg.pgno_first)
-                } else {
-                    seg.pgno_first
-                };
-                if start_pg <= seg.pgno_last {
-                    self.get_or_load_leaf_page(
-                        ctx,
-                        seg.segid,
-                        start_pg,
-                        start_pg == seg.pgno_first,
-                    )?;
-                }
-            }
-            let mut out: TermDocHitsMap = BTreeMap::new();
-            for seg in &segments {
-                if seg.pgno_first == 0 || seg.pgno_last < seg.pgno_first {
-                    continue;
-                }
-                let tombstones =
-                    self.get_or_load_tombstones(ctx, seg.segid, seg.n_tombstone_pages)?;
-                let idx_entries = self.get_or_load_seg_idx(ctx, seg.segid)?;
-                let pos = idx_entries.partition_point(|(k, _)| k.as_slice() <= target_key);
-                let start_pg = if pos > 0 {
-                    idx_entries[pos - 1].1.max(seg.pgno_first)
-                } else {
-                    seg.pgno_first
-                };
-                if start_pg > seg.pgno_last {
-                    return Err(err_corrupt());
-                }
-
-                'seg_pages: for pg in start_pg..=seg.pgno_last {
-                    let leaf =
-                        self.get_or_load_leaf_page(ctx, seg.segid, pg, pg == seg.pgno_first)?;
-                    for (k, (t, _, _)) in leaf.terms.iter().enumerate() {
-                        match t.as_slice().cmp(target_key) {
-                            std::cmp::Ordering::Less => {}
-                            std::cmp::Ordering::Greater => break 'seg_pages,
-                            std::cmp::Ordering::Equal => {
-                                let _ = self.decode_term_doclist_across_pages(
-                                    ctx,
-                                    cfg.detail,
-                                    seg,
-                                    tombstones.as_deref(),
-                                    pg,
-                                    &leaf,
-                                    k,
-                                    &mut out,
-                                )?;
-                                break 'seg_pages;
-                            }
-                        }
-                    }
-                }
-            }
-            flatten_term_doc_hits(out)
-        };
-
-        let arc = Arc::new(postings);
-        if self.read_cache.exact_terms.len() >= FTS5_EXACT_TERM_CACHE_MAX {
-            self.read_cache.exact_terms.clear();
-        }
-        self.read_cache
-            .exact_terms
-            .insert(SmallBytes22::from_slice(target_key), Arc::clone(&arc));
-        Ok(arc)
-    }
-
-    fn lookup_prefix_terms(
-        &mut self,
-        cfg: &Fts5Config,
-        ctx: &mut dyn VTabHostContext,
-        prefix_key: &[u8],
-    ) -> Result<Arc<TermPostings>> {
-        let err_corrupt =
-            || SqliteError::with_extended(FTS5_CORRUPT, "database disk image is malformed");
-        let segments = self.read_cache.segments.clone();
-        let mut per_term: MergedIndexMap = BTreeMap::new();
-
-        for seg in &segments {
-            if seg.pgno_first == 0 || seg.pgno_last < seg.pgno_first {
-                continue;
-            }
-            let tombstones = self.get_or_load_tombstones(ctx, seg.segid, seg.n_tombstone_pages)?;
-            let idx_entries = self.get_or_load_seg_idx(ctx, seg.segid)?;
-            let pos = idx_entries.partition_point(|(k, _)| k.as_slice() <= prefix_key);
-            let mut pg = if pos > 0 {
-                idx_entries[pos - 1].1.max(seg.pgno_first)
-            } else {
-                seg.pgno_first
-            };
-            if pg > seg.pgno_last {
-                return Err(err_corrupt());
-            }
-
-            'seg_scan: while pg <= seg.pgno_last {
-                let leaf = self.get_or_load_leaf_page(ctx, seg.segid, pg, pg == seg.pgno_first)?;
-                let mut jump_to_pg = pg;
-                for (k, (t, _, _)) in leaf.terms.iter().enumerate() {
-                    if t.as_slice() < prefix_key {
-                        continue;
-                    }
-                    if !t.starts_with(prefix_key) {
-                        break 'seg_scan;
-                    }
-                    let entry = per_term.entry(t.clone()).or_default();
-                    let last_cont = self.decode_term_doclist_across_pages(
-                        ctx,
-                        cfg.detail,
-                        seg,
-                        tombstones.as_deref(),
-                        pg,
-                        &leaf,
-                        k,
-                        entry,
-                    )?;
-                    if last_cont > jump_to_pg {
-                        jump_to_pg = last_cont;
-                    }
-                }
-                pg = jump_to_pg + 1;
-            }
-        }
-
-        // The pending entries of the same terms are the newest source.
-        if self.index.has_hash() {
-            for (key, doclist) in self.index.hash_scan_copy(prefix_key) {
-                let entry = per_term.entry(key).or_default();
-                Self::apply_hash_doclist(cfg.detail, &doclist, |rid, empty, body| {
-                    if empty {
-                        entry.remove(&rid);
-                    } else {
-                        entry.insert(rid, decode_poslist_body(cfg.detail, body)?);
-                    }
-                    Ok(())
-                })?;
-            }
-            // `fts5SetupPrefixIter`: C scans the main index for the prefix, or - when a
-            // prefix index one character longer exists - looks the token itself up and
-            // scans that prefix index. Only the scan touches the hash.
-            let token = &prefix_key[1..];
-            let n_char = String::from_utf8_lossy(token).chars().count();
-            match cfg.prefixes.iter().position(|&n| n == n_char + 1) {
-                Some(pi) => {
-                    let mut k = Vec::with_capacity(prefix_key.len());
-                    k.push(b'0' + (pi as u8) + 1);
-                    k.extend_from_slice(token);
-                    self.index.hash_scan_touch(&k);
-                }
-                None => self.index.hash_scan_touch(prefix_key),
-            }
-        }
-
-        let mut combined: TermDocHitsMap = BTreeMap::new();
-        for (_t, docs) in per_term {
-            for (rid, cols) in docs {
-                let dcols = combined.entry(rid).or_default();
-                for (cidx, offs) in cols {
-                    dcols.entry(cidx).or_default().extend(offs);
-                }
-            }
-        }
-        for cols in combined.values_mut() {
-            for offs in cols.values_mut() {
-                offs.sort_unstable();
-                offs.dedup();
-            }
-        }
-        Ok(Arc::new(flatten_term_doc_hits(combined)))
-    }
-
-    fn eval_phrase_selective(
-        &mut self,
-        cfg: &Fts5Config,
-        ctx: &mut dyn VTabHostContext,
-        phrase_idx: usize,
-        phrase: &QueryPhrase,
-    ) -> Result<EvalDocSet> {
-        if phrase.tokens.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut token_hits: Vec<Arc<TermPostings>> = Vec::with_capacity(phrase.tokens.len());
-        for ptok in &phrase.tokens {
-            let doc_map = if ptok.is_prefix {
-                let char_len = ptok.term.chars().count();
-                if let Some(p_pos) = cfg.prefixes.iter().position(|&n| n == char_len) {
-                    let p_key = make_term_key((p_pos + 1) as u8, &ptok.term);
-                    self.lookup_exact_term(cfg, ctx, &p_key)?
-                } else {
-                    let start_key = make_term_key(0, &ptok.term);
-                    self.lookup_prefix_terms(cfg, ctx, &start_key)?
-                }
-            } else {
-                let exact_key = make_term_key(0, &ptok.term);
-                self.lookup_exact_term(cfg, ctx, &exact_key)?
-            };
-            if doc_map.is_empty() {
-                return Ok(Vec::new());
-            }
-            token_hits.push(doc_map);
-        }
-        Ok(eval_phrase_from_token_hits(
-            phrase_idx,
-            phrase,
-            cfg,
-            &token_hits,
-        ))
-    }
-
-    fn get_or_load_docsize(
-        &mut self,
-        cfg: &Fts5Config,
-        ctx: &mut dyn VTabHostContext,
-        rowid: i64,
-    ) -> Result<Option<DocColSizes>> {
-        if !cfg.columnsize {
-            return Ok(None);
-        }
-        if let Some(sz) = self.read_cache.get_docsize(rowid) {
-            return Ok(Some(sz));
-        }
-        if let Some(row) = ctx.shadow_get_rowid(&self.shadows.docsize, rowid)?
-            && let Some(Value::Blob(b)) = row.get(1)
-            && let Some(list) = decode_varint_list(b)
-        {
-            let mut out: Vec<usize> = list.into_iter().map(|x| x as usize).collect();
-            out.resize(cfg.columns.len(), 0);
-            let doc_sz = DocColSizes::from_usize_vec(out);
-            self.read_cache.insert_docsize(rowid, doc_sz.clone());
-            return Ok(Some(doc_sz));
-        }
-        Ok(None)
     }
 }
 
@@ -4603,7 +1595,8 @@ impl VirtualTableModule for Fts5Module {
     ) -> Result<Box<dyn VirtualTable>> {
         let tbl_name = ctx.table_name().to_owned();
         let db_name = ctx.db_name().to_owned();
-        let cfg = Fts5Config::parse(&tbl_name, args)?;
+        let mut cfg = Fts5Config::parse(&tbl_name, args)?;
+        cfg.locale_hdr = self.aux_registry.locale_hdr();
 
         let db_q = quote_ident(&db_name);
         let data_sq = quote_single(&format!("{tbl_name}_data"));
@@ -4660,14 +1653,20 @@ impl VirtualTableModule for Fts5Module {
             let _ = ctx.set_vtab_config(VTabConfigOption::ConstraintSupport);
         }
         let _ = ctx.set_vtab_config(VTabConfigOption::Innocuous);
+        let _ = ctx.set_vtab_config(VTabConfigOption::FindFunction);
+        let _ = ctx.set_vtab_config(VTabConfigOption::NochangeUnread);
 
         // "Load the initial configuration": `sqlite3Fts5ConfigLoad(pConfig, iCookie-1)`.
         state.index.config_load(ctx, -1)?;
 
+        let cfg_arc = Arc::new(cfg.clone());
+        let state = Arc::new(Mutex::new(state));
+        self.aux_registry.register_table(&state, &cfg_arc);
         Ok(Box::new(Fts5Table {
+            cfg_arc,
             cfg,
             aux_registry: Arc::clone(&self.aux_registry),
-            state: Arc::new(Mutex::new(state)),
+            state,
         }))
     }
 
@@ -4677,12 +1676,15 @@ impl VirtualTableModule for Fts5Module {
         args: &[String],
     ) -> Result<Box<dyn VirtualTable>> {
         let tbl_name = ctx.table_name().to_owned();
-        let cfg = Fts5Config::parse(&tbl_name, args)?;
+        let mut cfg = Fts5Config::parse(&tbl_name, args)?;
+        cfg.locale_hdr = self.aux_registry.locale_hdr();
         ctx.declare_vtab(&cfg.declare_sql(&tbl_name))?;
         if cfg.content_mode == ContentMode::Normal {
             let _ = ctx.set_vtab_config(VTabConfigOption::ConstraintSupport);
         }
         let _ = ctx.set_vtab_config(VTabConfigOption::Innocuous);
+        let _ = ctx.set_vtab_config(VTabConfigOption::FindFunction);
+        let _ = ctx.set_vtab_config(VTabConfigOption::NochangeUnread);
         // fts5InitVtab -> sqlite3Fts5ConfigLoad(pConfig, iCookie-1): the `version` row of
         // %_config must be 4 or 5 (5 = secure-delete has been used). A config table that
         // cannot be read at this point is left to the first statement that needs it.
@@ -4694,10 +1696,14 @@ impl VirtualTableModule for Fts5Module {
             }
             state.index.config.pgsz = 0;
         }
+        let cfg_arc = Arc::new(cfg.clone());
+        let state = Arc::new(Mutex::new(state));
+        self.aux_registry.register_table(&state, &cfg_arc);
         Ok(Box::new(Fts5Table {
+            cfg_arc,
             cfg,
             aux_registry: Arc::clone(&self.aux_registry),
-            state: Arc::new(Mutex::new(state)),
+            state,
         }))
     }
 }
@@ -4705,15 +1711,11 @@ impl VirtualTableModule for Fts5Module {
 #[derive(Debug)]
 struct Fts5Table {
     cfg: Fts5Config,
+    /// The configuration as the cursors share it.
+    cfg_arc: Arc<Fts5Config>,
     aux_registry: Arc<Fts5AuxRegistry>,
     state: Arc<Mutex<Fts5SharedState>>,
 }
-
-const IDX_FULLSCAN: i32 = 0;
-const IDX_ROWID_EQ: i32 = 1;
-const IDX_MATCH: i32 = 2;
-const IDX_LIKE: i32 = 3;
-const IDX_GLOB: i32 = 4;
 
 // `FTS5_BI_ORDER_*`: the bits of the idxNum C reports.
 const FTS5_BI_ORDER_RANK: i32 = 0x0020;
@@ -4721,14 +1723,7 @@ const FTS5_BI_ORDER_ROWID: i32 = 0x0040;
 const FTS5_BI_ORDER_DESC: i32 = 0x0080;
 const PLAN_HINT_NEEDS_CONTENT: u64 = 1;
 const PLAN_HINT_NEEDS_RANK_COL: u64 = 2;
-
-const IDX_FLAG_HAS_RANK_CFG: i32 = 0x100;
-const IDX_FLAG_ORDER_RANK_ASC: i32 = 0x200;
-const IDX_FLAG_ORDER_RANK_DESC: i32 = 0x400;
-const IDX_FLAG_ORDER_ROWID_ASC: i32 = 0x800;
-const IDX_FLAG_ORDER_ROWID_DESC: i32 = 0x1000;
-const IDX_FLAG_NEEDS_CONTENT: i32 = 0x2000;
-const IDX_FLAG_NEEDS_RANK_COL: i32 = 0x4000;
+const PLAN_HINT_NEEDS_TBL_COL: u64 = 4;
 
 impl Fts5Table {
     fn hidden_tbl_col(&self) -> i32 {
@@ -4777,6 +1772,38 @@ impl Fts5Table {
         }
     }
 
+    /// The row `FTS5_STMT_LOOKUP` / `LOOKUP2` finds for `rowid`: one value per user column
+    /// and, for a locale=1 table with its own content, the `l<N>` value of each.
+    fn read_saved_row(
+        &self,
+        state: &Fts5SharedState,
+        ctx: &mut dyn VTabHostContext,
+        rowid: i64,
+    ) -> Result<Option<SavedRow>> {
+        let n = self.cfg.columns.len();
+        if self.cfg.content_mode == ContentMode::Normal && self.cfg.locale {
+            let Some(raw) = ctx.shadow_get_rowid(&state.shadows.content, rowid)? else {
+                return Ok(None);
+            };
+            let mut locs = vec![Value::Null; n];
+            let mut k = 1 + n;
+            for (i, l) in locs.iter_mut().enumerate() {
+                if !self.cfg.unindexed[i] {
+                    *l = raw.get(k).cloned().unwrap_or(Value::Null);
+                    k += 1;
+                }
+            }
+            return Ok(Some(SavedRow {
+                cols: self.cfg.content_row_to_cols(raw),
+                locs,
+            }));
+        }
+        Ok(self.read_content_row(state, ctx, rowid)?.map(|cols| SavedRow {
+            cols,
+            locs: vec![Value::Null; n],
+        }))
+    }
+
     /// `fts5StorageNewRowid`: `REPLACE INTO %_docsize VALUES(NULL, NULL[, NULL])` and the
     /// rowid it was given. Without a %_docsize table the caller has to supply the rowid.
     fn storage_new_rowid(
@@ -4812,6 +1839,7 @@ impl Fts5Table {
         replace: bool,
         new_rowid: Option<&Value>,
         col_vals: &[Value],
+        locs: &[Value],
     ) -> Result<i64> {
         if !self.cfg.has_content_table() {
             if let Some(Value::Integer(rid)) = new_rowid {
@@ -4855,7 +1883,7 @@ impl Fts5Table {
                 )
                 .map_err(rc_only);
         }
-        let row = self.cfg.content_row(0, col_vals);
+        let row = self.cfg.content_row(0, col_vals, locs)?;
         ctx.shadow_insert_row(
             &content,
             &mut state.content_hint,
@@ -4917,7 +1945,17 @@ impl Fts5Table {
                 if delete && res.is_err() {
                     break;
                 }
-                if let Some(text) = col_vals.get(i_col).and_then(fts5_value_bytes) {
+                let text = match col_vals.get(i_col) {
+                    Some(v) => match self.cfg.doc_text(v) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            res = Err(e);
+                            break;
+                        }
+                    },
+                    None => None,
+                };
+                if let Some(text) = text {
                     let index = &mut state.index;
                     let col_arg = if delete { -1 } else { i_col as i32 };
                     self.cfg.tokenizer.for_each_doc_token(&text, |tok| {
@@ -4952,19 +1990,21 @@ impl Fts5Table {
         rowid: i64,
         col_vals: &[Value],
     ) -> Result<()> {
-        state.load_totals(ctx)?;
-        state.index.begin_write(ctx, false, rowid)?;
+        let mut res = state.load_totals(ctx);
+        if res.is_ok() {
+            res = state.index.begin_write(ctx, false, rowid);
+        }
         let mut buf: Vec<u8> = Vec::with_capacity(self.cfg.columns.len() + 4);
         let mut sizes: Vec<u64> = Vec::with_capacity(self.cfg.columns.len());
-        self.index_tokens(state, col_vals, false, &mut buf, &mut sizes)?;
+        if res.is_ok() {
+            res = self.index_tokens(state, col_vals, false, &mut buf, &mut sizes);
+        }
+        // `p->nTotalRow++` is not guarded by `rc`: the row is counted even when the write
+        // could not begin (the statement fails, the in-memory totals keep the count).
         state.n_total_row += 1;
+        res?;
         // Write the %_docsize record
         self.insert_docsize(state, ctx, rowid, &buf)?;
-        if self.cfg.columnsize {
-            state
-                .read_cache
-                .insert_docsize(rowid, DocColSizes::from_u64_slice(&sizes));
-        }
         Ok(())
     }
 
@@ -4975,8 +2015,9 @@ impl Fts5Table {
         ctx: &mut dyn VTabHostContext,
         new_rowid: Option<&Value>,
         col_vals: &[Value],
+        locs: &[Value],
     ) -> Result<i64> {
-        let rid = self.content_insert(state, ctx, false, new_rowid, col_vals)?;
+        let rid = self.content_insert(state, ctx, false, new_rowid, col_vals, locs)?;
         self.index_insert(state, ctx, rid, col_vals)?;
         Ok(rid)
     }
@@ -4993,8 +2034,13 @@ impl Fts5Table {
         let old_vals: &[Value] = match vals {
             Some(v) => v,
             None => {
-                // FTS5_STMT_LOOKUP: without a row there is nothing to remove.
-                looked_up = self.read_content_row(state, ctx, rowid)?;
+                // FTS5_STMT_LOOKUP (+bSaveRow): without a row there is nothing to remove.
+                let save = std::mem::take(&mut state.want_saved_row);
+                let row = self.read_saved_row(state, ctx, rowid)?;
+                looked_up = row.as_ref().map(|r| r.cols.clone());
+                if save {
+                    state.saved_row = row;
+                }
                 match looked_up.as_deref() {
                     Some(v) => v,
                     None => return Ok(()),
@@ -5030,7 +2076,13 @@ impl Fts5Table {
         // Delete the index records
         state.index.begin_write(ctx, true, rowid)?;
         if self.cfg.contentless_delete {
+            let save = std::mem::take(&mut state.want_saved_row);
             self.contentless_delete_row(state, ctx, rowid)?;
+            // "if( rc==SQLITE_OK && bSaveRow && eContent==FTS5_CONTENT_UNINDEXED )
+            //    rc = sqlite3Fts5StorageFindDeleteRow(p, iDel);"
+            if save && self.cfg.unindexed_content {
+                state.saved_row = self.read_saved_row(state, ctx, rowid)?;
+            }
         } else {
             self.delete_from_index(state, ctx, rowid, vals)?;
         }
@@ -5041,7 +2093,6 @@ impl Fts5Table {
             let docsize = state.shadows.docsize.clone();
             ctx.shadow_delete_counted(&docsize, &mut state.docsize_hint, rowid)
                 .map_err(rc_only)?;
-            state.read_cache.remove_docsize(rowid);
         }
         // Delete the %_content record
         if self.cfg.has_content_table() {
@@ -5097,8 +2148,10 @@ impl Fts5Table {
             i_origin = i64::from(row.get(2).map_or(0, Value::to_integer_lossy) as i32);
         }
         if i_origin != 0 {
-            state.index.contentless_delete(ctx, i_origin, rowid)?;
+            let res = state.index.contentless_delete(ctx, i_origin, rowid);
+            // `p->nTotalRow--` follows the call whatever it returned
             state.n_total_row -= 1;
+            res?;
         }
         Ok(())
     }
@@ -5218,7 +2271,6 @@ impl Fts5Table {
             ctx.execute_sql_counted(&format!("DELETE FROM {db_q}.{content_q}"), &[])
                 .map_err(rc_only)?;
         }
-        state.read_cache.clear_all();
         // Reinitialize the %_data table. This call creates the initial structure and
         // averages records.
         state.index.reinit(ctx)?;
@@ -5265,17 +2317,16 @@ impl Fts5Table {
         for row in src_rows {
             let rid = row.first().map_or(0, Value::to_integer_lossy);
             let cvals = &row[1..];
-            state.index.begin_write(ctx, false, rid)?;
+            let mut res = state.index.begin_write(ctx, false, rid);
             let mut buf: Vec<u8> = Vec::with_capacity(self.cfg.columns.len() + 4);
             let mut sizes: Vec<u64> = Vec::with_capacity(self.cfg.columns.len());
-            self.index_tokens(state, cvals, false, &mut buf, &mut sizes)?;
-            state.n_total_row += 1;
-            self.insert_docsize(state, ctx, rid, &buf)?;
-            if self.cfg.columnsize {
-                state
-                    .read_cache
-                    .insert_docsize(rid, DocColSizes::from_u64_slice(&sizes));
+            if res.is_ok() {
+                res = self.index_tokens(state, cvals, false, &mut buf, &mut sizes);
             }
+            // `p->nTotalRow++` is not guarded by `rc` (as in `index_insert`)
+            state.n_total_row += 1;
+            res?;
+            self.insert_docsize(state, ctx, rid, &buf)?;
         }
         // Write the averages record
         state.save_totals(ctx)
@@ -5387,7 +2438,7 @@ impl Fts5Table {
                                     crate::fts5_index::entry_cksum(i_rowid, i_col, i_pos, 0, tok);
                             }
                             for (ii, &n_char) in prefixes.iter().enumerate() {
-                                let n_byte = charlen_to_bytelen(tok, n_char);
+                                let n_byte = crate::fts5_index::charlen_to_bytelen(tok, n_char);
                                 if n_byte != 0 {
                                     let present = detail != DetailMode::Full
                                         && !termset
@@ -5417,13 +2468,17 @@ impl Fts5Table {
 
             // Test that the "totals" (sometimes called "averages") record looks Ok
             // (`fts5StorageLoadTotals(p, 0)`: the totals of the open transaction, if any)
-            let avgs = state.read_averages(&self.cfg, ctx)?;
+            if !state.b_totals_valid {
+                let (n_row, sizes) = state.index.get_averages(ctx)?;
+                state.n_total_row = n_row;
+                state.a_total_size = sizes;
+            }
             for i in 0..n_cols {
-                if avgs.get(1 + i).copied().unwrap_or(0) as i64 != a_total_size[i] {
+                if state.a_total_size.get(i).copied().unwrap_or(0) != a_total_size[i] {
                     return Err(corrupt());
                 }
             }
-            let n_total_row = avgs.first().copied().unwrap_or(0) as i64;
+            let n_total_row = state.n_total_row;
 
             // Check that the %_docsize and %_content tables contain the expected number
             // of rows.
@@ -5578,52 +2633,6 @@ fn config_value_is_valid(key: &str, val: &Value) -> bool {
     }
 }
 
-/// The column weights of a rank specification `bm25(w0, w1, ...)` (`fts5FindRankFunction`:
-/// the arguments are SQL literals, read as doubles). `bm25` is the only ranking function.
-fn parse_rank_expression(s: &str) -> Result<Vec<f64>> {
-    let trimmed = s.trim_matches(' ');
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
-    }
-    if !config_rank_is_valid(trimmed.as_bytes()) {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("parse error in rank function: {s}"),
-        ));
-    }
-    let open_p = trimmed.find('(').unwrap_or(trimmed.len());
-    let fn_name = trimmed[..open_p].trim_matches(' ');
-    if !fn_name.eq_ignore_ascii_case("bm25") {
-        return Err(SqliteError::new(
-            ErrorCode::Error,
-            format!("no such function: {fn_name}"),
-        ));
-    }
-    let close_p = trimmed.rfind(')').unwrap_or(trimmed.len());
-    let mut weights = Vec::new();
-    let mut p = cfg_skip_ws(trimmed.as_bytes()[open_p + 1..close_p].as_ref());
-    while !p.is_empty() {
-        let Some(n) = cfg_literal_len(p) else {
-            break;
-        };
-        let lit = std::str::from_utf8(&p[..n]).unwrap_or("");
-        // sqlite3_value_double() of the literal: numbers as such, numeric text prefixes of
-        // strings, 0.0 for NULL and blobs.
-        let w = if lit.starts_with('\'') {
-            Value::Text(String::from_utf8_lossy(&cfg_dequote_word(lit.as_bytes())).into_owned())
-                .to_real_lossy()
-        } else {
-            lit.parse::<f64>().unwrap_or(0.0)
-        };
-        weights.push(w);
-        p = cfg_skip_ws(&p[n..]);
-        if p.first() == Some(&b',') {
-            p = cfg_skip_ws(&p[1..]);
-        }
-    }
-    Ok(weights)
-}
-
 impl VirtualTable for Fts5Table {
     /// `fts5BestIndexMethod`. `idxNum` carries the ORDER BY flags (`FTS5_BI_ORDER_*`), `idxStr`
     /// one item per xFilter argument: `M<col>` (MATCH; col == number of columns for the table
@@ -5733,7 +2742,8 @@ impl VirtualTable for Fts5Table {
             let ob = info.order_by[0];
             if ob.i_column == rank_col && n_seen_match > 0 {
                 idx_flags |= FTS5_BI_ORDER_RANK;
-            } else if ob.i_column == -1 {
+            } else if ob.i_column == -1 && (!ob.desc || !self.cfg.tokendata) {
+                // Note that tokendata=1 tables cannot currently handle "ORDER BY rowid DESC".
                 idx_flags |= FTS5_BI_ORDER_ROWID;
             }
             if (idx_flags & (FTS5_BI_ORDER_RANK | FTS5_BI_ORDER_ROWID)) != 0 {
@@ -5794,8 +2804,11 @@ impl VirtualTable for Fts5Table {
         let rank_bit = 1u64 << (rank_col as usize).min(63);
         // A `rank MATCH '...'` term alone does not make C call the ranking function: it is
         // looked up when the rank column is read or the sorter statement is prepared.
-        if (info.col_used & rank_bit) != 0 || (idx_flags & FTS5_BI_ORDER_RANK) != 0 {
+        if (info.col_used & rank_bit) != 0 {
             hint |= PLAN_HINT_NEEDS_RANK_COL;
+        }
+        if (info.col_used & (1u64 << n_vis.min(63))) != 0 {
+            hint |= PLAN_HINT_NEEDS_TBL_COL;
         }
         info.plan_hint = hint;
 
@@ -5805,26 +2818,25 @@ impl VirtualTable for Fts5Table {
     }
 
     fn open(&self) -> Result<Box<dyn VirtualCursor>> {
-        Ok(Box::new(Fts5Cursor {
-            cfg: self.cfg.clone(),
-            aux_registry: Arc::clone(&self.aux_registry),
-            state: Arc::clone(&self.state),
-            rows: Vec::new(),
-            pos: 0,
-            plan_hint: 0,
-        }))
+        // fts5OpenMethod
+        Ok(Box::new(main::Fts5Cursor::open(
+            &self.cfg_arc,
+            &self.state,
+            &self.aux_registry,
+        )))
     }
 
-    fn begin(&mut self, _ctx: &mut dyn VTabHostContext) -> Result<()> {
-        // `fts5NewTransaction` -> `sqlite3Fts5IndexReset`: the cached structure is dropped
-        // when the database has changed since it was read. Nothing is pending when a
-        // transaction starts, so the structure is simply read again on first use.
+    fn begin(&mut self, ctx: &mut dyn VTabHostContext) -> Result<()> {
+        // `fts5BeginMethod` -> `fts5NewTransaction`: unless a cursor is open on the table,
+        // `sqlite3Fts5IndexReset` drops the cached structure when the database has changed
+        // since it was read.
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.index.structure_invalidate();
+        if st.n_open_csr == 0 {
+            st.index.reset(ctx)?;
+        }
         Ok(())
     }
 
-    /// `fts5SyncMethod`.
     fn sync(&mut self, ctx: &mut dyn VTabHostContext) -> Result<()> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         Self::flush_to_disk(&mut st, ctx)
@@ -5850,7 +2862,8 @@ impl VirtualTable for Fts5Table {
     fn savepoint(&mut self, ctx: &mut dyn VTabHostContext, idx: usize) -> Result<()> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         sqliters_types::dtrace!("TR|f5|hook|savepoint i={}", idx as i64);
-        Self::flush_to_disk(&mut st, ctx)?;
+        // `pConfig->pzErrmsg` is not set in xSavepoint / xRelease: only the code survives.
+        Self::flush_to_disk(&mut st, ctx).map_err(rc_only)?;
         st.i_savepoint = idx as i64 + 1;
         Ok(())
     }
@@ -5865,7 +2878,7 @@ impl VirtualTable for Fts5Table {
             u8::from(flush)
         );
         if flush {
-            Self::flush_to_disk(&mut st, ctx)?;
+            Self::flush_to_disk(&mut st, ctx).map_err(rc_only)?;
             st.i_savepoint = idx as i64;
         }
         Ok(())
@@ -5873,6 +2886,8 @@ impl VirtualTable for Fts5Table {
 
     /// `fts5RollbackToMethod`.
     fn rollback_to(&mut self, _ctx: &mut dyn VTabHostContext, idx: usize) -> Result<()> {
+        // fts5TripCursors(pTab)
+        self.aux_registry.trip_cursors(&self.state);
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let discard = (idx as i64 + 1) <= st.i_savepoint;
         sqliters_types::dtrace!(
@@ -5885,7 +2900,6 @@ impl VirtualTable for Fts5Table {
             st.storage_rollback();
         }
         // The shadow tables have gone back to the savepoint.
-        st.read_cache.clear_all();
         Ok(())
     }
 
@@ -5922,8 +2936,9 @@ impl VirtualTable for Fts5Table {
     }
 
     fn invalidate_shadow_cache(&mut self) {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.read_cache.clear_all();
+        // C keeps nothing that depends on what other statements of the connection write
+        // to the shadow tables, except the structure record it caches until the data
+        // version of the database changes (`sqlite3Fts5IndexReset`) - and so does this.
     }
 
     /// `fts5UpdateMethod`.
@@ -5932,6 +2947,8 @@ impl VirtualTable for Fts5Table {
         ctx: &mut dyn VTabHostContext,
         op: VTabUpdateOperation,
     ) -> Result<Option<i64>> {
+        // fts5TripCursors(pTab)
+        self.aux_registry.trip_cursors(&self.state);
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.index.config.pgsz == 0 {
             let cookie = st.index.config.i_cookie;
@@ -5948,6 +2965,19 @@ impl VirtualTable for Fts5Table {
             } else {
                 VTabConflictMode::Abort
             };
+        // It is an error to write an fts5_locale() value to a table without the locale=1
+        // option.
+        // (a "special" INSERT — a value in the table-name column — is not checked)
+        let special = matches!(&op, VTabUpdateOperation::Insert { values, .. }
+            if values.get(n_cols).is_some_and(|v| !v.is_null()));
+        if !self.cfg.locale
+            && !special
+            && let VTabUpdateOperation::Insert { values, .. }
+            | VTabUpdateOperation::Update { values, .. } = &op
+            && values.iter().take(n_cols).any(|v| self.cfg.is_locale_value(v))
+        {
+            return Err(SqliteError::new(ErrorCode::Mismatch, "fts5_locale() requires locale=1"));
+        }
         match op {
             VTabUpdateOperation::Insert { new_rowid, values } => {
                 // A "special" INSERT: any non-NULL value in the table-name column.
@@ -5966,7 +2996,7 @@ impl VirtualTable for Fts5Table {
                     self.storage_delete(&mut st, ctx, rid, None)?;
                 }
                 let rid =
-                    self.storage_insert(&mut st, ctx, new_rowid.as_ref(), &values[..n_cols])?;
+                    self.storage_insert(&mut st, ctx, new_rowid.as_ref(), &values[..n_cols], &[])?;
                 Ok(Some(rid))
             }
             VTabUpdateOperation::Delete { old_rowid } => {
@@ -6029,29 +3059,67 @@ impl VirtualTable for Fts5Table {
                     return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
                 }
                 let new_val = Value::Integer(new_rid);
-                if old_rid != new_rid {
-                    if conflict == VTabConflictMode::Replace {
-                        self.storage_delete(&mut st, ctx, old_rid, None)?;
-                        self.storage_delete(&mut st, ctx, new_rid, None)?;
-                        self.storage_insert(&mut st, ctx, Some(&new_val), col_vals)?;
+                // `Fts5Storage.pSavedRow`: once the old row was looked up with "save", the
+                // columns the UPDATE does not assign (`sqlite3_value_nochange`) are taken
+                // from it, with their `l<N>` values; without a saved row they are NULL.
+                let nochange: Vec<bool> = (0..n_cols).map(|i| ctx.vtab_nochange(i)).collect();
+                let resolve = |st: &Fts5SharedState| -> (Vec<Value>, Vec<Value>) {
+                    let mut cols = Vec::with_capacity(n_cols);
+                    let mut locs = vec![Value::Null; n_cols];
+                    for i in 0..n_cols {
+                        if nochange[i] {
+                            match st.saved_row.as_ref() {
+                                Some(saved) => {
+                                    cols.push(saved.cols.get(i).cloned().unwrap_or(Value::Null));
+                                    locs[i] = saved.locs.get(i).cloned().unwrap_or(Value::Null);
+                                }
+                                None => cols.push(Value::Null),
+                            }
+                        } else {
+                            cols.push(col_vals[i].clone());
+                        }
+                    }
+                    (cols, locs)
+                };
+                let res = (|| -> Result<()> {
+                    if old_rid != new_rid {
+                        if conflict == VTabConflictMode::Replace {
+                            st.want_saved_row = true;
+                            self.storage_delete(&mut st, ctx, old_rid, None)?;
+                            self.storage_delete(&mut st, ctx, new_rid, None)?;
+                            let (cols, locs) = resolve(&st);
+                            self.storage_insert(&mut st, ctx, Some(&new_val), &cols, &locs)?;
+                        } else {
+                            // sqlite3Fts5StorageFindDeleteRow, then: a conflict on the new
+                            // rowid is detected before the index is touched.
+                            st.saved_row = self.read_saved_row(&st, ctx, old_rid)?;
+                            let (cols, locs) = resolve(&st);
+                            self.content_insert(&mut st, ctx, false, Some(&new_val), &cols, &locs)?;
+                            self.storage_delete(&mut st, ctx, old_rid, None)?;
+                            self.index_insert(&mut st, ctx, new_rid, &cols)?;
+                        }
+                    } else if content_only {
+                        // Only UNINDEXED columns of a contentless table change: a write to
+                        // %_content for contentless_unindexed=1 tables, a no-op otherwise.
+                        if self.cfg.unindexed_content {
+                            st.saved_row = self.read_saved_row(&st, ctx, old_rid)?;
+                            if st.saved_row.is_some() {
+                                let (cols, locs) = resolve(&st);
+                                self.content_insert(&mut st, ctx, true, Some(&new_val), &cols, &locs)?;
+                            }
+                        }
                     } else {
-                        // Detect a conflict on the new rowid before the index is touched.
-                        self.content_insert(&mut st, ctx, false, Some(&new_val), col_vals)?;
+                        st.want_saved_row = true;
                         self.storage_delete(&mut st, ctx, old_rid, None)?;
-                        self.index_insert(&mut st, ctx, new_rid, col_vals)?;
+                        let (cols, locs) = resolve(&st);
+                        self.storage_insert(&mut st, ctx, Some(&new_val), &cols, &locs)?;
                     }
-                } else if content_only {
-                    // Only UNINDEXED columns of a contentless table change: a write to
-                    // %_content for contentless_unindexed=1 tables, a no-op otherwise.
-                    if self.cfg.unindexed_content
-                        && self.read_content_row(&st, ctx, old_rid)?.is_some()
-                    {
-                        self.content_insert(&mut st, ctx, true, Some(&new_val), col_vals)?;
-                    }
-                } else {
-                    self.storage_delete(&mut st, ctx, old_rid, None)?;
-                    self.storage_insert(&mut st, ctx, Some(&new_val), col_vals)?;
-                }
+                    Ok(())
+                })();
+                // sqlite3Fts5StorageReleaseDeleteRow
+                st.saved_row = None;
+                st.want_saved_row = false;
+                res?;
                 Ok(Some(new_rid))
             }
         }
@@ -6080,7 +3148,6 @@ impl VirtualTable for Fts5Table {
         }
         let db_name = ctx.db_name().to_owned();
         st.set_names(&db_name, new_name, &self.cfg);
-        st.read_cache.clear_all();
         Ok(())
     }
 
@@ -6097,907 +3164,6 @@ impl VirtualTable for Fts5Table {
     }
 }
 
-#[derive(Debug)]
-struct Fts5CursorRow {
-    rowid: i64,
-    cols: Vec<Value>,
-    aux_handle: i64,
-    rank: Option<f64>,
-}
-
-#[derive(Debug)]
-struct Fts5Cursor {
-    cfg: Fts5Config,
-    aux_registry: Arc<Fts5AuxRegistry>,
-    state: Arc<Mutex<Fts5SharedState>>,
-    rows: Vec<Fts5CursorRow>,
-    pos: usize,
-    /// `VTabIndexInfo::plan_hint` of the plan being filtered.
-    plan_hint: u64,
-}
-
-impl Fts5Cursor {
-    /// `fts5ApiColumnSize` for a table without %_docsize: count the tokens of the stored text.
-    fn compute_fallback_col_sizes(&self, col_vals: &[Value]) -> DocColSizes {
-        let mut out = vec![0usize; self.cfg.columns.len()];
-        for (i, v) in col_vals.iter().enumerate().take(self.cfg.columns.len()) {
-            if !self.cfg.unindexed[i]
-                && let Some(text) = fts5_value_bytes(v)
-            {
-                let mut n = 0usize;
-                self.cfg
-                    .tokenizer
-                    .tok
-                    .tokenize(&text, &mut |_, _, _| n += 1);
-                out[i] = n;
-            }
-        }
-        DocColSizes::from_usize_vec(out)
-    }
-
-    /// The columns `xColumnSize` cannot size (`-1`): indexed columns of a contentless table
-    /// without %_docsize.
-    fn unknown_size_cols(&self) -> Vec<bool> {
-        if !self.cfg.columnsize && self.cfg.content_mode == ContentMode::Contentless {
-            self.cfg.unindexed.iter().map(|&u| !u).collect()
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// The column values of a matched row (`fts5SeekCursor`). A row that is in the index
-    /// but not in the content source is an error.
-    fn load_content_vals(
-        &self,
-        shadows: &Fts5ShadowNames,
-        ctx: &mut dyn VTabHostContext,
-        rowid: i64,
-    ) -> Result<Vec<Value>> {
-        let db_name = ctx.db_name().to_owned();
-        let missing = |content: String| {
-            SqliteError::with_extended(
-                FTS5_CORRUPT,
-                format!("fts5: missing row {rowid} from content table {content}"),
-            )
-        };
-        match &self.cfg.content_mode {
-            ContentMode::Normal | ContentMode::Contentless if self.cfg.has_content_table() => {
-                match ctx.shadow_get_rowid(&shadows.content, rowid)? {
-                    Some(r) => Ok(self.cfg.content_row_to_cols(r)),
-                    None => Err(missing(format!(
-                        "{}.'{}'",
-                        quote_single(&db_name),
-                        shadows.content.replace('\'', "''")
-                    ))),
-                }
-            }
-            ContentMode::Normal | ContentMode::Contentless => {
-                Ok(vec![Value::Null; self.cfg.columns.len()])
-            }
-            ContentMode::External { table, rowid_col } => {
-                let db_q = quote_ident(&db_name);
-                let ext_q = quote_ident(table);
-                let rid_q = quote_ident(rowid_col.as_deref().unwrap_or("rowid"));
-                let cols: Vec<String> = self.cfg.columns.iter().map(|c| quote_ident(c)).collect();
-                let mut r = ctx.query_sql(
-                    &format!(
-                        "SELECT {} FROM {db_q}.{ext_q} WHERE {rid_q} = ?1",
-                        cols.join(", ")
-                    ),
-                    &[Value::Integer(rowid)],
-                )?;
-                r.pop().ok_or_else(|| {
-                    missing(format!(
-                        "{}.{}",
-                        quote_single(&db_name),
-                        quote_single(table)
-                    ))
-                })
-            }
-        }
-    }
-}
-
-fn extract_like_glob_runs(pat: &str, is_glob: bool) -> Vec<String> {
-    let mut runs = Vec::new();
-    let mut cur = String::new();
-    let mut chars = pat.chars().peekable();
-    while let Some(ch) = chars.next() {
-        let is_wild = if is_glob {
-            matches!(ch, '*' | '?' | '[')
-        } else {
-            matches!(ch, '%' | '_')
-        };
-        if is_wild {
-            if is_glob && ch == '[' {
-                for next_c in chars.by_ref() {
-                    if next_c == ']' {
-                        break;
-                    }
-                }
-            }
-            if cur.chars().count() >= 3 {
-                runs.push(std::mem::take(&mut cur));
-            } else {
-                cur.clear();
-            }
-        } else {
-            cur.push(ch);
-        }
-    }
-    if cur.chars().count() >= 3 {
-        runs.push(cur);
-    }
-    runs
-}
-
-impl Fts5Cursor {
-    /// `fts5FilterMethod`: decodes the plan of `fts5BestIndexMethod` and runs it.
-    fn filter_plan(
-        &mut self,
-        ctx: &mut dyn VTabHostContext,
-        idx_num: i32,
-        idx_str: Option<&str>,
-        args: &[Value],
-    ) -> Result<()> {
-        let z = idx_str.unwrap_or("").as_bytes();
-        let mut match_items: Vec<String> = Vec::new();
-        let mut match_args: Vec<Value> = Vec::new();
-        let mut like: Option<(bool, Value)> = None;
-        let mut rowid_eq: Option<&Value> = None;
-        let mut rowid_le: Option<&Value> = None;
-        let mut rowid_ge: Option<&Value> = None;
-        let mut has_rank = false;
-        let mut n_match = 0usize;
-        let mut i = 0usize;
-        let mut i_arg = 0usize;
-        while i < z.len() {
-            let c = z[i];
-            i += 1;
-            let arg = args.get(i_arg);
-            i_arg += 1;
-            match c {
-                b'r' => {
-                    has_rank = true;
-                    match_items.push("r".to_owned());
-                    match_args.push(arg.cloned().unwrap_or(Value::Null));
-                }
-                b'M' | b'L' | b'G' => {
-                    let start = i;
-                    while i < z.len() && z[i].is_ascii_digit() {
-                        i += 1;
-                    }
-                    let col = std::str::from_utf8(&z[start..i]).unwrap_or("0");
-                    if c == b'M' {
-                        n_match += 1;
-                        match_items.push(format!("M{col}"));
-                        match_args.push(arg.cloned().unwrap_or(Value::Null));
-                    } else if like.is_none() {
-                        like = Some((c == b'G', arg.cloned().unwrap_or(Value::Null)));
-                    }
-                }
-                b'=' => rowid_eq = arg,
-                b'<' => rowid_le = arg,
-                _ => rowid_ge = arg,
-            }
-        }
-
-        let b_desc = (idx_num & FTS5_BI_ORDER_DESC) != 0;
-        let mut legacy = 0i32;
-        if (idx_num & FTS5_BI_ORDER_RANK) != 0 {
-            legacy |= if b_desc {
-                IDX_FLAG_ORDER_RANK_DESC
-            } else {
-                IDX_FLAG_ORDER_RANK_ASC
-            };
-        } else if (idx_num & FTS5_BI_ORDER_ROWID) != 0 {
-            legacy |= if b_desc {
-                IDX_FLAG_ORDER_ROWID_DESC
-            } else {
-                IDX_FLAG_ORDER_ROWID_ASC
-            };
-        }
-        if (self.plan_hint & PLAN_HINT_NEEDS_CONTENT) != 0 {
-            legacy |= IDX_FLAG_NEEDS_CONTENT;
-        }
-        if (self.plan_hint & PLAN_HINT_NEEDS_RANK_COL) != 0 {
-            legacy |= IDX_FLAG_NEEDS_RANK_COL;
-        }
-        if has_rank {
-            legacy |= IDX_FLAG_HAS_RANK_CFG;
-        }
-
-        // Set the cursor upper and lower rowid limits (`fts5GetRowidLimit`: only an integer
-        // value limits the scan).
-        if rowid_eq.is_some() {
-            rowid_le = rowid_eq;
-            rowid_ge = rowid_eq;
-        }
-        let i_last = numeric_integer_value(rowid_le).unwrap_or(i64::MAX);
-        let i_first = numeric_integer_value(rowid_ge).unwrap_or(i64::MIN);
-
-        // `fts5OpenMethod` -> `fts5NewTransaction` -> `sqlite3Fts5IndexReset` (the cached
-        // structure is dropped when the database changed; with nothing pending it is simply
-        // read again) and `fts5FilterMethod` -> `sqlite3Fts5IndexLoadConfig`.
-        {
-            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if st.index.n_pending_data == 0
-                && st.index.n_contentless_delete == 0
-                && !st.b_totals_valid
-            {
-                st.index.structure_invalidate();
-            }
-            st.index.load_config(ctx)?;
-        }
-
-        let exact_rowid_plan;
-        if n_match > 0 {
-            exact_rowid_plan = false;
-            let plan = match_items.join(",");
-            self.filter_legacy(ctx, IDX_MATCH | legacy, Some(&plan), &match_args)?;
-        } else if let Some((is_glob, pat)) = like {
-            exact_rowid_plan = false;
-            let mode = if is_glob { IDX_GLOB } else { IDX_LIKE };
-            self.filter_legacy(ctx, mode | legacy, None, &[pat])?;
-        } else if let Some(eq) = rowid_eq {
-            exact_rowid_plan = true;
-            self.filter_legacy(ctx, IDX_ROWID_EQ | legacy, None, std::slice::from_ref(eq))?;
-        } else {
-            exact_rowid_plan = false;
-            self.filter_legacy(ctx, IDX_FULLSCAN | legacy, None, &[])?;
-        }
-        if !exact_rowid_plan && (i_first != i64::MIN || i_last != i64::MAX) {
-            self.rows
-                .retain(|r| r.rowid >= i_first && r.rowid <= i_last);
-        }
-        Ok(())
-    }
-
-    fn filter_legacy(
-        &mut self,
-        ctx: &mut dyn VTabHostContext,
-        idx_num: i32,
-        idx_str: Option<&str>,
-        args: &[Value],
-    ) -> Result<()> {
-        self.rows.clear();
-        self.pos = 0;
-
-        let shadows = {
-            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.shadows.clone()
-        };
-
-        let db_q = quote_ident(ctx.db_name());
-        let mode = idx_num & 0xff;
-        let desc_rowid = (idx_num & IDX_FLAG_ORDER_ROWID_DESC) != 0;
-
-        match mode {
-            IDX_FULLSCAN => {
-                let order_kw = if desc_rowid { "DESC" } else { "ASC" };
-                match &self.cfg.content_mode {
-                    ContentMode::Normal | ContentMode::Contentless
-                        if self.cfg.has_content_table() =>
-                    {
-                        let content_q = quote_ident(&shadows.content);
-                        let qrows = ctx.query_sql(
-                            &format!(
-                                "SELECT {} FROM {db_q}.{content_q} ORDER BY id {order_kw}",
-                                self.cfg.content_select_list()
-                            ),
-                            &[],
-                        )?;
-                        for mut r in qrows {
-                            let rid = r[0].to_integer_lossy();
-                            r.drain(..1);
-                            self.rows.push(Fts5CursorRow {
-                                rowid: rid,
-                                cols: r,
-                                aux_handle: 0,
-                                rank: None,
-                            });
-                        }
-                    }
-                    ContentMode::External { table, rowid_col } => {
-                        let ext_q = quote_ident(table);
-                        let rid_q = quote_ident(rowid_col.as_deref().unwrap_or("rowid"));
-                        let mut cols = vec![rid_q.clone()];
-                        for c in &self.cfg.columns {
-                            cols.push(quote_ident(c));
-                        }
-                        let qrows = ctx.query_sql(
-                            &format!(
-                                "SELECT {} FROM {db_q}.{ext_q} ORDER BY {rid_q} {order_kw}",
-                                cols.join(", ")
-                            ),
-                            &[],
-                        )?;
-                        for mut r in qrows {
-                            let rid = r[0].to_integer_lossy();
-                            r.drain(..1);
-                            self.rows.push(Fts5CursorRow {
-                                rowid: rid,
-                                cols: r,
-                                aux_handle: 0,
-                                rank: None,
-                            });
-                        }
-                    }
-                    ContentMode::Normal | ContentMode::Contentless => {
-                        // A contentless table is scanned through %_docsize; without that
-                        // table there is nothing to scan (`fts5FilterMethod`).
-                        if !self.cfg.columnsize {
-                            return Err(SqliteError::new(
-                                ErrorCode::Error,
-                                format!("{}: table does not support scanning", shadows.table_name),
-                            ));
-                        }
-                        let docsize_q = quote_ident(&shadows.docsize);
-                        let qrows = ctx.query_sql(
-                            &format!("SELECT id FROM {db_q}.{docsize_q} ORDER BY id {order_kw}"),
-                            &[],
-                        )?;
-                        for r in qrows {
-                            let rid = r[0].to_integer_lossy();
-                            self.rows.push(Fts5CursorRow {
-                                rowid: rid,
-                                cols: Vec::new(),
-                                aux_handle: 0,
-                                rank: None,
-                            });
-                        }
-                    }
-                }
-            }
-            IDX_ROWID_EQ => {
-                let Some(Value::Integer(rid)) = args.first() else {
-                    return Ok(());
-                };
-                // `FTS5_PLAN_ROWID`: one lookup in the content source.
-                match &self.cfg.content_mode {
-                    ContentMode::Normal | ContentMode::Contentless
-                        if self.cfg.has_content_table() =>
-                    {
-                        if let Some(r) = ctx.shadow_get_rowid(&shadows.content, *rid)? {
-                            self.rows.push(Fts5CursorRow {
-                                rowid: *rid,
-                                cols: self.cfg.content_row_to_cols(r),
-                                aux_handle: 0,
-                                rank: None,
-                            });
-                        }
-                    }
-                    ContentMode::External { table, rowid_col } => {
-                        let ext_q = quote_ident(table);
-                        let rid_q = quote_ident(rowid_col.as_deref().unwrap_or("rowid"));
-                        let cols: Vec<String> =
-                            self.cfg.columns.iter().map(|c| quote_ident(c)).collect();
-                        let mut r = ctx.query_sql(
-                            &format!(
-                                "SELECT {} FROM {db_q}.{ext_q} WHERE {rid_q} = ?1",
-                                cols.join(", ")
-                            ),
-                            &[Value::Integer(*rid)],
-                        )?;
-                        if let Some(vals) = r.pop() {
-                            self.rows.push(Fts5CursorRow {
-                                rowid: *rid,
-                                cols: vals,
-                                aux_handle: 0,
-                                rank: None,
-                            });
-                        }
-                    }
-                    ContentMode::Normal | ContentMode::Contentless => {
-                        if !self.cfg.columnsize {
-                            return Err(SqliteError::new(
-                                ErrorCode::Error,
-                                format!("{}: table does not support scanning", shadows.table_name),
-                            ));
-                        }
-                        if ctx.shadow_get_rowid(&shadows.docsize, *rid)?.is_some() {
-                            self.rows.push(Fts5CursorRow {
-                                rowid: *rid,
-                                cols: Vec::new(),
-                                aux_handle: 0,
-                                rank: None,
-                            });
-                        }
-                    }
-                }
-            }
-            IDX_LIKE | IDX_GLOB => {
-                let Some(pat_val) = args.first() else {
-                    return Ok(());
-                };
-                if pat_val.is_null() {
-                    return Ok(());
-                }
-                let pat = pat_val.to_text_lossy();
-                let runs = extract_like_glob_runs(&pat, mode == IDX_GLOB);
-                if runs.is_empty() {
-                    return self.filter_legacy(ctx, IDX_FULLSCAN | (idx_num & !0xff), None, &[]);
-                }
-                let mut candidate_rowids: Option<BTreeSet<i64>> = None;
-                {
-                    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    st.ensure_structure_coherent(ctx)?;
-                    for run in &runs {
-                        for tg in self.cfg.tokenizer.tokenize(run, true) {
-                            let tkey = make_term_key(0, &tg.term);
-                            let hits = st.lookup_exact_term(&self.cfg, ctx, &tkey)?;
-                            let set: BTreeSet<i64> = hits.iter().map(|&(rid, _)| rid).collect();
-                            candidate_rowids = Some(match candidate_rowids {
-                                None => set,
-                                Some(prev) => prev.intersection(&set).copied().collect(),
-                            });
-                            if candidate_rowids.as_ref().is_some_and(BTreeSet::is_empty) {
-                                break;
-                            }
-                        }
-                    }
-                }
-                let mut rids: Vec<i64> = candidate_rowids.unwrap_or_default().into_iter().collect();
-                if desc_rowid {
-                    rids.reverse();
-                }
-                for rid in rids {
-                    let cols = self.load_content_vals(&shadows, ctx, rid)?;
-                    self.rows.push(Fts5CursorRow {
-                        rowid: rid,
-                        cols,
-                        aux_handle: 0,
-                        rank: None,
-                    });
-                }
-            }
-            IDX_MATCH => {
-                // `fts5FilterMethod`: the plan string lists the consumed constraints in
-                // argument order: `M<col>` for a MATCH (col == number of columns for the
-                // whole table) and `r` for the rank configuration.
-                let n_cols = self.cfg.columns.len();
-                let mut qexpr: Option<FtsQueryExpr> = None;
-                let mut phrases: Vec<QueryPhrase> = Vec::new();
-                let mut rank_arg: Option<&Value> = None;
-                for (arg_i, item) in idx_str.unwrap_or("").split(',').enumerate() {
-                    let val = args.get(arg_i);
-                    if item == "r" {
-                        rank_arg = val;
-                        continue;
-                    }
-                    let Some(col) = item.strip_prefix('M').and_then(|c| c.parse::<usize>().ok())
-                    else {
-                        continue;
-                    };
-                    let text = val.and_then(fts5_value_text).unwrap_or_default();
-                    let (mut new_expr, _) = QueryParser::parse_query(&self.cfg, &text)?;
-                    if col < n_cols {
-                        if self.cfg.detail == DetailMode::None {
-                            return Err(fts5_query_err(
-                                "fts5: column queries are not supported (detail=none)",
-                            ));
-                        }
-                        new_expr.set_colset(&[col]);
-                    }
-                    // `sqlite3Fts5ExprAnd`: the phrases of the new expression come first.
-                    let mut renumbered = Vec::new();
-                    new_expr.number_phrases(&mut renumbered);
-                    qexpr = Some(match qexpr.take() {
-                        None => new_expr,
-                        Some(mut old) => {
-                            old.number_phrases(&mut renumbered);
-                            QueryParser::make_node(QTok::And, old, new_expr)?
-                        }
-                    });
-                    phrases = renumbered;
-                }
-                let Some(qexpr) = qexpr else {
-                    return Ok(());
-                };
-
-                let need_rank_val = (idx_num & IDX_FLAG_NEEDS_RANK_COL) != 0;
-                // ORDER BY rank (`fts5CursorFirstSorted`): the index is read and the rank
-                // computed by the statement `SELECT rowid, rank FROM ft ORDER BY <rank>(ft)`
-                // the cursor steps. `sqlite3_step` hands back the primary result code only
-                // (`rc & db->errMask`) and the message of that statement is not passed on.
-                let sorted_by_rank =
-                    (idx_num & (IDX_FLAG_ORDER_RANK_ASC | IDX_FLAG_ORDER_RANK_DESC)) != 0;
-                let sorter_err = move |e: SqliteError| -> SqliteError {
-                    if sorted_by_rank {
-                        SqliteError::new(e.code, e.code.as_str())
-                    } else {
-                        e
-                    }
-                };
-                let contentless = self.cfg.content_mode == ContentMode::Contentless;
-                // detail=column / detail=none: phrase instances come from the row text.
-                let populate_from_text = self.cfg.detail != DetailMode::Full && !contentless;
-                let need_aux_texts = self.aux_registry.needs_aux_text() || populate_from_text;
-                // Column values are read for the result; the text is also needed for the
-                // column sizes of a table without %_docsize. A row missing from the content
-                // source is an error only where C would look it up (`fts5SeekCursor`).
-                let need_cols = (idx_num & IDX_FLAG_NEEDS_CONTENT) != 0;
-                let sizes_from_text = !self.cfg.columnsize && !contentless;
-                let need_content = need_cols || need_aux_texts || sizes_from_text;
-
-                let (rank_weights, phrase_doc_hits, matched_docs, total_rows, total_tokens) = {
-                    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    st.ensure_structure_coherent(ctx)?;
-
-                    // `fts5CursorParseRank`
-                    let rw = if let Some(rv) = rank_arg {
-                        let z = fts5_value_text(rv);
-                        let spec = match z {
-                            Some(z) if config_rank_is_valid(z.as_bytes()) => z.into_owned(),
-                            other => {
-                                return Err(SqliteError::new(
-                                    ErrorCode::Error,
-                                    format!(
-                                        "parse error in rank function: {}",
-                                        other.unwrap_or_default()
-                                    ),
-                                ));
-                            }
-                        };
-                        if need_rank_val {
-                            parse_rank_expression(&spec)
-                        } else {
-                            Ok(Vec::new())
-                        }
-                    } else if need_rank_val {
-                        st.get_configured_rank_weights(ctx)
-                    } else {
-                        Ok(Vec::new())
-                    };
-                    // `fts5FindRankFunction` runs when the sorter statement is prepared
-                    // (`fts5CursorFirstSorted`, ORDER BY rank) or when the rank column of a
-                    // row is read (`fts5ColumnMethod`): without a row there is no error.
-                    let rw = match rw {
-                        Ok(v) => Ok(v),
-                        Err(e)
-                            if (idx_num & (IDX_FLAG_ORDER_RANK_ASC | IDX_FLAG_ORDER_RANK_DESC))
-                                != 0 =>
-                        {
-                            return Err(e);
-                        }
-                        Err(e) => Err(e),
-                    };
-
-                    let mut precomputed_phrases = Vec::with_capacity(phrases.len());
-                    for (pi, ph) in phrases.iter().enumerate() {
-                        precomputed_phrases.push(
-                            st.eval_phrase_selective(&self.cfg, ctx, pi, ph)
-                                .map_err(sorter_err)?,
-                        );
-                    }
-                    let mut pd_hits = vec![0usize; phrases.len()];
-                    let mdocs = eval_query_expr_precomputed(
-                        &qexpr,
-                        &phrases,
-                        &mut precomputed_phrases,
-                        &mut pd_hits,
-                    );
-
-                    let rw = match rw {
-                        Ok(v) => v,
-                        Err(e) if !mdocs.is_empty() => return Err(e),
-                        Err(_) => Vec::new(),
-                    };
-                    let avgs = st.read_averages(&self.cfg, ctx).map_err(sorter_err)?;
-                    let tr = avgs[0];
-                    // (`fts5ApiColumnTotalSize`: i64 additions; the totals of a contentless
-                    // table can have gone below zero through 'delete' commands)
-                    let tt: u64 = avgs[1..].iter().fold(0u64, |a, &b| a.wrapping_add(b));
-                    (rw, pd_hits, mdocs, tr, tt)
-                };
-
-                let colsets = if populate_from_text {
-                    let mut v = Vec::with_capacity(phrases.len());
-                    collect_phrase_colsets(&qexpr, &mut v);
-                    v
-                } else {
-                    Vec::new()
-                };
-
-                let mut aux_rows: Vec<AuxRowEntry> = Vec::with_capacity(matched_docs.len());
-                self.rows.reserve(matched_docs.len());
-                let inst_key = |x: &PhraseInstance| (x.col_idx, x.token_offset, x.phrase_idx);
-                if !need_content && self.cfg.detail == DetailMode::Full {
-                    // Rows identified by the index alone: sizes from %_docsize (or unknown).
-                    let zero_sizes = DocColSizes::zeros(n_cols);
-                    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    for (rid, mut insts) in matched_docs {
-                        let mut missing_docsize = false;
-                        let col_sizes = match st
-                            .get_or_load_docsize(&self.cfg, ctx, rid)
-                            .map_err(sorter_err)?
-                        {
-                            Some(sz) => sz,
-                            None => {
-                                missing_docsize = self.cfg.columnsize;
-                                zero_sizes.clone()
-                            }
-                        };
-                        let slice = insts.as_mut_slice();
-                        if !slice.is_sorted_by_key(inst_key) {
-                            slice.sort_unstable_by_key(inst_key);
-                        }
-                        self.rows.push(Fts5CursorRow {
-                            rowid: rid,
-                            cols: Vec::new(),
-                            aux_handle: 0,
-                            rank: None,
-                        });
-                        aux_rows.push(AuxRowEntry {
-                            col_sizes,
-                            instances: insts,
-                            texts: None,
-                            missing_content: false,
-                            missing_docsize,
-                        });
-                    }
-                } else {
-                    for (rid, mut insts) in matched_docs {
-                        let mut missing_content = false;
-                        let cols = if need_content {
-                            match self.load_content_vals(&shadows, ctx, rid) {
-                                Ok(v) => v,
-                                Err(e)
-                                    if !need_cols
-                                        && e.code == ErrorCode::Corrupt
-                                        && e.message.starts_with("fts5: missing row") =>
-                                {
-                                    missing_content = true;
-                                    Vec::new()
-                                }
-                                Err(e) => return Err(e),
-                            }
-                        } else {
-                            Vec::new()
-                        };
-                        let texts = if need_aux_texts && !missing_content {
-                            let col_texts: Vec<Option<Vec<u8>>> =
-                                if contentless && !self.cfg.unindexed_content {
-                                    vec![None; n_cols]
-                                } else {
-                                    (0..n_cols)
-                                        .map(|i| {
-                                            cols.get(i)
-                                                .and_then(fts5_value_bytes)
-                                                .map(std::borrow::Cow::into_owned)
-                                        })
-                                        .collect()
-                                };
-                            Some(Box::new(AuxRowTexts { col_texts }))
-                        } else {
-                            None
-                        };
-                        // `fts5ApiColumnSize`
-                        let mut missing_docsize = false;
-                        let col_sizes = if self.cfg.columnsize {
-                            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                            match st
-                                .get_or_load_docsize(&self.cfg, ctx, rid)
-                                .map_err(sorter_err)?
-                            {
-                                Some(sz) => sz,
-                                None => {
-                                    missing_docsize = true;
-                                    DocColSizes::zeros(n_cols)
-                                }
-                            }
-                        } else if contentless {
-                            DocColSizes::zeros(n_cols)
-                        } else {
-                            self.compute_fallback_col_sizes(&cols)
-                        };
-                        if self.cfg.detail != DetailMode::Full {
-                            insts = match texts.as_ref() {
-                                Some(t) if populate_from_text => {
-                                    let mut active = vec![false; phrases.len()];
-                                    for inst in insts.as_slice() {
-                                        if let Some(a) = active.get_mut(inst.phrase_idx as usize) {
-                                            *a = true;
-                                        }
-                                    }
-                                    populate_instances_from_text(
-                                        &self.cfg,
-                                        &phrases,
-                                        &colsets,
-                                        &active,
-                                        &t.col_texts,
-                                    )
-                                }
-                                _ => PhraseHits::new(),
-                            };
-                        }
-                        let slice = insts.as_mut_slice();
-                        if !slice.is_sorted_by_key(inst_key) {
-                            slice.sort_unstable_by_key(inst_key);
-                        }
-                        self.rows.push(Fts5CursorRow {
-                            rowid: rid,
-                            cols,
-                            aux_handle: 0,
-                            rank: None,
-                        });
-                        aux_rows.push(AuxRowEntry {
-                            col_sizes,
-                            instances: insts,
-                            texts,
-                            missing_content,
-                            missing_docsize,
-                        });
-                    }
-                }
-
-                let mut qctx = AuxQueryContext::build(
-                    n_cols,
-                    self.cfg.tokenizer.clone(),
-                    phrases.iter().map(|p| p.tokens.len()).collect(),
-                    &phrase_doc_hits,
-                    total_rows,
-                    total_tokens,
-                    self.unknown_size_cols(),
-                    aux_rows,
-                );
-                qctx.bm25_needs_content = sizes_from_text || populate_from_text;
-                let qctx = Arc::new(qctx);
-                let qid = self.aux_registry.register_query(Arc::clone(&qctx));
-                for (idx, r) in self.rows.iter_mut().enumerate() {
-                    r.aux_handle = Fts5AuxRegistry::encode_handle(qid, idx);
-                    if need_rank_val {
-                        r.rank = Some(
-                            compute_bm25_for_row(&qctx, Some(idx), &rank_weights)
-                                .map_err(sorter_err)?,
-                        );
-                    }
-                }
-
-                if (idx_num & IDX_FLAG_ORDER_RANK_ASC) != 0 {
-                    self.rows.sort_by(|a, b| {
-                        a.rank
-                            .unwrap_or(0.0)
-                            .total_cmp(&b.rank.unwrap_or(0.0))
-                            .then_with(|| a.rowid.cmp(&b.rowid))
-                    });
-                } else if (idx_num & IDX_FLAG_ORDER_RANK_DESC) != 0 {
-                    self.rows.sort_by(|a, b| {
-                        b.rank
-                            .unwrap_or(0.0)
-                            .total_cmp(&a.rank.unwrap_or(0.0))
-                            .then_with(|| a.rowid.cmp(&b.rowid))
-                    });
-                } else if desc_rowid {
-                    self.rows.reverse();
-                }
-                return Ok(());
-            }
-            _ => {}
-        }
-
-        // A plan without MATCH: the auxiliary functions still work on its rows, with no
-        // phrases (`bm25()` is 0, `highlight()` returns the text unchanged).
-        if self.aux_registry.needs_aux_text() && !self.rows.is_empty() {
-            let n_cols = self.cfg.columns.len();
-            let contentless = self.cfg.content_mode == ContentMode::Contentless;
-            let (total_rows, total_tokens) = {
-                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                let avgs = st.read_averages(&self.cfg, ctx)?;
-                (avgs[0], avgs[1..].iter().sum::<u64>())
-            };
-            let mut aux_rows = Vec::with_capacity(self.rows.len());
-            for r in &self.rows {
-                let col_texts: Vec<Option<Vec<u8>>> = if contentless && !self.cfg.unindexed_content
-                {
-                    vec![None; n_cols]
-                } else {
-                    (0..n_cols)
-                        .map(|i| {
-                            r.cols
-                                .get(i)
-                                .and_then(fts5_value_bytes)
-                                .map(std::borrow::Cow::into_owned)
-                        })
-                        .collect()
-                };
-                let mut missing_docsize = false;
-                let col_sizes = if self.cfg.columnsize {
-                    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    match st.get_or_load_docsize(&self.cfg, ctx, r.rowid)? {
-                        Some(sz) => sz,
-                        None => {
-                            missing_docsize = true;
-                            DocColSizes::zeros(n_cols)
-                        }
-                    }
-                } else if contentless {
-                    DocColSizes::zeros(n_cols)
-                } else {
-                    self.compute_fallback_col_sizes(&r.cols)
-                };
-                aux_rows.push(AuxRowEntry {
-                    col_sizes,
-                    instances: PhraseHits::new(),
-                    texts: Some(Box::new(AuxRowTexts { col_texts })),
-                    missing_content: false,
-                    missing_docsize,
-                });
-            }
-            let qctx = Arc::new(AuxQueryContext::build(
-                n_cols,
-                self.cfg.tokenizer.clone(),
-                Vec::new(),
-                &[],
-                total_rows,
-                total_tokens,
-                self.unknown_size_cols(),
-                aux_rows,
-            ));
-            let qid = self.aux_registry.register_query(qctx);
-            for (idx, r) in self.rows.iter_mut().enumerate() {
-                r.aux_handle = Fts5AuxRegistry::encode_handle(qid, idx);
-            }
-        } else {
-            for r in &mut self.rows {
-                r.aux_handle = FTS5_AUX_ROWLESS_HANDLE;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl VirtualCursor for Fts5Cursor {
-    fn set_plan_hint(&mut self, hint: u64) {
-        self.plan_hint = hint;
-    }
-
-    fn filter(
-        &mut self,
-        ctx: &mut dyn VTabHostContext,
-        idx_num: i32,
-        idx_str: Option<&str>,
-        args: &[Value],
-    ) -> Result<()> {
-        self.filter_plan(ctx, idx_num, idx_str, args)
-    }
-
-    fn next(&mut self) -> Result<()> {
-        if self.pos < self.rows.len() {
-            self.pos += 1;
-        }
-        Ok(())
-    }
-
-    fn eof(&self) -> bool {
-        self.pos >= self.rows.len()
-    }
-
-    fn column(&self, col_idx: usize) -> Result<Value> {
-        let Some(row) = self.rows.get(self.pos) else {
-            return Ok(Value::Null);
-        };
-        let n_cols = self.cfg.columns.len();
-        if col_idx < n_cols {
-            Ok(row.cols.get(col_idx).cloned().unwrap_or(Value::Null))
-        } else if col_idx == n_cols {
-            if row.aux_handle > 0 {
-                Ok(Value::Integer(row.aux_handle))
-            } else {
-                Ok(Value::Null)
-            }
-        } else if col_idx == n_cols + 1 {
-            Ok(row.rank.map_or(Value::Null, real_result))
-        } else {
-            Ok(Value::Null)
-        }
-    }
-
-    fn rowid(&self) -> Result<i64> {
-        Ok(self.rows.get(self.pos).map_or(0, |r| r.rowid))
-    }
-}
-
 // ============================================================================
 // `Fts5VocabModule` (`fts5vocab` Virtual Table: `'row'`, `'col'`, `'instance'`)
 // ============================================================================
@@ -7010,12 +3176,26 @@ enum VocabType {
 }
 
 /// Built-in `fts5vocab` virtual table module for inspecting an `fts5` table's inverted index.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Fts5VocabModule;
+#[derive(Debug, Default, Clone)]
+pub struct Fts5VocabModule {
+    aux_registry: Arc<Fts5AuxRegistry>,
+}
+
+impl Fts5VocabModule {
+    /// `sqlite3Fts5VocabInit(pGlobal, db)`.
+    pub fn new(aux_registry: Arc<Fts5AuxRegistry>) -> Self {
+        Self { aux_registry }
+    }
+}
 
 impl VirtualTableModule for Fts5VocabModule {
     fn name(&self) -> &str {
         "fts5vocab"
+    }
+
+    /// (`fts5Vocab` has no `xUpdate`)
+    fn is_read_only(&self) -> bool {
+        true
     }
 
     fn risk_flags(&self) -> VTabRiskFlags {
@@ -7035,7 +3215,15 @@ impl VirtualTableModule for Fts5VocabModule {
         ctx: &mut dyn VTabHostContext,
         args: &[String],
     ) -> Result<Box<dyn VirtualTable>> {
+        // fts5VocabInitVtab: the (db, table, type) form only for a table in the temp schema
+        let b_db = args.len() == 3 && ctx.db_name() == "temp";
         let (target_db, target_tbl, vtype) = match args.len() {
+            _ if args.len() != 2 && !b_db => {
+                return Err(SqliteError::new(
+                    ErrorCode::Error,
+                    "wrong number of vtable arguments",
+                ));
+            }
             2 => {
                 let tbl = unquote_sql_token(args[0].trim())?;
                 let ty = parse_vocab_type(&unquote_sql_token(args[1].trim())?)?;
@@ -7050,7 +3238,7 @@ impl VirtualTableModule for Fts5VocabModule {
             _ => {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
-                    "fts5vocab: wrong number of arguments",
+                    "wrong number of vtable arguments",
                 ));
             }
         };
@@ -7063,19 +3251,11 @@ impl VirtualTableModule for Fts5VocabModule {
         ctx.declare_vtab(decl)?;
         let _ = ctx.set_vtab_config(VTabConfigOption::Innocuous);
         Ok(Box::new(Fts5VocabTable {
+            aux_registry: Arc::clone(&self.aux_registry),
             target_db,
             target_tbl,
             vtype,
         }))
-    }
-}
-
-/// `fts5VocabColumnMethod`: a count of zero is reported as NULL.
-fn vocab_count(n: i64) -> Value {
-    if n > 0 {
-        Value::Integer(n)
-    } else {
-        Value::Null
     }
 }
 
@@ -7097,6 +3277,7 @@ fn parse_vocab_type(s: &str) -> Result<VocabType> {
 
 #[derive(Debug)]
 struct Fts5VocabTable {
+    aux_registry: Arc<Fts5AuxRegistry>,
     target_db: Option<String>,
     target_tbl: String,
     vtype: VocabType,
@@ -7153,288 +3334,18 @@ impl VirtualTable for Fts5VocabTable {
     }
 
     fn open(&self) -> Result<Box<dyn VirtualCursor>> {
-        Ok(Box::new(Fts5VocabCursor {
-            target_db: self.target_db.clone(),
-            target_tbl: self.target_tbl.clone(),
-            vtype: self.vtype,
-            rows: Vec::new(),
-            pos: 0,
-        }))
+        Ok(Box::new(vocab::Fts5VocabCursor::new(
+            Arc::clone(&self.aux_registry),
+            self.target_db.clone(),
+            self.target_tbl.clone(),
+            self.vtype,
+        )))
     }
 }
 
-#[derive(Debug)]
-struct Fts5VocabCursor {
-    target_db: Option<String>,
-    target_tbl: String,
-    vtype: VocabType,
-    rows: Vec<Vec<Value>>,
-    pos: usize,
-}
 
-fn split_ddl_args(inner: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut cur = String::new();
-    let mut in_quote: Option<char> = None;
-    let mut chars = inner.chars().peekable();
-    while let Some(c) = chars.next() {
-        if let Some(q) = in_quote {
-            cur.push(c);
-            if c == q {
-                if chars.peek().copied() == Some(q) {
-                    if let Some(escaped) = chars.next() {
-                        cur.push(escaped);
-                    }
-                } else {
-                    in_quote = None;
-                }
-            }
-        } else {
-            match c {
-                '\'' | '"' | '`' => {
-                    in_quote = Some(c);
-                    cur.push(c);
-                }
-                '[' => {
-                    in_quote = Some(']');
-                    cur.push(c);
-                }
-                ',' => {
-                    args.push(std::mem::take(&mut cur));
-                }
-                _ => cur.push(c),
-            }
-        }
-    }
-    if !cur.trim().is_empty() {
-        args.push(cur);
-    }
-    args
-}
-
-fn detect_fts5_table_detail(
-    ctx: &mut dyn VTabHostContext,
-    db_q: &str,
-    target_tbl: &str,
-) -> DetailMode {
-    let Ok(rows) = ctx.query_sql(
-        &format!(
-            "SELECT sql FROM {db_q}.sqlite_schema WHERE type = 'table' AND name = ?1 COLLATE NOCASE"
-        ),
-        &[Value::Text(target_tbl.to_owned())],
-    ) else {
-        return DetailMode::Full;
-    };
-    let Some(Value::Text(sql)) = rows.first().and_then(|r| r.first()) else {
-        return DetailMode::Full;
-    };
-    let Some(open) = sql.find('(') else {
-        return DetailMode::Full;
-    };
-    let Some(close) = sql.rfind(')') else {
-        return DetailMode::Full;
-    };
-    if close <= open {
-        return DetailMode::Full;
-    }
-    let raw_args: Vec<String> = split_ddl_args(&sql[open + 1..close])
-        .iter()
-        .map(|a| a.trim().to_owned())
-        .collect();
-    Fts5Config::parse(target_tbl, &raw_args)
-        .map(|cfg| cfg.detail)
-        .unwrap_or(DetailMode::Full)
-}
-
-impl VirtualCursor for Fts5VocabCursor {
-    fn filter(
-        &mut self,
-        ctx: &mut dyn VTabHostContext,
-        idx_num: i32,
-        _idx_str: Option<&str>,
-        args: &[Value],
-    ) -> Result<()> {
-        self.rows.clear();
-        self.pos = 0;
-        // `fts5VocabFilterMethod`: the term limits xBestIndex asked for, in argument order
-        // EQ, GE, LE; a value that is not TEXT is no limit. With an equality only that term
-        // is visited (an IN list is run as one scan per value); otherwise the scan starts at
-        // the first term >= GE and stops after the last term <= LE (memcmp order).
-        let mut i_val = 0usize;
-        let mut next_text = |on: bool| -> Option<Vec<u8>> {
-            if !on {
-                return None;
-            }
-            let v = args.get(i_val);
-            i_val += 1;
-            match v {
-                Some(Value::Text(t)) => Some(t.as_bytes().to_vec()),
-                _ => None,
-            }
-        };
-        let term_eq = next_text((idx_num & 0x0100) != 0);
-        let term_ge = next_text((idx_num & 0x0200) != 0);
-        let term_le = next_text((idx_num & 0x0400) != 0);
-        let (term_ge, term_le) = if term_eq.is_some() {
-            (None, None)
-        } else {
-            (term_ge, term_le)
-        };
-        // `fts5VocabOpenMethod`: `sqlite3Fts5FlushToDisk(pFts5)`.
-        ctx.flush_vtab_pending(self.target_db.as_deref(), &self.target_tbl)?;
-        let db_name = self.target_db.as_deref().unwrap_or_else(|| ctx.db_name());
-        let db_q = quote_ident(db_name);
-
-        // Fetch target FTS5 column names via `pragma_table_info`
-        let info_rows = ctx.query_sql(
-            "SELECT name FROM pragma_table_info(?1, ?2) ORDER BY cid ASC",
-            &[
-                Value::Text(self.target_tbl.clone()),
-                Value::Text(db_name.to_owned()),
-            ],
-        )?;
-        let col_names: Vec<String> = info_rows
-            .into_iter()
-            .filter_map(|mut r| match r.pop() {
-                Some(Value::Text(s)) => Some(s),
-                _ => None,
-            })
-            .collect();
-
-        let target_detail = detect_fts5_table_detail(ctx, &db_q, &self.target_tbl);
-        let merged = load_merged_index(ctx, &db_q, &self.target_tbl, target_detail)?;
-
-        for (tkey, docs) in merged {
-            // Only main-index terms (`b'0'` prefix byte), skip prefix-index entries (`b'1'..`)
-            if tkey.first().copied() != Some(b'0') {
-                continue;
-            }
-            let term_bytes = &tkey[1..];
-            if term_eq.as_deref().is_some_and(|t| t != term_bytes)
-                || term_ge.as_deref().is_some_and(|t| term_bytes < t)
-                || term_le.as_deref().is_some_and(|t| term_bytes > t)
-            {
-                continue;
-            }
-            let term_str = String::from_utf8_lossy(&tkey[1..]).into_owned();
-            match self.vtype {
-                // `fts5VocabNextMethod`: instances are only counted for detail=full.
-                VocabType::Row => {
-                    let doc_cnt = docs.len() as i64;
-                    let mut tot_cnt = 0i64;
-                    if target_detail == DetailMode::Full {
-                        for cols in docs.values() {
-                            for offs in cols.values() {
-                                tot_cnt += offs.len() as i64;
-                            }
-                        }
-                    }
-                    self.rows.push(vec![
-                        Value::Text(term_str),
-                        vocab_count(doc_cnt),
-                        vocab_count(tot_cnt),
-                    ]);
-                }
-                VocabType::Col => {
-                    // One row per column the term occurs in, in column order; detail=none
-                    // reports every document under the first column.
-                    let mut by_col: BTreeMap<usize, (i64, i64)> = BTreeMap::new();
-                    for cols in docs.values() {
-                        if target_detail == DetailMode::None {
-                            by_col.entry(0).or_insert((0, 0)).0 += 1;
-                            continue;
-                        }
-                        for (&cidx, offs) in cols {
-                            let e = by_col.entry(cidx).or_insert((0, 0));
-                            e.0 += 1;
-                            if target_detail == DetailMode::Full {
-                                e.1 += offs.len() as i64;
-                            }
-                        }
-                    }
-                    for (cidx, (dc, tc)) in by_col {
-                        let cname = if target_detail == DetailMode::None {
-                            Value::Null
-                        } else {
-                            Value::Text(
-                                col_names
-                                    .get(cidx)
-                                    .cloned()
-                                    .unwrap_or_else(|| format!("c{cidx}")),
-                            )
-                        };
-                        self.rows.push(vec![
-                            Value::Text(term_str.clone()),
-                            cname,
-                            vocab_count(dc),
-                            vocab_count(tc),
-                        ]);
-                    }
-                }
-                VocabType::Instance => {
-                    // detail=full: one row per position; detail=column: one row per
-                    // (document, column) without offset; detail=none: one row per document.
-                    for (rowid, cols) in docs {
-                        if target_detail == DetailMode::None {
-                            self.rows.push(vec![
-                                Value::Text(term_str.clone()),
-                                Value::Integer(rowid),
-                                Value::Null,
-                                Value::Null,
-                            ]);
-                            continue;
-                        }
-                        for (cidx, offs) in cols {
-                            let cname = col_names
-                                .get(cidx)
-                                .cloned()
-                                .unwrap_or_else(|| format!("c{cidx}"));
-                            if target_detail != DetailMode::Full {
-                                self.rows.push(vec![
-                                    Value::Text(term_str.clone()),
-                                    Value::Integer(rowid),
-                                    Value::Text(cname),
-                                    Value::Null,
-                                ]);
-                            } else {
-                                for off in offs {
-                                    self.rows.push(vec![
-                                        Value::Text(term_str.clone()),
-                                        Value::Integer(rowid),
-                                        Value::Text(cname.clone()),
-                                        Value::Integer(off as i64),
-                                    ]);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn next(&mut self) -> Result<()> {
-        if self.pos < self.rows.len() {
-            self.pos += 1;
-        }
-        Ok(())
-    }
-
-    fn eof(&self) -> bool {
-        self.pos >= self.rows.len()
-    }
-
-    fn column(&self, col_idx: usize) -> Result<Value> {
-        Ok(self
-            .rows
-            .get(self.pos)
-            .and_then(|r| r.get(col_idx))
-            .cloned()
-            .unwrap_or(Value::Null))
-    }
-
-    fn rowid(&self) -> Result<i64> {
-        Ok((self.pos + 1) as i64)
-    }
-}
+mod auxfn;
+mod expr;
+mod main;
+mod vocab;
+pub use main::{Fts5AuxRegistry, Fts5AuxTarget};

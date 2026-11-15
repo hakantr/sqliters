@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use sqliters_types::{ErrorCode, Result, ShadowHint, SqliteError, VTabHostContext, Value};
 
@@ -29,6 +30,7 @@ pub(crate) const FTS5_CURRENT_VERSION_SECUREDELETE: i32 = 5;
 const SZ_HASH_ENTRY: i64 = 48;
 
 const FTS5_SEGITER_ONETERM: u8 = 0x01;
+const FTS5_SEGITER_REVERSE: u8 = 0x02;
 
 const FTS5_DATA_PAGE_B: u32 = 31;
 const FTS5_DATA_HEIGHT_B: u32 = 5;
@@ -320,9 +322,39 @@ fn hash_doclist_copy(detail: Detail, p: &HashEntry) -> Vec<u8> {
 }
 
 #[derive(Debug)]
+/// The hash function of the pending-terms table (`fts5HashKey`: `h = (h << 3) ^ h ^ p[i]`,
+/// here over the bytes in the order they are fed), spread over the word at the end. The
+/// table is only ever looked up by key or enumerated into a sorted list, so the function
+/// decides nothing but speed.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct Fts5KeyHasher(u64);
+
+impl std::hash::Hasher for Fts5KeyHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0 ^ 13;
+        for &b in bytes {
+            h = (h << 3) ^ h ^ u64::from(b);
+        }
+        self.0 = h;
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (self.0 << 3) ^ self.0 ^ (i as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        let h = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^ (h >> 29)
+    }
+}
+
+type Fts5KeyMap = HashMap<Vec<u8>, HashEntry, std::hash::BuildHasherDefault<Fts5KeyHasher>>;
+
+#[derive(Debug)]
 pub(crate) struct Fts5Hash {
     detail: Detail,
-    map: HashMap<Vec<u8>, HashEntry>,
+    map: Fts5KeyMap,
     key_buf: Vec<u8>,
 }
 
@@ -330,7 +362,7 @@ impl Fts5Hash {
     fn new(detail: Detail) -> Self {
         Self {
             detail,
-            map: HashMap::new(),
+            map: Fts5KeyMap::default(),
             key_buf: Vec::new(),
         }
     }
@@ -345,7 +377,10 @@ impl Fts5Hash {
         self.key_buf.push(b_byte);
         self.key_buf.extend_from_slice(token);
         let n_key = self.key_buf.len();
-        if !self.map.contains_key(self.key_buf.as_slice()) {
+        // (one lookup for a key that is there; a new key is entered and looked up again)
+        if let Some(p) = self.map.get(self.key_buf.as_slice()) {
+            n_incr -= p.n_data(n_key);
+        } else {
             let mut e = HashEntry::default();
             put_varint(&mut e.data, rowid as u64);
             e.i_rowid = rowid;
@@ -355,8 +390,6 @@ impl Fts5Hash {
                 e.i_col = if detail == Detail::Full { 0 } else { -1 };
             }
             self.map.insert(self.key_buf.clone(), e);
-        } else if let Some(p) = self.map.get(self.key_buf.as_slice()) {
-            n_incr -= p.n_data(n_key);
         }
         let Some(p) = self.map.get_mut(self.key_buf.as_slice()) else {
             return 0;
@@ -462,7 +495,7 @@ impl Fts5Hash {
 
     fn clear(&mut self) {
         // (`sqlite3Fts5HashClear` frees every entry; the slot array is kept.)
-        self.map = HashMap::new();
+        self.map = Fts5KeyMap::default();
     }
 }
 
@@ -693,6 +726,10 @@ pub(crate) struct IndexConfig {
     pub(crate) i_cookie: i32,
     /// `zRank` / `zRankArgs` as the text of the `rank` row (None = default).
     pub(crate) rank: Option<String>,
+    /// `bTokendata` (`tokendata=1`).
+    pub(crate) b_tokendata: bool,
+    /// `bPrefixInsttoken` (the 'insttoken' configuration value).
+    pub(crate) b_prefix_insttoken: bool,
 }
 
 impl IndexConfig {
@@ -717,6 +754,8 @@ impl IndexConfig {
             i_version: 0,
             i_cookie: 0,
             rank: None,
+            b_tokendata: false,
+            b_prefix_insttoken: false,
         }
     }
 
@@ -776,6 +815,8 @@ struct DlidxLvl {
     data: Option<Data>,
     i_off: i32,
     b_eof: bool,
+    /// Used by reverse iterators.
+    i_first_off: i32,
     i_leaf_pgno: i32,
     i_rowid: i64,
 }
@@ -800,6 +841,7 @@ fn dlidx_lvl_next(lvl: &mut DlidxLvl) -> bool {
         let (r, n) = get_varint(&data.p, lvl.i_off as usize);
         lvl.i_rowid = r as i64;
         lvl.i_off += n as i32;
+        lvl.i_first_off = lvl.i_off;
     } else {
         let mut i_off = lvl.i_off;
         while i_off < data.nn {
@@ -821,8 +863,41 @@ fn dlidx_lvl_next(lvl: &mut DlidxLvl) -> bool {
     lvl.b_eof
 }
 
+/// `fts5DlidxLvlPrev`.
+fn dlidx_lvl_prev(lvl: &mut DlidxLvl) -> bool {
+    let i_off = lvl.i_off;
+    if i_off <= lvl.i_first_off {
+        lvl.b_eof = true;
+    } else {
+        lvl.i_off = 0;
+        dlidx_lvl_next(lvl);
+        let Some(data) = lvl.data.as_ref() else {
+            return lvl.b_eof;
+        };
+        let a = &data.p;
+        let nn = data.nn;
+        loop {
+            let mut n_zero = 0;
+            let mut ii = lvl.i_off;
+            while ii < nn && byte_at(a, ii as usize) == 0 {
+                n_zero += 1;
+                ii += 1;
+            }
+            let (delta, nb) = get_varint(a, ii as usize);
+            ii += nb as i32;
+            if ii >= i_off {
+                break;
+            }
+            lvl.i_leaf_pgno += n_zero + 1;
+            lvl.i_rowid = lvl.i_rowid.wrapping_add(delta as i64);
+            lvl.i_off = ii;
+        }
+    }
+    lvl.b_eof
+}
+
 // ---------------------------------------------------------------------------------------
-// Segment iterator / multi-segment iterator (forward only, segments only)
+// Segment iterator / multi-segment iterator
 // ---------------------------------------------------------------------------------------
 
 #[derive(Debug, Default)]
@@ -841,7 +916,7 @@ struct SegIter {
     leaf: Option<Data>,
     next_leaf: Option<Data>,
     i_leaf_offset: i64,
-    tomb: Option<TombstoneArray>,
+    tomb: Option<Arc<Mutex<TombstoneArray>>>,
     i_term_leaf_pgno: i32,
     i_term_leaf_offset: i32,
     i_pgidx_off: i32,
@@ -855,6 +930,11 @@ struct SegIter {
     /// scan); the entries of the scan in key order and the position of the current one.
     hash_entries: Option<Vec<(Vec<u8>, Vec<u8>)>>,
     hash_pos: usize,
+    /// `pSeg==0`: the iterator reads the pending-terms hash (scan or single term).
+    is_hash: bool,
+    /// `iRowidOffset` / `aRowidOffset[]` (FTS5_SEGITER_REVERSE only).
+    i_rowid_offset: i32,
+    a_rowid_offset: Vec<i32>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -863,14 +943,69 @@ struct CResult {
     b_term_eq: bool,
 }
 
+/// `xSetOutputs` of an `Fts5Iter`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SetOutputs {
+    #[default]
+    Noop,
+    None,
+    Nocolset,
+    ZeroColset,
+    Col,
+    Col100,
+    Full,
+}
+
+/// Where `Fts5IndexIter.pData` points.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum DataSrc {
+    #[default]
+    Null,
+    /// Into the leaf of segment iterator `.0` at offset `.1`.
+    Leaf(usize, usize),
+    /// `Fts5Iter.poslist.p` (+ offset).
+    Poslist(usize),
+    /// The output of sub-iterator `.0` of the tokendata iterator.
+    Sub(usize),
+}
+
+/// `Fts5Iter` (with its base class `Fts5IndexIter`: `i_rowid`, `data()`, `n_data`, `b_eof`).
 #[derive(Debug, Default)]
-struct MultiIter {
+pub(crate) struct MultiIter {
     n_seg: usize,
     a_seg: Vec<SegIter>,
     a_first: Vec<CResult>,
     b_skip_empty: bool,
-    b_eof: bool,
+    pub(crate) b_eof: bool,
     i_switch_rowid: i64,
+    b_rev: bool,
+    /// `pColset` (a copy: the expression owns the original).
+    colset: Option<Vec<i32>>,
+    x_set_outputs: SetOutputs,
+    pub(crate) i_rowid: i64,
+    pub(crate) n_data: i32,
+    data_src: DataSrc,
+    poslist: Vec<u8>,
+    token_data: Option<Box<TokenDataIter>>,
+}
+
+/// `Fts5TokenDataMap`. (`i_iter` / `n_byte` are read by `sqlite3Fts5IterToken`, the
+/// xInstToken side.)
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default)]
+struct TokenDataMap {
+    i_rowid: i64,
+    i_pos: i64,
+    i_iter: i32,
+    n_byte: i32,
+}
+
+/// `Fts5TokenDataIter`.
+#[derive(Debug, Default)]
+struct TokenDataIter {
+    a_map: Vec<TokenDataMap>,
+    terms: Vec<u8>,
+    ap_iter: Vec<MultiIter>,
 }
 
 impl MultiIter {
@@ -886,9 +1021,30 @@ impl MultiIter {
             n_seg: n_slot,
             a_seg,
             a_first: vec![CResult::default(); n_slot],
-            b_skip_empty: false,
-            b_eof: false,
-            i_switch_rowid: 0,
+            ..Self::default()
+        }
+    }
+    /// `Fts5IndexIter.pData` / `nData`: the position list (or column list) of the
+    /// current entry.
+    pub(crate) fn data(&self) -> &[u8] {
+        let n = self.n_data.max(0) as usize;
+        match self.data_src {
+            DataSrc::Null => &[],
+            DataSrc::Leaf(i, off) => match self.a_seg.get(i).and_then(|s| s.leaf.as_ref()) {
+                Some(l) => {
+                    let off = off.min(l.p.len());
+                    &l.p[off..(off + n).min(l.p.len())]
+                }
+                None => &[],
+            },
+            DataSrc::Poslist(off) => {
+                let off = off.min(self.poslist.len());
+                &self.poslist[off..(off + n).min(self.poslist.len())]
+            }
+            DataSrc::Sub(i) => match self.token_data.as_ref().and_then(|t| t.ap_iter.get(i)) {
+                Some(sub) => sub.data(),
+                None => &[],
+            },
         }
     }
     #[inline]
@@ -921,10 +1077,10 @@ impl MultiIter {
                 if p1.i_rowid == p2.i_rowid {
                     return i2;
                 }
-                res = if p1.i_rowid > p2.i_rowid {
-                    std::cmp::Ordering::Greater
-                } else {
+                res = if (p1.i_rowid > p2.i_rowid) == self.b_rev {
                     std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
                 };
             }
             i_res = if res == std::cmp::Ordering::Less {
@@ -942,13 +1098,14 @@ impl MultiIter {
         self.b_eof = seg.leaf.is_none();
         self.i_switch_rowid = seg.i_rowid;
     }
-    /// `fts5MultiIterAdvanceRowid` (forward iteration); returns (collision, new first).
+    /// `fts5MultiIterAdvanceRowid`; returns (collision, new first).
     fn advance_rowid(&mut self, i_changed: usize) -> (bool, usize) {
         let mut i_new = i_changed;
         let new_rowid = self.a_seg[i_new].i_rowid;
-        if new_rowid == self.i_switch_rowid || new_rowid >= self.i_switch_rowid {
+        let b_rev = self.b_rev;
+        if new_rowid == self.i_switch_rowid || (new_rowid < self.i_switch_rowid) == b_rev {
             let mut i_other = i_changed ^ 1;
-            self.i_switch_rowid = i64::MAX;
+            self.i_switch_rowid = if b_rev { i64::MIN } else { i64::MAX };
             let mut i = (self.n_seg + i_changed) / 2;
             loop {
                 if self.a_first[i].b_term_eq {
@@ -956,10 +1113,10 @@ impl MultiIter {
                     let ro = self.a_seg[i_other].i_rowid;
                     if rn == ro {
                         return (true, i_new);
-                    } else if ro < rn {
+                    } else if (ro > rn) == b_rev {
                         self.i_switch_rowid = ro;
                         i_new = i_other;
-                    } else if ro < self.i_switch_rowid {
+                    } else if (ro > self.i_switch_rowid) == b_rev {
                         self.i_switch_rowid = ro;
                     }
                 }
@@ -1119,12 +1276,21 @@ pub(crate) struct Fts5Index {
     /// Only filled while `fts5FlushOneHash` runs, and kept in step with the rows it writes.
     idx_cache: HashMap<i32, Vec<(Vec<u8>, i64)>>,
     idx_cache_on: bool,
+    /// Where the host found `%_data` last time (`shadow_blob_get`).
+    data_rd_hint: sqliters_types::ShadowHint,
     sql_idx_scan: String,
     // SQL texts of the statements of `Fts5Index` (prepared lazily in C).
     sql_data_delete: String,
     sql_idx_delete: String,
     sql_idx_insert: String,
     sql_idx_select: String,
+    sql_idx_next_select: String,
+    sql_data_version: String,
+    /// `iStructVersion`: `PRAGMA data_version` when `pStruct` was read.
+    i_struct_version: i64,
+    /// `nRead`: total number of blocks read.
+    pub(crate) n_read: i64,
+    struct_gen: u64,
     sql_idx_secure_delete: String,
     sql_config_version: String,
     sql_config_select: String,
@@ -1156,11 +1322,17 @@ impl Fts5Index {
             write_gen: 0,
             idx_cache: HashMap::new(),
             idx_cache_on: false,
+            data_rd_hint: sqliters_types::ShadowHint::NONE,
             sql_idx_scan: String::new(),
             sql_data_delete: String::new(),
             sql_idx_delete: String::new(),
             sql_idx_insert: String::new(),
             sql_idx_select: String::new(),
+            sql_idx_next_select: String::new(),
+            sql_data_version: String::new(),
+            i_struct_version: 0,
+            n_read: 0,
+            struct_gen: 0,
             sql_idx_secure_delete: String::new(),
             sql_config_version: String::new(),
             sql_config_select: String::new(),
@@ -1176,6 +1348,7 @@ impl Fts5Index {
         self.db_name = db_name.to_owned();
         self.data_tbl = format!("{tbl_name}_data");
         self.idx_tbl = format!("{tbl_name}_idx");
+        self.data_rd_hint = sqliters_types::ShadowHint::NONE;
         self.config_tbl = format!("{tbl_name}_config");
         self.data_hint = ShadowHint::NONE;
         let db_q = q_ident(db_name);
@@ -1188,6 +1361,10 @@ impl Fts5Index {
         self.sql_idx_select = format!(
             "SELECT pgno FROM {db_q}.{idx_q} WHERE segid=? AND term<=? ORDER BY term DESC LIMIT 1"
         );
+        self.sql_idx_next_select = format!(
+            "SELECT pgno FROM {db_q}.{idx_q} WHERE segid=? AND term>? ORDER BY term ASC LIMIT 1"
+        );
+        self.sql_data_version = format!("PRAGMA {db_q}.data_version");
         self.sql_idx_scan =
             format!("SELECT term, pgno FROM {db_q}.{idx_q} WHERE segid=? ORDER BY term");
         self.idx_cache.clear();
@@ -1230,17 +1407,13 @@ impl Fts5Index {
 
     /// `fts5DataRead`.
     fn data_read(&mut self, ctx: &mut dyn VTabHostContext, i_rowid: i64) -> Result<Data> {
-        let row = ctx.shadow_get_rowid(&self.data_tbl, i_rowid)?;
-        match row.and_then(|mut r| {
-            if r.len() >= 2 {
-                Some(r.swap_remove(1))
-            } else {
-                None
-            }
-        }) {
-            Some(Value::Blob(b)) => Ok(Data::from_blob(b)),
-            Some(Value::Text(s)) => Ok(Data::from_blob(s.into_bytes())),
-            _ => Err(self.corrupt_rowid(i_rowid)),
+        self.n_read += 1;
+        sqliters_types::dtrace!("TR|f5q|rd|k={}", i_rowid);
+        let mut b = Vec::new();
+        if ctx.shadow_blob_get(&self.data_tbl, &mut self.data_rd_hint, i_rowid, 1, &mut b)? {
+            Ok(Data::from_blob(b))
+        } else {
+            Err(self.corrupt_rowid(i_rowid))
         }
     }
 
@@ -1375,6 +1548,8 @@ impl Fts5Index {
         ctx: &mut dyn VTabHostContext,
     ) -> Result<&mut Structure> {
         if self.p_struct.is_none() {
+            self.i_struct_version = self.index_data_version(ctx)?;
+            sqliters_types::dtrace!("TR|f5q|struct|read");
             let st = self.structure_read_uncached(ctx)?;
             self.p_struct = Some(st);
         }
@@ -1388,12 +1563,25 @@ impl Fts5Index {
     /// structure and the cache is empty.
     fn structure_take(&mut self, ctx: &mut dyn VTabHostContext) -> Result<Structure> {
         self.structure_read(ctx)?;
+        self.struct_gen = self.struct_gen.wrapping_add(1);
         self.p_struct.take().ok_or_else(corrupt)
     }
 
     /// `fts5StructureInvalidate`.
     pub(crate) fn structure_invalidate(&mut self) {
         self.p_struct = None;
+        self.struct_gen = self.struct_gen.wrapping_add(1);
+    }
+
+    /// Identifies the cached structure object (`sqlite3Fts5StructureRef` /
+    /// `sqlite3Fts5StructureTest`): it changes whenever the object is replaced.
+    pub(crate) fn struct_gen(&self) -> u64 {
+        self.struct_gen
+    }
+
+    /// The schema the table is in (`pConfig->zDb`).
+    pub(crate) fn db_name(&self) -> &str {
+        &self.db_name
     }
 
     /// `fts5StructureWrite`.
@@ -1596,6 +1784,8 @@ pub(crate) fn config_set_value(cfg: &mut IndexConfig, key: &str, val: &Value) ->
         let b = int_val(val).unwrap_or(-1);
         if b < 0 {
             ok = false;
+        } else {
+            cfg.b_prefix_insttoken = b != 0;
         }
     } else {
         ok = false;
@@ -1738,10 +1928,10 @@ impl Fts5Index {
         if n_tomb > 0 {
             let mut ap = Vec::with_capacity(n_tomb as usize);
             ap.resize_with(n_tomb as usize, || None);
-            it.tomb = Some(TombstoneArray {
+            it.tomb = Some(Arc::new(Mutex::new(TombstoneArray {
                 n_tombstone: n_tomb,
                 ap,
-            });
+            })));
         }
     }
 
@@ -1785,7 +1975,9 @@ impl Fts5Index {
         it: &mut SegIter,
         pb_new_term: Option<&mut bool>,
     ) -> Result<()> {
-        if self.config.detail == Detail::None {
+        if (it.flags & FTS5_SEGITER_REVERSE) != 0 {
+            self.seg_iter_next_reverse(ctx, it)
+        } else if self.config.detail == Detail::None {
             self.seg_iter_next_none(ctx, it, pb_new_term)
         } else {
             self.seg_iter_next_full(ctx, it, pb_new_term)
@@ -1800,7 +1992,7 @@ impl Fts5Index {
         pb_new_term: Option<&mut bool>,
     ) -> Result<()> {
         let mut i_off = it.i_leaf_offset;
-        if it.hash_entries.is_some() {
+        if it.is_hash {
             let Some(leaf) = it.leaf.as_ref() else {
                 return Ok(());
             };
@@ -1900,7 +2092,7 @@ impl Fts5Index {
                 it.i_rowid = it.i_rowid.wrapping_add(d as i64);
             }
             it.i_leaf_offset = i_off;
-        } else if it.hash_entries.is_some() {
+        } else if it.is_hash {
             let mut advanced = false;
             if (it.flags & FTS5_SEGITER_ONETERM) == 0 {
                 advanced = Self::seg_iter_hash_advance(it);
@@ -1978,10 +2170,11 @@ impl Fts5Index {
         Ok(())
     }
 
-    /// `fts5DlidxIterInit` (forward).
+    /// `fts5DlidxIterInit`.
     fn dlidx_iter_init(
         &mut self,
         ctx: &mut dyn VTabHostContext,
+        b_rev: bool,
         i_segid: i32,
         i_leaf_pg: i32,
     ) -> Result<DlidxIter> {
@@ -1989,6 +2182,12 @@ impl Fts5Index {
             i_segid,
             a_lvl: Vec::new(),
         };
+        sqliters_types::dtrace!(
+            "TR|f5q|dlidx|segid={} pg={} rev={}",
+            i_segid,
+            i_leaf_pg,
+            i32::from(b_rev)
+        );
         let mut i = 0;
         loop {
             let i_rowid = dlidx_rowid(i_segid, i, i_leaf_pg);
@@ -2006,11 +2205,54 @@ impl Fts5Index {
             }
             i += 1;
         }
-        // fts5DlidxIterFirst
-        for lvl in &mut iter.a_lvl {
-            dlidx_lvl_next(lvl);
+        if !b_rev {
+            // fts5DlidxIterFirst
+            for lvl in &mut iter.a_lvl {
+                dlidx_lvl_next(lvl);
+            }
+        } else {
+            self.dlidx_iter_last(ctx, &mut iter)?;
         }
         Ok(iter)
+    }
+
+    /// `fts5DlidxIterLast`.
+    fn dlidx_iter_last(&mut self, ctx: &mut dyn VTabHostContext, iter: &mut DlidxIter) -> Result<()> {
+        // Advance each level to the last entry on the last page
+        let mut i = iter.a_lvl.len();
+        while i > 0 {
+            i -= 1;
+            while !dlidx_lvl_next(&mut iter.a_lvl[i]) {}
+            iter.a_lvl[i].b_eof = false;
+            if i > 0 {
+                let pg = iter.a_lvl[i].i_leaf_pgno;
+                iter.a_lvl[i - 1] = DlidxLvl::default();
+                let data = self.data_read(ctx, dlidx_rowid(iter.i_segid, (i - 1) as i32, pg))?;
+                iter.a_lvl[i - 1].data = Some(data);
+            }
+        }
+        Ok(())
+    }
+
+    /// `fts5DlidxIterPrevR`.
+    fn dlidx_iter_prev_r(
+        &mut self,
+        ctx: &mut dyn VTabHostContext,
+        iter: &mut DlidxIter,
+        i_lvl: usize,
+    ) -> Result<bool> {
+        if dlidx_lvl_prev(&mut iter.a_lvl[i_lvl]) && (i_lvl + 1) < iter.a_lvl.len() {
+            self.dlidx_iter_prev_r(ctx, iter, i_lvl + 1)?;
+            if !iter.a_lvl[i_lvl + 1].b_eof {
+                let pg = iter.a_lvl[i_lvl + 1].i_leaf_pgno;
+                iter.a_lvl[i_lvl] = DlidxLvl::default();
+                let data = self.data_read(ctx, dlidx_rowid(iter.i_segid, i_lvl as i32, pg))?;
+                iter.a_lvl[i_lvl].data = Some(data);
+                while !dlidx_lvl_next(&mut iter.a_lvl[i_lvl]) {}
+                iter.a_lvl[i_lvl].b_eof = false;
+            }
+        }
+        Ok(iter.a_lvl[0].b_eof)
     }
 
     /// `fts5DlidxIterNextR`.
@@ -2049,22 +2291,25 @@ impl Fts5Index {
         if it.i_term_leaf_pgno == it.i_leaf_pgno && it.i_endof_doclist < leaf.sz_leaf {
             return Ok(());
         }
-        it.dlidx = Some(self.dlidx_iter_init(ctx, it.seg.i_segid, it.i_term_leaf_pgno)?);
+        let b_rev = (it.flags & FTS5_SEGITER_REVERSE) != 0;
+        it.dlidx = Some(self.dlidx_iter_init(ctx, b_rev, it.seg.i_segid, it.i_term_leaf_pgno)?);
         Ok(())
     }
 
-    /// `fts5LeafSeek` with `bGe == 0`.
+    /// `fts5LeafSeek`.
     fn leaf_seek(
         &mut self,
         ctx: &mut dyn VTabHostContext,
+        b_ge: bool,
         it: &mut SegIter,
         term: &[u8],
     ) -> Result<()> {
         let Some(leaf) = it.leaf.as_ref() else {
             return Ok(());
         };
+        let mut b_end_of_page = false;
         let a = &leaf.p;
-        let n = leaf.nn as u32;
+        let mut n = leaf.nn as u32;
         let n_term = term.len() as u32;
         let mut n_match: u32 = 0;
         let mut n_keep: u32 = 0;
@@ -2109,6 +2354,7 @@ impl Fts5Index {
                 }
             }
             if i_pgidx >= n {
+                b_end_of_page = true;
                 found = false;
                 break;
             }
@@ -2125,11 +2371,40 @@ impl Fts5Index {
             i_off += nb as u32;
         }
         if !found {
-            // search_failed with bGe==0
-            it.leaf = None;
-            return Ok(());
+            // search_failed:
+            if !b_ge {
+                it.leaf = None;
+                return Ok(());
+            } else if b_end_of_page {
+                loop {
+                    self.seg_iter_next_page(ctx, it)?;
+                    let Some(leaf) = it.leaf.as_ref() else {
+                        return Ok(());
+                    };
+                    if !leaf.is_termless() {
+                        i_pgidx = leaf.sz_leaf as u32;
+                        let (v, nb) = get_varint32(&leaf.p, i_pgidx as usize);
+                        i_pgidx += nb as u32;
+                        i_off = v as u32;
+                        if i_off < 4 || i64::from(i_off) >= i64::from(leaf.sz_leaf) {
+                            return Err(self.corrupt_iter(it));
+                        }
+                        n_keep = 0;
+                        i_term_off = i_off;
+                        n = leaf.nn as u32;
+                        let (v, nb) = get_varint32(&leaf.p, i_off as usize);
+                        i_off += nb as u32;
+                        n_new = v as u32;
+                        break;
+                    }
+                }
+            }
         }
         // search_success:
+        let Some(leaf) = it.leaf.as_ref() else {
+            return Ok(());
+        };
+        let a = &leaf.p;
         if i64::from(i_off) + i64::from(n_new) > i64::from(n) || n_new < 1 {
             return Err(self.corrupt_iter(it));
         }
@@ -2162,6 +2437,10 @@ impl Fts5Index {
         term: &[u8],
     ) -> Result<Option<i64>> {
         if !self.idx_cache_on {
+            // (the statement as one seek, when the host can do that)
+            if let Some(hit) = ctx.shadow_wr_seek(&self.idx_tbl, i64::from(i_segid), term, true)? {
+                return Ok(hit.and_then(|r| r.get(2).map(Value::to_integer_lossy)));
+            }
             let rows = ctx.query_sql(
                 &self.sql_idx_select,
                 &[
@@ -2212,16 +2491,18 @@ impl Fts5Index {
         Ok(if pos > 0 { Some(v[pos - 1].1) } else { None })
     }
 
-    /// `fts5SegIterSeekInit` for a plain term lookup (flags without SCAN / DESC).
+    /// `fts5SegIterSeekInit`.
     fn seg_iter_seek_init(
         &mut self,
         ctx: &mut dyn VTabHostContext,
         term: &[u8],
+        flags: i32,
         seg_pos: (usize, usize),
         seg: &StructureSegment,
         it: &mut SegIter,
     ) -> Result<()> {
         let mut i_pg: i32 = 1;
+        let b_ge = (flags & FTS5INDEX_QUERY_SCAN) != 0;
         let mut b_dlidx = false;
         *it = SegIter::default();
         it.seg_pos = Some(seg_pos);
@@ -2238,16 +2519,34 @@ impl Fts5Index {
             i_pg = seg.pgno_first;
             b_dlidx = false;
         }
+        sqliters_types::dtrace!(
+            "TR|f5q|idx|segid={} pg={} dlidx={}",
+            seg.i_segid,
+            i_pg,
+            i32::from(b_dlidx)
+        );
         it.i_leaf_pgno = i_pg - 1;
         self.seg_iter_next_page(ctx, it)?;
         if it.leaf.is_some() {
-            self.leaf_seek(ctx, it, term)?;
+            self.leaf_seek(ctx, b_ge, it, term)?;
         }
-        it.flags |= FTS5_SEGITER_ONETERM;
-        if it.leaf.is_some() && b_dlidx {
-            self.seg_iter_load_dlidx(ctx, it)?;
+        if !b_ge || (flags & FTS5INDEX_QUERY_SCANONETERM) != 0 {
+            it.flags |= FTS5_SEGITER_ONETERM;
+            if it.leaf.is_some() {
+                if (flags & FTS5INDEX_QUERY_DESC) != 0 {
+                    it.flags |= FTS5_SEGITER_REVERSE;
+                }
+                if b_dlidx {
+                    self.seg_iter_load_dlidx(ctx, it)?;
+                }
+                if (flags & FTS5INDEX_QUERY_DESC) != 0 {
+                    self.seg_iter_reverse(ctx, it)?;
+                }
+            }
         }
-        Self::seg_iter_alloc_tombstone(it);
+        if (flags & FTS5INDEX_QUERY_SCANONETERM) == 0 {
+            Self::seg_iter_alloc_tombstone(it);
+        }
         Ok(())
     }
 
@@ -2292,22 +2591,42 @@ impl Fts5Index {
         it: &mut SegIter,
         i_match: i64,
     ) -> Result<()> {
+        let b_rev = (it.flags & FTS5_SEGITER_REVERSE) != 0;
         let mut i_leaf_pgno = it.i_leaf_pgno;
         let mut b_move = true;
-        if let Some(mut dl) = it.dlidx.take() {
-            let res = (|| -> Result<()> {
-                while !dl.a_lvl[0].b_eof && i_match > dl.a_lvl[0].i_rowid {
-                    i_leaf_pgno = dl.a_lvl[0].i_leaf_pgno;
-                    self.dlidx_iter_next_r(ctx, &mut dl, 0)?;
-                }
-                Ok(())
-            })();
-            it.dlidx = Some(dl);
-            res?;
-        }
-        if i_leaf_pgno > it.i_leaf_pgno {
-            self.seg_iter_goto_page(ctx, it, i_leaf_pgno)?;
-            b_move = false;
+        if !b_rev {
+            if let Some(mut dl) = it.dlidx.take() {
+                let res = (|| -> Result<()> {
+                    while !dl.a_lvl[0].b_eof && i_match > dl.a_lvl[0].i_rowid {
+                        i_leaf_pgno = dl.a_lvl[0].i_leaf_pgno;
+                        self.dlidx_iter_next_r(ctx, &mut dl, 0)?;
+                    }
+                    Ok(())
+                })();
+                it.dlidx = Some(dl);
+                res?;
+            }
+            if i_leaf_pgno > it.i_leaf_pgno {
+                self.seg_iter_goto_page(ctx, it, i_leaf_pgno)?;
+                b_move = false;
+            }
+        } else {
+            if let Some(mut dl) = it.dlidx.take() {
+                let res = (|| -> Result<()> {
+                    while !dl.a_lvl[0].b_eof && i_match < dl.a_lvl[0].i_rowid {
+                        self.dlidx_iter_prev_r(ctx, &mut dl, 0)?;
+                    }
+                    Ok(())
+                })();
+                i_leaf_pgno = dl.a_lvl[0].i_leaf_pgno;
+                it.dlidx = Some(dl);
+                res?;
+            }
+            if i_leaf_pgno < it.i_leaf_pgno {
+                it.i_leaf_pgno = i_leaf_pgno + 1;
+                self.seg_iter_reverse_new_page(ctx, it)?;
+                b_move = false;
+            }
         }
         loop {
             if b_move {
@@ -2316,7 +2635,10 @@ impl Fts5Index {
             if it.leaf.is_none() {
                 break;
             }
-            if it.i_rowid >= i_match {
+            if !b_rev && it.i_rowid >= i_match {
+                break;
+            }
+            if b_rev && it.i_rowid <= i_match {
                 break;
             }
             b_move = true;
@@ -2364,9 +2686,10 @@ impl Fts5Index {
         }
         let i_rowid = seg.i_rowid as u64;
         let i_segid = seg.seg.i_segid;
-        let Some(arr) = seg.tomb.as_mut() else {
+        let Some(arr) = seg.tomb.as_ref() else {
             return Ok(false);
         };
+        let mut arr = arr.lock().unwrap_or_else(|e| e.into_inner());
         // Figure out which page the rowid might be present on.
         let i_pg = (i_rowid % arr.n_tombstone as u64) as usize;
         // If tombstone hash page iPg has not yet been loaded from the database, load it
@@ -2395,15 +2718,13 @@ impl Fts5Index {
         loop {
             let i_first = mi.first();
             let mut b_new_term = false;
-            let mut seg = std::mem::take(&mut mi.a_seg[i_first]);
-            let r = if b_use_from && seg.dlidx.is_some() {
-                self.seg_iter_next_from(ctx, &mut seg, i_from)
+            let seg = &mut mi.a_seg[i_first];
+            if b_use_from && seg.dlidx.is_some() {
+                self.seg_iter_next_from(ctx, seg, i_from)?;
             } else {
-                self.seg_iter_next(ctx, &mut seg, Some(&mut b_new_term))
-            };
+                self.seg_iter_next(ctx, seg, Some(&mut b_new_term))?;
+            }
             let at_eof = seg.leaf.is_none();
-            mi.a_seg[i_first] = seg;
-            r?;
             let mut cur = i_first;
             let advanced = if at_eof || b_new_term {
                 true
@@ -2423,7 +2744,7 @@ impl Fts5Index {
             if (!mi.b_skip_empty || mi.a_seg[cur].n_pos != 0)
                 && !self.multi_iter_is_deleted(ctx, mi)?
             {
-                return Ok(());
+                return self.set_outputs(ctx, mi, cur);
             }
             b_use_from = false;
         }
@@ -2454,6 +2775,9 @@ impl Fts5Index {
         };
         if empty || self.multi_iter_is_deleted(ctx, mi)? {
             self.multi_iter_next(ctx, mi, false, 0)?;
+        } else if !mi.b_eof {
+            let i_first = mi.first();
+            self.set_outputs(ctx, mi, i_first)?;
         }
         Ok(())
     }
@@ -2467,22 +2791,15 @@ impl Fts5Index {
         i_level: usize,
         n_segment: usize,
     ) -> Result<MultiIter> {
-        let n_seg = st.a_level[i_level].a_seg.len().min(n_segment);
-        let mut mi = MultiIter::alloc(n_seg);
-        let mut i_iter = 0;
-        for i_seg in (0..n_seg).rev() {
-            let mut it = SegIter::default();
-            self.seg_iter_init(
-                ctx,
-                (i_level, i_seg),
-                &st.a_level[i_level].a_seg[i_seg],
-                &mut it,
-            )?;
-            mi.a_seg[i_iter] = it;
-            i_iter += 1;
-        }
-        self.multi_iter_finish_setup(ctx, &mut mi)?;
-        Ok(mi)
+        self.multi_iter_new(
+            ctx,
+            st,
+            FTS5INDEX_QUERY_NOOUTPUT,
+            None,
+            None,
+            i_level as i32,
+            n_segment,
+        )
     }
 
     /// `fts5MultiIterNew(p, pStruct, FTS5INDEX_QUERY_SKIPHASH, 0, pTerm, nTerm, -1, 0, ..)`:
@@ -2493,21 +2810,15 @@ impl Fts5Index {
         st: &Structure,
         term: &[u8],
     ) -> Result<MultiIter> {
-        let n_seg = st.n_segment.max(0) as usize;
-        let mut mi = MultiIter::alloc(n_seg);
-        let mut i_iter = 0;
-        for (i_lvl, lvl) in st.a_level.iter().enumerate() {
-            for i_seg in (0..lvl.a_seg.len()).rev() {
-                let mut it = SegIter::default();
-                self.seg_iter_seek_init(ctx, term, (i_lvl, i_seg), &lvl.a_seg[i_seg], &mut it)?;
-                if i_iter < mi.a_seg.len() {
-                    mi.a_seg[i_iter] = it;
-                }
-                i_iter += 1;
-            }
-        }
-        self.multi_iter_finish_setup(ctx, &mut mi)?;
-        Ok(mi)
+        self.multi_iter_new(
+            ctx,
+            st,
+            FTS5INDEX_QUERY_SKIPHASH,
+            None,
+            Some(term),
+            -1,
+            0,
+        )
     }
 
     /// `fts5MultiIterNextFrom`.
@@ -2523,7 +2834,10 @@ impl Fts5Index {
                 break;
             }
             let i_rowid = mi.a_seg[mi.first()].i_rowid;
-            if i_rowid >= i_match {
+            if !mi.b_rev && i_rowid >= i_match {
+                break;
+            }
+            if mi.b_rev && i_rowid <= i_match {
                 break;
             }
         }
@@ -3978,7 +4292,8 @@ impl Fts5Index {
     fn index_flush(&mut self, ctx: &mut dyn VTabHostContext) -> Result<()> {
         // Unless it is empty, flush the hash table to disk
         if let Some(e) = &self.flush_rc {
-            return Err(e.clone());
+            // `p->rc = p->flushRc`: only the code is kept, no message is produced again
+            return Err(rc_only(e.clone()));
         }
         if self.n_pending_data != 0 || self.n_contentless_delete != 0 {
             let mut hash = match self.hash.take() {
@@ -4297,15 +4612,19 @@ impl Fts5Index {
             u8::from(c2),
             u8::from(c3)
         );
-        if c1 || c2 || c3 {
-            self.index_flush(ctx)?;
-        }
+        // (C sets iWriteRowid / bDelete / nPendingRow after the flush whatever `p->rc` is:
+        // after a failed flush the next write starts from this rowid)
+        let flushed = if c1 || c2 || c3 {
+            self.index_flush(ctx)
+        } else {
+            Ok(())
+        };
         self.i_write_rowid = i_rowid;
         self.b_delete = b_delete;
         if !b_delete {
             self.n_pending_row += 1;
         }
-        Ok(())
+        flushed
     }
 
     /// `sqlite3Fts5IndexWrite`.
@@ -4523,35 +4842,6 @@ impl Fts5Index {
         Ok(())
     }
 
-    /// True when the pending-terms hash exists (`p->pHash!=0`): queries then read it as the
-    /// newest source.
-    pub(crate) fn has_hash(&self) -> bool {
-        self.hash.is_some()
-    }
-
-    /// `fts5SegIterHashInit` for a term lookup: the pending doclist of `key`.
-    pub(crate) fn hash_query(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.hash.as_ref().and_then(|h| h.query(key))
-    }
-
-    /// The pending entries whose key starts with `prefix`, in key order (no side effect).
-    pub(crate) fn hash_scan_copy(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        match self.hash.as_ref() {
-            Some(h) => h.scan_copy(prefix),
-            None => Vec::new(),
-        }
-    }
-
-    /// The side effects of `fts5SegIterHashInit` for a scan over the keys starting with
-    /// `prefix` (`pTerm==0 || (flags & FTS5INDEX_QUERY_SCAN)`): the scan fixes the size
-    /// field of every position list it visits and `bDelete` is cleared, so that the next
-    /// write to the row most recently written flushes the hash first.
-    pub(crate) fn hash_scan_touch(&mut self, prefix: &[u8]) {
-        if let Some(h) = self.hash.as_mut() {
-            h.scan_touch(prefix);
-            self.b_delete = false;
-        }
-    }
 }
 
 /// `sqlite3Fts5IndexCharlenToBytelen`.
@@ -4626,35 +4916,6 @@ impl Fts5Index {
         true
     }
 
-    /// `fts5SegIterHashInit(p, 0, 0, flags, pIter)`: an iterator over the whole pending-terms
-    /// hash. The scan fixes the pending position lists and clears `bDelete`.
-    fn seg_iter_hash_init(&mut self, it: &mut SegIter) {
-        *it = SegIter::default();
-        let entries = match self.hash.as_mut() {
-            Some(h) => {
-                h.scan_touch(&[]);
-                h.scan_copy(&[])
-            }
-            None => Vec::new(),
-        };
-        self.b_delete = false;
-        if let Some((key, list)) = entries.first() {
-            let mut d = Data::from_blob(list.clone());
-            d.sz_leaf = d.nn;
-            let (rowid, n) = get_varint(&d.p, 0);
-            it.term.extend_from_slice(key);
-            it.i_rowid = rowid as i64;
-            it.i_leaf_offset = n as i64;
-            it.i_endof_doclist = d.nn;
-            it.leaf = Some(d);
-        }
-        it.hash_entries = Some(entries);
-        it.hash_pos = 0;
-        if it.leaf.is_some() {
-            self.seg_iter_load_npos(it);
-        }
-    }
-
     /// `fts5MultiIterNew(p, pStruct, FTS5INDEX_QUERY_NOOUTPUT, 0, 0, 0, -1, 0, ..)`: every
     /// entry of the index, the hash included.
     fn multi_iter_new_all(
@@ -4662,28 +4923,7 @@ impl Fts5Index {
         ctx: &mut dyn VTabHostContext,
         st: &Structure,
     ) -> Result<MultiIter> {
-        let with_hash = self.hash.is_some();
-        let n_seg = st.n_segment.max(0) as usize + usize::from(with_hash);
-        let mut mi = MultiIter::alloc(n_seg);
-        let mut i_iter = 0;
-        if with_hash {
-            let mut it = SegIter::default();
-            self.seg_iter_hash_init(&mut it);
-            mi.a_seg[i_iter] = it;
-            i_iter += 1;
-        }
-        for (i_lvl, lvl) in st.a_level.iter().enumerate() {
-            for i_seg in (0..lvl.a_seg.len()).rev() {
-                let mut it = SegIter::default();
-                self.seg_iter_init(ctx, (i_lvl, i_seg), &lvl.a_seg[i_seg], &mut it)?;
-                if i_iter < mi.a_seg.len() {
-                    mi.a_seg[i_iter] = it;
-                }
-                i_iter += 1;
-            }
-        }
-        self.multi_iter_finish_setup(ctx, &mut mi)?;
-        Ok(mi)
+        self.multi_iter_new(ctx, st, FTS5INDEX_QUERY_NOOUTPUT, None, None, -1, 0)
     }
 
     /// `fts5SegiterPoslist(p, pSeg, 0, pBuf)`: the position list of the current entry.
@@ -4707,7 +4947,7 @@ impl Fts5Index {
         let mut pgno = seg.i_leaf_pgno;
         let pgno_save = pgno + 1;
         while n_rem > 0 {
-            if seg.hash_entries.is_some() {
+            if seg.is_hash {
                 return Err(self.corrupt_idx());
             }
             pgno += 1;
@@ -4891,7 +5131,7 @@ impl Fts5Index {
                 let mut i_prev_leaf = i_idx_leaf;
                 let i_segid = seg.i_segid;
                 let mut i_pg = 0;
-                let mut dl = self.dlidx_iter_init(ctx, i_segid, i_idx_leaf)?;
+                let mut dl = self.dlidx_iter_init(ctx, false, i_segid, i_idx_leaf)?;
                 while !dl.a_lvl[0].b_eof {
                     // Check any rowid-less pages that occur before the current leaf.
                     i_pg = i_prev_leaf + 1;
@@ -5015,3 +5255,6 @@ impl Fts5Index {
         Ok(())
     }
 }
+
+mod read;
+pub(crate) use read::*;

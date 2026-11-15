@@ -171,33 +171,17 @@ fn register_builtin_extension_functions(
     functions: &mut FunctionRegistry,
     fts5_aux: Arc<Fts5AuxRegistry>,
 ) {
-    let aux_bm25 = Arc::clone(&fts5_aux);
-    functions.register_scalar("bm25", None, FunctionFlags::INNOCUOUS, move |args| {
-        if args.len() == 1 {
-            return Ok(RuntimeValue::plain(
-                aux_bm25.eval_bm25(std::slice::from_ref(&args[0].value))?,
-            ));
-        }
-        let vals: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
-        Ok(RuntimeValue::plain(aux_bm25.eval_bm25(&vals)?))
-    });
-
-    let aux_hl = Arc::clone(&fts5_aux);
-    functions.register_scalar(
-        "highlight",
-        Some(4),
-        FunctionFlags::INNOCUOUS,
-        move |args| {
-            let vals: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
-            Ok(RuntimeValue::plain(aux_hl.eval_highlight(&vals)?))
-        },
-    );
-
-    let aux_snip = fts5_aux;
-    functions.register_scalar("snippet", Some(6), FunctionFlags::INNOCUOUS, move |args| {
-        let vals: Vec<Value> = args.iter().map(|rv| rv.value.clone()).collect();
-        Ok(RuntimeValue::plain(aux_snip.eval_snippet(&vals)?))
-    });
+    // The auxiliary functions of FTS5 (`sqlite3_overload_function`): called with a column
+    // of an FTS5 table as first argument they run on that table's cursor (the engine
+    // dispatches those calls, `fts5ApiCallback`); anywhere else they are not usable.
+    for name in ["bm25", "highlight", "snippet", "fts5_get_locale"] {
+        functions.register_scalar(name, None, FunctionFlags::NONE, move |_args| {
+            Err(SqliteError::new(
+                ErrorCode::Error,
+                format!("unable to use function {name} in the requested context"),
+            ))
+        });
+    }
 
     functions.register_scalar(
         "fts5_source_id",
@@ -206,7 +190,46 @@ fn register_builtin_extension_functions(
         |_args| Ok(RuntimeValue::plain(Fts5AuxRegistry::eval_fts5_source_id())),
     );
 
-    functions.register_scalar("fts5", Some(1), FunctionFlags::INNOCUOUS, |args| {
+    // fts5_locale(LOCALE, TEXT) and fts5_insttoken(X) (`fts5LocaleFunc`, `fts5InsttokenFunc`).
+    {
+        let aux = Arc::clone(&fts5_aux);
+        let cb: crate::execution_context::ScalarFunctionCallback = Arc::new(move |args: &[RuntimeValue]| {
+            Ok(RuntimeValue::plain(aux.eval_fts5_locale(&args[0].value, &args[1].value)))
+        });
+        functions.register_scalar_shared(
+            "fts5_locale",
+            Some(2),
+            FunctionFlags::INNOCUOUS | FunctionFlags::RESULT_SUBTYPE | FunctionFlags::SUBTYPE,
+            cb,
+        );
+    }
+    functions.register_scalar_shared(
+        "fts5_insttoken",
+        Some(1),
+        FunctionFlags::INNOCUOUS | FunctionFlags::RESULT_SUBTYPE,
+        Arc::new(|args: &[RuntimeValue]| {
+            Ok(RuntimeValue {
+                value: args[0].value.clone(),
+                subtype: sqliters_ext::FTS5_INSTTOKEN_SUBTYPE,
+            })
+        }),
+    );
+
+    // `sqlite3_overload_function(db, "MATCH", 2)`: the MATCH operator on anything but a
+    // virtual table that implements it.
+    functions.register_scalar_shared(
+        "match",
+        Some(2),
+        FunctionFlags::NONE,
+        Arc::new(|_args: &[RuntimeValue]| {
+            Err(SqliteError::new(
+                ErrorCode::Error,
+                "unable to use function MATCH in the requested context",
+            ))
+        }),
+    );
+
+    functions.register_scalar("fts5", Some(1), FunctionFlags::NONE, |args| {
         Ok(RuntimeValue::plain(Fts5AuxRegistry::eval_fts5_ptr_func(
             &args[0].value,
         )))
@@ -215,7 +238,7 @@ fn register_builtin_extension_functions(
     functions.register_scalar(
         "rtreedepth",
         Some(1),
-        FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS,
+        FunctionFlags::NONE,
         |args| {
             Ok(RuntimeValue::plain(sqliters_ext::eval_rtreedepth(
                 &args[0].value,
@@ -226,7 +249,7 @@ fn register_builtin_extension_functions(
     functions.register_scalar(
         "rtreenode",
         Some(2),
-        FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS,
+        FunctionFlags::NONE,
         |args| {
             Ok(RuntimeValue::plain(sqliters_ext::eval_rtreenode(
                 &args[0].value,
@@ -244,7 +267,7 @@ fn register_builtin_extension_functions(
     );
 
     // rtree.c registers rtreecheck with nArg = -1 and checks the count when it is called.
-    functions.register_scalar("rtreecheck", None, FunctionFlags::INNOCUOUS, |_| {
+    functions.register_scalar("rtreecheck", None, FunctionFlags::NONE, |_| {
         Err(SqliteError::new(
             ErrorCode::Internal,
             "__sqliters_builtin_rtreecheck__",
@@ -4974,6 +4997,9 @@ pub struct Statement {
     ignored_fk_parent_tables: Vec<(DatabaseId, String)>,
     unparsed_tail: String,
     lifecycle: StatementLifecycle,
+    /// The error of a scan that failed after it had produced rows: reported once the rows
+    /// are used up (see `StmtTxTracker::partial_rows`).
+    deferred_error: Option<SqliteError>,
 }
 
 impl fmt::Debug for Statement {
@@ -6923,6 +6949,7 @@ impl Statement {
             ignored_fk_parent_tables: artifacts.ignored_fk_parent_tables,
             unparsed_tail,
             lifecycle: StatementLifecycle::Ready,
+            deferred_error: None,
         })
     }
 
@@ -7291,6 +7318,7 @@ impl Statement {
     /// active execution (`sqlite3VdbeReset`), while leaving the statement rewound to `Ready`
     /// (unless cleanup I/O poisoned the connection).
     pub fn reset(&mut self) -> Result<()> {
+        self.deferred_error = None;
         if matches!(
             self.lifecycle,
             StatementLifecycle::Ready | StatementLifecycle::Halted { last_error: None }
@@ -8830,6 +8858,19 @@ impl Statement {
                     inner.in_user_btree_tx = true;
                 }
 
+                // A scan the engine stepped row by row failed after it had produced rows:
+                // they come out first (`sqlite3_step` returned SQLITE_ROW for each of
+                // them), the error when they are used up.
+                let exec_res = match exec_res {
+                    Err(e) => match stmt_tx.partial_rows.take() {
+                        Some((column_names, rows)) if !rows.is_empty() => {
+                            self.deferred_error = Some(e);
+                            Ok(QueryOutput { column_names, rows })
+                        }
+                        _ => Err(e),
+                    },
+                    ok => ok,
+                };
                 match exec_res {
                     Ok(out) => {
                         if !out.column_names.is_empty() {
@@ -9541,6 +9582,13 @@ impl Statement {
                 Ok(StepResult::Done)
             }
             RunningExec::Vdbe { vm, read_instances } => {
+                // `db->nChange`, `db->nTotalChange` and `db->lastRowid` belong to the
+                // connection: statements that ran since this one last returned a row have
+                // moved them, and this statement goes on from their values.
+                vm.runtime_ctx.last_insert_rowid = inner.runtime.last_insert_rowid;
+                vm.runtime_ctx.last_changes = inner.runtime.last_changes;
+                vm.runtime_ctx.total_changes = inner.runtime.total_changes;
+                vm.runtime_ctx.nested_changes = inner.runtime.nested_changes;
                 let step_res = {
                     let encoding = inner.effective_encoding();
                     let rt_snapshot = vm.runtime_ctx;
@@ -9697,6 +9745,21 @@ impl Statement {
 
                 if let Some(vals) = rows.next() {
                     Ok(StepResult::Row(Row::new(vals)))
+                } else if let Some(e) = self.deferred_error.take() {
+                    let cursors = std::mem::take(lease_cursors);
+                    let r_insts = std::mem::take(read_instances);
+                    let _ = inner.finish_activity(
+                        hid,
+                        ActivityFinish::ReadAborted {
+                            lease_cursors: cursors,
+                            read_instances: r_insts,
+                        },
+                        shared,
+                    );
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(e.clone()),
+                    };
+                    Err(e)
                 } else {
                     let cursors = std::mem::take(lease_cursors);
                     let r_insts = std::mem::take(read_instances);
@@ -13301,6 +13364,10 @@ mod c_align_h4_tests;
 mod c_align_h5_tests;
 #[cfg(test)]
 mod c_align_h6_tests;
+#[cfg(test)]
+mod c_align_h7_tests;
+#[cfg(test)]
+mod c_align_h7b_tests;
 #[cfg(test)]
 mod c_align_h6b_tests;
 #[cfg(test)]
