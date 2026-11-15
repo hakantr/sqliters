@@ -12,7 +12,7 @@
 | Adım | Commit | Kapsam | `EXPLAIN` C ile aynı (adımın sınıfı) | Tüm ifade türlerinde üreticinin kabul ettiği | Testler |
 | :--- | :--- | :--- | ---: | ---: | :--- |
 | V1 — temel, ifadeler, `FROM`'suz `SELECT` | `bdffdc1` | program gösterimi ve kurucu, `EXPLAIN` listesi, C'nin ayrıştırma ağacı, `resolve.c`, `expr.c`, `VALUES`, işlem ifadeleri | 54.469 / 54.469 kabul edilen (144 desteklenmiyor) | 3.954 / 39.300 (%10,1) | 907 geçti, bilinen 4 başarısız, 337 yok sayıldı |
-| V2 — tablolar: şema bağdaştırıcısı, sıralayıcı, `where.c` ailesi, birleşimler | V2COMMIT | `whereexpr.c`, `where.c`, `wherecode.c`, `select.c` (GROUP BY hariç), alt sorgu düzleştirme, görünümler, `EXPLAIN QUERY PLAN` | 35.525 / 35.526 kabul edilen (3.474 desteklenmiyor) | 13.659 / 39.300 (%34,8) | 929 geçti, bilinen 4 başarısız, 337 yok sayıldı |
+| V2 — tablolar: şema bağdaştırıcısı, sıralayıcı, `where.c` ailesi, birleşimler | `c4efe5e` | `whereexpr.c`, `where.c`, `wherecode.c`, `select.c` (GROUP BY hariç), alt sorgu düzleştirme, görünümler, `EXPLAIN QUERY PLAN` | 35.525 / 35.526 kabul edilen (3.474 desteklenmiyor) | 13.659 / 39.300 (%34,8) | 929 geçti, bilinen 4 başarısız, 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
