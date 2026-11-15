@@ -522,3 +522,8 @@ fn p4_table(name: &str) -> P4 {
 pub fn p4_table_of(p: &Parse, tab: TableId) -> P4 {
     p4_table(&p.tab(tab).z_name)
 }
+
+/// The P4_INDEX operand for an index (`OP_IdxDelete`).
+pub fn p4_index_of(p: &Parse, idx: IndexId) -> P4 {
+    P4::Index(Arc::new(sqliters_vdbe::vdbeaux::P4Index { name: p.idx(idx).z_name.clone() }))
+}

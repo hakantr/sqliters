@@ -244,3 +244,155 @@ pub fn load(dump: &str, id: i64) -> Result<Option<Program>, String> {
         ..Program::default()
     }))
 }
+
+// ---------------------------------------------------------------------------------------------
+// Writer (the inverse of `load`): a program in the dump format of the C driver
+// ---------------------------------------------------------------------------------------------
+
+fn hexs(b: &[u8]) -> String {
+    if b.is_empty() {
+        return "-".to_owned();
+    }
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn func_text(f: &FuncDef) -> String {
+    format!("{} {} {} {} {} {}", hexs(f.name.as_bytes()), f.n_arg, f.func_flags, f.user_data, f.x_finalize as i32, f.x_value as i32)
+}
+
+/// The text of one instruction (`O ...` line of `dumpOps()`); `sub_index` numbers the
+/// sub-programs.
+fn op_text(o: &VdbeOp, sub_index: &mut dyn FnMut(&Arc<SubProgram>) -> usize) -> String {
+    let mut s = format!("O {} {} {} {} {} ", OPCODE_NAME[o.opcode as usize], o.p1, o.p2, o.p3, o.p5);
+    match &o.p4 {
+        P4::NotUsed => s.push('-'),
+        P4::Static(z) => {
+            s.push_str("S ");
+            s.push_str(&hexs(z.as_bytes()));
+        }
+        P4::Dynamic(z) => {
+            s.push_str("S ");
+            let n = if o.opcode == crate::opcodes::OP_Blob { (o.p1.max(0) as usize).min(z.len()) } else { z.iter().position(|&c| c == 0).unwrap_or(z.len()) };
+            s.push_str(&hexs(&z[..n]));
+        }
+        P4::CollSeq(c) => s.push_str(&format!("C {} {}", hexs(c.name.as_bytes()), c.enc)),
+        P4::Int32(i) => s.push_str(&format!("I {i}")),
+        P4::SubProgram(sp) => s.push_str(&format!("P {}", sub_index(sp))),
+        P4::Table(t) => s.push_str(&format!("T {}", hexs(t.name.as_bytes()))),
+        P4::Index(x) => s.push_str(&format!("X {}", hexs(x.name.as_bytes()))),
+        P4::FuncDef(f) => s.push_str(&format!("F {}", func_text(f))),
+        P4::FuncCtx(c) => s.push_str(&format!("G {} {} {}", func_text(&c.p_func), c.argc, c.i_op)),
+        P4::KeyInfo(k) => {
+            s.push_str(&format!("K {} {} {}", k.enc, k.n_key_field, k.n_all_field));
+            for j in 0..k.n_all_field as usize {
+                let nk = (j as u16) < k.n_key_field;
+                s.push_str(&format!(" {} ", if nk { k.a_sort_flags.get(j).copied().unwrap_or(0) } else { 0 }));
+                match (nk, k.a_coll.get(j).cloned().flatten()) {
+                    (true, Some(c)) => s.push_str(&format!("{}:{}", hexs(c.name.as_bytes()), c.enc)),
+                    _ => s.push('-'),
+                }
+            }
+        }
+        P4::Mem(v) => {
+            s.push_str("M ");
+            match v {
+                Value::Null => s.push('N'),
+                Value::Integer(i) => s.push_str(&format!("I{i}")),
+                Value::Real(r) => s.push_str(&format!("R{:016x}", r.to_bits())),
+                Value::Text(t) => {
+                    s.push('T');
+                    s.push_str(&hexs(t.as_bytes()));
+                }
+                Value::Blob(b) => {
+                    s.push('B');
+                    s.push_str(&hexs(b));
+                }
+            }
+        }
+        P4::IntArray(a) => {
+            s.push_str(&format!("A {}", a.len()));
+            for x in a {
+                s.push_str(&format!(" {x}"));
+            }
+        }
+        P4::SubrtnSig(g) => s.push_str(&format!(
+            "U {} {} {} {} {} {}",
+            g.sel_id,
+            g.b_complete as i32,
+            hexs(g.z_aff.as_bytes()),
+            g.i_table,
+            g.i_addr,
+            g.reg_return
+        )),
+        P4::Vtab(_) => s.push('V'),
+    }
+    s
+}
+
+/// `dumpProgram()` of the C driver: the program `prog` as dump text with id `ln`. Stub
+/// sub-program operands stand for `prog.p_program[n_csr]` (C's operand points at that object).
+pub fn dump(prog: &Program, ln: i64) -> String {
+    let mut subs: Vec<Arc<SubProgram>> = Vec::new();
+    let resolve = |sp: &Arc<SubProgram>| -> Arc<SubProgram> {
+        if sp.is_stub() { prog.p_program.get(sp.n_csr as usize).cloned().unwrap_or_else(|| sp.clone()) } else { sp.clone() }
+    };
+    fn index_of(subs: &mut Vec<Arc<SubProgram>>, sp: Arc<SubProgram>) -> usize {
+        if let Some(i) = subs.iter().position(|s| Arc::ptr_eq(s, &sp)) {
+            return i;
+        }
+        subs.push(sp);
+        subs.len() - 1
+    }
+    // number the sub-programs first (in the order the instructions name them, nested ones after)
+    for o in &prog.a_op {
+        if let P4::SubProgram(sp) = &o.p4 {
+            index_of(&mut subs, resolve(sp));
+        }
+    }
+    let mut done = 0;
+    while done < subs.len() {
+        let s = subs[done].clone();
+        done += 1;
+        for o in &s.a_op {
+            if let P4::SubProgram(sp) = &o.p4 {
+                index_of(&mut subs, resolve(sp));
+            }
+        }
+    }
+    let mut out = format!(
+        "PROG {} {} {} {} {} {} {} {} {} {} {} {} {} {}\n",
+        ln,
+        prog.a_op.len(),
+        prog.n_mem,
+        prog.n_cursor,
+        prog.n_var,
+        prog.uses_stmt_journal as i32,
+        prog.read_only as i32,
+        prog.b_is_reader as i32,
+        prog.n_res_column,
+        prog.btree_mask,
+        prog.lock_mask,
+        prog.min_write_file_format,
+        prog.expmask,
+        subs.len()
+    );
+    let numbering = subs.clone();
+    let mut idx = |sp: &Arc<SubProgram>| -> usize {
+        let r = resolve(sp);
+        numbering.iter().position(|s| Arc::ptr_eq(s, &r)).unwrap_or(usize::MAX)
+    };
+    for o in &prog.a_op {
+        out.push_str(&op_text(o, &mut idx));
+        out.push('\n');
+    }
+    for (i, s) in numbering.iter().enumerate() {
+        let t = numbering.iter().position(|x| x.token == s.token).unwrap_or(i);
+        out.push_str(&format!("SUB {} {} {} {} {}\n", i, s.a_op.len(), s.n_mem, s.n_csr, t));
+        for o in &s.a_op {
+            out.push_str(&op_text(o, &mut idx));
+            out.push('\n');
+        }
+    }
+    out.push_str("END\n");
+    out
+}

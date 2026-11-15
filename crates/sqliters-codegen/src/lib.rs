@@ -16,9 +16,12 @@ pub mod build_tab;
 pub mod builtin_funcs;
 pub mod callback;
 pub mod consts;
+pub mod delete;
 pub mod expr;
 pub mod exprcode;
 pub mod flatten;
+pub mod fkey;
+pub mod insert;
 pub mod merge;
 pub mod parse;
 pub mod parse_tables;
@@ -27,8 +30,11 @@ pub mod schema;
 pub mod select;
 pub mod sqliteint;
 pub mod tk;
+pub mod trigger;
 pub mod treedump;
 pub mod tokenize;
+pub mod update;
+pub mod upsert;
 pub mod util;
 pub mod vtab;
 pub mod walker;
@@ -44,6 +50,8 @@ mod explain_tests;
 mod plan_tests;
 #[cfg(test)]
 mod vtab_tests;
+#[cfg(test)]
+mod dml_tests;
 
 use sqliters_vdbe::vdbeaux::Program;
 
@@ -117,6 +125,13 @@ fn prepare_result(mut p: Parse<'_>) -> PrepareResult {
     #[cfg(test)]
     for e in &p.init_errors {
         eprintln!("schema load: {e}");
+    }
+    #[cfg(not(test))]
+    if std::env::var_os("SQLITERS_CG_INITERR").is_some() {
+        // Verification aid: the schema rows the generator could not load, and why.
+        for e in &p.init_errors {
+            eprintln!("schema load: {e}");
+        }
     }
     if let Some(why) = p.unsupported {
         return PrepareResult::Unsupported(why);

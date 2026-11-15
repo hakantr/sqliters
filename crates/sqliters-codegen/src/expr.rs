@@ -1936,6 +1936,17 @@ pub fn sqlite3_expr_compare(p: &Parse, use_parse: bool, a: ExprId, b: ExprId, i_
         if pb.op == TK_VARIABLE && pa.i_column == pb.i_column {
             return 0;
         }
+        if (p.db.flags & SQLITE_EnableQPSG) != 0 {
+            return 2;
+        }
+        if crate::build_tab::sqlite3_value_from_expr(p, b, SQLITE_AFF_BLOB).is_some() {
+            // sqlite3VdbeReprepareOnBind(pParse->pVdbe, iVar, 0): binding a new value to the
+            // variable may change the plan (the statement has no bound values yet, so the
+            // comparison result stays 2)
+            let i_var = pa.i_column as i32;
+            let m: u32 = if i_var >= 32 { 0x8000_0000 } else { 1u32 << (i_var - 1) };
+            p.pending_expmask.set(p.pending_expmask.get() | m);
+        }
         return 2;
     }
     let combined_flags = pa.flags | pb.flags;
@@ -2449,4 +2460,47 @@ pub fn sqlite3_touch_register(p: &mut Parse, i_reg: i32) {
     if p.n_mem < i_reg {
         p.n_mem = i_reg;
     }
+}
+
+/// `sqlite3ExprListAppendVector(pParse, pList, pColumns, pExpr)`: append a new element to
+/// the given ExprList for each column in the vector `(a, b, c) = expr` of an UPDATE SET
+/// clause.
+pub fn sqlite3_expr_list_append_vector(p: &mut Parse, list: ExprListId, columns: IdListId, e: ExprId) -> ExprListId {
+    let mut list = list;
+    let i_first = if list.nn() { p.l(list).a.len() } else { 0 };
+    if columns.is_null() || e.is_null() {
+        return list;
+    }
+    let n_id = p.a_idlist[columns.ix()].a.len() as i32;
+    // If the RHS is a vector, then we can immediately check to see that the size of the RHS
+    // and LHS match. But if the RHS is a SELECT, we can't really do that check until
+    // sqlite3ResolveExprNames() is called.
+    if p.e(e).op != TK_SELECT {
+        let n = sqlite3_expr_vector_size(p, e);
+        if n_id != n {
+            p.error_msg(format!("{n_id} columns assigned {n} values"));
+            return list;
+        }
+    }
+    for i in 0..n_id {
+        let sub = sqlite3_expr_for_vector_field(p, e, i, n_id);
+        if sub.is_null() {
+            continue;
+        }
+        list = sqlite3_expr_list_append(p, list, sub);
+        if list.nn() {
+            let name = p.a_idlist[columns.ix()].a[i as usize].clone();
+            p.lm(list).a.last_mut().expect("item").z_e_name = Some(name);
+        }
+    }
+    if p.e(e).op == TK_SELECT && list.nn() {
+        let first = p.l(list).a[i_first].p_expr;
+        // Store the SELECT statement in pRight so it will be deleted when
+        // sqlite3ExprListDelete() is called
+        p.em(first).p_right = e;
+        // Remember the size of the LHS in iTable so that we can check that the RHS and LHS
+        // sizes match during code generation.
+        p.em(first).i_table = n_id;
+    }
+    list
 }

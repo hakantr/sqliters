@@ -3442,6 +3442,21 @@ impl Connection {
         self.prepare_with_mode(sql, PrepareMode::V2)
     }
 
+    /// Test oracle of the port of C's code generator: the program the generator builds for
+    /// the statement `sql` in the connection's current state (what `sqlite3_prepare_v2`
+    /// would build in C). `Err` carries C's compile error (`"error: ..."`) or the part of the
+    /// generator that is not ported (`"unsupported: ..."`). Nothing else changes.
+    #[doc(hidden)]
+    pub fn c_generated_program(&self, sql: &str) -> std::result::Result<sqliters_vdbe::vdbeaux::Program, String> {
+        let session = self.shared.enter().map_err(|e| e.message)?;
+        let (r, _, _) = cgen::c_prepare(session.inner(), sql);
+        match r {
+            sqliters_codegen::PrepareResult::Program(p) => Ok(*p),
+            sqliters_codegen::PrepareResult::Error { message, .. } => Err(format!("error: {message}")),
+            sqliters_codegen::PrepareResult::Unsupported(why) => Err(format!("unsupported: {why}")),
+        }
+    }
+
     /// Compiles the first SQL statement in `sql` using legacy [`PrepareMode::V1`]
     /// (`sqlite3_prepare` — does not auto-reprepare on schema change).
     pub fn prepare_v1(&self, sql: &str) -> Result<Statement> {

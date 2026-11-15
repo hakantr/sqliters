@@ -49,6 +49,8 @@ define_id!(AggInfoId);
 define_id!(TableId);
 define_id!(NcId);
 define_id!(IndexId);
+define_id!(UpsertId);
+define_id!(TriggerId);
 
 /// `LogEst`
 pub type LogEst = i16;
@@ -352,6 +354,8 @@ pub struct NameContext {
     pub n_nested_select: u32,
     /// SELECT statement for any window functions
     pub p_win_select: SelectId,
+    /// `uNC.pUpsert`: the ON CONFLICT clause information (NC_UUpsert)
+    pub p_upsert: UpsertId,
 }
 
 /// `struct Select`
@@ -651,6 +655,122 @@ pub struct FKey {
     pub a_action: [u8; 2],
 }
 
+/// `struct Upsert`: the ON CONFLICT clause of an UPSERT (upsert.c).
+#[derive(Debug, Clone, Default)]
+pub struct Upsert {
+    /// Optional description of conflict target
+    pub p_upsert_target: ExprListId,
+    /// WHERE clause for partial index targets
+    pub p_upsert_target_where: ExprId,
+    /// The SET clause from an ON CONFLICT UPDATE
+    pub p_upsert_set: ExprListId,
+    /// WHERE clause for the ON CONFLICT UPDATE
+    pub p_upsert_where: ExprId,
+    /// Next ON CONFLICT clause in the list
+    pub p_next_upsert: UpsertId,
+    /// True for DO UPDATE. False for DO NOTHING
+    pub is_do_update: bool,
+    /// True if 2nd or later with same pUpsertIdx
+    pub is_dup: bool,
+    /// UNIQUE constraint specified by pUpsertTarget
+    pub p_upsert_idx: IndexId,
+    /// Table to be updated
+    pub p_upsert_src: SrcListId,
+    /// First register of range holding data
+    pub reg_data: i32,
+    /// Index of the data cursor
+    pub i_data_cur: i32,
+    /// Index of the first index cursor
+    pub i_idx_cur: i32,
+}
+
+/// `struct TriggerStep`: one step of a trigger program (or the RETURNING pseudo-step).
+#[derive(Debug, Clone, Default)]
+pub struct TriggerStep {
+    /// One of TK_DELETE, TK_UPDATE, TK_INSERT, TK_SELECT, TK_RETURNING
+    pub op: u8,
+    /// OE_Rollback etc.
+    pub orconf: u8,
+    /// SELECT statement or RHS of INSERT INTO SELECT ...
+    pub p_select: SelectId,
+    /// Table to insert into, update or delete from (with the FROM clause of UPDATE)
+    pub p_src: SrcListId,
+    /// The WHERE clause for DELETE or UPDATE steps
+    pub p_where: ExprId,
+    /// SET clause for UPDATE, or RETURNING clause
+    pub p_expr_list: ExprListId,
+    /// Column names for INSERT
+    pub p_id_list: IdListId,
+    /// Upsert clauses on an INSERT
+    pub p_upsert: UpsertId,
+    /// Original SQL text of this command
+    pub z_span: Option<String>,
+}
+
+/// `struct Trigger`: a trigger (or the RETURNING pseudo-trigger `retTrig`).
+#[derive(Debug, Clone, Default)]
+pub struct Trigger {
+    /// The name of the trigger
+    pub z_name: Option<String>,
+    /// The table or view to which the trigger applies
+    pub table: String,
+    /// One of TK_DELETE, TK_UPDATE, TK_INSERT (TK_RETURNING until first use)
+    pub op: u8,
+    /// One of TRIGGER_BEFORE, TRIGGER_AFTER
+    pub tr_tm: u8,
+    /// This trigger implements a RETURNING clause
+    pub b_returning: bool,
+    /// The WHEN clause of the expression (may be NULL)
+    pub p_when: ExprId,
+    /// If this is an UPDATE OF <column-list> trigger, the <column-list> is stored here
+    pub p_columns: IdListId,
+    /// `pSchema`: schema containing the trigger (index into `db->aDb[]`)
+    pub i_schema: i32,
+    /// `pTabSchema`: schema containing the table (index into `db->aDb[]`, -1: none)
+    pub i_tab_schema: i32,
+    /// Link list of trigger program steps
+    pub step_list: Vec<TriggerStep>,
+}
+
+/// `struct Returning`: information about a RETURNING clause (`pParse->u1.d.pReturning`).
+#[derive(Debug, Clone, Default)]
+pub struct Returning {
+    /// List of expressions to return
+    pub p_return_el: ExprListId,
+    /// The RETURNING trigger (`retTrig`)
+    pub ret_trig: TriggerId,
+    /// Transient table holding RETURNING results
+    pub i_ret_cur: i32,
+    /// Number of in pReturnEL after expansion
+    pub n_ret_col: i32,
+    /// Register array for holding a row of RETURNING
+    pub i_ret_reg: i32,
+}
+
+/// `struct AutoincInfo`: information about an AUTOINCREMENT table.
+#[derive(Debug, Clone, Default)]
+pub struct AutoincInfo {
+    /// Table this info block refers to
+    pub p_tab: TableId,
+    /// Index in sqlite3.aDb[] of database holding pTab
+    pub i_db: i32,
+    /// Memory register holding the rowid counter
+    pub reg_ctr: i32,
+}
+
+/// `struct TriggerPrg`: a trigger sub-program coded for one (trigger, ON CONFLICT) pair.
+#[derive(Debug, Clone)]
+pub struct TriggerPrg {
+    /// Trigger this program was coded from
+    pub p_trigger: TriggerId,
+    /// Default ON CONFLICT policy
+    pub orconf: i32,
+    /// Program implementing pTrigger/orconf (index into `Parse::a_sub_program`)
+    pub i_program: usize,
+    /// Masks of old.*, new.* columns accessed
+    pub a_colmask: [u32; 2],
+}
+
 /// The in-memory schema of one database (`struct Schema`: `tblHash`, `idxHash`) as the
 /// generator loads it (`build_tab::sqlite3_init`).
 #[derive(Debug, Clone, Default)]
@@ -666,6 +786,14 @@ pub struct SchemaState {
     pub bad: std::collections::HashMap<String, &'static str>,
     /// Lower-case names of the tables that have triggers (rows of type "trigger" seen so far)
     pub triggers: Vec<String>,
+    /// `pSeqTab`: the sqlite_sequence table used by AUTOINCREMENT
+    pub p_seq_tab: TableId,
+    /// `trigHash`: the triggers of this schema (C's hash: iteration order and buckets)
+    pub trig_hash: crate::trigger::TrigHash,
+    /// Number of "trigger" rows of sqlite_schema seen while loading
+    pub n_trigger_rows: usize,
+    /// Triggers whose SQL text the generator could not load: lower-case table name -> reason
+    pub bad_trig: std::collections::HashMap<String, &'static str>,
 }
 
 /// `struct Table` as far as the V1 code generator reads it. Tables come from one adapter
@@ -710,6 +838,8 @@ pub struct Table {
     pub vtab_args: Vec<Option<String>>,
     /// `u.vtab.p`: the connection's `VTable` of a virtual table, once connected
     pub vtab: Option<VTable>,
+    /// `pTrigger`: list of triggers on this object, most recent first
+    pub p_trigger: Vec<TriggerId>,
 }
 
 /// `struct VTable`, the part the code generator reads: the instance of a virtual table that
@@ -1090,6 +1220,8 @@ pub struct Db<'a> {
     /// `PRAGMA case_sensitive_like = x` was run on the connection: like() was re-registered
     /// (`sqlite3RegisterLikeFunctions`)
     pub case_sensitive_like: bool,
+    /// `xAuth!=0`: an authorizer callback is registered
+    pub x_auth: bool,
     /// The engine side
     pub host: &'a dyn Host,
 }
@@ -1112,6 +1244,7 @@ impl<'a> Db<'a> {
         a_limit[SQLITE_LIMIT_TRIGGER_DEPTH as usize] = 1000;
         a_limit[SQLITE_LIMIT_WORKER_THREADS as usize] = 0;
         a_limit[SQLITE_LIMIT_PARSER_DEPTH as usize] = 2500;
+        a_limit[SQLITE_LIMIT_TRIGGER_STEPS as usize] = 65000;
         Db {
             flags: SQLITE_ShortColNames | SQLITE_EnableTrigger | SQLITE_EnableView | SQLITE_CacheSpill
                 | SQLITE_TrustedSchema | SQLITE_DqsDML | SQLITE_DqsDDL | SQLITE_AutoIndex | SQLITE_Comments,
@@ -1128,6 +1261,7 @@ impl<'a> Db<'a> {
             schema_not_loaded: false,
             encoding_fixed: false,
             case_sensitive_like: false,
+            x_auth: false,
             host,
         }
     }
@@ -1324,6 +1458,56 @@ pub struct Parse<'a> {
     pub epo_tab: std::collections::HashMap<String, TableId>,
     /// `db->pVtabCtx` chain: the tables whose constructor is running
     pub vtab_ctx: Vec<TableId>,
+
+    // ---- DML, triggers, RETURNING (step V5) ----
+    /// `Upsert` objects
+    pub a_upsert: Vec<Upsert>,
+    /// `Trigger` objects (of the schemas and the RETURNING pseudo-trigger)
+    pub a_trigger: Vec<Trigger>,
+    /// `bReturning`: coding a RETURNING trigger
+    pub b_returning: bool,
+    /// `u1.d.pReturning`: the RETURNING clause
+    pub p_returning: Option<Returning>,
+    /// `pAinc`: information about AUTOINCREMENT counters (C's list order: newest first)
+    pub p_ainc: Vec<AutoincInfo>,
+    /// `usesAinc`: the statement uses AUTOINCREMENT
+    pub uses_ainc: bool,
+    /// `eTriggerOp`: TK_UPDATE, TK_INSERT or TK_DELETE
+    pub e_trigger_op: u8,
+    /// `eOrconf`: default ON CONFLICT policy for trigger steps
+    pub e_orconf: u8,
+    /// `oldmask`: mask of old.* columns referenced
+    pub oldmask: u32,
+    /// `newmask`: mask of new.* columns referenced
+    pub newmask: u32,
+    /// `disableTriggers`: true to disable triggers
+    pub disable_triggers: bool,
+    /// `pNewTrigger != 0`: a CREATE TRIGGER statement is being parsed
+    pub p_new_trigger: bool,
+    /// `pTriggerPrg`: linked list of coded triggers (newest first)
+    pub p_trigger_prg: Vec<TriggerPrg>,
+    /// `pToplevel != 0`: this Parse codes a trigger sub-program (see `trigger.rs`)
+    pub is_nested_trigger: bool,
+    /// Trigger steps built by the parser (`TriggerStep` objects; ids are index+1)
+    pub tstep_pool: Vec<TriggerStep>,
+    /// `trigger_cmd_list` values of the parser: lists of step ids (ids are index+1)
+    pub tstep_lists: Vec<Vec<u32>>,
+    /// The trigger being built by CREATE TRIGGER (`pNewTrigger`) at schema load
+    pub new_trigger: Option<Trigger>,
+    /// The trigger sub-programs of the statement (`TriggerPrg.pProgram`), in link order
+    pub sub_programs: Vec<crate::trigger::SubProgSlot>,
+    /// Number of trigger sub-parses currently open (`pOuterParse` chain length)
+    pub trigger_depth: i32,
+    /// `FKey.apTrigger[]` of the statement: (child table, index of the foreign key in its
+    /// `p_fkey`, ON DELETE action trigger, ON UPDATE action trigger)
+    pub fk_action_triggers: Vec<(TableId, usize, Option<TriggerId>, Option<TriggerId>)>,
+    /// The swapped-out state of the enclosing Parses while trigger sub-programs are coded
+    /// (index 0: the top-level Parse)
+    pub sub_parse_stack: Vec<crate::trigger::SubParseState>,
+    /// `sqlite3VdbeReprepareOnBind()` calls made where the Parse is not mutable
+    /// (`exprCompareVariable()`): `expmask` bits for the current program, merged into `v`
+    /// before the program changes hands
+    pub pending_expmask: std::cell::Cell<u32>,
 }
 
 impl<'a> Parse<'a> {
@@ -1410,6 +1594,28 @@ impl<'a> Parse<'a> {
             ap_vtab_lock: Vec::new(),
             epo_tab: std::collections::HashMap::new(),
             vtab_ctx: Vec::new(),
+            a_upsert: vec![Upsert::default()],
+            a_trigger: vec![Trigger::default()],
+            b_returning: false,
+            p_returning: None,
+            p_ainc: Vec::new(),
+            uses_ainc: false,
+            e_trigger_op: 0,
+            e_orconf: 0,
+            oldmask: 0,
+            newmask: 0,
+            disable_triggers: false,
+            p_new_trigger: false,
+            p_trigger_prg: Vec::new(),
+            is_nested_trigger: false,
+            tstep_pool: Vec::new(),
+            tstep_lists: Vec::new(),
+            new_trigger: None,
+            sub_programs: Vec::new(),
+            trigger_depth: 0,
+            fk_action_triggers: Vec::new(),
+            sub_parse_stack: Vec::new(),
+            pending_expmask: std::cell::Cell::new(0),
         }
     }
 
@@ -1527,6 +1733,37 @@ impl<'a> Parse<'a> {
     pub fn new_nc(&mut self, nc: NameContext) -> NcId {
         self.a_nc.push(nc);
         NcId(self.a_nc.len() as u32 - 1)
+    }
+    #[inline]
+    pub fn up(&self, id: UpsertId) -> &Upsert {
+        &self.a_upsert[id.ix()]
+    }
+    #[inline]
+    pub fn upm(&mut self, id: UpsertId) -> &mut Upsert {
+        debug_assert!(id.nn());
+        &mut self.a_upsert[id.ix()]
+    }
+    pub fn new_upsert(&mut self, u: Upsert) -> UpsertId {
+        self.a_upsert.push(u);
+        UpsertId(self.a_upsert.len() as u32 - 1)
+    }
+    #[inline]
+    pub fn trig(&self, id: TriggerId) -> &Trigger {
+        &self.a_trigger[id.ix()]
+    }
+    #[inline]
+    pub fn trigm(&mut self, id: TriggerId) -> &mut Trigger {
+        debug_assert!(id.nn());
+        &mut self.a_trigger[id.ix()]
+    }
+    pub fn new_trigger(&mut self, t: Trigger) -> TriggerId {
+        self.a_trigger.push(t);
+        TriggerId(self.a_trigger.len() as u32 - 1)
+    }
+    /// `sqlite3IsToplevel(pParse)`
+    #[inline]
+    pub fn is_toplevel(&self) -> bool {
+        !self.is_nested_trigger
     }
     pub fn new_agg(&mut self, a: AggInfo) -> AggInfoId {
         self.a_agg.push(a);

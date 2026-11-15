@@ -39,7 +39,22 @@ pub fn sqlite3_finish_coding(p: &mut Parse) {
         }
         sqlite3_get_vdbe(p);
     }
-    // (pParse->bReturning: RETURNING is not ported in step V1)
+    if p.b_returning {
+        let r = p.p_returning.clone().unwrap_or_default();
+        if r.n_ret_col != 0 {
+            p.v.add_op0(OP_FkCheck);
+            let addr_rewind = p.v.add_op1(OP_Rewind, r.i_ret_cur);
+            let reg = r.i_ret_reg;
+            let mut i = 0;
+            while i < r.n_ret_col {
+                p.v.add_op3(OP_Column, r.i_ret_cur, i, reg + i);
+                i += 1;
+            }
+            p.v.add_op2(OP_ResultRow, reg, i);
+            p.v.add_op2(OP_Next, r.i_ret_cur, addr_rewind + 1);
+            p.v.jump_here(addr_rewind);
+        }
+    }
     p.v.add_op0(OP_Halt);
 
     // The cookie mask contains one bit for each database file open. (Bit 0 is for main, bit 1
@@ -65,8 +80,19 @@ pub fn sqlite3_finish_coding(p: &mut Parse) {
             p.v.change_p5(1);
         }
     }
-    // (pParse->nVtabLock / OP_VBegin, codeTableLocks, sqlite3AutoincrementBegin: virtual
-    // tables, shared-cache table locks and AUTOINCREMENT belong to later steps)
+    for i in 0..p.ap_vtab_lock.len() {
+        let tab = p.ap_vtab_lock[i];
+        let vt = crate::vtab::sqlite3_get_vtable(p, tab).map(|v| v.id).unwrap_or(0);
+        let name = p.tab(tab).z_name.clone();
+        p.v.add_op4(OP_VBegin, 0, 0, 0, P4::Vtab(std::sync::Arc::new(sqliters_vdbe::vdbeaux::P4Vtab { id: vt, name })));
+    }
+    p.ap_vtab_lock.clear();
+    // (codeTableLocks: shared-cache table locks are not used by the engine)
+
+    // Initialize any AUTOINCREMENT data structures required.
+    if p.uses_ainc {
+        crate::insert::sqlite3_autoincrement_begin(p);
+    }
 
     // Code constant expressions that were factored out of inner loops.
     if p.p_const_expr.nn() {
@@ -80,6 +106,13 @@ pub fn sqlite3_finish_coding(p: &mut Parse) {
             };
             sqlite3_expr_code(p, e, reg);
             i += 1;
+        }
+    }
+
+    if p.b_returning {
+        let r = p.p_returning.clone().unwrap_or_default();
+        if r.n_ret_col != 0 {
+            p.v.add_op2(OP_OpenEphemeral, r.i_ret_cur, r.n_ret_col);
         }
     }
 
@@ -97,6 +130,8 @@ pub fn sqlite3_finish_coding(p: &mut Parse) {
 /// The `sqlite3VdbeMakeReady(v, pParse)` call at the end of `sqlite3FinishCoding()`: take the
 /// finished program out of the Parse.
 pub fn sqlite3_vdbe_make_ready(p: &mut Parse) -> Program {
+    crate::trigger::finish_sub_programs(p);
+    p.v.expmask |= p.pending_expmask.take();
     let v = std::mem::take(&mut p.v);
     v.make_ready(MakeReady {
         n_var: p.n_var,
@@ -507,4 +542,55 @@ pub fn sqlite3_vdbe_explain_parent(p: &Parse) -> i32 {
         return 0;
     }
     p.v.get_op(p.addr_explain).p2
+}
+
+/// `sqlite3HaltConstraint(pParse, errCode, onError, p4, p4type, p5Errmsg)`: code an OP_Halt
+/// that causes the vdbe to return an SQLITE_CONSTRAINT error.
+pub fn sqlite3_halt_constraint(p: &mut Parse, err_code: i32, on_error: i32, p4: P4, p5_errmsg: i32) {
+    sqlite3_get_vdbe(p);
+    if on_error == OE_Abort {
+        sqlite3_may_abort(p);
+    }
+    p.v.add_op4(OP_Halt, err_code, on_error, 0, p4);
+    p.v.change_p5(p5_errmsg as u16);
+}
+
+/// `sqlite3UniqueConstraint(pParse, onError, pIdx)`: code an OP_Halt due to UNIQUE or
+/// PRIMARY KEY constraint violation.
+pub fn sqlite3_unique_constraint(p: &mut Parse, on_error: i32, idx: IndexId) {
+    let tab = p.idx(idx).p_table;
+    let mut err = String::new();
+    if p.idx(idx).a_col_expr.nn() {
+        err.push_str(&format!("index '{}'", p.idx(idx).z_name));
+    } else {
+        for j in 0..p.idx(idx).n_key_col as usize {
+            let c = p.idx(idx).ai_column[j] as usize;
+            if j != 0 {
+                err.push_str(", ");
+            }
+            err.push_str(&p.tab(tab).z_name);
+            err.push('.');
+            err.push_str(&p.tab(tab).a_col[c].z_cn_name);
+        }
+    }
+    let code = if p.idx(idx).is_primary_key() { SQLITE_CONSTRAINT_PRIMARYKEY } else { SQLITE_CONSTRAINT_UNIQUE };
+    sqlite3_halt_constraint(p, code, on_error, P4::dynamic(&err), P5_ConstraintUnique);
+}
+
+/// `sqlite3RowidConstraint(pParse, onError, pTab)`: code an OP_Halt due to non-unique rowid.
+pub fn sqlite3_rowid_constraint(p: &mut Parse, on_error: i32, tab: TableId) {
+    let (msg, rc) = {
+        let t = p.tab(tab);
+        if t.i_p_key >= 0 {
+            (format!("{}.{}", t.z_name, t.a_col[t.i_p_key as usize].z_cn_name), SQLITE_CONSTRAINT_PRIMARYKEY)
+        } else {
+            (format!("{}.rowid", t.z_name), SQLITE_CONSTRAINT_ROWID)
+        }
+    };
+    sqlite3_halt_constraint(p, rc, on_error, P4::dynamic(&msg), P5_ConstraintUnique);
+}
+
+/// `sqlite3WritableSchema(db)`: true if PRAGMA writable_schema=ON and not defensive.
+pub fn sqlite3_writable_schema(p: &Parse) -> bool {
+    (p.db.flags & (SQLITE_WriteSchema | SQLITE_Defensive)) == SQLITE_WriteSchema
 }

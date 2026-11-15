@@ -157,7 +157,7 @@ impl Host for EngineHost<'_> {
         for tr in &schema.triggers {
             rows.push((
                 tr.schema_rowid,
-                SchemaRow { ty: "trigger".into(), name: tr.name.clone(), tbl_name: tr.tbl_name.clone(), rootpage: 0, sql: Some("CREATE TRIGGER".into()) },
+                SchemaRow { ty: "trigger".into(), name: tr.name.clone(), tbl_name: tr.tbl_name.clone(), rootpage: 0, sql: Some(tr.raw_sql.clone()) },
             ));
         }
         rows.sort_by_key(|(rowid, _)| *rowid);
@@ -359,6 +359,24 @@ fn make_db<'a>(inner: &ConnectionInner, host: &'a EngineHost<'a>) -> Db<'a> {
     // The flag pragmas (automatic_index, reverse_unordered_selects, short_column_names,
     // full_column_names): the bits that differ from C's default.
     db.flags ^= inner.db_set.c_flags_toggled();
+    // The connection flags of DML code generation (PRAGMA foreign_keys, recursive_triggers,
+    // count_changes, writable_schema) and the authorizer (`db->xAuth`).
+    {
+        use sqliters_codegen::consts::{SQLITE_CountRows, SQLITE_ForeignKeys, SQLITE_RecTriggers, SQLITE_WriteSchema};
+        if inner.foreign_keys {
+            db.flags |= SQLITE_ForeignKeys;
+        }
+        if inner.recursive_triggers {
+            db.flags |= SQLITE_RecTriggers;
+        }
+        if inner.count_changes {
+            db.flags |= SQLITE_CountRows;
+        }
+        if inner.writable_schema {
+            db.flags |= SQLITE_WriteSchema;
+        }
+    }
+    db.x_auth = inner.authorizer.is_some();
     db.case_sensitive_like = inner.db_set.c_case_sensitive_like();
     db.schema_not_loaded = inner.db_set.c_prepare_unloaded();
     db.encoding_fixed = inner.db_set.c_encoding_fixed();

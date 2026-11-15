@@ -202,8 +202,9 @@ pub fn sqlite3_get_vdbe(p: &mut Parse) {
     if p.has_vdbe {
         return;
     }
-    // if( pParse->pToplevel==0 ) pParse->okConstFactor = 1;
-    p.ok_const_factor = true;
+    if !p.is_nested_trigger {
+        p.ok_const_factor = true;
+    }
     // sqlite3VdbeCreate(pParse)
     p.v = Vdbe::new();
     p.v.add_op2(OP_Init, 0, 1);
@@ -2347,7 +2348,23 @@ fn select_inner_loop(
             sqlite3_release_temp_range(p, r1, n_prefix_reg + 1);
         }
         SRT_Upfrom => {
-            p.not_supported("SELECT destination of UPDATE ... FROM");
+            if let Some(s) = sort.as_deref_mut() {
+                push_onto_sorter(p, s, sel, reg_result, reg_orig, n_result_col, n_prefix_reg);
+            } else {
+                let i2 = dest.i_sd_parm2;
+                let r1 = sqlite3_get_temp_reg(p);
+                // If the UPDATE FROM join is an aggregate that matches no rows, it might still
+                // be trying to return one row, because that is what aggregates do. Don't
+                // record that empty row in the output table.
+                p.v.add_op2(OP_IsNull, reg_result, i_break);
+                let neg = (i2 < 0) as i32;
+                p.v.add_op3(OP_MakeRecord, reg_result + neg, n_result_col - neg, r1);
+                if i2 < 0 {
+                    p.v.add_op3(OP_Insert, i_parm, r1, reg_result);
+                } else {
+                    p.v.add_op4_int(OP_IdxInsert, i_parm, r1, reg_result, i2);
+                }
+            }
         }
         // If we are creating a set for an "expr IN (SELECT ...)" construct, then there should
         // be a single item on the stack. Write this item into the set table with bogus data.
@@ -2574,7 +2591,15 @@ fn generate_sort_tail(p: &mut Parse, sel: SelectId, sort: &mut SortCtx, n_column
             // The LIMIT clause will terminate the loop for us
         }
         SRT_Upfrom => {
-            p.not_supported("SELECT destination of UPDATE ... FROM");
+            let i2 = dest.i_sd_parm2;
+            let r1 = sqlite3_get_temp_reg(p);
+            let neg = (i2 < 0) as i32;
+            p.v.add_op3(OP_MakeRecord, reg_row + neg, n_column - neg, r1);
+            if i2 < 0 {
+                p.v.add_op3(OP_Insert, i_parm, r1, reg_row);
+            } else {
+                p.v.add_op4_int(OP_IdxInsert, i_parm, r1, reg_row, i2);
+            }
         }
         _ => {
             if e_dest == SRT_Output {
@@ -3767,8 +3792,19 @@ fn sqlite3_select_body(p: &mut Parse, sel: SelectId, dest: &mut SelectDest, b_po
     // If the SF_UFSrcCheck flag is set, then this function is being called as part of
     // populating the temp table for an UPDATE...FROM statement.
     if p.s(sel).sel_flags & SF_UFSrcCheck != 0 {
-        p.not_supported("UPDATE ... FROM");
-        return rc;
+        let src = p.s(sel).p_src;
+        if same_src_alias(p, src, 0, src) {
+            let it = &p.src(src).a[0];
+            let name = match &it.z_alias {
+                Some(a) => a.clone(),
+                None => p.tab(it.p_s_tab).z_name.clone(),
+            };
+            p.error_msg(format!("target object/alias may not appear in FROM clause: {name}"));
+            return rc;
+        }
+        // Clear the SF_UFSrcCheck flag. The check has already been performed, and leaving
+        // the flag set might cause the error to be issued again.
+        p.sm(sel).sel_flags &= !SF_UFSrcCheck;
     }
 
     if dest.e_dest as i32 == SRT_Output {
@@ -4991,4 +5027,35 @@ pub fn sqlite3_multi_values(p: &mut Parse, left: SelectId, row: ExprListId) -> S
         }
     }
     left
+}
+
+/// `sameSrcAlias(p0, pSrc)`: return true if any FROM-clause term of `src` (or of a nested
+/// FROM in it) other than `p0` (item `i0` of list `src0`) has the same table and the same
+/// alias as p0.
+fn same_src_alias(p: &Parse, src0: SrcListId, i0: usize, src: SrcListId) -> bool {
+    let (t0, a0) = {
+        let it = &p.src(src0).a[i0];
+        (it.p_s_tab, it.z_alias.clone())
+    };
+    for i in 0..p.src(src).a.len() {
+        if src == src0 && i == i0 {
+            continue;
+        }
+        let it = &p.src(src).a[i];
+        let same_alias = match (&a0, &it.z_alias) {
+            (None, None) => true,
+            (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+            _ => false,
+        };
+        if t0 == it.p_s_tab && same_alias {
+            return true;
+        }
+        if it.is_subquery {
+            let sub = it.p_subq.as_ref().expect("subquery").p_select;
+            if (p.s(sub).sel_flags & SF_NestedFrom) != 0 && same_src_alias(p, src0, i0, p.s(sub).p_src) {
+                return true;
+            }
+        }
+    }
+    false
 }

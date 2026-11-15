@@ -273,6 +273,9 @@ impl YyParser {
                     let msg = format!("near \"{}\": syntax error", p.tok_str(&yyminor));
                     p.error_msg_tok(msg, &yyminor);
                 } else {
+                    if std::env::var_os("SQLITERS_CG_PARSEDBG").is_some() {
+                        eprintln!("parse error at end: major={} state={} stack={:?}", yymajor, yyact, self.yystack.iter().map(|e| e.major).collect::<Vec<_>>());
+                    }
                     p.error_msg("incomplete input");
                 }
                 break;
@@ -1118,7 +1121,8 @@ impl YyParser {
             282 => m!(0).i = OE_Fail,     // raisetype ::= FAIL
             309 | 310 => {
                 // with ::= WITH wqlist ; with ::= WITH RECURSIVE wqlist   (DML prefix)
-                p.not_supported("WITH prefix of a DML statement");
+                let w = WithId(m!(0).id);
+                crate::select::sqlite3_with_push(p, w);
             }
             311 => m!(0).i = M10d_Any,  // wqas ::= AS
             312 => m!(-1).i = M10d_Yes, // wqas ::= AS MATERIALIZED
@@ -1518,6 +1522,223 @@ impl YyParser {
                 let x = m!(0).tok;
                 crate::vtab::sqlite3_vtab_arg_extend(p, &x);
             }
+            // ---- DML (step V5) ----
+            76 => {
+                // orconf ::= OR resolvetype
+                let v = m!(0).i;
+                m!(-1).i = v;
+            }
+            152 => {
+                // cmd ::= with DELETE FROM xfullname indexed_opt where_opt_ret
+                let (x, i, w) = (SrcListId(m!(-2).id), m!(-1).tok, ex!(0));
+                if dml_supported(p) {
+                    sqlite3_src_list_indexed_by(p, x, &i);
+                    crate::delete::sqlite3_delete_from(p, x, w, ExprListId::NULL, ExprId::NULL);
+                }
+            }
+            157 => {
+                // where_opt_ret ::= RETURNING selcollist
+                let x = el!(0);
+                crate::trigger::sqlite3_add_returning(p, x);
+                m!(-1).id = 0;
+            }
+            158 => {
+                // where_opt_ret ::= WHERE expr RETURNING selcollist
+                let (x, y) = (m!(-2).id, el!(0));
+                crate::trigger::sqlite3_add_returning(p, y);
+                m!(-3).id = x;
+            }
+            159 => {
+                // cmd ::= with UPDATE orconf xfullname indexed_opt SET setlist from where_opt_ret
+                let (r, mut x, i, y, f, w) = (m!(-6).i, SrcListId(m!(-5).id), m!(-4).tok, el!(-2), SrcListId(m!(-1).id), ex!(0));
+                if dml_supported(p) {
+                    sqlite3_src_list_indexed_by(p, x, &i);
+                    crate::expr::sqlite3_expr_list_check_length(p, y, "set list");
+                    if f.nn() {
+                        let mut from_clause = f;
+                        if p.src(from_clause).n_src() > 1 {
+                            let sub = crate::select::sqlite3_select_new(
+                                p,
+                                ExprListId::NULL,
+                                from_clause,
+                                ExprId::NULL,
+                                ExprListId::NULL,
+                                ExprId::NULL,
+                                ExprListId::NULL,
+                                SF_NestedFrom,
+                                ExprId::NULL,
+                            );
+                            let as_ = Token { z: Token::NO_Z, n: 0 };
+                            from_clause = sqlite3_src_list_append_from_term(p, SrcListId::NULL, None, None, &as_, sub, None);
+                        }
+                        x = crate::build::sqlite3_src_list_append_list(p, x, from_clause);
+                    }
+                    crate::update::sqlite3_update(p, x, y, w, r, ExprListId::NULL, ExprId::NULL, UpsertId::NULL);
+                }
+            }
+            160 => {
+                // setlist ::= setlist COMMA nm EQ expr
+                let (a, x, y) = (el!(-4), m!(-2).tok, ex!(0));
+                let a = sqlite3_expr_list_append(p, a, y);
+                crate::expr::sqlite3_expr_list_set_name(p, a, &x, 1);
+                m!(-4).id = a.0;
+            }
+            161 => {
+                // setlist ::= setlist COMMA LP idlist RP EQ expr
+                let (a, x, y) = (el!(-6), IdListId(m!(-3).id), ex!(0));
+                m!(-6).id = crate::expr::sqlite3_expr_list_append_vector(p, a, x, y).0;
+            }
+            162 => {
+                // setlist ::= nm EQ expr
+                let (x, y) = (m!(-2).tok, ex!(0));
+                let a = sqlite3_expr_list_append(p, ExprListId::NULL, y);
+                crate::expr::sqlite3_expr_list_set_name(p, a, &x, 1);
+                m!(-2).id = a.0;
+            }
+            163 => {
+                // setlist ::= LP idlist RP EQ expr
+                let (x, y) = (IdListId(m!(-3).id), ex!(0));
+                m!(-4).id = crate::expr::sqlite3_expr_list_append_vector(p, ExprListId::NULL, x, y).0;
+            }
+            164 => {
+                // cmd ::= with insert_cmd INTO xfullname idlist_opt select upsert
+                let (r, x, f, s, u) = (m!(-5).i, SrcListId(m!(-3).id), IdListId(m!(-2).id), sl!(-1), UpsertId(m!(0).id));
+                if dml_supported(p) {
+                    crate::insert::sqlite3_insert(p, x, s, f, r, u);
+                }
+            }
+            165 => {
+                // cmd ::= with insert_cmd INTO xfullname idlist_opt DEFAULT VALUES returning
+                let (r, x, f) = (m!(-6).i, SrcListId(m!(-4).id), IdListId(m!(-3).id));
+                if dml_supported(p) {
+                    crate::insert::sqlite3_insert(p, x, SelectId::NULL, f, r, UpsertId::NULL);
+                }
+            }
+            166 => m!(1).id = 0, // upsert ::=
+            167 => {
+                // upsert ::= RETURNING selcollist
+                let x = el!(0);
+                m!(-1).id = 0;
+                crate::trigger::sqlite3_add_returning(p, x);
+            }
+            168 => {
+                // upsert ::= ON CONFLICT LP sortlist RP where_opt DO UPDATE SET setlist where_opt upsert
+                let (t, tw, z, w, n) = (el!(-8), ex!(-6), el!(-2), ex!(-1), UpsertId(m!(0).id));
+                m!(-11).id = crate::upsert::sqlite3_upsert_new(p, t, tw, z, w, n).0;
+            }
+            169 => {
+                // upsert ::= ON CONFLICT LP sortlist RP where_opt DO NOTHING upsert
+                let (t, tw, n) = (el!(-5), ex!(-3), UpsertId(m!(0).id));
+                m!(-8).id = crate::upsert::sqlite3_upsert_new(p, t, tw, ExprListId::NULL, ExprId::NULL, n).0;
+            }
+            170 => {
+                // upsert ::= ON CONFLICT DO NOTHING returning
+                m!(-4).id = crate::upsert::sqlite3_upsert_new(p, ExprListId::NULL, ExprId::NULL, ExprListId::NULL, ExprId::NULL, UpsertId::NULL).0;
+            }
+            171 => {
+                // upsert ::= ON CONFLICT DO UPDATE SET setlist where_opt returning
+                let (z, w) = (el!(-2), ex!(-1));
+                m!(-7).id = crate::upsert::sqlite3_upsert_new(p, ExprListId::NULL, ExprId::NULL, z, w, UpsertId::NULL).0;
+            }
+            172 => {
+                // returning ::= RETURNING selcollist
+                let x = el!(0);
+                crate::trigger::sqlite3_add_returning(p, x);
+            }
+            173 => {
+                // insert_cmd ::= INSERT orconf
+                let r = m!(0).i;
+                m!(-1).i = r;
+            }
+            174 => m!(0).i = OE_Replace, // insert_cmd ::= REPLACE
+            // ---- CREATE TRIGGER (schema load) ----
+            260 => {
+                // cmd ::= createkw trigger_decl BEGIN trigger_cmd_list END
+                let list = m!(-1).id;
+                let steps: Vec<TriggerStep> = if list == 0 {
+                    Vec::new()
+                } else {
+                    p.tstep_lists[list as usize - 1].iter().map(|&i| p.tstep_pool[i as usize - 1].clone()).collect()
+                };
+                crate::trigger::sqlite3_finish_trigger(p, steps);
+            }
+            261 => {
+                // trigger_decl ::= temp TRIGGER ifnotexists nm dbnm trigger_time trigger_event ON fullname foreach_clause when_clause
+                let (b, z, c, da, db, e, g, t, noerr) =
+                    (m!(-7).tok, m!(-6).tok, m!(-5).i, m!(-4).i, IdListId(m!(-4).id), SrcListId(m!(-2).id), ex!(0), m!(-10).i, m!(-8).i);
+                if p.db.init_busy {
+                    crate::trigger::sqlite3_begin_trigger(p, &b, &z, c, da, db, e, g, t != 0, noerr != 0);
+                } else {
+                    p.not_supported("statement kind (grammar rule not ported)");
+                }
+                m!(-10).tok = if z.n == 0 { b } else { z };
+            }
+            262 => {
+                // trigger_time ::= BEFORE|AFTER
+                let x = major!(0) as i32;
+                m!(0).i = x;
+            }
+            263 => m!(-1).i = TK_INSTEAD as i32, // trigger_time ::= INSTEAD OF
+            264 => m!(1).i = TK_BEFORE as i32,   // trigger_time ::=
+            265 | 266 => {
+                // trigger_event ::= DELETE|INSERT ; trigger_event ::= UPDATE
+                let x = major!(0) as i32;
+                m!(0).i = x;
+                m!(0).id = 0;
+            }
+            267 => {
+                // trigger_event ::= UPDATE OF idlist
+                let x = m!(0).id;
+                m!(-2).i = TK_UPDATE as i32;
+                m!(-2).id = x;
+            }
+            268 => m!(1).id = 0, // when_clause ::=
+            269 => {
+                // when_clause ::= WHEN expr
+                let x = m!(0).id;
+                m!(-1).id = x;
+            }
+            270 => {
+                // trigger_cmd_list ::= trigger_cmd_list trigger_cmd SEMI
+                let (l, x) = (m!(-2).id, m!(-1).id);
+                if l != 0 && x != 0 {
+                    p.tstep_lists[l as usize - 1].push(x);
+                }
+            }
+            271 => {
+                // trigger_cmd_list ::= trigger_cmd SEMI
+                let x = m!(-1).id;
+                if x != 0 {
+                    p.tstep_lists.push(vec![x]);
+                    m!(-1).id = p.tstep_lists.len() as u32;
+                }
+            }
+            272 => p.error_msg("the INDEXED BY clause is not allowed on UPDATE or DELETE statements within triggers"),
+            273 => p.error_msg("the NOT INDEXED clause is not allowed on UPDATE or DELETE statements within triggers"),
+            274 => {
+                // trigger_cmd ::= UPDATE orconf xfullname tridxby SET setlist from where_opt scanpt
+                let (b, r, x, y, f, z, e) = (m!(-8).tok, m!(-7).i, SrcListId(m!(-6).id), el!(-3), SrcListId(m!(-2).id), ex!(-1), m!(0).i);
+                let st = crate::trigger::sqlite3_trigger_update_step(p, x, f, y, z, r as u8, b.z as usize, e as usize);
+                m!(-8).id = push_step(p, st);
+            }
+            275 => {
+                // trigger_cmd ::= scanpt insert_cmd INTO xfullname idlist_opt select upsert scanpt
+                let (b, r, x, f, sel, u, z) = (m!(-7).i, m!(-6).i, SrcListId(m!(-4).id), IdListId(m!(-3).id), sl!(-2), UpsertId(m!(-1).id), m!(0).i);
+                let st = crate::trigger::sqlite3_trigger_insert_step(p, x, f, sel, r as u8, u, b as usize, z as usize);
+                m!(-7).id = push_step(p, st);
+            }
+            276 => {
+                // trigger_cmd ::= DELETE FROM xfullname tridxby where_opt scanpt
+                let (b, x, y, e) = (m!(-5).tok, SrcListId(m!(-3).id), ex!(-1), m!(0).i);
+                let st = crate::trigger::sqlite3_trigger_delete_step(p, x, y, b.z as usize, e as usize);
+                m!(-5).id = push_step(p, st);
+            }
+            277 => {
+                // trigger_cmd ::= scanpt select scanpt
+                let (b, x, e) = (m!(-2).i, sl!(-1), m!(0).i);
+                let st = crate::trigger::sqlite3_trigger_select_step(p, x, b as usize, e as usize);
+                m!(-2).id = push_step(p, Some(st));
+            }
             n if (n as i32) < YYNRULE_WITH_ACTION => {
                 // A rule with an action in parse.y that step V1 does not port: CREATE / DROP /
                 // ALTER, INSERT / UPDATE / DELETE, triggers, PRAGMA, VACUUM, ATTACH, ANALYZE,
@@ -1537,5 +1758,27 @@ impl YyParser {
         self.yystack[new_top].stateno = yyact;
         self.yystack[new_top].major = yygoto;
         yyact
+    }
+}
+
+/// The DML statement kinds are given to the ported code generator unless the connection
+/// state they depend on is not represented (an authorizer callback: sqlite3AuthCheck()).
+fn dml_supported(p: &mut Parse) -> bool {
+    if p.db.x_auth {
+        p.not_supported("DML statement of a connection with an authorizer");
+        return false;
+    }
+    true
+}
+
+/// Keep a trigger step built by an action of the trigger grammar; its id (index+1, 0 for
+/// NULL) is the semantic value of `trigger_cmd`.
+fn push_step(p: &mut Parse, st: Option<TriggerStep>) -> u32 {
+    match st {
+        Some(st) => {
+            p.tstep_pool.push(st);
+            p.tstep_pool.len() as u32
+        }
+        None => 0,
     }
 }

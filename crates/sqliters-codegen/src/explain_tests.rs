@@ -102,9 +102,15 @@ fn program_sizing() {
 
 #[test]
 fn unsupported_statements_are_reported_not_approximated() {
-    for sql in ["create table t(x)", "insert into t values(1)", "pragma page_size"] {
+    for sql in ["create table t(x)", "drop table t", "pragma page_size"] {
         assert!(matches!(prepare(Db::new(&NoHost), sql), PrepareResult::Unsupported(_)), "{sql}");
     }
+    // DML is compiled since step V5: with no schema it is C's error (C 3.54.1:
+    // "Parse error near line 1: no such table: t", no error offset).
+    let PrepareResult::Error { message, offset } = prepare(Db::new(&NoHost), "insert into t values(1)") else {
+        panic!("insert into t values(1)")
+    };
+    assert_eq!((message.as_str(), offset), ("no such table: t", -1));
     // A table in FROM is compiled since step V2: with no schema it is C's error.
     let PrepareResult::Error { message, offset } = prepare(Db::new(&NoHost), "select a from t") else {
         panic!("select a from t")

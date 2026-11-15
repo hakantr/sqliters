@@ -509,11 +509,12 @@ fn planner_dump_of_a_join() {
 #[test]
 fn unsupported_in_v3() {
     let host = TestHost;
-    // (V4b: table-valued functions are ported - see vtab_tests.rs; the statement kinds of DML
-    // are not)
-    for sql in ["insert into t(b) values(1)"] {
+    // (V4b: table-valued functions are ported - see vtab_tests.rs; V5: DML is ported, the DDL
+    // statement kinds are not)
+    for sql in ["create trigger tr after insert on t begin select 1; end"] {
         assert!(matches!(crate::prepare(db(&host), sql), PrepareResult::Unsupported(_)), "{sql}");
     }
+    assert!(matches!(crate::prepare(db(&host), "insert into t(b) values(1)"), PrepareResult::Program(_)));
 }
 #[test]
 fn group_by_in_index_order() {

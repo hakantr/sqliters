@@ -422,8 +422,85 @@ fn lookup_name(p: &mut Parse, z_db: Option<String>, z_tab: Option<String>, right
         // trigger argument reference, or maybe it is an excluded.* from an upsert, or maybe
         // it is a reference to the system RETURNING clause.
         //
-        // TODO(later steps): pParse->pTriggerTab (new / old), NC_UUpsert (excluded),
-        // NC_UBaseReg (RETURNING). None of these contexts exists in step V1.
+        if cnt == 0 && z_db.is_none() {
+            let mut tab = TableId::NULL;
+            if p.p_trigger_tab.nn() {
+                let op = p.e_trigger_op;
+                let ttab = p.p_trigger_tab;
+                if p.b_returning {
+                    if (p.nc(nc).nc_flags & NC_UBaseReg) != 0
+                        && (z_tab.is_none()
+                            || z_tab.as_deref().is_some_and(|z| z.eq_ignore_ascii_case(&p.tab(ttab).z_name))
+                            || z_tab.as_deref().is_some_and(|z| is_valid_schema_table_name(z, &p.tab(ttab).z_name, false)))
+                    {
+                        p.em(e).i_table = (op != TK_DELETE) as i32;
+                        tab = ttab;
+                    }
+                } else if op != TK_DELETE && z_tab.as_deref().is_some_and(|z| z.eq_ignore_ascii_case("new")) {
+                    p.em(e).i_table = 1;
+                    tab = ttab;
+                } else if op != TK_INSERT && z_tab.as_deref().is_some_and(|z| z.eq_ignore_ascii_case("old")) {
+                    p.em(e).i_table = 0;
+                    tab = ttab;
+                }
+            }
+            if (p.nc(nc).nc_flags & NC_UUpsert) != 0 && z_tab.is_some() {
+                let up = p.nc(nc).p_upsert;
+                if up.nn() && z_tab.as_deref().is_some_and(|z| z.eq_ignore_ascii_case("excluded")) {
+                    let src = p.up(up).p_upsert_src;
+                    tab = p.src(src).a[0].p_s_tab;
+                    p.em(e).i_table = EXCLUDED_TABLE_NUMBER;
+                }
+            }
+            if tab.nn() {
+                let tdb = p.tab(tab).i_db;
+                schema = if tdb < 0 { None } else { Some(tdb) };
+                cnt_tab += 1;
+                let mut i_col = sqlite3_column_index(p, tab, &z_col);
+                if i_col >= 0 {
+                    if p.tab(tab).i_p_key as i32 == i_col {
+                        i_col = -1;
+                    }
+                } else if crate::expr::sqlite3_is_rowid(&z_col) && visible_rowid(p, tab) {
+                    i_col = -1;
+                } else {
+                    i_col = p.tab(tab).n_col() as i32;
+                }
+                if i_col < p.tab(tab).n_col() as i32 {
+                    cnt += 1;
+                    p_match = None;
+                    if p.e(e).i_table == EXCLUDED_TABLE_NUMBER {
+                        // (IN_RENAME_OBJECT is not ported)
+                        let up = p.nc(nc).p_upsert;
+                        let st = crate::schema::sqlite3_table_column_to_storage(p.tab(tab), i_col);
+                        p.em(e).i_table = p.up(up).reg_data + st;
+                        e_new_expr_op = TK_REGISTER;
+                    } else {
+                        p.em(e).y_tab = tab;
+                        if p.b_returning {
+                            e_new_expr_op = TK_REGISTER;
+                            let base = p.nc(nc).i_base_reg;
+                            let n_col = p.tab(tab).n_col() as i32;
+                            let st = crate::schema::sqlite3_table_column_to_storage(p.tab(tab), i_col);
+                            let x = p.em(e);
+                            x.op2 = TK_COLUMN;
+                            x.i_column = i_col as i16;
+                            x.i_table = base + (n_col + 1) * x.i_table + st + 1;
+                        } else {
+                            p.em(e).i_column = i_col as i16;
+                            e_new_expr_op = TK_TRIGGER;
+                            if i_col < 0 {
+                                p.em(e).aff_expr = SQLITE_AFF_INTEGER;
+                            } else if p.e(e).i_table == 0 {
+                                p.oldmask |= if i_col >= 32 { 0xffff_ffff } else { 1u32 << i_col };
+                            } else {
+                                p.newmask |= if i_col >= 32 { 0xffff_ffff } else { 1u32 << i_col };
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Perhaps the name is a reference to the ROWID
         if cnt == 0
@@ -714,7 +791,20 @@ fn resolve_expr_step(p: &mut Parse, w: &mut Walker, e: ExprId) -> i32 {
     match op {
         // The special operator TK_ROW means use the rowid for the first column in the FROM
         // clause. This is used by the LIMIT and ORDER BY clause handling of UPDATE and
-        // DELETE statements (SQLITE_ENABLE_UPDATE_DELETE_LIMIT, not compiled in).
+        // DELETE statements, and by UPDATE ... FROM.
+        TK_ROW => {
+            let src = p.nc(nc).p_src_list;
+            let (tab, cur) = {
+                let it = &p.src(src).a[0];
+                (it.p_s_tab, it.i_cursor)
+            };
+            let x = p.em(e);
+            x.op = TK_COLUMN;
+            x.y_tab = tab;
+            x.i_table = cur;
+            x.i_column -= 1;
+            x.aff_expr = SQLITE_AFF_INTEGER;
+        }
         TK_NOTNULL | TK_ISNULL => {
             // Record the number of outer-context references so that the counts can be
             // restored if the term is optimized away.

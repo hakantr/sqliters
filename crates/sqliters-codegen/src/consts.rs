@@ -512,3 +512,19 @@ pub const WHERE_SELFCULL: i32 = 0x800000;
 pub const WHERE_OMIT_OFFSET: i32 = 0x1000000;
 pub const WHERE_COROUTINE: i32 = 0x2000000;
 pub const WHERE_EXPRIDX: i32 = 0x4000000;
+
+// ---- result codes of constraint failures (sqlite3.h) ----
+pub const SQLITE_CONSTRAINT: i32 = 19;
+pub const SQLITE_CONSTRAINT_CHECK: i32 = SQLITE_CONSTRAINT | (1 << 8);
+pub const SQLITE_CONSTRAINT_FOREIGNKEY: i32 = SQLITE_CONSTRAINT | (3 << 8);
+pub const SQLITE_CONSTRAINT_NOTNULL: i32 = SQLITE_CONSTRAINT | (5 << 8);
+pub const SQLITE_CONSTRAINT_PRIMARYKEY: i32 = SQLITE_CONSTRAINT | (6 << 8);
+pub const SQLITE_CONSTRAINT_TRIGGER: i32 = SQLITE_CONSTRAINT | (7 << 8);
+pub const SQLITE_CONSTRAINT_UNIQUE: i32 = SQLITE_CONSTRAINT | (8 << 8);
+pub const SQLITE_CONSTRAINT_ROWID: i32 = SQLITE_CONSTRAINT | (10 << 8);
+pub const SQLITE_CORRUPT: i32 = 11;
+pub const SQLITE_CORRUPT_SEQUENCE: i32 = SQLITE_CORRUPT | (2 << 8);
+/// `EXCLUDED_TABLE_NUMBER` (resolve.c): iTable of an `excluded.*` reference
+pub const EXCLUDED_TABLE_NUMBER: i32 = 2;
+/// `ALLBITS`: a Bitmask with all bits set
+pub const ALLBITS: u64 = u64::MAX;

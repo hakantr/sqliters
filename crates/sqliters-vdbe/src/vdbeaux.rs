@@ -910,12 +910,14 @@ impl Program {
                     }
                     ap_sub[j].a_op[i].clone()
                 };
-                if b_list_subprogs
-                    && let P4::SubProgram(sp) = &op.p4
-                    && !ap_sub.iter().any(|s| Arc::ptr_eq(s, sp))
-                {
-                    ap_sub.push(sp.clone());
-                    n_row += sp.a_op.len();
+                if b_list_subprogs && let P4::SubProgram(sp0) = &op.p4 {
+                    // A stub names the sub-program of `p_program` it stands for (C's operand
+                    // points at that same object).
+                    let sp = if sp0.is_stub() { self.p_program.get(sp0.n_csr as usize).unwrap_or(sp0) } else { sp0 };
+                    if !ap_sub.iter().any(|s| Arc::ptr_eq(s, sp)) {
+                        ap_sub.push(sp.clone());
+                        n_row += sp.a_op.len();
+                    }
                 }
                 if explain != 2 || op.opcode == OP_Explain || (op.opcode == OP_Init && i_pc > 1) {
                     found = Some((i, op));

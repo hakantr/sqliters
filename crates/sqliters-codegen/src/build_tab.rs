@@ -66,6 +66,11 @@ fn is_space(c: u8) -> bool {
 
 /// `sqlite3DbSpanDup(db, zStart, zEnd)`: the text between two offsets of the statement, with
 /// leading and trailing whitespace removed.
+/// `sqlite3DbSpanDup()` over the statement text (crate-visible form of [`span_dup`]).
+pub(crate) fn span_dup_pub(p: &Parse, z_start: usize, z_end: usize) -> String {
+    span_dup(p, z_start, z_end)
+}
+
 fn span_dup(p: &Parse, mut z_start: usize, z_end: usize) -> String {
     let b = p.z_sql.as_bytes();
     let z_end = z_end.min(b.len());
@@ -82,7 +87,7 @@ fn span_dup(p: &Parse, mut z_start: usize, z_end: usize) -> String {
 /// `sqlite3TwoPartName(pParse, pName1, pName2, pUnqual)`: the table or view or trigger name
 /// is passed to this routine via tokens pName1 and pName2. This routine sets `*unqual` to the
 /// token that holds the unqualified name and returns the index of the database (-1 on error).
-fn sqlite3_two_part_name(p: &mut Parse, name1: &Token, name2: &Token, unqual: &mut Token) -> i32 {
+pub(crate) fn sqlite3_two_part_name(p: &mut Parse, name1: &Token, name2: &Token, unqual: &mut Token) -> i32 {
     if name2.n > 0 {
         if p.db.init_busy {
             p.error_msg("corrupt database");
@@ -110,7 +115,7 @@ fn sqlite3_two_part_name(p: &mut Parse, name1: &Token, name2: &Token, unqual: &m
 /// the UTF-8 string zName is a legal unqualified name for a new schema object (table, index,
 /// view or trigger). While the schema is loaded, the name, type and table name of the object
 /// must be the ones of the `sqlite_schema` row being parsed.
-fn sqlite3_check_object_name(p: &mut Parse, z_name: &str, z_type: &str, z_tbl_name: &str) -> bool {
+pub(crate) fn sqlite3_check_object_name(p: &mut Parse, z_name: &str, z_type: &str, z_tbl_name: &str) -> bool {
     if (p.db.flags & SQLITE_WriteSchema) != 0 && (p.db.flags & SQLITE_Defensive) == 0 {
         // sqlite3WritableSchema(db)
         return false;
@@ -412,7 +417,7 @@ fn sqlite3_string_to_id(p: &mut Parse, e: ExprId) {
 /// `sqlite3HasExplicitNulls(pParse, pList)`: if expression list pList contains an expression
 /// that was parsed with an explicit "NULLS FIRST" or "NULLS LAST" clause, leave an error in
 /// pParse and return non-zero.
-fn sqlite3_has_explicit_nulls(p: &mut Parse, list: ExprListId) -> bool {
+pub fn sqlite3_has_explicit_nulls(p: &mut Parse, list: ExprListId) -> bool {
     if list.nn() {
         for i in 0..p.l(list).a.len() {
             if p.l(list).a[i].b_nulls {
@@ -1039,6 +1044,12 @@ pub fn sqlite3_end_table(p: &mut Parse, has_end: bool, tab_opts: u32, select: Se
         let key = p.tab(tab).z_name.to_ascii_lowercase();
         p.a_schema[i_db].tbl_hash.insert(key, tab);
         p.p_new_table = TableId::NULL;
+        // If this is the magic sqlite_sequence table used by autoincrement, then record a
+        // pointer to this table in the main database structure so that INSERT can find the
+        // table easily.
+        if p.tab(tab).z_name == "sqlite_sequence" {
+            p.a_schema[i_db].p_seq_tab = tab;
+        }
     }
 }
 
@@ -1450,7 +1461,7 @@ fn reorder_replace_indexes(p: &mut Parse, tab: TableId) {
 // ---------------------------------------------------------------------------------------------
 
 /// `fixExprCb(p, pExpr)` (walker callback of sqlite3FixSelect; `b1` is DbFixer.bTemp).
-fn fix_expr_cb(p: &mut Parse, w: &mut Walker, e: ExprId) -> i32 {
+pub(crate) fn fix_expr_cb(p: &mut Parse, w: &mut Walker, e: ExprId) -> i32 {
     if !w.b1 {
         p.em(e).flags |= EP_FromDDL;
     }
@@ -1464,7 +1475,7 @@ fn fix_expr_cb(p: &mut Parse, w: &mut Walker, e: ExprId) -> i32 {
 /// `fixSelectCb(p, pSelect)` (`n` is the database of the schema object, `b1` is
 /// DbFixer.bTemp): every table reference of a non-TEMP view is tied to the database of the
 /// view.
-fn fix_select_cb(p: &mut Parse, w: &mut Walker, sel: SelectId) -> i32 {
+pub(crate) fn fix_select_cb(p: &mut Parse, w: &mut Walker, sel: SelectId) -> i32 {
     let src = p.s(sel).p_src;
     if src.is_null() {
         return WRC_Continue;
@@ -1476,7 +1487,8 @@ fn fix_select_cb(p: &mut Parse, w: &mut Walker, sel: SelectId) -> i32 {
             {
                 let i_db2 = p.db.a_db.iter().position(|d| d.z_db_s_name.eq_ignore_ascii_case(&zdb)).map_or(-1, |x| x as i32);
                 if w.n != i_db2 {
-                    let msg = format!("view {} cannot reference objects in database {}", p.init_az[1], zdb);
+                    let kind = if w.i2 == 1 { "trigger" } else { "view" };
+                    let msg = format!("{} {} cannot reference objects in database {}", kind, p.init_az[1], zdb);
                     p.error_msg(msg);
                     return WRC_Abort;
                 }
@@ -1693,8 +1705,7 @@ fn sqlite3_init_callback(p: &mut Parse, i_db: usize, row: &SchemaRow) {
         // The parts of C's parser that are not ported yet: a trigger is only noted on its
         // table.
         if row.ty.eq_ignore_ascii_case("trigger") {
-            p.a_schema[i_db].triggers.push(row.tbl_name.to_ascii_lowercase());
-            return;
+            p.a_schema[i_db].n_trigger_rows += 1;
         }
         // Call the parser to process a CREATE TABLE, INDEX or VIEW. But because
         // db->init.busy is set to 1, no VDBE code is generated or executed. All the parser
@@ -1707,8 +1718,13 @@ fn sqlite3_init_callback(p: &mut Parse, i_db: usize, row: &SchemaRow) {
             // is a construct that is not ported. Statements that use the object, or the
             // table of the index, are reported as unsupported.
             let why = p.init_fail.take().unwrap_or("schema object whose SQL text the generator could not load");
-            p.a_schema[i_db].bad.insert(row.name.to_ascii_lowercase(), why);
-            p.a_schema[i_db].bad.insert(row.tbl_name.to_ascii_lowercase(), why);
+            if row.ty.eq_ignore_ascii_case("trigger") {
+                // A trigger only matters to the statements that fire it (sqlite3TriggersExist)
+                p.a_schema[i_db].bad_trig.insert(row.tbl_name.to_ascii_lowercase(), why);
+            } else {
+                p.a_schema[i_db].bad.insert(row.name.to_ascii_lowercase(), why);
+                p.a_schema[i_db].bad.insert(row.tbl_name.to_ascii_lowercase(), why);
+            }
         }
         p.init_i_db = 0;
     } else if row.sql.as_deref().is_some_and(|s| !s.is_empty()) {

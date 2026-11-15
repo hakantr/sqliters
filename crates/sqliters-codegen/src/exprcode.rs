@@ -1593,9 +1593,37 @@ pub fn sqlite3_expr_code_target(p: &mut Parse, mut e: ExprId, target: i32) -> i3
             if i_tab < 0 {
                 if p.i_self_tab < 0 {
                     // Other columns in the same row for CHECK constraints or generated
-                    // columns: belongs to DML.
-                    p.not_supported("column reference relative to a row under construction (iSelfTab<0)");
-                    return target;
+                    // columns or for inserting into partial index. The row is held in
+                    // registers starting at -iSelfTab.
+                    let tab = p.e(e).y_tab;
+                    let i_col = p.e(e).i_column as i32;
+                    if i_col < 0 {
+                        return -1 - p.i_self_tab;
+                    }
+                    let i_src = crate::schema::sqlite3_table_column_to_storage(p.tab(tab), i_col) - p.i_self_tab;
+                    let (cf, aff) = {
+                        let c = &p.tab(tab).a_col[i_col as usize];
+                        (c.col_flags, c.affinity)
+                    };
+                    if cf & COLFLAG_GENERATED as u16 != 0 {
+                        if cf & COLFLAG_BUSY as u16 != 0 {
+                            let msg = format!("generated column loop on \"{}\"", p.tab(tab).a_col[i_col as usize].z_cn_name);
+                            p.error_msg(msg);
+                            return 0;
+                        }
+                        p.tabm(tab).a_col[i_col as usize].col_flags |= COLFLAG_BUSY as u16;
+                        if cf & COLFLAG_NOTAVAIL as u16 != 0 {
+                            sqlite3_expr_code_generated_column(p, tab, i_col as usize, i_src);
+                        }
+                        p.tabm(tab).a_col[i_col as usize].col_flags &= !((COLFLAG_BUSY | COLFLAG_NOTAVAIL) as u16);
+                        return i_src;
+                    } else if aff == SQLITE_AFF_REAL {
+                        p.v.add_op2(OP_SCopy, i_src, target);
+                        p.v.add_op1(OP_RealAffinity, target);
+                        return target;
+                    } else {
+                        return i_src;
+                    }
                 } else {
                     // Coding an expression that is part of an index where column names in
                     // the index refer to the table to which the index belongs
@@ -1940,8 +1968,21 @@ pub fn sqlite3_expr_code_target(p: &mut Parse, mut e: ExprId, target: i32) -> i3
             expr_code_between(p, e, target, None, 0);
             target
         }
+        // If the opcode is TK_TRIGGER, then the expression is a reference to a column in the
+        // new.* or old.* pseudo-tables available to trigger programs. In this case Expr.iTable
+        // is set to 1 for the new.* pseudo-table, or 0 for the old.* pseudo-table. Expr.iColumn
+        // is set to the column of the pseudo-table to read, or to -1 to read the rowid field.
         TK_TRIGGER => {
-            p.not_supported("OLD.* / NEW.* reference of a trigger program");
+            let tab = p.e(e).y_tab;
+            let i_col = p.e(e).i_column as i32;
+            let n_col = p.tab(tab).n_col() as i32;
+            let p1 = p.e(e).i_table * (n_col + 1) + 1 + crate::schema::sqlite3_table_column_to_storage(p.tab(tab), i_col);
+            p.v.add_op2(OP_Param, p1, target);
+            // If the column has REAL affinity, it may currently be stored as an integer. Use
+            // OP_RealAffinity to make sure it is converted to a real.
+            if i_col >= 0 && p.tab(tab).a_col[i_col as usize].affinity == SQLITE_AFF_REAL {
+                p.v.add_op1(OP_RealAffinity, target);
+            }
             in_reg
         }
         TK_VECTOR => {
@@ -2040,7 +2081,20 @@ pub fn sqlite3_expr_code_target(p: &mut Parse, mut e: ExprId, target: i32) -> i3
                 p.error_msg("RAISE() may only be used within a trigger-program");
                 return 0;
             }
-            p.not_supported("RAISE() inside a trigger program");
+            let aff = p.e(e).aff_expr as i32;
+            if aff == OE_Abort {
+                crate::build::sqlite3_may_abort(p);
+            }
+            if aff == OE_Ignore {
+                p.v.add_op2(OP_Halt, SQLITE_OK, OE_Ignore);
+            } else {
+                let left = p.e(e).p_left;
+                let r1 = sqlite3_expr_code_temp(p, left, &mut reg_free1);
+                let code = if p.p_trigger_tab.nn() { SQLITE_CONSTRAINT_TRIGGER } else { SQLITE_ERROR };
+                p.v.add_op3(OP_Halt, code, aff, r1);
+            }
+            sqlite3_release_temp_reg(p, reg_free1);
+            sqlite3_release_temp_reg(p, reg_free2);
             in_reg
         }
         _ => {
