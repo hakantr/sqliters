@@ -5018,6 +5018,34 @@ thread_local! {
     static DTRACE_IN_BATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// `sqlite3VdbeList()` of a C program for `EXPLAIN`. In a UTF-16 database C's P4_MEM text
+/// is held in the database encoding and `sqlite3VdbeDisplayP4()` hands out `pMem->z` as a C
+/// string: the bytes of the UTF-16 text up to the first zero byte (`"xyzzy"` lists as `x` in
+/// UTF-16le, as an empty string in UTF-16be).
+fn c_list_rows(prog: &sqliters_vdbe::vdbeaux::Program, enc: TextEncoding) -> Vec<Vec<Value>> {
+    let explain = prog.explain.max(1);
+    let mut rows = prog.list(explain);
+    if explain != 1 || enc == TextEncoding::Utf8 {
+        return rows;
+    }
+    for ((_, op), row) in prog.list_ops(explain).iter().zip(rows.iter_mut()) {
+        if let sqliters_vdbe::vdbeaux::P4::Mem(Value::Text(s)) = &op.p4 {
+            let mut z: Vec<u8> = Vec::with_capacity(s.len() * 2);
+            for u in s.encode_utf16() {
+                let b = if enc == TextEncoding::Utf16Le { u.to_le_bytes() } else { u.to_be_bytes() };
+                z.extend_from_slice(&b);
+            }
+            let end = z.iter().position(|&c| c == 0).unwrap_or(z.len());
+            z.truncate(end);
+            row[5] = match String::from_utf8(z) {
+                Ok(x) => Value::Text(x),
+                Err(e) => Value::Blob(e.into_bytes()),
+            };
+        }
+    }
+    rows
+}
+
 /// The column names of `EXPLAIN`.
 fn explain_column_names(explain: u8) -> Vec<String> {
     let names = if explain == 2 {
@@ -5520,6 +5548,14 @@ fn stmt_references_temp_catalog(stmt: &Stmt, db_set: &DatabaseSet) -> bool {
                 || del.returning.iter().any(|rc| {
                     matches!(rc, ResultColumn::Expr { expr, .. } if expr_references_temp_catalog(expr, db_set))
                 })
+        }
+        // pragma.c:457: a pragma on the temp database opens it (sqlite3OpenTempDatabase);
+        // integrity_check / quick_check without a schema verify every database
+        // (sqlite3CodeVerifySchema(pParse, 1) opens temp, build.c:5447)
+        Stmt::Pragma { schema, name, .. } => {
+            schema.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("temp"))
+                || (schema.is_none()
+                    && (name.eq_ignore_ascii_case("integrity_check") || name.eq_ignore_ascii_case("quick_check")))
         }
         _ => false,
     }
@@ -6721,24 +6757,41 @@ impl Statement {
         let mut c_explain_of_rejected: Option<Arc<sqliters_vdbe::vdbeaux::Program>> = None;
         // C's schema-load state (DB_SchemaLoaded) when this prepare starts
         let c_unloaded = inner.db_set.c_any_schema_unloaded();
+        inner.db_set.c_note_encoding_fixed();
         inner.db_set.set_c_prepare_unloaded(c_unloaded);
         let (stmt_opt, tail) = match parse_one(sql) {
             Ok(x) => x,
             Err(e) => {
                 if !cgen::is_explain(sql) {
-                    return Err(e);
-                }
-                match cgen::c_explain_tail(inner, sql) {
-                    (cgen::CExplain::Error { message, offset }, _) => {
+                    // A statement the engine's parser rejects: when C's parser (the port)
+                    // rejects it too, the message and the byte offset are C's (e.g. the
+                    // first `SELECT` of a connection loses the offset of an error that
+                    // `sqlite3Init()` clears, see `Db.encoding_fixed`).
+                    if let (cgen::CExplain::Error { message, offset }, _, loaded) = cgen::c_explain_tail(inner, sql) {
+                        if loaded {
+                            // C's sqlite3ReadSchema() loaded the schemas before the error
+                            inner.db_set.c_mark_schemas_loaded();
+                        }
                         let ce = SqliteError::new(ErrorCode::Error, message);
                         return Err(ce.with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }));
                     }
-                    (cgen::CExplain::Program(prog), tail_ofs) => {
+                    return Err(e);
+                }
+                match cgen::c_explain_tail(inner, sql) {
+                    (cgen::CExplain::Error { message, offset }, _, loaded) => {
+                        if loaded {
+                            // C's sqlite3ReadSchema() loaded the schemas before the error
+                            inner.db_set.c_mark_schemas_loaded();
+                        }
+                        let ce = SqliteError::new(ErrorCode::Error, message);
+                        return Err(ce.with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }));
+                    }
+                    (cgen::CExplain::Program(prog), tail_ofs, _) => {
                         c_explain_of_rejected = Some(prog);
                         let (stand_in, _) = parse_one("EXPLAIN SELECT 1")?;
                         (stand_in, &sql[tail_ofs.min(sql.len())..])
                     }
-                    (cgen::CExplain::Unsupported, _) => return Err(e),
+                    (cgen::CExplain::Unsupported, _, _) => return Err(e),
                 }
             }
         };
@@ -6751,24 +6804,31 @@ impl Statement {
         // differ until the next ANALYZE.
         {
             let target = match &stmt_opt {
-                Some(Stmt::Insert(i)) => Some(i.table.name.as_str()),
-                Some(Stmt::Update(u)) => Some(u.table.name.as_str()),
-                Some(Stmt::Delete(d)) => Some(d.table.name.as_str()),
-                Some(Stmt::DropTable { name, .. }) => Some(name.name.as_str()),
+                Some(Stmt::Insert(i)) => Some(&i.table),
+                Some(Stmt::Update(u)) => Some(&u.table),
+                Some(Stmt::Delete(d)) => Some(&d.table),
+                Some(Stmt::DropTable { name, .. }) => Some(name),
                 _ => None,
             };
-            if target.is_some_and(|t| t.eq_ignore_ascii_case("sqlite_stat1")) {
-                inner.db_set.c_mark_stat_dirty();
+            if let Some(t) = target
+                && t.name.eq_ignore_ascii_case("sqlite_stat1")
+            {
+                // (the database whose sqlite_stat1 it is; every database if that is not known)
+                let i_db = inner.db_set.find_relation_in_set(t).ok().flatten().map(|(id, _)| id.index());
+                inner.db_set.c_mark_stat_dirty(i_db);
             }
         }
-        let c_first_load = (needs_schema || matches!(stmt_opt, Some(Stmt::AttachDatabase { .. })))
+        // C reads the schema at prepare for more statements than the engine loads it for
+        // (pragmas with PragFlg_NeedSchema, the query form of PRAGMA encoding): C's state only.
+        let c_reads_schema = needs_schema || stmt_opt.as_ref().is_some_and(crate::engine::c_pragma_reads_schema);
+        let c_first_load = (c_reads_schema || matches!(stmt_opt, Some(Stmt::AttachDatabase { .. })))
             && inner.db_set.c_any_schema_unloaded();
         if needs_schema && !matches!(stmt_opt, Some(Stmt::Explain { .. })) {
             // (a statement that will be stepped: its OP_Transaction checks the cookie. EXPLAIN
             // does not run the program, so it still lists the cookie that is ahead.)
             inner.db_set.c_apply_cookie_ahead();
         }
-        if needs_schema || matches!(stmt_opt, Some(Stmt::AttachDatabase { .. })) {
+        if c_reads_schema || matches!(stmt_opt, Some(Stmt::AttachDatabase { .. })) {
             // sqlite3ReadSchema() -> sqlite3Init(): every schema is loaded from here on
             inner.db_set.c_mark_schemas_loaded();
         }
@@ -8843,7 +8903,7 @@ impl Statement {
                 let exec_res = match &self.c_explain {
                     Some(prog) => Ok(engine::QueryOutput {
                         column_names: explain_column_names(prog.explain),
-                        rows: prog.list(prog.explain.max(1)),
+                        rows: c_list_rows(prog, inner.effective_encoding()),
                     }),
                     None => exec_res,
                 };
@@ -13374,6 +13434,8 @@ mod c_align_h6b_tests;
 mod c_align_v1_tests;
 #[cfg(test)]
 mod c_align_v2_tests;
+#[cfg(test)]
+mod c_align_v3_tests;
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
 /// value below is what the reference `sqlite3` produces for the same statements.
 #[cfg(test)]

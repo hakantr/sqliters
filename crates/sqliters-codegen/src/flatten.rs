@@ -418,7 +418,17 @@ fn subst_expr(p: &mut Parse, x: &mut SubstContext, e: ExprId) -> ExprId {
         let l = p.e(e).x_list();
         subst_expr_list(p, x, l);
     }
-    // (EP_WinFunc: window functions are reported as unsupported before any flattening)
+    if p.e(e).has(EP_WinFunc) {
+        let wn = p.e(e).y_win;
+        let (f, part, ob) = {
+            let w = &p.a_win[wn.ix()];
+            (w.p_filter, w.p_partition, w.p_order_by)
+        };
+        let nf = subst_expr(p, x, f);
+        p.a_win[wn.ix()].p_filter = nf;
+        subst_expr_list(p, x, part);
+        subst_expr_list(p, x, ob);
+    }
     e
 }
 

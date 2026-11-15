@@ -227,16 +227,6 @@ impl ColumnSchema {
         self.default_p4_for_table(false)
     }
 
-    /// `sqlite3ValueFromExpr(db, pDflt, enc, pCol->affinity, &v)` of the DEFAULT expression,
-    /// as `sqlite3ColumnDefault()` computes it for the P4 operand of `OP_Column` (`None` when
-    /// the expression is not a constant C can fold).
-    pub(crate) fn default_value_for_cgen(&self) -> Option<Value> {
-        self.default_expr.as_ref().and_then(|e| {
-            default_float_token_text(e, self.default_src.as_deref(), self.affinity)
-                .or_else(|| default_value_from_expr(e, self.affinity))
-        })
-    }
-
     /// Estimates column width (`pCol->szEst` in `sqlite/src/build.c:1559-1775`), where 1 unit = 4 bytes.
     pub fn estimated_width(&self) -> u32 {
         let trimmed = self.type_name.trim();
@@ -866,6 +856,10 @@ pub struct SchemaData {
     pub schema_cookie: u32,
     pub loaded: bool,
     pub had_pages: bool,
+    /// The rows of `sqlite_stat1` (tbl, idx, stat) in the order `sqlite3AnalysisLoad()` reads
+    /// them, as last read by [`Schema::reload_stat1`]: C's code generator (the port) loads
+    /// its statistics from them with C's `analysisLoader()`.
+    pub stat1_rows: Vec<(String, Option<String>, String)>,
 }
 
 /// Copy-on-write (`Arc`-backed) schema handle so `Schema::clone` and `snapshot_open_schemas`
@@ -1100,6 +1094,7 @@ impl Schema {
                 schema_cookie: btree.pager().header().schema_cookie,
                 loaded: true,
                 had_pages: false,
+                stat1_rows: Vec::new(),
             }))
         } else {
             Self::load_inner(btree, db_schema_name)
@@ -1505,6 +1500,7 @@ impl Schema {
             schema_cookie: btree.pager().header().schema_cookie,
             loaded: true,
             had_pages: true,
+            stat1_rows: Vec::new(),
         });
         let _ = schema.reload_stat1(btree);
         Ok(schema)
@@ -1528,6 +1524,7 @@ impl Schema {
         }
 
         let data = Arc::make_mut(&mut self.0);
+        data.stat1_rows.clear();
         for tbl in &mut data.tables {
             tbl.stat1 = TableStat1::default();
             tbl.without_rowid_pk_stat1 = None;
@@ -1589,6 +1586,11 @@ impl Schema {
             else {
                 continue;
             };
+            Arc::make_mut(&mut self.0).stat1_rows.push((
+                tbl_str.clone(),
+                val_to_stat_text(idx_val),
+                stat_str.clone(),
+            ));
             let Some(tbl_pos) = self
                 .tables
                 .iter()
@@ -1680,6 +1682,7 @@ pub fn build_table_schema_from_ast(
     let mut autoincrement = false;
     let mut has_pk = false;
     let mut inline_autos: Vec<PendingAutoIndex> = Vec::new();
+    let mut deferred_wr_ipk: Option<(ConflictAction, Vec<IndexedColSchema>)> = None;
 
     for (col_idx, cdef) in ct.columns.iter().enumerate() {
         // Check duplicate column name
@@ -1815,10 +1818,12 @@ pub fn build_table_schema_from_ast(
         if is_pk {
             // In SQLite, `col INTEGER PRIMARY KEY` (exact declared type `INTEGER` and not `WITHOUT ROWID` and not `DESC`)
             // aliases the B+Tree rowid (`pTab->iPKey = col_idx`) and does NOT create an autoindex!
-            if !ct.without_rowid
-                && !pk_desc
-                && cdef.type_name.trim().eq_ignore_ascii_case("INTEGER")
-            {
+            // `sqlite3AddPrimaryKey`: one column whose type is exactly INTEGER, not DESC, is
+            // the rowid alias for the parser, which does not know yet whether WITHOUT ROWID
+            // follows. For a WITHOUT ROWID table `convertToWithoutRowidTable` creates the
+            // PRIMARY KEY index at the end of the statement, after every UNIQUE index.
+            let ipk_shape = !pk_desc && cdef.type_name.trim().eq_ignore_ascii_case("INTEGER");
+            if !ct.without_rowid && ipk_shape {
                 rowid_alias_col = Some(col_idx);
                 rowid_pk_conflict = pk_conflict;
                 autoincrement = pk_autoinc;
@@ -1831,25 +1836,30 @@ pub fn build_table_schema_from_ast(
                     };
                     return Err(SqliteError::new(ErrorCode::Error, msg));
                 }
-                push_inline_autoindex(
-                    tbl_name,
-                    &mut inline_autos,
-                    pk_conflict,
-                    "pk",
-                    vec![IndexedColSchema {
-                        col_idx: Some(col_idx),
-                        expr: None,
-                        name: cdef.name.clone(),
-                        sort_order: KeySortOrder {
-                            desc: pk_desc,
-                            nulls_last: pk_desc,
-                            collation,
-                            custom_collation: custom_collation
-                                .as_deref()
-                                .map(CustomCollation::unbound),
-                        },
-                    }],
-                )?;
+                let pk_cols_vec = vec![IndexedColSchema {
+                    col_idx: Some(col_idx),
+                    expr: None,
+                    name: cdef.name.clone(),
+                    sort_order: KeySortOrder {
+                        desc: pk_desc,
+                        nulls_last: pk_desc,
+                        collation,
+                        custom_collation: custom_collation
+                            .as_deref()
+                            .map(CustomCollation::unbound),
+                    },
+                }];
+                if ct.without_rowid && ipk_shape {
+                    deferred_wr_ipk = Some((pk_conflict, pk_cols_vec));
+                } else {
+                    push_inline_autoindex(
+                        tbl_name,
+                        &mut inline_autos,
+                        pk_conflict,
+                        "pk",
+                        pk_cols_vec,
+                    )?;
+                }
             }
         }
 
@@ -1896,18 +1906,43 @@ pub fn build_table_schema_from_ast(
                     }
                 }
 
-                // Single-column `PRIMARY KEY(col)` (ASC) on a column declared `INTEGER` is also a rowid alias!
-                if !ct.without_rowid
-                    && resolved.len() == 1
-                    && !resolved[0].sort_order.desc
-                    && let Some(pk_ci) = resolved[0].col_idx
-                    && columns[pk_ci]
-                        .type_name
-                        .trim()
-                        .eq_ignore_ascii_case("INTEGER")
+                // Single-column `PRIMARY KEY(col)` on a column declared `INTEGER` is also a
+                // rowid alias, with or without DESC (`sqlite3AddPrimaryKey` is called with
+                // sortOrder==0 for the table constraint; the DESC of the list is only kept in
+                // `pParse->iPkSortOrder` for a WITHOUT ROWID table, whose PRIMARY KEY index
+                // `convertToWithoutRowidTable` creates at the end of the statement, with the
+                // collation of the column).
+                let ipk_ci = if resolved.len() == 1 {
+                    resolved[0].col_idx.filter(|&ci| {
+                        columns[ci].type_name.trim().eq_ignore_ascii_case("INTEGER")
+                    })
+                } else {
+                    None
+                };
+                if let Some(pk_ci) = ipk_ci
+                    && !ct.without_rowid
                 {
                     rowid_alias_col = Some(pk_ci);
                     rowid_pk_conflict = *conflict;
+                } else if let Some(pk_ci) = ipk_ci {
+                    let desc = resolved[0].sort_order.desc;
+                    deferred_wr_ipk = Some((
+                        *conflict,
+                        vec![IndexedColSchema {
+                            col_idx: Some(pk_ci),
+                            expr: None,
+                            name: columns[pk_ci].name.clone(),
+                            sort_order: KeySortOrder {
+                                desc,
+                                nulls_last: desc,
+                                collation: columns[pk_ci].collation,
+                                custom_collation: columns[pk_ci]
+                                    .custom_collation
+                                    .as_deref()
+                                    .map(CustomCollation::unbound),
+                            },
+                        }],
+                    ));
                 } else {
                     push_inline_autoindex(tbl_name, &mut inline_autos, *conflict, "pk", resolved)?;
                 }
@@ -2007,6 +2042,12 @@ pub fn build_table_schema_from_ast(
             ));
         }
         // `convertToWithoutRowidTable` in `sqlite/src/build.c`:
+        // 0. A PRIMARY KEY that the parser took for the rowid alias gets its index now: it
+        //    is the last automatic index of the table (or an identical UNIQUE index becomes
+        //    the PRIMARY KEY).
+        if let Some((pk_conflict, pk_cols_vec)) = deferred_wr_ipk.take() {
+            push_inline_autoindex(tbl_name, &mut inline_autos, pk_conflict, "pk", pk_cols_vec)?;
+        }
         // 1. Locate the `"pk"` autoindex and deduplicate repeated `(col_idx, collation)` columns.
         let Some(pk_pos) = inline_autos.iter().position(|a| a.origin == "pk") else {
             return Err(SqliteError::new(

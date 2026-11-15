@@ -23,7 +23,7 @@ use crate::tk::*;
 ///
 /// The collating sequence for the compound select is taken from the left-most term of the
 /// select that has a collating sequence.
-fn multi_select_coll_seq(p: &mut Parse, sel: SelectId, i_col: i32) -> Option<Arc<CollSeq>> {
+pub(crate) fn multi_select_coll_seq(p: &mut Parse, sel: SelectId, i_col: i32) -> Option<Arc<CollSeq>> {
     let prior = p.s(sel).p_prior;
     let mut ret = if prior.nn() { multi_select_coll_seq(p, prior, i_col) } else { None };
     // iCol must be less than p->pEList->nExpr. Otherwise an error would have been thrown
@@ -39,7 +39,7 @@ fn multi_select_coll_seq(p: &mut Parse, sel: SelectId, i_col: i32) -> Option<Arc
 /// `sel` (which is a compound) is used to build a KeyInfo for the merge: each term gets the
 /// collating sequence of the corresponding result column (an explicit COLLATE operator is
 /// added to the term).
-fn multi_select_by_merge_key_info(p: &mut Parse, sel: SelectId, n_extra: i32) -> KeyInfo {
+pub(crate) fn multi_select_by_merge_key_info(p: &mut Parse, sel: SelectId, n_extra: i32) -> KeyInfo {
     let order_by = p.s(sel).p_order_by;
     let n_order_by = if order_by.nn() { p.l(order_by).n_expr() } else { 0 };
     let mut ret = KeyInfo::alloc(p.enc(), (n_order_by + n_extra) as usize, 1);
@@ -170,7 +170,26 @@ fn generate_output_subroutine(
             p.v.add_op1(OP_Yield, dest.i_sd_parm);
         }
         SRT_DistQueue | SRT_Queue => {
-            p.not_supported("recursive common table expression (SRT_Queue)");
+            let i_parm = dest.i_sd_parm;
+            let so = dest.p_order_by;
+            let n_key = p.l(so).n_expr();
+            let r1 = sqlite3_get_temp_reg(p);
+            let r2 = sqlite3_get_temp_range(p, n_key + 2);
+            let r3 = r2 + n_key + 1;
+
+            p.v.add_op3(OP_MakeRecord, p_in.i_sdst, p_in.n_sdst, r3);
+            if dest.e_dest as i32 == SRT_DistQueue {
+                p.v.add_op2(OP_IdxInsert, i_parm + 1, r3);
+            }
+            for ii in 0..n_key {
+                let col = p.l(so).a[ii as usize].i_order_by_col as i32;
+                p.v.add_op2(OP_SCopy, p_in.i_sdst + col - 1, r2 + ii);
+            }
+            p.v.add_op2(OP_Sequence, i_parm, r2 + n_key);
+            p.v.add_op3(OP_MakeRecord, r2, n_key + 2, r1);
+            p.v.add_op4_int(OP_IdxInsert, i_parm, r1, r2, n_key + 2);
+            sqlite3_release_temp_reg(p, r1);
+            sqlite3_release_temp_range(p, r2, n_key + 2);
         }
         // Ignore the output
         SRT_Discard => {}

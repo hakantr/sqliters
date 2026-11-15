@@ -81,7 +81,8 @@ pub fn guess_error_offset(sql: &str, msg: &str) -> Option<usize> {
         let rest = msg.strip_suffix(" already exists")?;
         let name = rest
             .strip_prefix("table ")
-            .or_else(|| rest.strip_prefix("index "))
+            // (not "index %s already exists": build.c:4168 formats the name with %s, so C
+            // records no error offset)
             .or_else(|| rest.strip_prefix("view "))
             .or_else(|| rest.strip_prefix("trigger "))?;
         Want::Created(name)

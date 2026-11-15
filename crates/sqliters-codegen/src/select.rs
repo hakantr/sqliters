@@ -1677,7 +1677,7 @@ pub fn sqlite3_result_set_of_select(p: &mut Parse, select: SelectId, aff: u8) ->
 /// message is left in pParse->zErrMsg.
 pub fn sqlite3_view_get_column_names(p: &mut Parse, tab: TableId) -> i32 {
     // A positive nCol means the columns names for this view are already known.
-    if !p.tab(tab).is_virtual() && p.tab(tab).view_cols_done && !p.tab(tab).a_col.is_empty() && !p.tab(tab).view_busy {
+    if !p.tab(tab).is_virtual() && !p.tab(tab).a_col.is_empty() && !p.tab(tab).view_busy {
         return 0;
     }
     let mut n_err = 0;
@@ -1710,9 +1710,6 @@ pub fn sqlite3_view_get_column_names(p: &mut Parse, tab: TableId) -> i32 {
     // view and will assign cursors to the elements of the FROM clause. But we do not want
     // these changes to be permanent. So the computation is done on a copy of the SELECT
     // statement that defines the view.
-    if !crate::schema::ensure_view_select(p, tab) {
-        return 1 + p.n_err;
-    }
     let vs = p.tab(tab).p_select;
     let sel = sqlite3_select_dup(p, vs, 0);
     if sel.nn() {
@@ -1753,7 +1750,6 @@ pub fn sqlite3_view_get_column_names(p: &mut Parse, tab: TableId) -> i32 {
         let t = p.tabm(tab);
         t.n_nv_col = n;
         t.view_busy = false;
-        t.view_cols_done = true;
         // sqlite3DeleteTable(db, pSelTab); sqlite3SelectDelete(db, pSel): the tables the copy
         // of the view's SELECT referred to are released (Table.nTabRef--).
         fn release_cb(p: &mut Parse, _w: &mut Walker, s: SelectId) -> i32 {
@@ -2396,8 +2392,40 @@ fn select_inner_loop(
                 p.v.add_op2(OP_ResultRow, reg_result, n_result_col);
             }
         }
+        // Write the results into a priority queue that is order according to pDest->pOrderBy
+        // (in pSO). pDest->iSDParm (in iParm) is the cursor for an index with pSO->nExpr+2
+        // columns. Build a key using pSO for the first N columns, and the Sequence
+        // (OP_Sequence) as the N+1-th column. The final column is the record containing the
+        // result set.
         SRT_DistQueue | SRT_Queue => {
-            p.not_supported("SELECT destination of a recursive CTE");
+            let so = dest.p_order_by;
+            let n_key = p.l(so).n_expr();
+            let r1 = sqlite3_get_temp_reg(p);
+            let r2 = sqlite3_get_temp_range(p, n_key + 2);
+            let r3 = r2 + n_key + 1;
+            let mut addr_test = 0;
+            if e_dest == SRT_DistQueue {
+                // If the destination is DistQueue, then cursor (iParm+1) is open on a second
+                // ephemeral index that holds all values every previously added to the queue.
+                addr_test = p.v.add_op4_int(OP_Found, i_parm + 1, 0, reg_result, n_result_col);
+            }
+            p.v.add_op3(OP_MakeRecord, reg_result, n_result_col, r3);
+            if e_dest == SRT_DistQueue {
+                p.v.add_op2(OP_IdxInsert, i_parm + 1, r3);
+                p.v.change_p5(OPFLAG_USESEEKRESULT as u16);
+            }
+            for i in 0..n_key {
+                let col = p.l(so).a[i as usize].i_order_by_col as i32;
+                p.v.add_op2(OP_SCopy, reg_result + col - 1, r2 + i);
+            }
+            p.v.add_op2(OP_Sequence, i_parm, r2 + n_key);
+            p.v.add_op3(OP_MakeRecord, r2, n_key + 2, r1);
+            p.v.add_op4_int(OP_IdxInsert, i_parm, r1, r2, n_key + 2);
+            if addr_test != 0 {
+                p.v.jump_here(addr_test);
+            }
+            sqlite3_release_temp_reg(p, r1);
+            sqlite3_release_temp_range(p, r2, n_key + 2);
         }
         // Discard the results. This is used for SELECT statements inside the body of a
         // TRIGGER. The purpose of such selects is to call user-defined functions that have
@@ -2688,6 +2716,192 @@ pub(crate) fn union_with_limit_one(p: &mut Parse, sel: SelectId) -> bool {
     true
 }
 
+/// `hasAnchor(p)`: return true if the SELECT statement which is known to be the recursive part
+/// of a recursive CTE still has its anchor terms attached. If the anchor terms have already
+/// been removed, return false.
+fn has_anchor(p: &Parse, mut sel: SelectId) -> bool {
+    while sel.nn() && (p.s(sel).sel_flags & SF_Recursive) != 0 {
+        sel = p.s(sel).p_prior;
+    }
+    sel.nn()
+}
+
+/// `generateWithRecursiveQuery(pParse, p, pDest)`: this routine generates VDBE code to compute
+/// the content of a WITH RECURSIVE query of the form:
+///
+/// ```text
+///   <recursive-table> AS (<setup-query> UNION [ALL] <recursive-query>)
+///                         \___________/             \_______________/
+///                           p->pPrior                      p
+/// ```
+///
+/// There is exactly one reference to the recursive-table in the FROM clause of
+/// recursive-query, marked with the SrcList->a[].fg.isRecursive flag.
+///
+/// The setup-query runs once to generate an initial set of rows that go into a Queue table.
+/// Rows are extracted from the Queue table one by one. Each row extracted from Queue is
+/// output to pDest. Then the single extracted row (now in the iCurrent table) becomes the
+/// content of the recursive-table for a recursive-query run. The output of the
+/// recursive-query is added to the Queue table. Then another row is extracted from Queue and
+/// the iteration continues until the Queue table is empty.
+///
+/// If the compound query operator is UNION then no duplicate rows are ever inserted into the
+/// Queue table. The iDistinct table keeps a copy of all rows that have ever been inserted
+/// into Queue and causes duplicates to be discarded. If the operator is UNION ALL, then
+/// duplicates are allowed.
+///
+/// If the query has an ORDER BY, then entries in the Queue table are kept in ORDER BY order
+/// and the first entry is extracted for each cycle. Without an ORDER BY, the Queue table is
+/// just a FIFO.
+///
+/// If a LIMIT clause is provided, then the iteration stops after LIMIT rows have been output
+/// to pDest. A LIMIT of zero means to output no rows and a negative LIMIT means to output
+/// all rows. If there is also an OFFSET clause, then that many initial rows are skipped
+/// before any rows are output.
+fn generate_with_recursive_query(p: &mut Parse, sel: SelectId, dest: &mut SelectDest) {
+    let src = p.s(sel).p_src; // The FROM clause of the recursive query
+    let mut n_col = p.l(p.s(sel).p_e_list).n_expr(); // Number of columns in the recursive table
+    let mut i_current = 0; // The Current table
+    let mut i_distinct = 0; // To ensure unique results if UNION
+
+    // (p->pWin: window functions are reported as unsupported by the parser)
+
+    // (sqlite3AuthCheck(pParse, SQLITE_RECURSIVE, ...): authorization is done by the engine)
+
+    // Process the LIMIT and OFFSET clauses, if they exist
+    let addr_break = p.v.make_label();
+    p.sm(sel).n_select_row = 320; // 4 billion rows
+    compute_limit_registers(p, sel, addr_break);
+    let limit = p.s(sel).p_limit;
+    let reg_limit = p.s(sel).i_limit;
+    let reg_offset = p.s(sel).i_offset;
+    p.sm(sel).p_limit = ExprId::NULL;
+    p.sm(sel).i_limit = 0;
+    p.sm(sel).i_offset = 0;
+    let order_by = p.s(sel).p_order_by;
+
+    // Locate the cursor number of the Current table
+    for it in &p.src(src).a {
+        if it.is_recursive {
+            i_current = it.i_cursor;
+            break;
+        }
+    }
+
+    // Allocate cursors numbers for Queue and Distinct. The cursor number for the Distinct
+    // table must be exactly one greater than Queue in order for the SRT_DistFifo and
+    // SRT_DistQueue destinations to work.
+    let i_queue = p.n_tab;
+    p.n_tab += 1;
+    let e_dest;
+    if p.s(sel).op == TK_UNION {
+        e_dest = if order_by.nn() { SRT_DistQueue } else { SRT_DistFifo };
+        i_distinct = p.n_tab;
+        p.n_tab += 1;
+    } else {
+        e_dest = if order_by.nn() { SRT_Queue } else { SRT_Fifo };
+    }
+    let mut dest_queue = sqlite3_select_dest_init(e_dest, i_queue);
+
+    // Allocate cursors for Current, Queue, and Distinct.
+    p.n_mem += 1;
+    let reg_current = p.n_mem;
+    p.v.add_op3(OP_OpenPseudo, i_current, reg_current, n_col);
+    if order_by.nn() {
+        let key_info = crate::merge::multi_select_by_merge_key_info(p, sel, 1);
+        let n = p.l(order_by).n_expr();
+        p.v.add_op4(OP_OpenEphemeral, i_queue, n + 2, 0, P4::KeyInfo(Arc::new(key_info)));
+        dest_queue.p_order_by = order_by;
+    } else {
+        p.v.add_op2(OP_OpenEphemeral, i_queue, n_col);
+    }
+    if i_distinct != 0 {
+        // Generate an ephemeral table used to enforce distinctness on the output of the
+        // recursive part of the CTE.
+        n_col = p.l(p.s(sel).p_e_list).n_expr();
+        let mut key_info = KeyInfo::alloc(p.enc(), n_col as usize, 1);
+        for i in 0..n_col {
+            let c = match crate::merge::multi_select_coll_seq(p, sel, i) {
+                Some(c) => c,
+                None => crate::callback::dflt_coll(p),
+            };
+            key_info.a_coll[i as usize] = Some(c);
+        }
+        p.v.add_op4(OP_OpenEphemeral, i_distinct, n_col, 0, P4::KeyInfo(Arc::new(key_info)));
+    }
+
+    // Detach the ORDER BY clause from the compound SELECT
+    p.sm(sel).p_order_by = ExprListId::NULL;
+
+    // Figure out how many elements of the compound SELECT are part of the recursive query.
+    // Make sure no recursive elements use aggregate functions. Mark the recursive elements as
+    // UNION ALL even if they are really UNION because the distinctness will be enforced by
+    // the iDistinct table. pFirstRec is left pointing to the left-most recursive term of the
+    // CTE.
+    let mut first_rec = sel;
+    let mut ok = true;
+    loop {
+        if p.s(first_rec).sel_flags & SF_Aggregate != 0 {
+            p.error_msg("recursive aggregate queries not supported".to_owned());
+            ok = false;
+            break;
+        }
+        p.sm(first_rec).op = TK_ALL;
+        let prior = p.s(first_rec).p_prior;
+        if (p.s(prior).sel_flags & SF_Recursive) == 0 {
+            break;
+        }
+        first_rec = prior;
+    }
+
+    if ok {
+        // Store the results of the setup-query in Queue.
+        let setup = p.s(first_rec).p_prior;
+        p.sm(setup).p_next = SelectId::NULL;
+        crate::build::sqlite3_vdbe_explain(p, true, "SETUP".to_owned());
+        let rc = sqlite3_select(p, setup, &mut dest_queue);
+        p.sm(setup).p_next = sel;
+        if rc == 0 {
+            // Find the next row in the Queue and output that row
+            let addr_top = p.v.add_op2(OP_Rewind, i_queue, addr_break);
+
+            // Transfer the next row in Queue over to Current
+            p.v.add_op1(OP_NullRow, i_current); // To reset column cache
+            if order_by.nn() {
+                let n = p.l(order_by).n_expr();
+                p.v.add_op3(OP_Column, i_queue, n + 1, reg_current);
+            } else {
+                p.v.add_op2(OP_RowData, i_queue, reg_current);
+            }
+            p.v.add_op1(OP_Delete, i_queue);
+
+            // Output the single row in Current
+            let addr_cont = p.v.make_label();
+            code_offset(p, reg_offset, addr_cont);
+            select_inner_loop(p, sel, i_current, None, None, dest, addr_cont, addr_break);
+            if reg_limit != 0 {
+                p.v.add_op2(OP_DecrJumpZero, reg_limit, addr_break);
+            }
+            p.v.resolve_label(addr_cont);
+
+            // Execute the recursive SELECT taking the single row in Current as the value for
+            // the recursive-table. Store the results in the Queue.
+            p.sm(first_rec).p_prior = SelectId::NULL;
+            crate::build::sqlite3_vdbe_explain(p, true, "RECURSIVE STEP".to_owned());
+            sqlite3_select(p, sel, &mut dest_queue);
+            p.sm(first_rec).p_prior = setup;
+
+            // Keep running the loop until the Queue is empty
+            p.v.goto(addr_top);
+            p.v.resolve_label(addr_break);
+        }
+    }
+
+    // end_of_recursive_query:
+    p.sm(sel).p_order_by = order_by;
+    p.sm(sel).p_limit = limit;
+}
+
 /// `multiSelect(pParse, p, pDest)`: this routine is called to process a compound query form
 /// from two or more separate queries using UNION, UNION ALL, EXCEPT, or INTERSECT. The
 /// right-most SELECT is `sel`; the others are found through `pPrior`.
@@ -2713,9 +2927,8 @@ fn multi_select(p: &mut Parse, sel: SelectId, p_dest: &mut SelectDest) -> i32 {
     if !done {
         // Make sure all SELECTs in the statement have the same number of elements in their
         // result sets.
-        if (p.s(sel).sel_flags & SF_Recursive) != 0 {
-            p.not_supported("recursive common table expression");
-            return 1;
+        if (p.s(sel).sel_flags & SF_Recursive) != 0 && has_anchor(p, sel) {
+            generate_with_recursive_query(p, sel, &mut dest);
         } else if p.s(sel).p_order_by.nn() {
             return crate::merge::multi_select_by_merge(p, sel, p_dest);
         } else if p.s(sel).op != TK_ALL && !union_with_limit_one(p, sel) {
@@ -2851,8 +3064,139 @@ fn analyze_agg_func_args(p: &mut Parse, agg: AggInfoId, nc: NcId) {
             let l = p.e(left).x_list();
             sqlite3_expr_analyze_agg_list(p, nc, l);
         }
+        if p.e(e).has(EP_WinFunc) {
+            let f = p.a_win[p.e(e).y_win.ix()].p_filter;
+            sqlite3_expr_analyze_aggregates(p, nc, f);
+        }
     }
     p.ncm(nc).nc_flags &= !NC_InAggFunc;
+}
+
+/// The aggregate-info dump (verification aid; the C side is `v3DumpAgg()` of the instrumented
+/// scratch amalgamation): the AggInfo object as the code generator uses it, with the decisions
+/// of the aggregate half of sqlite3Select() in `x`.
+fn dump_agg(p: &mut Parse, sel: SelectId, agg: AggInfoId, p_where: ExprId, kind: &str, x: [i32; 4]) {
+    if p.where_dump.is_none() {
+        return;
+    }
+    fn count_and(p: &Parse, e: ExprId) -> i32 {
+        if e.is_null() {
+            0
+        } else if p.e(e).op == TK_AND {
+            count_and(p, p.e(e).p_left) + count_and(p, p.e(e).p_right)
+        } else {
+            1
+        }
+    }
+    let a = p.agg(agg);
+    let gb = p.s(sel).p_group_by;
+    let mut out = vec![format!(
+        "AGG {} sel={} nCol={} nAcc={} nFunc={} nSortCol={} sortIdx={} sortPTab={} useSortIdx={} firstReg={} x=[{},{},{},{}] nWhere={} nHaving={} nGroupBy={}",
+        kind,
+        p.s(sel).sel_id,
+        a.n_column(),
+        a.n_accumulator,
+        a.n_func(),
+        a.n_sorting_column,
+        a.sorting_idx,
+        a.sorting_idx_p_tab,
+        a.use_sorting_idx,
+        a.i_first_reg,
+        x[0],
+        x[1],
+        x[2],
+        x[3],
+        count_and(p, p_where),
+        count_and(p, p.s(sel).p_having),
+        if gb.nn() { p.l(gb).n_expr() } else { 0 }
+    )];
+    for (i, c) in a.a_col.iter().enumerate() {
+        out.push(format!(
+            "AGGCOL {} tab={} iTable={} iColumn={} iSorter={} op={}",
+            i,
+            if c.p_tab.nn() { p.tab(c.p_tab).z_name.as_str() } else { "-" },
+            c.i_table,
+            c.i_column,
+            c.i_sorter_column,
+            if c.p_c_expr.nn() { p.e(c.p_c_expr).op as i32 } else { 0 }
+        ));
+    }
+    for (i, f) in a.a_func.iter().enumerate() {
+        let l = if f.p_f_expr.nn() { p.e(f.p_f_expr).x_list() } else { ExprListId::NULL };
+        out.push(format!(
+            "AGGFUNC {} name={} nArg={} iDistinct={} iOBTab={} bOBPayload={} bOBUnique={} bUseSubtype={} filter={}",
+            i,
+            f.p_func.as_ref().map_or("-", |d| d.name.as_str()),
+            if l.nn() { p.l(l).n_expr() } else { 0 },
+            f.i_distinct,
+            f.i_ob_tab,
+            f.b_ob_payload as i32,
+            f.b_ob_unique as i32,
+            f.b_use_subtype as i32,
+            (f.p_f_expr.nn() && p.e(f.p_f_expr).has(EP_WinFunc)) as i32
+        ));
+    }
+    if let Some(d) = p.where_dump.as_mut() {
+        d.extend(out);
+    }
+}
+
+/// `optimizeAggregateUseOfIndexedExpr(pParse, pSelect, pAggInfo, pNC)`: an index on
+/// expressions is being used in the inner loop of an aggregate query with a GROUP BY clause.
+/// This routine attempts to adjust the AggInfo object to take advantage of index and to
+/// perhaps use the index as a covering index.
+fn optimize_aggregate_use_of_indexed_expr(p: &mut Parse, sel: SelectId, agg: AggInfoId, nc: NcId) {
+    let n_acc = p.agg(agg).n_accumulator as usize;
+    p.aggm(agg).a_col.truncate(n_acc);
+    if p.agg(agg).n_sorting_column > 0 {
+        let mut mx = p.l(p.s(sel).p_group_by).n_expr() - 1;
+        for c in &p.agg(agg).a_col {
+            let k = c.i_sorter_column;
+            if k > mx {
+                mx = k;
+            }
+        }
+        p.aggm(agg).n_sorting_column = (mx + 1) as u32;
+    }
+    analyze_agg_func_args(p, agg, nc);
+}
+
+/// `aggregateIdxEprRefToColCallback(pWalker, pExpr)`: walker callback for
+/// aggregateConvertIndexedExprRefToColumn().
+fn aggregate_idx_epr_ref_to_col_callback(p: &mut Parse, _w: &mut Walker, e: ExprId) -> i32 {
+    let x = p.e(e);
+    if x.p_agg_info.is_null() {
+        return WRC_Continue;
+    }
+    if x.op == TK_AGG_COLUMN || x.op == TK_AGG_FUNCTION || x.op == TK_IF_NULL_ROW {
+        return WRC_Continue;
+    }
+    let agg = x.p_agg_info;
+    let i_agg = x.i_agg as i32;
+    if i_agg >= p.agg(agg).n_column() {
+        return WRC_Continue;
+    }
+    let (i_table, i_column) = {
+        let c = &p.agg(agg).a_col[i_agg as usize];
+        (c.i_table, c.i_column)
+    };
+    let x = p.em(e);
+    x.op = TK_AGG_COLUMN;
+    x.i_table = i_table;
+    x.i_column = i_column as i16;
+    x.flags &= !(EP_Skip | EP_Collate | EP_Unlikely);
+    WRC_Prune
+}
+
+/// `aggregateConvertIndexedExprRefToColumn(pAggInfo)`: convert every pAggInfo->aFunc[].pExpr
+/// such that any node within those expressions that has pAppInfo set is changed into a
+/// TK_AGG_COLUMN opcode.
+fn aggregate_convert_indexed_expr_ref_to_column(p: &mut Parse, agg: AggInfoId) {
+    let mut w = Walker { x_expr_callback: Some(aggregate_idx_epr_ref_to_col_callback), ..Walker::default() };
+    for i in 0..p.agg(agg).a_func.len() {
+        let e = p.agg(agg).a_func[i].p_f_expr;
+        sqlite3_walk_expr(p, &mut w, e);
+    }
 }
 
 /// `assignAggregateRegisters(pParse, pAggInfo)`: allocate a block of registers so that there
@@ -3004,7 +3348,29 @@ fn update_accumulator(p: &mut Parse, reg_acc: i32, agg: AggInfoId, e_distinct_ty
         let mut reg_agg_sz = 0;
         let mut reg_distinct = 0;
         let list = p.e(f.p_f_expr).x_list();
-        // (EP_WinFunc / FILTER: not ported in step V1)
+        if p.e(f.p_f_expr).has(EP_WinFunc) {
+            let filter = p.a_win[p.e(f.p_f_expr).y_win.ix()].p_filter;
+            if p.agg(agg).n_accumulator != 0
+                && f.p_func.as_ref().is_some_and(|d| (d.func_flags & SQLITE_FUNC_NEEDCOLL) != 0)
+                && reg_acc != 0
+            {
+                // If regAcc==0, there there exists some min() or max() function without a
+                // FILTER clause that will ensure the magnet registers are populated.
+                if reg_hit == 0 {
+                    p.n_mem += 1;
+                    reg_hit = p.n_mem;
+                }
+                // If this is the first row of the group (regAcc contains 0), clear the
+                // "magnet" register regHit so that the accumulator registers are populated if
+                // the FILTER clause jumps over the the invocation of min() or max()
+                // altogether. Or, if this is not the first row (regAcc contains 1), set the
+                // magnet register so that the accumulators are not populated unless the
+                // min()/max() is invoked and indicates that they should be.
+                p.v.add_op2(OP_Copy, reg_acc, reg_hit);
+            }
+            addr_next = p.v.make_label();
+            sqlite3_expr_if_false(p, filter, addr_next, SQLITE_JUMPIFNULL);
+        }
         if f.i_ob_tab >= 0 {
             // Instead of invoking AggStep, we must push the arguments and inputs onto the
             // sorter and defer the AggStep until finalize.
@@ -3987,10 +4353,6 @@ fn sqlite3_select_body(p: &mut Parse, sel: SelectId, dest: &mut SelectDest, b_po
         // Processing for aggregates with GROUP BY is very different and much more complex
         // than aggregates without a GROUP BY. tag-select-0810
         if group_by.nn() {
-            if !p.src(tab_list).a.is_empty() {
-                p.not_supported("GROUP BY over a FROM clause");
-                return rc;
-            }
             let mut distinct = ExprListId::NULL;
             let mut dist_flag: u16 = 0;
             let n_group_by = p.l(group_by).n_expr();
@@ -4047,18 +4409,76 @@ fn sqlite3_select_body(p: &mut Parse, sel: SelectId, dest: &mut SelectDest, b_po
             let Some(winfo) = sqlite3_where_begin(p, tab_list, p_where, group_by, distinct, sel, flags, 0) else {
                 return rc;
             };
+            if !p.p_idx_epr.is_empty() {
+                let nc = p.new_nc(NameContext { p_src_list: tab_list, p_agg_info: agg, ..NameContext::default() });
+                optimize_aggregate_use_of_indexed_expr(p, sel, agg, nc);
+                p.a_nc.truncate(nc.ix());
+            }
             assign_aggregate_registers(p, agg);
             let e_dist = winfo.is_distinct();
-            if winfo.is_ordered() != n_group_by {
+            let group_by_sort;
+            let mut sort_p_tab = 0;
+            let mut sort_out = 0;
+            let mut winfo = Some(winfo);
+            if winfo.as_ref().is_some_and(|w| w.is_ordered() == n_group_by) {
+                // The optimizer is able to deliver rows in group by order so we do not have
+                // to sort. The OP_OpenEphemeral table will be cancelled later because we
+                // still need to use the pKeyInfo
+                group_by_sort = false;
+            } else {
                 // Rows are coming out in undetermined order. We have to push each row into a
                 // sorting index, terminate the first loop, then loop over the sorting index
                 // in order to get the output in sorted order
-                p.not_supported("GROUP BY that needs a sorter");
-                return rc;
+                let usage = if s_distinct.is_tnct != 0 && (p.s(sel).sel_flags & SF_Distinct) == 0 { "DISTINCT" } else { "GROUP BY" };
+                explain_temp_table(p, usage);
+
+                group_by_sort = true;
+                let mut n_col = n_group_by;
+                let mut j = n_group_by;
+                for i in 0..p.agg(agg).a_col.len() {
+                    if p.agg(agg).a_col[i].i_sorter_column >= j {
+                        n_col += 1;
+                        j += 1;
+                    }
+                }
+                let reg_base = sqlite3_get_temp_range(p, n_col);
+                sqlite3_expr_code_expr_list(p, group_by, reg_base, 0, 0);
+                j = n_group_by;
+                p.aggm(agg).direct_mode = 1;
+                for i in 0..p.agg(agg).a_col.len() {
+                    let (i_sorter_column, c_expr) = {
+                        let c = &p.agg(agg).a_col[i];
+                        (c.i_sorter_column, c.p_c_expr)
+                    };
+                    if i_sorter_column >= j {
+                        sqlite3_expr_code(p, c_expr, j + reg_base);
+                        j += 1;
+                    }
+                }
+                p.aggm(agg).direct_mode = 0;
+                let reg_record = sqlite3_get_temp_reg(p);
+                p.v.add_op3(OP_MakeRecord, reg_base, n_col, reg_record);
+                p.v.add_op2(OP_SorterInsert, sorting_idx, reg_record);
+                sqlite3_release_temp_reg(p, reg_record);
+                sqlite3_release_temp_range(p, reg_base, n_col);
+                sqlite3_where_end(p, winfo.take().expect("where info"));
+                sort_p_tab = p.n_tab;
+                p.n_tab += 1;
+                p.aggm(agg).sorting_idx_p_tab = sort_p_tab;
+                sort_out = sqlite3_get_temp_reg(p);
+                p.v.add_op3(OP_OpenPseudo, sort_p_tab, sort_out, n_col);
+                p.v.add_op2(OP_SorterSort, sorting_idx, addr_end);
+                p.aggm(agg).use_sorting_idx = 1;
             }
-            // The optimizer is able to deliver rows in group by order so we do not have to
-            // sort. The OP_OpenEphemeral table will be cancelled later because we still need
-            // to use the pKeyInfo
+
+            // If there are entries in pAgggInfo->aFunc[] that contain subexpressions that are
+            // indexed (and that were previously identified and tagged in
+            // optimizeAggregateUseOfIndexedExpr()) then those subexpressions must now be
+            // converted into a TK_AGG_COLUMN node so that the value is correctly pulled from
+            // the index rather than being recomputed.
+            if !p.p_idx_epr.is_empty() {
+                aggregate_convert_indexed_expr_ref_to_column(p, agg);
+            }
 
             // If the index or temporary table used by the GROUP BY sort will naturally
             // deliver rows in the order required by the ORDER BY clause, cancel the
@@ -4067,7 +4487,11 @@ fn sqlite3_select_body(p: &mut Parse, sel: SelectId, dest: &mut SelectDest, b_po
             // This is an optimization - the correct answer should result regardless. Use the
             // SQLITE_GroupByOrder flag with SQLITE_TESTCTRL_OPTIMIZER to disable this
             // optimization for testing purposes.
-            if order_by_grp && p.db.optimization_enabled(SQLITE_GroupByOrder) && winfo.is_sorted() {
+            dump_agg(p, sel, agg, p_where, "groupby", [group_by_sort as i32, order_by_grp as i32, e_dist, dist_flag as i32]);
+            if order_by_grp
+                && p.db.optimization_enabled(SQLITE_GroupByOrder)
+                && (group_by_sort || winfo.as_ref().is_some_and(|w| w.is_sorted()))
+            {
                 s_sort.p_order_by = ExprListId::NULL;
                 p.v.change_to_noop(s_sort.addr_sort_index);
             }
@@ -4076,13 +4500,21 @@ fn sqlite3_select_body(p: &mut Parse, sel: SelectId, dest: &mut SelectDest, b_po
             // location iBMem+0, b1 is iBMem+1, and so forth) Then compare the current GROUP
             // BY terms against the GROUP BY terms from the previous row currently stored in
             // a0, a1, a2...
+            let addr_top_of_loop = p.v.current_addr();
+            if group_by_sort {
+                p.v.add_op3(OP_SorterData, sorting_idx, sort_out, sort_p_tab);
+            }
             for j in 0..n_group_by {
                 let (i_order_by_col, ge) = {
                     let it = &p.l(group_by).a[j as usize];
                     (it.i_order_by_col as i32, it.p_expr)
                 };
-                p.aggm(agg).direct_mode = 1;
-                sqlite3_expr_code(p, ge, i_b_mem + j);
+                if group_by_sort {
+                    p.v.add_op3(OP_Column, sort_p_tab, j, i_b_mem + j);
+                } else {
+                    p.aggm(agg).direct_mode = 1;
+                    sqlite3_expr_code(p, ge, i_b_mem + j);
+                }
                 if i_order_by_col != 0 {
                     let el = p.s(sel).p_e_list;
                     let mut px = p.l(el).a[(i_order_by_col - 1) as usize].p_expr;
@@ -4118,8 +4550,12 @@ fn sqlite3_select_body(p: &mut Parse, sel: SelectId, dest: &mut SelectDest, b_po
             p.v.add_op2(OP_Integer, 1, i_use_flag);
 
             // End of the loop
-            sqlite3_where_end(p, winfo);
-            p.v.change_to_noop(addr_sorting_idx);
+            if group_by_sort {
+                p.v.add_op2(OP_SorterNext, sorting_idx, addr_top_of_loop);
+            } else {
+                sqlite3_where_end(p, winfo.take().expect("where info"));
+                p.v.change_to_noop(addr_sorting_idx);
+            }
 
             // Output the final row of result
             p.v.add_op2(OP_Gosub, reg_output_row, addr_output_row_label);
@@ -4199,7 +4635,6 @@ fn sqlite3_select_body(p: &mut Parse, sel: SelectId, dest: &mut SelectDest, b_po
                         if !x.b_unordered
                             && x.sz_idx_row < p.tab(tab).sz_tab_row
                             && x.p_part_idx_where.is_null()
-                            && !x.b_partial
                             && (best.is_null() || x.sz_idx_row < p.idx(best).sz_idx_row)
                         {
                             best = ix;
@@ -4219,6 +4654,7 @@ fn sqlite3_select_body(p: &mut Parse, sel: SelectId, dest: &mut SelectDest, b_po
                 }
                 assign_aggregate_registers(p, agg);
                 let reg = p.agg(agg).func_reg(0);
+                dump_agg(p, sel, agg, p_where, "count", [if best.nn() { p.idx(best).tnum as i32 } else { 0 }, i_csr, 0, 0]);
                 p.v.add_op2(OP_Count, i_csr, reg);
                 p.v.add_op1(OP_Close, i_csr);
                 explain_simple_count(p, tab, best);
@@ -4275,6 +4711,7 @@ fn sqlite3_select_body(p: &mut Parse, sel: SelectId, dest: &mut SelectDest, b_po
                     return rc;
                 };
                 let e_dist = winfo.is_distinct();
+                dump_agg(p, sel, agg, p_where, "plain", [min_max_flag as i32, reg_acc, e_dist, dist_flag as i32]);
                 update_accumulator(p, reg_acc, agg, e_dist);
                 if e_dist != WHERE_DISTINCT_NOOP && !p.agg(agg).a_func.is_empty() {
                     let (i_distinct, i_dist_addr) = (p.agg(agg).a_func[0].i_distinct, p.agg(agg).a_func[0].i_dist_addr);

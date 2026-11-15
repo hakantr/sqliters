@@ -12,6 +12,7 @@
 #![allow(clippy::collapsible_if, clippy::collapsible_else_if, clippy::needless_range_loop, clippy::manual_range_contains)]
 
 pub mod build;
+pub mod build_tab;
 pub mod builtin_funcs;
 pub mod callback;
 pub mod consts;
@@ -34,6 +35,7 @@ pub mod where_;
 pub mod wherecode;
 pub mod whereexpr;
 pub mod whereint;
+pub mod window;
 
 #[cfg(test)]
 mod explain_tests;
@@ -93,6 +95,13 @@ pub fn prepare_with_where_dump(db: Db<'_>, z_sql: &str) -> (PrepareResult, usize
     (prepare_result(p), tail, dump)
 }
 
+/// The schema objects of the connection as the generator loads them (verification aid: the
+/// schema layer of the differential proof; see [`build_tab::schema_dump`]).
+pub fn schema_dump(db: Db<'_>) -> Vec<String> {
+    let mut p = Parse::new(db, "");
+    build_tab::schema_dump(&mut p)
+}
+
 #[allow(dead_code)]
 fn prepare_tail_plain(db: Db<'_>, z_sql: &str) -> (PrepareResult, usize) {
     let mut p = Parse::new(db, z_sql);
@@ -102,6 +111,10 @@ fn prepare_tail_plain(db: Db<'_>, z_sql: &str) -> (PrepareResult, usize) {
 }
 
 fn prepare_result(mut p: Parse<'_>) -> PrepareResult {
+    #[cfg(test)]
+    for e in &p.init_errors {
+        eprintln!("schema load: {e}");
+    }
     if let Some(why) = p.unsupported {
         return PrepareResult::Unsupported(why);
     }

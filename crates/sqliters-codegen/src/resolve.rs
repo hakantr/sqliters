@@ -51,7 +51,12 @@ fn resolve_alias(p: &mut Parse, e_list: ExprListId, i_col: i32, e: ExprId, n_sub
     }
     // memcpy(&temp, pDup, sizeof(Expr)); memcpy(pDup, pExpr, sizeof(Expr)); memcpy(pExpr, &temp, ...)
     p.a_expr.swap(dup.ix(), e.ix());
-    // (EP_WinFunc: pExpr->y.pWin->pOwner = pExpr — window functions are not ported)
+    if p.e(e).has(EP_WinFunc) {
+        let wn = p.e(e).y_win;
+        if wn.nn() {
+            p.a_win[wn.ix()].p_owner = e;
+        }
+    }
 }
 
 /// `areDoubleQuotedStringsEnabled(db, pTopNC)`: return TRUE if the double-quoted string
@@ -903,6 +908,10 @@ fn resolve_expr_step(p: &mut Parse, w: &mut Walker, e: ExprId) -> i32 {
                     let msg = format!("wrong number of arguments to function {}()", p.e(e).tok());
                     p.error_msg_expr(msg, e);
                     p.ncm(nc).n_nc_err += 1;
+                } else if !is_agg && p.e(e).has(EP_WinFunc) {
+                    let msg = format!("FILTER may not be used with non-aggregate {}()", p.e(e).tok());
+                    p.error_msg_expr(msg, e);
+                    p.ncm(nc).n_nc_err += 1;
                 } else if !is_agg && p.e(e).p_left.nn() {
                     sqlite3_expr_order_by_aggregate_error(p, e);
                     p.ncm(nc).n_nc_err += 1;
@@ -913,7 +922,7 @@ fn resolve_expr_step(p: &mut Parse, w: &mut Walker, e: ExprId) -> i32 {
                     // arguments for window functions.
                     p.ncm(nc).nc_flags &= !(NC_AllowWin | NC_AllowAgg);
                 }
-            } else if p.e(e).p_left.nn() {
+            } else if p.e(e).has(EP_WinFunc) || p.e(e).p_left.nn() {
                 is_agg = true;
             }
             sqlite3_walk_expr_list(p, w, list);
@@ -927,6 +936,10 @@ fn resolve_expr_step(p: &mut Parse, w: &mut Walker, e: ExprId) -> i32 {
                     // For looping up thru outer contexts
                     p.em(e).op = TK_AGG_FUNCTION;
                     p.em(e).op2 = 0;
+                    if p.e(e).has(EP_WinFunc) {
+                        let f = p.a_win[p.e(e).y_win.ix()].p_filter;
+                        sqlite3_walk_expr(p, w, f);
+                    }
                     let mut nc2 = nc;
                     while nc2.nn() && {
                         let sl = p.nc(nc2).p_src_list;
@@ -1412,8 +1425,8 @@ fn resolve_select_step(p: &mut Parse, w: &mut Walker, sel: SelectId) -> i32 {
             }
         }
 
-        // The ORDER BY and GROUP BY clauses may not refer to terms in outer queries
-        p.ncm(snc).p_next = NcId::NULL;
+        // (3.54.1 keeps sNC.pNext = pOuterNC here: ORDER BY and GROUP BY terms of a sub-select
+        // may refer to columns of outer queries; older releases cleared it.)
         p.ncm(snc).nc_flags |= NC_AllowAgg | NC_AllowWin;
 
         // Process the ORDER BY clause for singleton SELECT statements. The ORDER BY clause

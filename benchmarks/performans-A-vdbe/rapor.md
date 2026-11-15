@@ -13,6 +13,7 @@
 | :--- | :--- | :--- | ---: | ---: | :--- |
 | V1 — temel, ifadeler, `FROM`'suz `SELECT` | `bdffdc1` | program gösterimi ve kurucu, `EXPLAIN` listesi, C'nin ayrıştırma ağacı, `resolve.c`, `expr.c`, `VALUES`, işlem ifadeleri | 54.469 / 54.469 kabul edilen (144 desteklenmiyor) | 3.954 / 39.300 (%10,1) | 907 geçti, bilinen 4 başarısız, 337 yok sayıldı |
 | V2 — tablolar: şema bağdaştırıcısı, sıralayıcı, `where.c` ailesi, birleşimler | `c4efe5e` | `whereexpr.c`, `where.c`, `wherecode.c`, `select.c` (GROUP BY hariç), alt sorgu düzleştirme, görünümler, `EXPLAIN QUERY PLAN` | 35.525 / 35.526 kabul edilen (3.474 desteklenmiyor) | 13.659 / 39.300 (%34,8) | 929 geçti, bilinen 4 başarısız, 337 yok sayıldı |
+| V3 — şemanın C gibi yüklenmesi, GROUP BY / HAVING / FILTER, özyinelemeli CTE | (bu commit) | `build.c` tablo/indeks/görünüm kurucuları, `sqlite3Init`, `sqlite3AnalysisLoad`, GROUP BY sıralayıcı dalı, FILTER, `generateWithRecursiveQuery`, C bağlantı durumu (DBFLAG_EncodingFixed) | 87.000 / 87.000 kabul edilen (8 derlem; 0 farklı) | 14.133 / 39.300 (%36,0) | 979 geçti, bilinen 4 başarısız, 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -75,6 +76,34 @@ Ayrıntı: `karar_esligi_v1.md` (işlev eşlemesi, karar tabloları, kapsam tabl
 **C'nin planı ile eski yürütücünün planı.** Kabul edilen 10.680 ifadenin 8.067'sinde plan metni farklı (birleşim sırası; C'nin otomatik indeks + Bloom süzgeci kullandığı yerde eski yürütücü tarıyor; C'nin indeks/satır kimliğiyle aradığı yerde tarama). `EXPLAIN QUERY PLAN` artık C'nin planını basıyor, yürütme taşıma bitene kadar eski planla çalışıyor.
 
 **Bilinen eksikler.** `OP_Transaction` nesil işleneni şu durumlarda izlenmiyor: başka bağlantının şema değişikliği, çerez değiştikten sonra başarısız olan diğer DDL, `ATTACH`/`DETACH` hataları. Üretici "desteklenmiyor" diyor: tablo üzerinde GROUP BY / HAVING, pencere işlevleri, özyinelemeli CTE, sanal tablolar, DML, DDL, `PRAGMA`, VIRTUAL üretilmiş sütunlu tablolar, `COLLATE BINARY` açıkça yazılmış tablolar. Bu adımda görülen eski motor farkları: `gorulen_farklar_v2.md`.
+
+## V3 — şemanın C gibi yüklenmesi, GROUP BY / HAVING / FILTER, özyinelemeli CTE
+
+**Taşınan** (`crates/sqliters-codegen/src/`; 71 yeni/değişen C işlevi, toplam 497; ayrıntı `karar_esligi_v3.md`).
+- `build_tab.rs` (yeni): `sqlite3StartTable` … `sqlite3EndTable`, `convertToWithoutRowidTable`, `sqlite3CreateIndex`, `sqlite3CreateView`, `sqlite3Init` / `sqlite3InitOne` / `sqlite3InitCallback`, `sqlite3AnalysisLoad`, `sqlite3ValueFromExpr`. V2'nin `TableDef` bağdaştırıcısı silindi: şema artık `sqlite_schema` satırlarından C'nin ayrıştırıcısıyla kuruluyor. VIRTUAL üretilmiş sütunlar, açık `COLLATE BINARY`, birincil anahtardan önce `UNIQUE` artık destekleniyor.
+- `select.rs` / `expr.rs` / `window.rs`: GROUP BY'ın sıralayıcı dalı, `optimizeAggregateUseOfIndexedExpr`, toplama işlevlerinde FILTER, `generateWithRecursiveQuery` (`SRT_Queue` / `SRT_DistQueue`). V2 açığı kapandı: `sqlite3SrcListDup` CTE kullanımını saymıyordu.
+- `resolve.rs`: 3.54.1'de olmayan `sNC.pNext = 0` satırı kaldırıldı (alt seçimin ORDER BY'ı dış sütunu adlandırabiliyor).
+- Motor tarafı: D1 (WITHOUT ROWID + tek INTEGER birincil anahtarın indeks sırası, veritabanı dosyası C ile bayt bayt aynı), D10 (`sqlite_stat1` metni, `analysis_limit` dahil), D18/D19 hata metinleri; C'nin `DBFLAG_EncodingFixed` / şema yüklendi durumu (şemayı okuyan 21 pragma, `ATTACH`, ilk ifadede hata konumunun kaybolması); `PRAGMA reverse_unordered_selects` altında `sqlite_stat1` ters okunuyor; UTF-16 veritabanında P4_MEM metni C gibi listeleniyor; geçici veritabanı C'nin açtığı yerde açılıyor.
+
+**Kanıt** (ikili `r9`; sonuçlar `target/perf-work/v3/res/*_r9.*`).
+
+| Derlem | İfade | `EXPLAIN` aynı | EQP aynı | Terim / döngü / yol / agg katmanı |
+| :--- | ---: | ---: | ---: | :--- |
+| ddl_a | 12.000 | 12.000 | 12.000 | 0 fark |
+| plan_a | 26.000 | 26.000 | 26.000 | 0 fark |
+| plan_b | 13.000 | 13.000 | 13.000 | 0 fark |
+| agg_a / agg_b / agg_c | 21.000 | 21.000 | 21.000 | 0 fark |
+| cte_a / cte_b | 15.000 | 15.000 | 15.000 | 0 fark |
+
+- Şema katmanı (C `v3DumpSchema` ile): 400 / 400 şema aynı. Kütüphane düzeyi: 54.609 / 54.613 aynı, 0 farklı, 4 desteklenmiyor. Bağlantı durumu yoklamaları: 66 / 68 aynı (kalan 2: üreticinin taşımadığı türden başarısız ilk ifade).
+- **Tüm ifade türleri** (39.300): kabul **%34,8 → %36,0** (14.133); `EXPLAIN` aynı 13.778, farklı 355 (V2: 380); EQP aynı 13.861, farklı 272. Üretici tarafında fark kalmadı; 355'in her sınıfı atfedildi: yalnız C kabuğunda olan işlev/sıralama/modül (D4, D5), eski motor farklarının yansımaları (D8, D12, D13, D20, D22, D24–D27, D29), 1 izlenmeyen şema sıfırlaması, 3 rastgele veri. Desteklenmeyen: ifade türü (DML, DDL, PRAGMA), pencere işlevleri 409, sanal tablo / tablo değerli işlev 241.
+- **C tarafı kapsamı** (gcov; V3'ün 71 işlevi): satır %84,6, dal %75,9 (`target/perf-work/v3/cov/`).
+- **Yürütme:** testler 979 geçti (C beklentili 4 yeni üretici + 6 yeni `c_align_v3` testi), bilinen 4 sanal tablo testi başarısız, 337 yok sayıldı; DML farksalı 378 / 400 (V2: 377); ayrışma bulucu 241 / 2 / 1 / 1 (h7b ile aynı; `g06_vacuum_into_main_untouched` yalnız stderr'de farklı — C ve Rust koşusunun paylaştığı sabit tmpfs yolu, r6'da da aynı).
+- **Hız** (speedbench, `vmerge_bin` tabanına göre): toplam 298,6 → 301,4 ms (1,009x), geomean 1,016x, özet uyuşmazlığı 0. W01 +%5,8 ve W03 +%3 9 denemelik tekrarda da kaldı; nedeni bulunamadı (fark satır başına ekleme / nokta okuma yoluna dokunmuyor). Ölçüm, makine hattının ajanı aynı anda derleme yaparken alındı.
+
+**Değişen test beklentileri.** `plan_tests.rs`: `unsupported_over_tables` yerine `unsupported_in_v3`; tablo üzerinde GROUP BY artık destekleniyor (C'nin listesi `group_by_in_index_order` ile sınanıyor). Başka beklenti değişmedi.
+
+**Bilinen eksikler ve sonraki adım.** Pencere işlevleri ve FROM içinde sanal tablolar / tablo değerli işlevler taşınmadı; öneri: V4a (`window.c`) ve V4b (`vtab.c`, `whereLoopAddVirtual`). Bu adımda görülen eski motor farkları `gorulen_farklar_v3.md`'de (D1–D29). **D23 veri farkı:** `SELECT 0.5 IS TRUE` motorda 0, C'de 1 — motor kuyruğunda öne alınmalı.
 
 ## Bu adımda görülen, eski motora ait C farkları (dokunulmadı)
 

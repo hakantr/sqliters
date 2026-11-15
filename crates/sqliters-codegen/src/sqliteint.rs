@@ -582,10 +582,37 @@ pub struct Column {
     pub z_type: Option<String>,
     /// The collating sequence name (stored after the type in C when COLFLAG_HASCOLL)
     pub z_coll: Option<String>,
-    /// `sqlite3ValueFromExpr(sqlite3ColumnExpr(pTab,pCol), enc, affinity)`: the constant the
-    /// DEFAULT clause stands for (`None` when there is no DEFAULT or it is not a constant);
-    /// the P4 of an OP_Column that reads this column (`sqlite3ColumnDefault`)
-    pub dflt_value: Option<sqliters_types::Value>,
+}
+
+/// `struct FKey`: each foreign key constraint of a table (the child table).
+#[derive(Debug, Clone, Default)]
+pub struct FKey {
+    /// `zTo`: name of the table that the key points to (aka: parent)
+    pub z_to: String,
+    /// `aCol[]`: (iFrom: index of column in the child table, zCol: name of the column in zTo,
+    /// NULL to use the PRIMARY KEY)
+    pub a_col: Vec<(i32, Option<String>)>,
+    /// True if constraint checking is deferred till COMMIT
+    pub is_deferred: bool,
+    /// ON DELETE and ON UPDATE actions, respectively
+    pub a_action: [u8; 2],
+}
+
+/// The in-memory schema of one database (`struct Schema`: `tblHash`, `idxHash`) as the
+/// generator loads it (`build_tab::sqlite3_init`).
+#[derive(Debug, Clone, Default)]
+pub struct SchemaState {
+    /// `DB_SchemaLoaded`
+    pub loaded: bool,
+    /// `tblHash`: all tables and views, by lower-case name
+    pub tbl_hash: std::collections::HashMap<String, TableId>,
+    /// `idxHash`: all (named) indices, by lower-case name
+    pub idx_hash: std::collections::HashMap<String, IndexId>,
+    /// Objects whose SQL text the generator could not load (a construct that is not ported):
+    /// lower-case name of the object and of its table -> the reason reported
+    pub bad: std::collections::HashMap<String, &'static str>,
+    /// Lower-case names of the tables that have triggers (rows of type "trigger" seen so far)
+    pub triggers: Vec<String>,
 }
 
 /// `struct Table` as far as the V1 code generator reads it. Tables come from one adapter
@@ -616,15 +643,12 @@ pub struct Table {
     pub p_index: Vec<IndexId>,
     /// `pCheck` of a view: the explicit column names of `CREATE VIEW v(a,b,..)`
     pub p_check: ExprListId,
-    /// `pTrigger!=0`
-    /// A property of the declaration that the schema adapter cannot represent yet: a statement
-    /// that uses the table is reported as unsupported.
-    pub unsupported_decl: Option<&'static str>,
     pub has_trigger: bool,
-    /// The text of the CREATE VIEW statement of a view (parsed when the view is used)
-    pub z_sql: Option<String>,
-    /// True once `sqlite3ViewGetColumnNames()` has filled `a_col` of a view in this statement
-    pub view_cols_done: bool,
+    /// `u.tab.pDfltList`: DEFAULT clauses on various columns, or the AS clauses of generated
+    /// columns (`Column.iDflt` is an index into this list, plus one)
+    pub p_dflt_list: ExprListId,
+    /// `u.tab.pFKey`: linked list of all foreign keys in this table, most recent first
+    pub p_fkey: Vec<FKey>,
     /// C's `nCol<0` marker of a view: its column names are being computed, or its SELECT is
     /// being expanded (detects circular view definitions)
     pub view_busy: bool,
@@ -683,9 +707,6 @@ pub struct Index {
     /// For each entry of `az_coll`: true if C's pointer is the static `sqlite3StrBINARY`
     /// (the KeyInfo then has a NULL collation, shown as an empty name in EXPLAIN)
     pub a_coll_static: Vec<bool>,
-    /// The index was declared with a WHERE clause (`pPartIdxWhere!=0`, also before the
-    /// expression is parsed)
-    pub b_partial: bool,
     /// WHERE clause for partial indices
     pub p_part_idx_where: ExprId,
     /// Column expressions
@@ -720,18 +741,14 @@ pub struct Index {
     /// new `aiRowLogEst[]` has nColumn entries, so C's read of `aiRowLogEst[nColumn]` lands on
     /// `aiColumn[0]`, which follows it in the same allocation.
     pub is_resized: bool,
+    /// `pSchema`: the database of the index (index into `db->aDb[]`)
+    pub i_db: i32,
     /// Index references one or more VIRTUAL columns
     pub b_has_v_col: bool,
     /// Index contains an expression, either a literal expression or a reference to a VIRTUAL column
     pub b_has_expr: bool,
     /// Unindexed columns in pTab
     pub col_not_idxed: Bitmask,
-    /// The text of the CREATE INDEX statement when the index has expression columns or a
-    /// WHERE clause that are not parsed yet (`a_col_expr` / `p_part_idx_where` are filled from
-    /// it on first use)
-    pub z_sql: Option<String>,
-    /// True once the expressions of `z_sql` were parsed and resolved
-    pub exprs_done: bool,
 }
 
 impl Index {
@@ -849,6 +866,9 @@ pub struct DbInfo {
 /// What the code generator asks of the engine: the schema adapter and the registries of
 /// application-defined functions and collations.
 pub trait Host {
+    /// `sqlite3ReadSchema()` -> `sqlite3Init()` did work: C's connection has its schemas loaded
+    /// from now on, also when the statement fails afterwards (the engine mirrors that state).
+    fn note_schema_loaded(&self) {}
     /// Application-defined functions named `name` (`db->aFunc`), any arity. Built-in functions
     /// are known to the code generator itself.
     fn user_functions(&self, name: &str) -> Vec<Arc<FuncDef>>;
@@ -856,20 +876,31 @@ pub trait Host {
     /// (`sqlite3FindCollSeq`; the lookup ignores ASCII case). BINARY, NOCASE and RTRIM are
     /// known to the code generator itself.
     fn find_collation(&self, name: &str) -> Option<String>;
-    /// `sqlite3HashFind(&db->aDb[i_db].pSchema->tblHash, name)`: the table or view `name`
-    /// (compared without regard to ASCII case) of database `i_db`, as a declaration from which
-    /// [`crate::schema`] builds C's `Table` and `Index` objects.
-    fn find_table(&self, _i_db: usize, _name: &str) -> Option<crate::schema::TableDef> {
+    /// The rows of `sqlite_schema` of database `i_db` in rowid order ("SELECT*FROM
+    /// sqlite_schema ORDER BY rowid" of `sqlite3InitOne()`): the generator builds its schema
+    /// objects from the SQL text of these rows exactly as `sqlite3InitCallback()` does.
+    fn schema_rows(&self, _i_db: usize) -> Vec<crate::build_tab::SchemaRow> {
+        Vec::new()
+    }
+    /// The rows of `sqlite_stat1` of database `i_db` (tbl, idx, stat) in the order C reads
+    /// them ("SELECT tbl,idx,stat FROM sqlite_stat1" of `sqlite3AnalysisLoad()`).
+    fn stat1_rows(&self, _i_db: usize) -> Vec<(String, Option<String>, String)> {
+        Vec::new()
+    }
+    /// A reason why statements that use table `name` of database `i_db` must be reported as
+    /// unsupported: state of C's connection that the schema text does not show (statistics C
+    /// keeps from an earlier ANALYZE).
+    fn table_unsupported(&self, _i_db: usize, _name: &str) -> Option<&'static str> {
         None
     }
-    /// True if C's connection has already computed the column names of view `name` of
-    /// database `i_db` (`sqlite3ViewGetColumnNames()` ran since the schema was last reset):
-    /// the first use of a view in a connection advances `Parse.nSelect`.
-    fn view_columns_known(&self, _i_db: usize, _name: &str) -> bool {
+    /// True if table `name` (lower case) of database `i_db` was created by a CREATE TABLE
+    /// statement of this connection after C last ran `sqlite3AnalysisLoad()` on that database
+    /// (schema load or ANALYZE): C's Index objects of the table then still have the row
+    /// estimates `sqlite3CreateIndex()` computed, which differ from the ones of a schema load
+    /// when `convertToWithoutRowidTable()` removed redundant PRIMARY KEY columns afterwards.
+    fn created_since_load(&self, _i_db: usize, _name: &str) -> bool {
         false
     }
-    /// The code generator computed the column names of view `name` of database `i_db`.
-    fn set_view_columns_known(&self, _i_db: usize, _name: &str) {}
 }
 
 /// A [`Host`] with no application-defined functions or collations.
@@ -904,6 +935,9 @@ pub struct Db<'a> {
     /// True if C's connection would still have to read the schema (`sqlite3Init()` runs at the
     /// first `sqlite3ReadSchema()` of the statement and resets `db->errByteOffset`)
     pub schema_not_loaded: bool,
+    /// `db->mDbFlags & DBFLAG_EncodingFixed`: some `sqlite_schema` row was read by this
+    /// connection. While clear, `cmd ::= select` calls sqlite3ReadSchema() itself.
+    pub encoding_fixed: bool,
     /// `PRAGMA case_sensitive_like = x` was run on the connection: like() was re-registered
     /// (`sqlite3RegisterLikeFunctions`)
     pub case_sensitive_like: bool,
@@ -943,6 +977,7 @@ impl<'a> Db<'a> {
                 DbInfo { z_db_s_name: "temp".into(), has_bt: false, file_format: 4, ..DbInfo::default() },
             ],
             schema_not_loaded: false,
+            encoding_fixed: false,
             case_sensitive_like: false,
             host,
         }
@@ -1092,7 +1127,26 @@ pub struct Parse<'a> {
     /// `pIdxPartExpr`: expressions constrained by a partial index in use
     pub p_idx_part_expr: Vec<IndexedExpr>,
     /// The schema tables already converted to `Table` objects, by (database, lower-case name)
-    pub tab_cache: std::collections::HashMap<(usize, String), TableId>,
+    /// The schemas of the connection as loaded by `sqlite3Init()` (one per `db->aDb[]`)
+    pub a_schema: Vec<SchemaState>,
+    /// `pNewTable`: a table being constructed by CREATE TABLE
+    pub p_new_table: TableId,
+    /// `u1.cr.constraintName`: name of the constraint currently being parsed
+    pub cr_constraint_name: Token,
+    /// `iPkSortOrder`: ASC or DESC for INTEGER PRIMARY KEY
+    pub i_pk_sort_order: u8,
+    /// `sNameToken`: token with unqualified schema object name
+    pub s_name_token: Token,
+    /// `db->init.iDb`: which db file is being initialized
+    pub init_i_db: usize,
+    /// `db->init.newTnum`: rootpage of table being initialized
+    pub init_new_tnum: u32,
+    /// `db->init.azInit`: type, name and tbl_name of the sqlite_schema row being loaded
+    pub init_az: [String; 3],
+    /// Why the last schema row failed to load (see `build_tab::init_parse`)
+    pub init_fail: Option<&'static str>,
+    /// Diagnostics: the schema rows that failed to load, with the error or the missing piece
+    pub init_errors: Vec<String>,
     /// `u1.d.pReturning` etc. are not ported; `nTableLock`/`aTableLock` only matter with a
     /// shared cache.
     /// Depth of nested `sqlite3Select()` calls for which `OP_Explain` nodes are open
@@ -1101,10 +1155,6 @@ pub struct Parse<'a> {
     /// Verification aid: when `Some`, the WHERE-term and WhereLoop dumps of where.c are
     /// collected here.
     pub where_dump: Option<Vec<String>>,
-
-    /// `Some` while the text of a schema object is parsed (`db->init.busy` in C, where it is a
-    /// separate Parse): `cmd ::= select` stores the Select here instead of coding it.
-    pub capture_select: Option<SelectId>,
 
     /// Verification aid: when `Some`, the tree dumps of [`crate::treedump`] are collected here.
     pub tree_dump: Option<Vec<String>>,
@@ -1182,10 +1232,18 @@ impl<'a> Parse<'a> {
             a_cte_use: Vec::new(),
             p_idx_epr: Vec::new(),
             p_idx_part_expr: Vec::new(),
-            tab_cache: std::collections::HashMap::new(),
+            a_schema: Vec::new(),
+            p_new_table: TableId::NULL,
+            cr_constraint_name: Token::EMPTY,
+            i_pk_sort_order: 0,
+            s_name_token: Token::EMPTY,
+            init_i_db: 0,
+            init_new_tnum: 0,
+            init_az: [String::new(), String::new(), String::new()],
+            init_fail: None,
+            init_errors: Vec::new(),
             explain_dummy: 0,
             where_dump: None,
-            capture_select: None,
             tree_dump: None,
             suppress_err: false,
             unsupported: None,
