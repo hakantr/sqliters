@@ -1295,6 +1295,8 @@ pub(crate) fn rollback_all_databases(
     }
 
     if reload_schemas_if_changed && *ctx.schema_changed_in_tx {
+        // sqlite3RollbackAll(): schemaChange -> sqlite3ResetAllSchemasOfConnection()
+        ctx.db_set.c_reset_all_schemas();
         for slot in ctx.db_set.slots_mut() {
             if let Some(ref mut bt) = slot.btree
                 && let Ok(mut fresh) = Schema::load_for_schema(bt, Some(&slot.name))
@@ -2351,6 +2353,11 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                 *ctx.deferred_fk_suspects = sp.deferred_fk_suspects;
                 ctx.mutation_pipeline.truncate(sp.mutation_len_at_open);
                 ctx.savepoints.truncate(pos + 1);
+                if *ctx.schema_changed_in_tx {
+                    // OP_Savepoint (ROLLBACK TO): isSchemaChange ->
+                    // sqlite3ResetAllSchemasOfConnection()
+                    ctx.db_set.c_reset_all_schemas();
+                }
                 if is_schema_change {
                     ctx.db_set.invalidate_all_blobs();
                 } else {
@@ -3689,7 +3696,17 @@ fn execute_write_body_inner(
             catalog_sql,
             ..
         } => {
-            exec_create_virtual_table(ctx, *if_not_exists, name, module_name, args, catalog_sql)?;
+            if let Err(e) = exec_create_virtual_table(ctx, *if_not_exists, name, module_name, args, catalog_sql) {
+                // C runs OP_ParseSchema (DBFLAG_SchemaChange) before OP_VCreate: when the
+                // module is missing or its constructor fails in autocommit mode, the
+                // statement is rolled back by sqlite3RollbackAll(), which resets all schemas.
+                if is_in_autocommit(ctx)
+                    && (e.message.starts_with("no such module:") || e.message.starts_with("vtable constructor failed"))
+                {
+                    ctx.db_set.c_reset_all_schemas();
+                }
+                return Err(e);
+            }
             ctx.db_set.rebind_all_collations(ctx.collations);
             Ok(QueryOutput::default())
         }
@@ -3725,7 +3742,12 @@ fn execute_write_body_inner(
             Ok(QueryOutput::default())
         }
         Stmt::AlterTable { table, action } => {
+            let c_db = ctx.db_set.find_relation_in_set(table).ok().flatten().map(|(id, _)| id.index());
             exec_alter_table(ctx, table, action)?;
+            // C's ALTER TABLE ends with OP_ParseSchema (P4==0) on the database and on temp
+            if let Some(i) = c_db {
+                ctx.db_set.c_reparse_schema(i);
+            }
             ctx.db_set.rebind_all_collations(ctx.collations);
             Ok(QueryOutput::default())
         }
@@ -3735,6 +3757,8 @@ fn execute_write_body_inner(
         }
         Stmt::Analyze(target) => {
             exec_analyze(ctx, target.as_ref())?;
+            // OP_LoadAnalysis: sqlite3AnalysisLoad() on C's existing schema objects
+            ctx.db_set.c_note_stats(true);
             Ok(QueryOutput::default())
         }
         Stmt::Pragma {
@@ -3859,7 +3883,10 @@ pub fn execute_statement(
             let Stmt::Vacuum { schema, into } = stmt else {
                 unreachable!();
             };
-            exec_vacuum(ctx, schema.as_deref(), into.as_ref(), params)
+            let r = exec_vacuum(ctx, schema.as_deref(), into.as_ref(), params);
+            // sqlite3RunVacuum() ends with sqlite3ResetAllSchemasOfConnection()
+            ctx.db_set.c_reset_all_schemas();
+            r
         }
         StmtCategory::IncrementalVacuum => {
             let Stmt::Pragma { schema, value, .. } = stmt else {
@@ -41392,6 +41419,8 @@ fn exec_pragma(
                     }
                 };
                 if ctx.db_set.set_temp_store(mode, is_in_autocommit(ctx))? {
+                    // invalidateTempStorage(): sqlite3ResetAllSchemasOfConnection()
+                    ctx.db_set.c_reset_all_schemas();
                     *ctx.schema_generation += 1;
                     *ctx.v1_expire_generation += 1;
                 }
@@ -41428,6 +41457,8 @@ fn exec_pragma(
                     }
                 }
                 if is_reset {
+                    // PRAGMA writable_schema=RESET: sqlite3ResetAllSchemasOfConnection()
+                    ctx.db_set.c_reset_all_schemas();
                     for slot in ctx.db_set.slots_mut() {
                         slot.schema = Schema::default();
                     }
@@ -41551,6 +41582,31 @@ fn exec_pragma(
                 "cell_size_check",
                 Value::Integer(i64::from(ctx.db_set.cell_size_check())),
             ));
+        }
+        // The boolean flag pragmas of `db->flags` that only C's code generator reads
+        // (pragma.c PragTyp_FLAG): the value is kept for the generator (`cgen.rs`) and
+        // reported as C reports it. (flag bit of C, value that is C's default)
+        "AUTOMATIC_INDEX" | "REVERSE_UNORDERED_SELECTS" | "SHORT_COLUMN_NAMES" | "FULL_COLUMN_NAMES" => {
+            let (bit, dflt, col) = match upper.as_str() {
+                "AUTOMATIC_INDEX" => (0x8000u64, true, "automatic_index"),
+                "REVERSE_UNORDERED_SELECTS" => (0x1000u64, false, "reverse_unordered_selects"),
+                "SHORT_COLUMN_NAMES" => (0x40u64, true, "short_column_names"),
+                _ => (0x4u64, false, "full_column_names"),
+            };
+            if let Some(pv) = value {
+                let on = pragma_get_boolean(pv, false);
+                ctx.db_set.set_c_flag_toggled(bit, on != dflt);
+                return Ok(QueryOutput::default());
+            }
+            let on = ((ctx.db_set.c_flags_toggled() & bit) != 0) != dflt;
+            return Ok(single_col(col, Value::Integer(i64::from(on))));
+        }
+        "CASE_SENSITIVE_LIKE" => {
+            if let Some(pv) = value {
+                let _ = pv;
+                ctx.db_set.set_c_case_sensitive_like(true);
+            }
+            return Ok(QueryOutput::default());
         }
         "TRUSTED_SCHEMA" => {
             if let Some(pv) = value {
@@ -44910,6 +44966,13 @@ fn infer_pragma_columns(name: &str, value: Option<&PragmaValue>) -> Vec<String> 
                 Vec::new()
             } else {
                 vec!["count_changes".to_owned()]
+            }
+        }
+        "AUTOMATIC_INDEX" | "REVERSE_UNORDERED_SELECTS" | "SHORT_COLUMN_NAMES" | "FULL_COLUMN_NAMES" => {
+            if value.is_some() {
+                Vec::new()
+            } else {
+                vec![name.to_ascii_lowercase()]
             }
         }
         "INDEX_INFO" => {

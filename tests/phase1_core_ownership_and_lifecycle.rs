@@ -2340,8 +2340,8 @@ fn test_audit4_without_rowid_and_not_indexed_incremental_vdbe_zero_overflow_read
         explain_rows
             .rows
             .iter()
-            .any(|r| r.get_str(1) == Some("OpenReadIdx")),
-        "WITHOUT ROWID SELECT must compile to VDBE OpenReadIdx, got: {:?}",
+            .any(|r| r.get_str(1) == Some("OpenRead") && r.get_str(5).is_some_and(|p4| p4.starts_with("k("))),
+        "WITHOUT ROWID SELECT must open the PRIMARY KEY index (OpenRead with a KeyInfo, C's listing), got: {:?}",
         explain_rows.rows
     );
 

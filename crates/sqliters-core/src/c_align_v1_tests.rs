@@ -24,7 +24,7 @@ fn explain(conn: &Connection, sql: &str) -> Vec<String> {
                     .join("|")
             })
             .collect(),
-        Err(e) => vec![format!("ERR {} {}", e.offset.map_or(-1, |o| o as i64), e.message)],
+        Err(e) => vec![format!("ERR {} {}", e.c_offset(), e.message)],
     }
 }
 

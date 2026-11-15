@@ -227,6 +227,16 @@ impl ColumnSchema {
         self.default_p4_for_table(false)
     }
 
+    /// `sqlite3ValueFromExpr(db, pDflt, enc, pCol->affinity, &v)` of the DEFAULT expression,
+    /// as `sqlite3ColumnDefault()` computes it for the P4 operand of `OP_Column` (`None` when
+    /// the expression is not a constant C can fold).
+    pub(crate) fn default_value_for_cgen(&self) -> Option<Value> {
+        self.default_expr.as_ref().and_then(|e| {
+            default_float_token_text(e, self.default_src.as_deref(), self.affinity)
+                .or_else(|| default_value_from_expr(e, self.affinity))
+        })
+    }
+
     /// Estimates column width (`pCol->szEst` in `sqlite/src/build.c:1559-1775`), where 1 unit = 4 bytes.
     pub fn estimated_width(&self) -> u32 {
         let trimmed = self.type_name.trim();
@@ -1588,6 +1598,20 @@ impl Schema {
             };
 
             let idx_opt = val_to_stat_text(idx_val);
+            // `analysisLoader`: `pIndex==0` — the idx column is NULL, or it names no index
+            // (`sqlite3FindIndex` fails), or it equals the table name and the table has no
+            // PRIMARY KEY index: the row then describes the table itself.
+            let idx_opt = idx_opt.filter(|idx_str| {
+                if tbl_str.eq_ignore_ascii_case(idx_str) {
+                    self.tables[tbl_pos].without_rowid
+                        || self
+                            .indexes
+                            .iter()
+                            .any(|ix| ix.table_name.eq_ignore_ascii_case(&tbl_str) && ix.origin == "pk")
+                } else {
+                    self.indexes.iter().any(|ix| ix.name.eq_ignore_ascii_case(idx_str))
+                }
+            });
             match idx_opt {
                 None => {
                     let decoded = decode_stat1_string(&stat_str, 1);

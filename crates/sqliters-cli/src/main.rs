@@ -1529,10 +1529,13 @@ pub fn run_one_sql_line(
                 if rc > 1 {
                     tail.push_str(&format!(" ({rc})"));
                 }
-                let offset = e
-                    .err
-                    .offset
-                    .or_else(|| util::guess_error_offset(&e.sql, &e.err.message));
+                // An error of C's code generator carries C's own answer (an offset, or
+                // "none"): nothing is guessed for it.
+                let offset = match e.err.offset {
+                    Some(o) if o == sqliters::SqliteError::NO_OFFSET => None,
+                    Some(o) => Some(o),
+                    None => util::guess_error_offset(&e.sql, &e.err.message),
+                };
                 tail.push_str(&util::shell_error_context(&e.sql, offset));
             }
             let prefix = if z_filename.is_some() || !p.stdin_is_interactive {

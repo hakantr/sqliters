@@ -319,7 +319,12 @@ impl YyParser {
         match yyruleno {
             0 => p.explain = 1,  // explain ::= EXPLAIN  (pParse->pReprepare==0 always here)
             1 => p.explain = 2,  // explain ::= EXPLAIN QUERY PLAN
-            2 => sqlite3_finish_coding(p), // cmdx ::= cmd
+            2 => {
+                // cmdx ::= cmd
+                if p.capture_select.is_none() {
+                    sqlite3_finish_coding(p)
+                }
+            }
             3 => {
                 // cmd ::= BEGIN transtype trans_opt
                 let ty = m!(-1).i;
@@ -376,8 +381,12 @@ impl YyParser {
                 // if( (db->mDbFlags & DBFLAG_EncodingFixed)!=0 || sqlite3ReadSchema(pParse)==SQLITE_OK )
                 // (the engine's schema is always loaded)
                 let s = sl!(0);
-                crate::treedump::v1_dump_select(p, "P", s);
-                sqlite3_select(p, s, &mut dest);
+                if p.capture_select.is_some() {
+                    p.capture_select = Some(s);
+                } else {
+                    crate::treedump::v1_dump_select(p, "P", s);
+                    sqlite3_select(p, s, &mut dest);
+                }
             }
             85 => {
                 // select ::= WITH wqlist selectnowith
@@ -401,10 +410,20 @@ impl YyParser {
                 let mut p_rhs = sl!(0);
                 let p_lhs = sl!(-2);
                 if p_rhs.nn() && p.s(p_rhs).p_prior.nn() {
-                    // The RHS is itself a compound (a multi-row VALUES): wrap it in a
-                    // subquery. Needs sqlite3SrcListAppendFromTerm (FROM clause terms).
-                    p.not_supported("compound SELECT whose right operand is a compound (FROM subquery)");
-                    p_rhs = SelectId::NULL;
+                    let x = Token { z: Token::NO_Z, n: 0 };
+                    parser_double_link_select(p, p_rhs);
+                    let p_from = sqlite3_src_list_append_from_term(p, SrcListId::NULL, None, None, &x, p_rhs, None);
+                    p_rhs = sqlite3_select_new(
+                        p,
+                        ExprListId::NULL,
+                        p_from,
+                        ExprId::NULL,
+                        ExprListId::NULL,
+                        ExprId::NULL,
+                        ExprListId::NULL,
+                        0,
+                        ExprId::NULL,
+                    );
                 }
                 if p_rhs.nn() {
                     let op = m!(-1).i;
@@ -504,13 +523,152 @@ impl YyParser {
             107 | 110 => m!(1).id = 0,                       // from ::= ; stl_prefix ::=
             108 => {
                 // from ::= FROM seltablist
-                p.not_supported("FROM clause");
-                m!(-1).id = 0;
+                let l = SrcListId(m!(0).id);
+                m!(-1).id = l.0;
+                sqlite3_src_list_shift_join_type(p, l);
             }
-            109 | 111..=115 | 118..=123 | 125..=127 | 129 | 132 | 133 => {
-                // FROM clause terms, table names, join operators, USING, INDEXED BY
-                p.not_supported("FROM clause term");
+            109 => {
+                // stl_prefix ::= seltablist joinop
+                let l = SrcListId(m!(-1).id);
+                if l.nn() && !p.src(l).a.is_empty() {
+                    let jt = m!(0).i as u8;
+                    p.srcm(l).a.last_mut().expect("item").jointype = jt;
+                }
             }
+            111 => {
+                // seltablist ::= stl_prefix nm dbnm as on_using
+                let (l, t, d, a) = (SrcListId(m!(-4).id), m!(-3).tok, m!(-2).tok, m!(-1).tok);
+                let ou = OnOrUsing { p_on: ExprId(m!(0).id), p_using: IdListId(m!(0).id2) };
+                m!(-4).id = sqlite3_src_list_append_from_term(p, l, Some(&t), Some(&d), &a, SelectId::NULL, Some(&ou)).0;
+            }
+            112 => {
+                // seltablist ::= stl_prefix nm dbnm as indexed_by on_using
+                let (l, t, d, a) = (SrcListId(m!(-5).id), m!(-4).tok, m!(-3).tok, m!(-2).tok);
+                let ou = OnOrUsing { p_on: ExprId(m!(0).id), p_using: IdListId(m!(0).id2) };
+                let l = sqlite3_src_list_append_from_term(p, l, Some(&t), Some(&d), &a, SelectId::NULL, Some(&ou));
+                m!(-5).id = l.0;
+                let ib = m!(-1).tok;
+                sqlite3_src_list_indexed_by(p, l, &ib);
+            }
+            113 => {
+                // seltablist ::= stl_prefix nm dbnm LP exprlist RP as on_using
+                let (l, t, d, a) = (SrcListId(m!(-7).id), m!(-6).tok, m!(-5).tok, m!(-1).tok);
+                let ou = OnOrUsing { p_on: ExprId(m!(0).id), p_using: IdListId(m!(0).id2) };
+                let l = sqlite3_src_list_append_from_term(p, l, Some(&t), Some(&d), &a, SelectId::NULL, Some(&ou));
+                m!(-7).id = l.0;
+                let args = el!(-3);
+                sqlite3_src_list_func_args(p, l, args);
+            }
+            114 => {
+                // seltablist ::= stl_prefix LP select RP as on_using
+                let (l, a, sub) = (SrcListId(m!(-5).id), m!(-1).tok, sl!(-3));
+                let ou = OnOrUsing { p_on: ExprId(m!(0).id), p_using: IdListId(m!(0).id2) };
+                m!(-5).id = sqlite3_src_list_append_from_term(p, l, None, None, &a, sub, Some(&ou)).0;
+            }
+            115 => {
+                // seltablist ::= stl_prefix LP seltablist RP as on_using
+                let (l, a, inner) = (SrcListId(m!(-5).id), m!(-1).tok, SrcListId(m!(-3).id));
+                let ou = OnOrUsing { p_on: ExprId(m!(0).id), p_using: IdListId(m!(0).id2) };
+                if l.is_null() && a.n == 0 && ou.p_on.is_null() && ou.p_using.is_null() {
+                    m!(-5).id = inner.0;
+                } else if inner.nn() && p.src(inner).a.len() == 1 {
+                    let l = sqlite3_src_list_append_from_term(p, l, None, None, &a, SelectId::NULL, Some(&ou));
+                    m!(-5).id = l.0;
+                    if l.nn() {
+                        let old = std::mem::take(&mut p.srcm(inner).a[0]);
+                        let new = p.srcm(l).a.last_mut().expect("item");
+                        new.z_name = old.z_name;
+                        if old.is_subquery {
+                            new.is_subquery = true;
+                            new.p_subq = old.p_subq;
+                        } else {
+                            new.z_database = old.z_database;
+                        }
+                        if old.is_tab_func {
+                            new.p_func_arg = old.p_func_arg;
+                            new.is_tab_func = true;
+                        } else if old.is_indexed_by {
+                            new.z_indexed_by = old.z_indexed_by;
+                            new.is_indexed_by = true;
+                        }
+                        new.not_indexed = old.not_indexed;
+                        let nested = new.p_subq.as_ref().map(|q| q.p_select);
+                        if let Some(sub) = nested
+                            && new.is_subquery
+                            && (p.s(sub).sel_flags & SF_NestedFrom) != 0
+                        {
+                            p.srcm(l).a.last_mut().expect("item").is_nested_from = true;
+                        }
+                    }
+                } else {
+                    sqlite3_src_list_shift_join_type(p, inner);
+                    let sub = sqlite3_select_new(
+                        p,
+                        ExprListId::NULL,
+                        inner,
+                        ExprId::NULL,
+                        ExprListId::NULL,
+                        ExprId::NULL,
+                        ExprListId::NULL,
+                        SF_NestedFrom,
+                        ExprId::NULL,
+                    );
+                    m!(-5).id = sqlite3_src_list_append_from_term(p, l, None, None, &a, sub, Some(&ou)).0;
+                }
+            }
+            118 | 120 => {
+                // fullname ::= nm ; xfullname ::= nm
+                let t = m!(0).tok;
+                m!(0).id = sqlite3_src_list_append(p, SrcListId::NULL, Some(&t), None).0;
+            }
+            119 | 121 => {
+                // fullname ::= nm DOT nm ; xfullname ::= nm DOT nm
+                let (t, d) = (m!(-2).tok, m!(0).tok);
+                m!(-2).id = sqlite3_src_list_append(p, SrcListId::NULL, Some(&t), Some(&d)).0;
+            }
+            122 => {
+                // xfullname ::= nm AS nm
+                let (t, a) = (m!(-2).tok, m!(0).tok);
+                let l = sqlite3_src_list_append(p, SrcListId::NULL, Some(&t), None);
+                if l.nn() {
+                    let alias = sqlite3_dequote(p.tok_str(&a));
+                    p.srcm(l).a[0].z_alias = Some(alias);
+                }
+                m!(-2).id = l.0;
+            }
+            123 => {
+                // xfullname ::= nm DOT nm AS nm
+                let (t, d, a) = (m!(-4).tok, m!(-2).tok, m!(0).tok);
+                let l = sqlite3_src_list_append(p, SrcListId::NULL, Some(&t), Some(&d));
+                if l.nn() {
+                    let alias = sqlite3_dequote(p.tok_str(&a));
+                    p.srcm(l).a[0].z_alias = Some(alias);
+                }
+                m!(-4).id = l.0;
+            }
+            125 => {
+                // joinop ::= JOIN_KW JOIN
+                let a = m!(-1).tok;
+                m!(-1).i = sqlite3_join_type(p, &a, None, None);
+            }
+            126 => {
+                // joinop ::= JOIN_KW nm JOIN
+                let (a, b) = (m!(-2).tok, m!(-1).tok);
+                m!(-2).i = sqlite3_join_type(p, &a, Some(&b), None);
+            }
+            127 => {
+                // joinop ::= JOIN_KW nm nm JOIN
+                let (a, b, c) = (m!(-3).tok, m!(-2).tok, m!(-1).tok);
+                m!(-3).i = sqlite3_join_type(p, &a, Some(&b), Some(&c));
+            }
+            129 => {
+                // on_using ::= USING LP idlist RP
+                let l = m!(-1).id;
+                m!(-3).id = 0;
+                m!(-3).id2 = l;
+            }
+            132 => m!(-2).tok = m!(0).tok, // indexed_by ::= INDEXED BY nm
+            133 => m!(-1).tok = Token { z: Token::NO_Z, n: 1 }, // indexed_by ::= NOT INDEXED
             116 | 131 => m!(1).tok = Token::EMPTY, // dbnm ::= ; indexed_opt ::=
             124 => m!(0).i = JT_INNER,             // joinop ::= COMMA|JOIN
             128 => {
@@ -557,9 +715,15 @@ impl YyParser {
             }
             175 => m!(1).id = 0,              // idlist_opt ::=
             176 => m!(-2).id = m!(-1).id,     // idlist_opt ::= LP idlist RP
-            177 | 178 => {
-                // idlist ::= idlist COMMA nm ; idlist ::= nm
-                p.not_supported("identifier list");
+            177 => {
+                // idlist ::= idlist COMMA nm
+                let (l, t) = (IdListId(m!(-2).id), m!(0).tok);
+                m!(-2).id = sqlite3_id_list_append(p, l, &t).0;
+            }
+            178 => {
+                // idlist ::= nm
+                let t = m!(0).tok;
+                m!(0).id = sqlite3_id_list_append(p, IdListId::NULL, &t).0;
             }
             179 => m!(-2).id = m!(-1).id, // expr ::= LP expr RP
             180 => {
@@ -847,8 +1011,29 @@ impl YyParser {
             }
             226 => {
                 // expr ::= expr in_op nm dbnm paren_exprlist
-                p.not_supported("IN table (FROM clause)");
-                m!(-4).id = 0;
+                let (t, d) = (m!(-2).tok, m!(-1).tok);
+                let p_src = sqlite3_src_list_append(p, SrcListId::NULL, Some(&t), Some(&d));
+                let p_select = sqlite3_select_new(
+                    p,
+                    ExprListId::NULL,
+                    p_src,
+                    ExprId::NULL,
+                    ExprListId::NULL,
+                    ExprId::NULL,
+                    ExprListId::NULL,
+                    0,
+                    ExprId::NULL,
+                );
+                let args = el!(0);
+                if args.nn() {
+                    sqlite3_src_list_func_args(p, if p_select.nn() { p_src } else { SrcListId::NULL }, args);
+                }
+                let mut e = sqlite3_p_expr(p, TK_IN, ex!(-4), ExprId::NULL);
+                sqlite3_p_expr_add_select(p, e, p_select);
+                if m!(-3).i != 0 {
+                    e = sqlite3_p_expr(p, TK_NOT, e, ExprId::NULL);
+                }
+                m!(-4).id = e.0;
             }
             227 => {
                 // expr ::= EXISTS LP select RP
@@ -916,6 +1101,7 @@ impl YyParser {
                     p_select: sl!(-1),
                     z_cte_err: None,
                     e_m10d: m!(-3).i as u8,
+                    p_use: 0,
                 });
                 m!(-5).id = self.a_cte.len() as u32 - 1;
             }

@@ -114,6 +114,12 @@ fn intern_func(p: &mut Parse, b: &BuiltinFunc) -> Arc<FuncDef> {
 /// functions (`db->aFunc`) are preferred over built-in functions unless `DBFLAG_PreferBuiltin`
 /// is set.
 pub fn sqlite3_find_function(p: &mut Parse, z_name: &str, n_arg: i32, _create_flag: u8) -> Option<Arc<FuncDef>> {
+    if p.db.case_sensitive_like && z_name.eq_ignore_ascii_case("like") {
+        // sqlite3RegisterLikeFunctions(): like() is then a connection-level function with
+        // other flags and wildcard set; the engine does not implement the pragma yet.
+        p.not_supported("like() after PRAGMA case_sensitive_like");
+        return None;
+    }
     let enc = p.db.enc;
     let mut best: Option<Arc<FuncDef>> = None;
     let mut best_score = 0;

@@ -248,6 +248,18 @@ impl SqliteError {
         Self::with_extended_owned(extended_code, message.into())
     }
 
+    /// Value of [`SqliteError::offset`] for an error of C's code generator (the port) that has
+    /// no byte offset: `sqlite3_error_offset()` is -1 and nothing may be guessed for it.
+    pub const NO_OFFSET: usize = usize::MAX;
+
+    /// `sqlite3_error_offset()`: the byte offset of the error in the statement text, -1 if none.
+    pub fn c_offset(&self) -> i64 {
+        match self.offset {
+            Some(o) if o != Self::NO_OFFSET => o as i64,
+            _ => -1,
+        }
+    }
+
     #[cold]
     #[inline(never)]
     pub fn with_offset(mut self, offset: usize) -> Self {

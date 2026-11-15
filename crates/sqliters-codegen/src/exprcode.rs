@@ -190,40 +190,50 @@ fn expr_compute_operands(p: &mut Parse, e: ExprId, free1: &mut i32, free2: &mut 
     (addr_is_null, r1, r2)
 }
 
-/// `isCandidateForInOpt(pX)`: the right-hand side of an IN operator is a simple
-/// "SELECT <column> FROM <table>" that can use an existing table or index. In step V1 no
-/// real table can appear in a FROM clause, so the answer is always "no"; a table source is
-/// reported as unsupported.
-fn is_candidate_for_in_opt(p: &mut Parse, x: ExprId) -> bool {
+/// `isCandidateForInOpt(pX)`: pX is the RHS of an IN operator. If pX is a SELECT statement
+/// that can be simplified to a direct table access, then return a pointer to the SELECT
+/// statement. If pX is not a SELECT statement, or if the SELECT statement needs to be
+/// manifested into a transient table, then return NULL.
+fn is_candidate_for_in_opt(p: &Parse, x: ExprId) -> SelectId {
     let ex = p.e(x);
     if !ex.use_x_select() {
-        return false;
+        return SelectId::NULL; // Not a subquery
     }
     if ex.has(EP_VarSelect) {
-        return false;
+        return SelectId::NULL; // Correlated subq
     }
-    let s = p.s(ex.x_select());
+    let sel = ex.x_select();
+    let s = p.s(sel);
     if s.p_prior.nn() {
-        return false;
+        return SelectId::NULL; // Not a compound SELECT
     }
     if s.sel_flags & SF_Aggregate != 0 {
-        return false;
+        return SelectId::NULL; // No GROUP BY keyword or aggregate functions
     }
     if s.p_limit.nn() {
-        return false;
+        return SelectId::NULL; // Has no LIMIT clause
     }
     if s.p_where.nn() {
-        return false;
+        return SelectId::NULL; // Has no WHERE clause
     }
     let src = p.src(s.p_src);
     if src.a.len() != 1 {
-        return false;
+        return SelectId::NULL; // Single term in FROM clause
     }
     if src.a[0].is_subquery {
-        return false;
+        return SelectId::NULL; // FROM is not a subquery or view
     }
-    p.not_supported("IN (SELECT ... FROM table): sqlite3FindInIndex over a table or index");
-    false
+    let tab = src.a[0].p_s_tab;
+    if p.tab(tab).is_virtual() {
+        return SelectId::NULL; // FROM clause not a virtual table
+    }
+    // All SELECT results must be columns.
+    for it in &p.l(s.p_e_list).a {
+        if p.e(it.p_expr).op != TK_COLUMN {
+            return SelectId::NULL;
+        }
+    }
+    sel
 }
 
 /// `sqlite3SetHasNullFlag(v, iCur, regHasNull, eSortOrder)`: generate code that checks the
@@ -256,12 +266,12 @@ pub fn sqlite3_find_in_index(
     x: ExprId,
     in_flags: u32,
     mut pr_rhs_has_null: Option<&mut i32>,
-    ai_map: Option<&mut Vec<i32>>,
+    mut ai_map: Option<&mut Vec<i32>>,
     pi_tab: &mut i32,
 ) -> i32 {
     let mut e_type = 0;
     sqlite3_get_vdbe(p);
-    let mut i_tab = p.n_tab;
+    let i_tab = p.n_tab;
     p.n_tab += 1;
 
     // If the RHS of this IN(...) operator is a SELECT, and if it matters whether or not the
@@ -283,10 +293,155 @@ pub fn sqlite3_find_in_index(
         }
     }
 
-    // Check to see if an existing table or index can be used to satisfy the query.
-    if p.n_err == 0 && is_candidate_for_in_opt(p, x) {
-        // (not reachable in step V1)
-    }
+    // Check to see if an existing table or index can be used to satisfy the query. This is
+    // preferable to generating a new ephemeral table.
+    let cand = if p.n_err == 0 { is_candidate_for_in_opt(p, x) } else { SelectId::NULL };
+    if cand.nn() {
+        let e_list = p.s(cand).p_e_list;
+        let n_expr = p.l(e_list).n_expr();
+        let tab = p.src(p.s(cand).p_src).a[0].p_s_tab;
+
+        // Code an OP_Transaction and OP_TableLock for <table>.
+        let i_db = p.tab(tab).i_db;
+        crate::build::sqlite3_code_verify_schema(p, i_db);
+        let (tnum, name) = (p.tab(tab).tnum, p.tab(tab).z_name.clone());
+        crate::schema::sqlite3_table_lock(p, i_db, tnum, 0, &name);
+
+        if n_expr == 1 && p.e(p.l(e_list).a[0].p_expr).i_column < 0 {
+            // The "x IN (SELECT rowid FROM table)" case
+            let i_addr = p.v.add_op0(OP_Once);
+            crate::schema::sqlite3_open_table(p, i_tab, i_db, tab, OP_OpenRead);
+            e_type = IN_INDEX_ROWID;
+            crate::build::sqlite3_vdbe_explain(p, false, format!("USING ROWID SEARCH ON TABLE {name} FOR IN-OPERATOR"));
+            p.v.jump_here(i_addr);
+        } else {
+            let mut affinity_ok = true;
+            let left = p.e(x).p_left;
+
+            // Check that the affinity that will be used to perform each comparison is the
+            // same as the affinity of each column in table on the RHS of the IN operator. If
+            // it not, it is not possible to use any index of the RHS table.
+            let mut i = 0;
+            while i < n_expr && affinity_ok {
+                let lhs = sqlite3_vector_field_subexpr(p, left, i);
+                let i_col = p.e(p.l(e_list).a[i as usize].p_expr).i_column as i32;
+                let idxaff = sqlite3_table_column_affinity(p, tab, i_col); // RHS table
+                let cmpaff = sqlite3_compare_affinity(p, lhs, idxaff);
+                match cmpaff {
+                    SQLITE_AFF_BLOB => {}
+                    SQLITE_AFF_TEXT => {
+                        // sqlite3CompareAffinity() only returns TEXT if one side or the other
+                        // has no affinity and the other side is TEXT. Hence, the only way for
+                        // cmpaff to be TEXT is for idxaff to be TEXT. So the next statement
+                        // cannot be true.
+                    }
+                    _ => affinity_ok = idxaff >= SQLITE_AFF_NUMERIC,
+                }
+                i += 1;
+            }
+
+            if affinity_ok {
+                let must_be_unique = (in_flags & IN_INDEX_LOOP as u32) != 0;
+                // Search for an existing index that will work for this IN operator
+                let list = p.tab(tab).p_index.clone();
+                for idx in list {
+                    if e_type != 0 {
+                        break;
+                    }
+                    let (n_column, n_key_col, partial, unique) = {
+                        let ix = p.idx(idx);
+                        (ix.n_column as i32, ix.n_key_col as i32, ix.p_part_idx_where.nn() || ix.b_partial, ix.is_unique())
+                    };
+                    if n_column < n_expr {
+                        continue;
+                    }
+                    if partial {
+                        continue;
+                    }
+                    // Maximum nColumn is BMS-2, not BMS-1, so that we can compute BITMASK(nExpr)
+                    // without overflowing
+                    if n_column >= BMS - 1 {
+                        continue;
+                    }
+                    if must_be_unique && (n_key_col > n_expr || (n_column > n_expr && !unique)) {
+                        continue; // This index is not unique over the IN RHS columns
+                    }
+
+                    let mut col_used: Bitmask = 0; // Columns of index used so far
+                    for i in 0..n_expr {
+                        let lhs = sqlite3_vector_field_subexpr(p, left, i);
+                        let rhs = p.l(e_list).a[i as usize].p_expr;
+                        let req = sqlite3_binary_compare_coll_seq(p, lhs, rhs);
+                        let rhs_col = p.e(rhs).i_column;
+                        let mut j = 0;
+                        while j < n_expr {
+                            let ix = p.idx(idx);
+                            if ix.ai_column[j as usize] != rhs_col {
+                                j += 1;
+                                continue;
+                            }
+                            if let Some(r) = &req
+                                && !r.name.eq_ignore_ascii_case(&ix.az_coll[j as usize])
+                            {
+                                j += 1;
+                                continue;
+                            }
+                            break;
+                        }
+                        if j == n_expr {
+                            break;
+                        }
+                        let m_col: Bitmask = 1u64 << j;
+                        if m_col & col_used != 0 {
+                            break; // Each column used only once
+                        }
+                        col_used |= m_col;
+                        if let Some(m) = ai_map.as_deref_mut() {
+                            m[i as usize] = j;
+                        }
+                    }
+
+                    if col_used == (1u64 << n_expr) - 1 {
+                        // If we reach this point, that means the index pIdx is usable
+                        let i_addr = p.v.add_op0(OP_Once);
+                        let (idx_name, idx_tnum, sort0) = {
+                            let ix = p.idx(idx);
+                            (ix.z_name.clone(), ix.tnum, ix.a_sort_order[0] as i32)
+                        };
+                        crate::build::sqlite3_vdbe_explain(p, false, format!("USING INDEX {idx_name} FOR IN-OPERATOR"));
+                        p.v.add_op3(OP_OpenRead, i_tab, idx_tnum as i32, i_db);
+                        crate::schema::sqlite3_vdbe_set_p4_key_info(p, idx);
+                        e_type = IN_INDEX_INDEX_ASC + sort0;
+
+                        if let Some(r) = pr_rhs_has_null.as_deref_mut() {
+                            p.n_mem += 1;
+                            *r = p.n_mem;
+                            if n_expr == 1 {
+                                let reg = p.n_mem;
+                                sqlite3_set_has_null_flag(p, i_tab, reg, sort0);
+                            }
+                        }
+                        p.v.jump_here(i_addr);
+                    }
+                } // End loop over indexes
+            } // End if( affinity_ok )
+        } // End if not an rowid index
+    } // End attempt to optimize using an index
+    find_in_index_tail(p, x, in_flags, pr_rhs_has_null, ai_map, pi_tab, i_tab, e_type)
+}
+
+/// The rest of `sqlite3FindInIndex()` after the attempt to use an existing table or index.
+#[allow(clippy::too_many_arguments)]
+fn find_in_index_tail(
+    p: &mut Parse,
+    x: ExprId,
+    in_flags: u32,
+    mut pr_rhs_has_null: Option<&mut i32>,
+    ai_map: Option<&mut Vec<i32>>,
+    pi_tab: &mut i32,
+    mut i_tab: i32,
+    mut e_type: i32,
+) -> i32 {
 
     // If no preexisting index is available for the IN clause and IN_INDEX_NOOP is an allowed
     // reply and the RHS of the IN operator is a list, not a subquery and the RHS is not
@@ -444,6 +599,10 @@ pub fn sqlite3_code_rhs_of_in(p: &mut Parse, e: ExprId, i_tab: i32, mut allow_bl
         // If there is, then make use of that prior materialization rather than recomputing it.
         if p.e(e).has(EP_Subrtn) || find_compatible_in_rhs_subrtn(p, e, sig.as_ref()) {
             addr_once = p.v.add_op0(OP_Once);
+            if p.e(e).use_x_select() {
+                let id = p.s(p.e(e).x_select()).sel_id;
+                crate::build::sqlite3_vdbe_explain(p, false, format!("REUSE LIST SUBQUERY {id}"));
+            }
             let (reg_return, i_addr, tab) = (p.e(e).y_sub_reg_return, p.e(e).y_sub_i_addr, p.e(e).i_table);
             p.v.add_op2(OP_Gosub, reg_return, i_addr);
             p.v.add_op2(OP_OpenDup, i_tab, tab);
@@ -486,6 +645,11 @@ pub fn sqlite3_code_rhs_of_in(p: &mut Parse, e: ExprId, i_tab: i32, mut allow_bl
         // and opened above.
         let select = p.e(e).x_select();
         let e_list = p.s(select).p_e_list;
+        {
+            let id = p.s(select).sel_id;
+            let corr = if addr_once != 0 { "" } else { "CORRELATED " };
+            crate::build::sqlite3_vdbe_explain(p, true, format!("{corr}LIST SUBQUERY {id}"));
+        }
         // If the LHS and RHS of the IN operator do not match, that error will have been
         // caught earlier.
         if p.l(e_list).n_expr() == n_val {
@@ -605,6 +769,8 @@ pub fn sqlite3_code_subselect(p: &mut Parse, e: ExprId) -> i32 {
 
     // If this routine has already been coded, then invoke it as a subroutine.
     if p.e(e).has(EP_Subrtn) {
+        let id = p.s(sel).sel_id;
+        crate::build::sqlite3_vdbe_explain(p, false, format!("REUSE SUBQUERY {id}"));
         let (reg_return, i_addr) = (p.e(e).y_sub_reg_return, p.e(e).y_sub_i_addr);
         p.v.add_op2(OP_Gosub, reg_return, i_addr);
         return p.e(e).i_table;
@@ -628,6 +794,11 @@ pub fn sqlite3_code_subselect(p: &mut Parse, e: ExprId) -> i32 {
     // array of registers and return the index of the first register. If this is an EXISTS,
     // write an integer 0 (not exists) or 1 (exists) into a memory cell and record that memory
     // cell in iColumn.
+    {
+        let id = p.s(sel).sel_id;
+        let corr = if addr_once != 0 { "" } else { "CORRELATED " };
+        crate::build::sqlite3_vdbe_explain(p, true, format!("{corr}SCALAR SUBQUERY {id}"));
+    }
     let n_reg = if p.e(e).op == TK_SELECT { p.l(p.s(sel).p_e_list).n_expr() } else { 1 };
     let mut dest = SelectDest { e_dest: 0, i_sd_parm: p.n_mem + 1, ..SelectDest::default() };
     p.n_mem += n_reg;
@@ -949,28 +1120,77 @@ fn code_integer(p: &mut Parse, e: ExprId, neg_flag: bool, i_mem: i32) {
     }
 }
 
+/// `sqlite3ExprCodeLoadIndexColumn(pParse, pIdx, iTabCur, iIdxCol, regOut)`: generate code
+/// that will load into register regOut a value that is appropriate for the iIdxCol-th
+/// column of index pIdx.
+pub fn sqlite3_expr_code_load_index_column(p: &mut Parse, idx: IndexId, i_tab_cur: i32, i_idx_col: i32, reg_out: i32) {
+    let i_tab_col = p.idx(idx).ai_column[i_idx_col as usize] as i32;
+    if i_tab_col == XN_EXPR {
+        let e = p.l(p.idx(idx).a_col_expr).a[i_idx_col as usize].p_expr;
+        p.i_self_tab = i_tab_cur + 1;
+        sqlite3_expr_code_copy(p, e, reg_out);
+        p.i_self_tab = 0;
+    } else {
+        let tab = p.idx(idx).p_table;
+        sqlite3_expr_code_get_column_of_table(p, tab, i_tab_cur, i_tab_col, reg_out);
+    }
+}
+
+/// `sqlite3ColumnDefault(v, pTab, i, iReg)`: the most recently coded instruction was an
+/// OP_Column to retrieve the i-th column of table pTab. This routine sets the P4 parameter
+/// of the OP_Column to the default value, if any.
+///
+/// The default value of a column is specified by a DEFAULT clause in the column definition.
+/// This was either supplied by the user when the table was created, or added later to the
+/// table definition by an ALTER TABLE command. If the latter, then the row-records in the
+/// table btree on disk may not contain a value for the column and the default value, taken
+/// from the P4 parameter of the OP_Column instruction, is returned instead. If the former,
+/// then all row-records are guaranteed to include a value for the column and the P4 value is
+/// not required.
+///
+/// Column definitions created by an ALTER TABLE command may only have literal default
+/// values. Other, more complex expressions, are stored without a P4 value.
+///
+/// If column as REAL affinity and the table is an ordinary b-tree table (not a virtual
+/// table) then the value might have been stored as an integer. In that case, add an
+/// OP_RealAffinity opcode to make sure it has been converted into REAL.
+pub fn sqlite3_column_default(p: &mut Parse, tab: TableId, i: i32, i_reg: i32) {
+    let (has_dflt, dflt, aff) = {
+        let c = &p.tab(tab).a_col[i as usize];
+        (c.i_dflt != 0, c.dflt_value.clone(), c.affinity)
+    };
+    if has_dflt
+        && let Some(v) = dflt
+    {
+        p.v.append_p4(P4::Mem(v));
+    }
+    if aff == SQLITE_AFF_REAL {
+        p.v.add_op1(OP_RealAffinity, i_reg);
+    }
+}
+
 /// `sqlite3ExprCodeGetColumnOfTable(v, pTab, iTabCur, iCol, regOut)`: generate code to extract
-/// the value of the `i_col`-th column of a table. Step V1 reaches this only for the result
-/// columns of a co-routine subquery, which `sqlite3WhereEnd()` turns into register copies.
+/// the value of the iCol-th column of a table.
 pub fn sqlite3_expr_code_get_column_of_table(p: &mut Parse, tab: TableId, i_tab_cur: i32, i_col: i32, reg_out: i32) {
-    let t = p.tab(tab);
-    if i_col < 0 || i_col == t.i_p_key as i32 {
+    if i_col < 0 || i_col == p.tab(tab).i_p_key as i32 {
         p.v.add_op2(OP_Rowid, i_tab_cur, reg_out);
     } else {
-        if t.e_tab_type == TABTYP_VTAB as u8
-            || (t.tab_flags & (TF_HasGenerated | TF_WithoutRowid)) != 0
-            || (t.tab_flags & TF_Ephemeral) == 0
-        {
-            p.not_supported("column of a table (virtual, generated, WITHOUT ROWID or schema table)");
+        let x;
+        if p.tab(tab).is_virtual() {
+            p.v.add_op3(OP_VColumn, i_tab_cur, i_col, reg_out);
             return;
+        } else if p.tab(tab).a_col[i_col as usize].col_flags & COLFLAG_VIRTUAL as u16 != 0 {
+            // sqlite3ExprCodeGeneratedColumn(): needs the AS expression of the column
+            p.not_supported("VIRTUAL generated column");
+            return;
+        } else if !p.tab(tab).has_rowid() {
+            let pk = crate::schema::sqlite3_primary_key_index(p, tab);
+            x = crate::schema::sqlite3_table_column_to_index(p.idx(pk), i_col);
+        } else {
+            x = crate::schema::sqlite3_table_column_to_storage(p.tab(tab), i_col);
         }
-        // x = sqlite3TableColumnToStorage(pTab, iCol): no virtual columns, so x==iCol
-        p.v.add_op3(OP_Column, i_tab_cur, i_col, reg_out);
-        // sqlite3ColumnDefault(): a view / subquery has no DEFAULT values; a column with REAL
-        // affinity gets OP_RealAffinity.
-        if p.tab(tab).a_col[i_col as usize].affinity == SQLITE_AFF_REAL {
-            p.v.add_op1(OP_RealAffinity, reg_out);
-        }
+        p.v.add_op3(OP_Column, i_tab_cur, x, reg_out);
+        sqlite3_column_default(p, tab, i_col, reg_out);
     }
 }
 
@@ -1163,6 +1383,90 @@ fn expr_code_target_and_or(p: &mut Parse, e: ExprId, target: i32, p_tmp_reg: &mu
     target
 }
 
+/// `sqlite3IndexedExprLookup(pParse, pExpr, target)`: check to see if pExpr is one of the
+/// indexed expressions on pParse->pIdxEpr. If it is, then resolve the expression by reading
+/// from the index, and return the register into which the value has been read. If pExpr is
+/// not an indexed expression, then return negative.
+fn sqlite3_indexed_expr_lookup(p: &mut Parse, e: ExprId, target: i32) -> i32 {
+    // C walks the list from the most recently added entry
+    for k in (0..p.p_idx_epr.len()).rev() {
+        let ie = p.p_idx_epr[k].clone();
+        let mut i_data_cur = ie.i_data_cur;
+        if i_data_cur < 0 {
+            continue;
+        }
+        if p.i_self_tab != 0 {
+            if ie.i_data_cur != p.i_self_tab - 1 {
+                continue;
+            }
+            i_data_cur = -1;
+        }
+        if sqlite3_expr_compare(p, false, e, ie.p_expr, i_data_cur) != 0 {
+            continue;
+        }
+        let expr_aff = sqlite3_expr_affinity(p, e);
+        if (expr_aff <= SQLITE_AFF_BLOB && ie.aff != SQLITE_AFF_BLOB)
+            || (expr_aff == SQLITE_AFF_TEXT && ie.aff != SQLITE_AFF_TEXT)
+            || (expr_aff >= SQLITE_AFF_NUMERIC && ie.aff != SQLITE_AFF_NUMERIC)
+        {
+            // Affinity mismatch on a generated column
+            continue;
+        }
+        // Functions that might set a subtype should not be replaced by the value taken from
+        // an expression index if they are themselves an argument to another scalar function
+        // or aggregate. https://sqlite.org/forum/forumpost/68d284c86b082c3e
+        if p.e(e).has(EP_SubtArg) && sqlite3_expr_can_return_subtype(p, e) {
+            continue;
+        }
+        if ie.b_maybe_null_row || sqlite3_expr_is_constant(p, e) != 0 {
+            // The value of pExpr should be computed from the original expression, rather
+            // than from the index, if the index row is a NULL row of an outer join (or the
+            // expression is a constant: an index-only constant is cheaper to evaluate).
+            let addr = p.v.current_addr();
+            p.v.add_op3(OP_IfNullRow, ie.i_idx_cur, addr + 3, target);
+            p.v.add_op3(OP_Column, ie.i_idx_cur, ie.i_idx_col, target);
+            p.v.goto(0);
+            let saved = std::mem::take(&mut p.p_idx_epr);
+            sqlite3_expr_code(p, e, target);
+            p.p_idx_epr = saved;
+            p.v.jump_here(addr + 2);
+        } else {
+            p.v.add_op3(OP_Column, ie.i_idx_cur, ie.i_idx_col, target);
+        }
+        return target;
+    }
+    -1 // Not found
+}
+
+/// `exprPartidxExprLookup(pParse, pExpr, iTarget)`: expression pExpr is guaranteed to be a
+/// TK_COLUMN or equivalent. This function checks the Parse.pIdxPartExpr list to see if this
+/// column might be replaced with a constant value. If so, it generates code to store the
+/// constant value in a register and returns the register number. Otherwise 0.
+fn expr_partidx_expr_lookup(p: &mut Parse, e: ExprId, i_target: i32) -> i32 {
+    for k in (0..p.p_idx_part_expr.len()).rev() {
+        let ie = p.p_idx_part_expr[k].clone();
+        if p.e(e).i_column as i32 == ie.i_idx_col && p.e(e).i_table == ie.i_data_cur {
+            let mut addr = 0;
+            if ie.b_maybe_null_row {
+                addr = p.v.add_op1(OP_IfNullRow, ie.i_idx_cur);
+            }
+            let ret = sqlite3_expr_code_target(p, ie.p_expr, i_target);
+            p.v.add_op4(OP_Affinity, ret, 1, 0, P4::Dynamic(vec![ie.aff]));
+            if sqlite3_expr_can_return_subtype(p, ie.p_expr) {
+                // If the expression value may have a sub-type, clear it. Values read from
+                // the index never have a sub-type.
+                p.v.add_op1(OP_ClrSubtype, ret);
+            }
+            if addr != 0 {
+                p.v.jump_here(addr);
+                p.v.change_p3(addr, ret);
+            }
+            return ret;
+        }
+    }
+    0
+}
+
 /// `sqlite3ExprCodeTarget(pParse, pExpr, target)`: generate code into the current Vdbe to
 /// evaluate the given expression. Attempt to store the results in register `target`. Return
 /// the register where results are stored.
@@ -1177,7 +1481,12 @@ pub fn sqlite3_expr_code_target(p: &mut Parse, mut e: ExprId, target: i32) -> i3
     let mut op;
     loop {
         // expr_code_doover:
-        // (pParse->pIdxEpr: indexed expressions are set up by where.c only)
+        if e.nn() && !p.p_idx_epr.is_empty() && !p.e(e).has(EP_Leaf) {
+            let r1 = sqlite3_indexed_expr_lookup(p, e, target);
+            if r1 >= 0 {
+                return r1;
+            }
+        }
         op = if e.is_null() { TK_NULL } else { p.e(e).op };
         match op {
             TK_COLLATE => {
@@ -1245,10 +1554,23 @@ pub fn sqlite3_expr_code_target(p: &mut Parse, mut e: ExprId, target: i32) -> i3
                 }
                 return i_reg;
             }
+            let mut i_tab = i_tab;
             if i_tab < 0 {
-                // (CHECK constraints, generated columns and index expressions: pParse->iSelfTab)
-                p.not_supported("column reference relative to Parse.iSelfTab");
-                return target;
+                if p.i_self_tab < 0 {
+                    // Other columns in the same row for CHECK constraints or generated
+                    // columns: belongs to DML.
+                    p.not_supported("column reference relative to a row under construction (iSelfTab<0)");
+                    return target;
+                } else {
+                    // Coding an expression that is part of an index where column names in
+                    // the index refer to the table to which the index belongs
+                    i_tab = p.i_self_tab - 1;
+                }
+            } else if !p.p_idx_part_expr.is_empty() {
+                let r1 = expr_partidx_expr_lookup(p, e, target);
+                if r1 != 0 {
+                    return r1;
+                }
             }
             let (tab, i_column, op2) = (p.e(e).y_tab, p.e(e).i_column as i32, p.e(e).op2);
             sqlite3_expr_code_get_column(p, tab, i_column, i_tab, target, op2)
@@ -1579,7 +1901,30 @@ pub fn sqlite3_expr_code_target(p: &mut Parse, mut e: ExprId, target: i32) -> i3
         // TK_IF_NULL_ROW Expr nodes are inserted ahead of expressions that derive from the
         // right-hand table of a LEFT JOIN (flattened subqueries, where.c).
         TK_IF_NULL_ROW => {
-            p.not_supported("TK_IF_NULL_ROW (flattened LEFT JOIN subquery)");
+            let ok_const_factor = p.ok_const_factor;
+            let agg = p.e(e).p_agg_info;
+            if agg.nn() {
+                let i_agg = p.e(e).i_agg as i32;
+                if p.agg(agg).direct_mode == 0 {
+                    return p.agg(agg).column_reg(i_agg);
+                }
+                if p.agg(agg).use_sorting_idx != 0 {
+                    let (ptab, i_sorter) = (p.agg(agg).sorting_idx_p_tab, p.agg(agg).a_col[i_agg as usize].i_sorter_column);
+                    p.v.add_op3(OP_Column, ptab, i_sorter, target);
+                    return target;
+                }
+            }
+            let i_table = p.e(e).i_table;
+            let addr_inr = p.v.add_op3(OP_IfNullRow, i_table, 0, target);
+            // The OP_IfNullRow opcode above can overwrite the result register with NULL. So
+            // we must ensure that the result register is not one that is used for
+            // constant-factored expressions. Disable factoring of constants within the
+            // IF_NULL_ROW.
+            p.ok_const_factor = false;
+            let left = p.e(e).p_left;
+            sqlite3_expr_code(p, left, target);
+            p.ok_const_factor = ok_const_factor;
+            p.v.jump_here(addr_inr);
             in_reg
         }
         // Form A:

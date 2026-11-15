@@ -686,6 +686,16 @@ impl Vdbe {
         }
     }
 
+    /// `sqlite3VdbeReprepareOnBind(v, iVar, 0)`: configure SQL variable iVar so that binding a
+    /// new value to it signals that re-preparing the statement may result in a better query
+    /// plan (the `expmask` bit of the variable is set; `smimask` is not kept by this port,
+    /// its only setter passes bSmallint and is recorded where it is ported).
+    pub fn reprepare_on_bind(&mut self, i_var: i32) {
+        debug_assert!(i_var > 0);
+        let m: u32 = if i_var >= 32 { 0x8000_0000 } else { 1u32 << (i_var - 1) };
+        self.expmask |= m;
+    }
+
     /// `sqlite3VdbeMakeReady(p, pParse)`: finish the program. `sizing` carries the `Parse`
     /// fields the function reads.
     pub fn make_ready(mut self, sizing: MakeReady) -> Program {

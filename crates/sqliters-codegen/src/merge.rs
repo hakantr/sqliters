@@ -149,6 +149,7 @@ fn generate_output_subroutine(
             p.v.add_op4_int(OP_IdxInsert, dest.i_sd_parm, r1, p_in.i_sdst, p_in.n_sdst);
             if dest.i_sd_parm2 > 0 {
                 p.v.add_op4_int(OP_FilterAdd, dest.i_sd_parm2, 0, p_in.i_sdst, p_in.n_sdst);
+                crate::build::sqlite3_vdbe_explain(p, false, "CREATE BLOOM FILTER".to_owned());
             }
             sqlite3_release_temp_reg(p, r1);
         }
@@ -322,11 +323,17 @@ pub fn multi_select_by_merge(p: &mut Parse, sel: SelectId, dest: &mut SelectDest
     let mut dest_a = sqlite3_select_dest_init(SRT_Coroutine, reg_addr_a);
     let mut dest_b = sqlite3_select_dest_init(SRT_Coroutine, reg_addr_b);
 
+    {
+        let op_name = sqlite3_select_op_name(p.s(sel).op);
+        crate::build::sqlite3_vdbe_explain(p, true, format!("MERGE ({op_name})"));
+    }
+
     // Generate a coroutine to evaluate the SELECT statement to the left of the compound
     // operator - the "A" select.
     let addr_select_a = p.v.current_addr() + 1;
     let mut addr1 = p.v.add_op3(OP_InitCoroutine, reg_addr_a, 0, addr_select_a);
     p.sm(prior).i_limit = reg_limit_a;
+    crate::build::sqlite3_vdbe_explain(p, true, "LEFT".to_owned());
     sqlite3_select(p, prior, &mut dest_a);
     p.v.end_coroutine(reg_addr_a);
     p.n_temp_reg = 0;
@@ -340,6 +347,7 @@ pub fn multi_select_by_merge(p: &mut Parse, sel: SelectId, dest: &mut SelectDest
     let saved_offset = p.s(sel).i_offset;
     p.sm(sel).i_limit = reg_limit_b;
     p.sm(sel).i_offset = 0;
+    crate::build::sqlite3_vdbe_explain(p, true, "RIGHT".to_owned());
     sqlite3_select(p, sel, &mut dest_b);
     p.sm(sel).i_limit = saved_limit;
     p.sm(sel).i_offset = saved_offset;
@@ -440,5 +448,6 @@ pub fn multi_select_by_merge(p: &mut Parse, sel: SelectId, dest: &mut SelectDest
     p.sm(prior).p_order_by = ExprListId::NULL;
 
     // TBD: Insert subroutine calls to close cursors on incomplete subqueries
+    crate::build::sqlite3_vdbe_explain_pop(p);
     (p.n_err != 0) as i32
 }

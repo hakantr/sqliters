@@ -117,6 +117,25 @@ pub struct DbSlot {
     pub schema: Schema,
     /// Monotonic unique identity for this slot's schema lifetime.
     pub schema_instance_id: SchemaInstanceId,
+    /// C's `Schema.iGeneration`: the number of times a loaded schema of this database was
+    /// cleared (`sqlite3SchemaClear`); operand P4 of `OP_Transaction` in C's programs.
+    pub c_generation: i32,
+    /// C's `DB_SchemaLoaded` of this database as far as the engine can tell: a statement that
+    /// reads the schema was prepared since the schema was last cleared.
+    pub c_loaded: bool,
+    /// `sqlite_stat1` of this database was written by a statement and not read back by ANALYZE
+    /// since: C's in-memory statistics may differ from the engine's (which may have re-read
+    /// them). C's code generator (the port) then reports the tables of this database as
+    /// unsupported.
+    pub c_stat_dirty: bool,
+    /// Tables and indexes (lower case; an index as "<table>\u{1}<index>") that had
+    /// statistics the last time C read `sqlite_stat1` into its current schema objects.
+    pub c_stat_seen: std::collections::HashSet<String>,
+    /// Tables whose statistics C keeps from an earlier read although the row is gone
+    /// (`sqlite3AnalysisLoad()` does not reset `Table.nRowLogEst`, `szTabRow`, nor the
+    /// `unordered` / `noskipscan` / `sz=` state of an index): the port reports them as
+    /// unsupported until C's schema is reset.
+    pub c_stat_stale: std::collections::HashSet<String>,
     /// Deferred page size requested via `PRAGMA [schema.]page_size = N` for next `VACUUM`.
     pub next_page_size: Option<u32>,
     /// Deferred auto-vacuum mode requested via `PRAGMA [schema.]auto_vacuum = M` for next `VACUUM`.
@@ -250,6 +269,13 @@ pub struct DatabaseSet {
     /// `PRAGMA cell_size_check` (`SQLITE_CellSizeCk` in `sqlite3.flags`), applied to every
     /// database of the connection, including ones opened later.
     cell_size_check: bool,
+    /// The boolean `db->flags` pragmas that only C's code generator reads (see
+    /// [`DatabaseSet::c_flag`]): bits whose value differs from C's default.
+    c_flags_toggled: u64,
+    /// `PRAGMA case_sensitive_like` (`sqlite3RegisterLikeFunctions`)
+    c_case_sensitive_like: bool,
+    c_prepare_unloaded: bool,
+    c_cookie_ahead: Option<usize>,
 }
 
 impl std::fmt::Debug for DatabaseSet {
@@ -281,6 +307,11 @@ impl DatabaseSet {
                 btree: Some(main_btree),
                 schema: main_schema,
                 schema_instance_id: SchemaInstanceId(1),
+                c_generation: 0,
+            c_loaded: false,
+            c_stat_dirty: false,
+            c_stat_seen: Default::default(),
+            c_stat_stale: Default::default(),
                 next_page_size: None,
                 next_auto_vacuum: None,
                 max_page_count: SQLITE_MAX_PAGE_COUNT,
@@ -293,6 +324,11 @@ impl DatabaseSet {
                 btree: None,
                 schema: Schema::default(),
                 schema_instance_id: SchemaInstanceId(2),
+                c_generation: 0,
+            c_loaded: false,
+            c_stat_dirty: false,
+            c_stat_seen: Default::default(),
+            c_stat_stale: Default::default(),
                 next_page_size: None,
                 next_auto_vacuum: None,
                 max_page_count: SQLITE_MAX_PAGE_COUNT,
@@ -324,6 +360,10 @@ impl DatabaseSet {
             temp_trigger_bindings: Vec::new(),
             analysis_limit: 0,
             cell_size_check: false,
+            c_flags_toggled: 0,
+            c_case_sensitive_like: false,
+            c_prepare_unloaded: false,
+            c_cookie_ahead: None,
             xferopt_delta: std::sync::atomic::AtomicU64::new(0),
             open_blobs: std::collections::HashMap::new(),
             vtab_registry: crate::vtab::VTabRegistry::new(),
@@ -635,6 +675,161 @@ impl DatabaseSet {
             }
         }
         Ok(false)
+    }
+
+    /// The bits of C's `db->flags` (given as C's flag value) that were switched away from
+    /// their default by a flag pragma (`automatic_index`, `reverse_unordered_selects`,
+    /// `short_column_names`, `full_column_names`). Only C's code generator (the port) reads
+    /// them.
+    #[inline]
+    pub const fn c_flags_toggled(&self) -> u64 {
+        self.c_flags_toggled
+    }
+
+    /// Records that flag `bit` of C's `db->flags` now differs (`true`) or not from its default.
+    pub fn set_c_flag_toggled(&mut self, bit: u64, toggled: bool) {
+        if toggled {
+            self.c_flags_toggled |= bit;
+        } else {
+            self.c_flags_toggled &= !bit;
+        }
+    }
+
+    /// `sqlite3AnalysisLoad()` ran for every database (ANALYZE, or the first read of the
+    /// schema): record which tables and indexes have statistics now; the ones that had some
+    /// before and have none now keep stale values in C.
+    pub fn c_note_stats(&mut self, after_analyze: bool) {
+        for slot in &mut self.slots {
+            let mut cur = std::collections::HashSet::new();
+            for t in &slot.schema.tables {
+                if t.stat1.has_stat1 {
+                    cur.insert(t.name.to_ascii_lowercase());
+                }
+                if t.without_rowid_pk_stat1.as_ref().is_some_and(|s| s.has_stat1) {
+                    cur.insert(format!("{}\u{1}", t.name.to_ascii_lowercase()));
+                }
+            }
+            for ix in &slot.schema.indexes {
+                if ix.stat1.as_ref().is_some_and(|s| s.has_stat1) {
+                    cur.insert(format!("{}\u{1}{}", ix.table_name.to_ascii_lowercase(), ix.name.to_ascii_lowercase()));
+                }
+            }
+            for gone in slot.c_stat_seen.difference(&cur) {
+                let table = gone.split('\u{1}').next().unwrap_or("").to_owned();
+                slot.c_stat_stale.insert(table);
+            }
+            slot.c_stat_seen = cur;
+            if after_analyze {
+                slot.c_stat_dirty = false;
+            }
+        }
+    }
+
+    /// A statement writes `sqlite_stat1`.
+    pub fn c_mark_stat_dirty(&mut self) {
+        for slot in &mut self.slots {
+            slot.c_stat_dirty = true;
+        }
+    }
+
+    /// A statement that changed the schema cookie of database `i_db` was rolled back alone
+    /// inside a transaction (C: CREATE VIRTUAL TABLE failing in OP_VCreate): C's in-memory
+    /// cookie is then ahead of the file, and the next statement that checks the cookie gets
+    /// SQLITE_SCHEMA, which resets that schema and the temp schema (`sqlite3ResetOneSchema`)
+    /// before the statement is prepared again.
+    pub fn c_note_cookie_ahead(&mut self, i_db: usize) {
+        self.c_cookie_ahead = Some(i_db);
+    }
+
+    /// The database whose in-memory schema cookie C has one ahead of the file, if any.
+    pub const fn c_cookie_ahead(&self) -> Option<usize> {
+        self.c_cookie_ahead
+    }
+
+    /// The next statement that reads the schema is being prepared: apply a pending
+    /// [`Self::c_note_cookie_ahead`].
+    pub fn c_apply_cookie_ahead(&mut self) {
+        if let Some(i_db) = self.c_cookie_ahead.take() {
+            for i in [i_db, 1] {
+                if let Some(slot) = self.slots.get_mut(i)
+                    && slot.c_loaded
+                {
+                    slot.c_generation += 1;
+                    slot.c_stat_dirty = false;
+                    slot.c_stat_seen.clear();
+                    slot.c_stat_stale.clear();
+                }
+                if i_db == 1 {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// `sqlite3ResetAllSchemasOfConnection()`: every loaded schema is cleared
+    /// (`sqlite3SchemaClear`: `iGeneration++` if `DB_SchemaLoaded`). C does this when a
+    /// transaction that changed the schema is rolled back and at the end of VACUUM.
+    pub fn c_reset_all_schemas(&mut self) {
+        self.c_cookie_ahead = None;
+        for slot in &mut self.slots {
+            if slot.c_loaded {
+                slot.c_generation += 1;
+                slot.c_loaded = false;
+                slot.c_stat_dirty = false;
+                slot.c_stat_seen.clear();
+                slot.c_stat_stale.clear();
+            }
+        }
+    }
+
+    /// `OP_ParseSchema` with P4==0 (ALTER TABLE, `renameReloadSchema()`): the schema of
+    /// database `i_db` is cleared and read again, then the same for the temp database.
+    pub fn c_reparse_schema(&mut self, i_db: usize) {
+        for i in [i_db, 1] {
+            if let Some(slot) = self.slots.get_mut(i)
+                && slot.c_loaded
+            {
+                slot.c_generation += 1;
+                slot.c_stat_dirty = false;
+                slot.c_stat_seen.clear();
+                slot.c_stat_stale.clear();
+            }
+            if i_db == 1 {
+                break;
+            }
+        }
+    }
+
+    /// `sqlite3Init()` ran: all schemas are loaded.
+    pub fn c_mark_schemas_loaded(&mut self) {
+        for slot in &mut self.slots {
+            slot.c_loaded = true;
+        }
+    }
+
+    /// True if `sqlite3Init()` has work to do (some schema is not loaded).
+    pub fn c_any_schema_unloaded(&self) -> bool {
+        self.slots.iter().any(|s| !s.c_loaded)
+    }
+
+    /// Whether some schema was not loaded when the statement being prepared started
+    /// (`sqlite3ReadSchema()` then runs `sqlite3Init()`, which resets the error offset).
+    pub const fn c_prepare_unloaded(&self) -> bool {
+        self.c_prepare_unloaded
+    }
+
+    pub fn set_c_prepare_unloaded(&mut self, v: bool) {
+        self.c_prepare_unloaded = v;
+    }
+
+    /// `PRAGMA case_sensitive_like` as last set.
+    #[inline]
+    pub const fn c_case_sensitive_like(&self) -> bool {
+        self.c_case_sensitive_like
+    }
+
+    pub fn set_c_case_sensitive_like(&mut self, on: bool) {
+        self.c_case_sensitive_like = on;
     }
 
     /// Current `PRAGMA cell_size_check` flag.
@@ -1520,6 +1715,11 @@ impl DatabaseSet {
             btree: Some(btree),
             schema,
             schema_instance_id: instance_id,
+            c_generation: 0,
+            c_loaded: false,
+            c_stat_dirty: false,
+            c_stat_seen: Default::default(),
+            c_stat_stale: Default::default(),
             next_page_size: None,
             next_auto_vacuum: None,
             max_page_count: SQLITE_MAX_PAGE_COUNT,

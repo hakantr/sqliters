@@ -102,7 +102,12 @@ fn program_sizing() {
 
 #[test]
 fn unsupported_statements_are_reported_not_approximated() {
-    for sql in ["select a from t", "create table t(x)", "insert into t values(1)", "select row_number() over ()", "pragma page_size"] {
+    for sql in ["create table t(x)", "insert into t values(1)", "select row_number() over ()", "pragma page_size"] {
         assert!(matches!(prepare(Db::new(&NoHost), sql), PrepareResult::Unsupported(_)), "{sql}");
     }
+    // A table in FROM is compiled since step V2: with no schema it is C's error.
+    let PrepareResult::Error { message, offset } = prepare(Db::new(&NoHost), "select a from t") else {
+        panic!("select a from t")
+    };
+    assert_eq!((message.as_str(), offset), ("no such table: t", -1));
 }

@@ -931,6 +931,7 @@ pub fn sqlite3_with_dup(p: &mut Parse, with: WithId) -> WithId {
             z_name: c.z_name.clone(),
             e_m10d: c.e_m10d,
             z_cte_err: None,
+            p_use: 0,
         });
     }
     p.a_with.push(new);
@@ -1229,10 +1230,426 @@ pub fn sqlite3_expr_is_constant_not_join(p: &mut Parse, e: ExprId) -> i32 {
     expr_is_const(p, e, 2, true, 0)
 }
 
-/// `sqlite3ExprIsTableConstant(p, iCur, bAllowSubq)` without sub-queries: return non-zero if
-/// the expression is constant for every single row of the table with cursor `i_cur`.
+/// `sqlite3ExprIsTableConstant(p, iCur, 0)`: return non-zero if the expression is constant
+/// for every single row of the table with cursor `i_cur`.
 pub fn sqlite3_expr_is_table_constant(p: &mut Parse, e: ExprId, i_cur: i32) -> i32 {
-    expr_is_const(p, e, 3, false, i_cur)
+    sqlite3_expr_is_table_constant_subq(p, e, i_cur, false)
+}
+
+/// `exprSelectWalkTableConstant(pWalker, pSelect)`: Walker callback of
+/// sqlite3ExprIsTableConstant() for sub-queries: an uncorrelated sub-query is constant.
+fn expr_select_walk_table_constant(p: &mut Parse, w: &mut Walker, s: SelectId) -> i32 {
+    if (p.s(s).sel_flags & SF_Correlated) != 0 {
+        w.e_code = 0;
+        return WRC_Abort;
+    }
+    WRC_Prune
+}
+
+/// `sqlite3ExprIsTableConstant(p, iCur, bAllowSubq)`: walk an expression tree. Return
+/// non-zero if the expression is constant for any single row of the table with cursor iCur.
+/// In other words, the expression must not refer to any non-deterministic function nor any
+/// table other than iCur.
+///
+/// Consider uncorrelated subqueries to be constants if the bAllowSubq parameter is true.
+pub fn sqlite3_expr_is_table_constant_subq(p: &mut Parse, e: ExprId, i_cur: i32, b_allow_subq: bool) -> i32 {
+    let mut w = Walker {
+        e_code: 3,
+        has_parse: false,
+        x_expr_callback: Some(expr_node_is_constant),
+        x_select_callback: Some(if b_allow_subq { expr_select_walk_table_constant } else { sqlite3_select_walk_fail }),
+        n: i_cur,
+        ..Walker::default()
+    };
+    sqlite3_walk_expr(p, &mut w, e);
+    w.e_code as i32
+}
+
+/// `sqlite3ExprIsSingleTableConstraint(pExpr, pSrcList, iSrc, bAllowSubq)`: check pExpr to
+/// see if it is an constraint on the single data source pSrc = &pSrcList->a[iSrc]. In other
+/// words, check to see if pExpr constrains pSrc but does not depend on any other tables or
+/// data sources anywhere else in the query. Return true (non-zero) if pExpr is a constraint
+/// on pSrc only.
+///
+/// This is an optimization. False negatives will perhaps cause slower queries, but false
+/// positives will yield incorrect answers. So when in doubt, return 0.
+///
+/// To be an single-source constraint, the following must be true:
+///
+///   (1)  pExpr cannot refer to any table other than pSrc->iCursor.
+///
+///   (2a) pExpr cannot use subqueries unless the bAllowSubq parameter is true and the
+///        subquery is non-correlated
+///
+///   (2b) pExpr cannot use non-deterministic functions.
+///
+///   (3)  pSrc cannot be part of the left operand for a RIGHT JOIN. (Is there some way to
+///        relax this constraint?)
+///
+///   (4)  If pSrc is the right operand of a LEFT JOIN, then...
+///         (4a)  pExpr must come from an ON clause..
+///         (4b)  and specifically the ON clause associated with the LEFT JOIN.
+///
+///   (5)  If pSrc is the right operand of a LEFT JOIN or the left operand of a RIGHT JOIN,
+///        then pExpr must be from the WHERE clause, not an ON clause.
+///
+///   (6) Either:
+///
+///       (6a) pExpr does not originate in an ON or USING clause, or
+///
+///       (6b) The ON or USING clause from which pExpr is derived is not to the left of a
+///            RIGHT JOIN (or FULL JOIN).
+///
+/// Without this restriction, accepting pExpr as a single-table constraint might move the
+/// the ON/USING filter expression from the left side of a RIGHT JOIN over to the right
+/// side, which leads to incorrect answers. See also restriction (9) on push-down.
+pub fn sqlite3_expr_is_single_table_constraint(p: &mut Parse, e: ExprId, src_list: SrcListId, i_src: usize, b_allow_subq: bool) -> bool {
+    let (jointype, i_cursor) = {
+        let it = &p.src(src_list).a[i_src];
+        (it.jointype as i32, it.i_cursor)
+    };
+    if jointype & JT_LTORJ != 0 {
+        return false; // rule (3)
+    }
+    if jointype & JT_LEFT != 0 {
+        if !p.e(e).has(EP_OuterON) {
+            return false; // rule (4a)
+        }
+        if p.e(e).w != i_cursor {
+            return false; // rule (4b)
+        }
+    } else if p.e(e).has(EP_OuterON) {
+        return false; // rule (5)
+    }
+    if p.e(e).has(EP_OuterON | EP_InnerON) // (6a)
+        && (p.src(src_list).a[0].jointype as i32 & JT_LTORJ) != 0
+    // Fast pre-test of (6b)
+    {
+        for jj in 0..i_src {
+            if p.e(e).w == p.src(src_list).a[jj].i_cursor {
+                if (p.src(src_list).a[jj].jointype as i32 & JT_LTORJ) != 0 {
+                    return false; // restriction (6)
+                }
+                break;
+            }
+        }
+    }
+    // Rules (1), (2a), and (2b) handled by the following:
+    sqlite3_expr_is_table_constant_subq(p, e, i_cursor, b_allow_subq) != 0
+}
+
+/// `exprImpliesNotNull(pParse, p, pNN, iTab, seenNot)`: return non-zero if Expr p can only
+/// be true if pNN is not NULL.
+///
+/// Or if seenNot is true, return non-zero if Expr p can only be non-NULL if pNN is not NULL
+fn expr_implies_not_null(p: &Parse, e: ExprId, nn: ExprId, i_tab: i32, mut seen_not: bool) -> bool {
+    if sqlite3_expr_compare(p, true, e, nn, i_tab) == 0 {
+        return p.e(nn).op != TK_NULL;
+    }
+    let x = p.e(e);
+    match x.op {
+        TK_IN => {
+            if seen_not && x.has(EP_xIsSelect) {
+                return false;
+            }
+            expr_implies_not_null(p, x.p_left, nn, i_tab, true)
+        }
+        TK_BETWEEN => {
+            let list = x.x_list();
+            if seen_not {
+                return false;
+            }
+            if expr_implies_not_null(p, p.l(list).a[0].p_expr, nn, i_tab, true)
+                || expr_implies_not_null(p, p.l(list).a[1].p_expr, nn, i_tab, true)
+            {
+                return true;
+            }
+            expr_implies_not_null(p, x.p_left, nn, i_tab, true)
+        }
+        TK_EQ | TK_NE | TK_LT | TK_LE | TK_GT | TK_GE | TK_PLUS | TK_MINUS | TK_BITOR | TK_LSHIFT | TK_RSHIFT | TK_CONCAT
+        | TK_STAR | TK_REM | TK_BITAND | TK_SLASH => {
+            if !matches!(x.op, TK_STAR | TK_REM | TK_BITAND | TK_SLASH) {
+                seen_not = true;
+            }
+            if expr_implies_not_null(p, x.p_right, nn, i_tab, seen_not) {
+                return true;
+            }
+            expr_implies_not_null(p, x.p_left, nn, i_tab, seen_not)
+        }
+        TK_SPAN | TK_COLLATE | TK_UPLUS | TK_UMINUS => expr_implies_not_null(p, x.p_left, nn, i_tab, seen_not),
+        TK_TRUTH => {
+            if seen_not {
+                return false;
+            }
+            if x.op2 != TK_IS {
+                return false;
+            }
+            expr_implies_not_null(p, x.p_left, nn, i_tab, true)
+        }
+        TK_BITNOT | TK_NOT => expr_implies_not_null(p, x.p_left, nn, i_tab, true),
+        _ => false,
+    }
+}
+
+/// `sqlite3ExprIsNotTrue(pExpr)`: return true if the boolean value of the expression is
+/// always either FALSE or NULL.
+fn sqlite3_expr_is_not_true(p: &mut Parse, e: ExprId) -> bool {
+    if p.e(e).op == TK_NULL {
+        return true;
+    }
+    if p.e(e).op == TK_TRUEFALSE && sqlite3_expr_truth_value(p, e) == 0 {
+        return true;
+    }
+    matches!(sqlite3_expr_is_integer(p, e, false, false), Some(0))
+}
+
+/// `sqlite3ExprIsIIF(db, pExpr)`: return true if the expression is one of the following:
+///
+/// ```text
+///    CASE WHEN x THEN y END
+///    CASE WHEN x THEN y ELSE NULL END
+///    CASE WHEN x THEN y ELSE false END
+///    iif(x,y)
+///    iif(x,y,NULL)
+///    iif(x,y,false)
+/// ```
+fn sqlite3_expr_is_iif(p: &mut Parse, e: ExprId) -> bool {
+    if p.e(e).op == TK_FUNCTION {
+        let z = p.e(e).tok().to_owned();
+        if !z.starts_with('i') && !z.starts_with('I') {
+            return false;
+        }
+        let list = p.e(e).x_list();
+        if list.is_null() {
+            return false;
+        }
+        let n = p.l(list).n_expr();
+        let Some(def) = sqlite3_find_function(p, &z, n, 0) else {
+            return false;
+        };
+        if (def.func_flags & SQLITE_FUNC_INLINE) == 0 {
+            return false;
+        }
+        if def.user_data != INLINEFUNC_iif as i64 {
+            return false;
+        }
+    } else if p.e(e).op == TK_CASE {
+        if p.e(e).p_left.nn() {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    let list = p.e(e).x_list();
+    if p.l(list).n_expr() == 2 {
+        return true;
+    }
+    if p.l(list).n_expr() == 3 {
+        let third = p.l(list).a[2].p_expr;
+        if sqlite3_expr_is_not_true(p, third) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `sqlite3ExprImpliesExpr(pParse, pE1, pE2, iTab)`: return true if we can prove the pE2
+/// will always be true if pE1 is true. Return false if we cannot complete the proof or if
+/// pE2 might be false. Examples:
+///
+/// ```text
+///     pE1: x==5        pE2: x==5             Result: true
+///     pE1: x>0         pE2: x==5             Result: false
+///     pE1: x=21        pE2: x=21 OR y=43     Result: true
+///     pE1: x!=123      pE2: x IS NOT NULL    Result: true
+///     pE1: x!=?1       pE2: x IS NOT NULL    Result: true
+///     pE1: x IS NULL   pE2: x IS NOT NULL    Result: false
+///     pE1: x IS ?2     pE2: x IS NOT NULL    Result: false
+///     pE1: iif(x,y)    pE2: x                Result: true
+///     PE1: iif(x,y,0)  pE2: x                Result: true
+/// ```
+///
+/// When comparing TK_COLUMN nodes between pE1 and pE2, if pE2 has Expr.iTable<0 then assume
+/// a table number given by iTab.
+///
+/// If pParse is not NULL, then the values of bound variables in pE1 are compared against
+/// literal values in pE2 and pParse->pVdbe->expmask is modified to cause a reprepare if the
+/// values change (there are no bound values at the first prepare).
+///
+/// When in doubt, return false. Returning true might give a performance improvement.
+/// Returning false might cause a performance reduction, but it will always give the correct
+/// answer and is hence always safe.
+pub fn sqlite3_expr_implies_expr(p: &mut Parse, e1: ExprId, e2: ExprId, i_tab: i32) -> bool {
+    if sqlite3_expr_compare(p, true, e1, e2, i_tab) == 0 {
+        return true;
+    }
+    if p.e(e2).op == TK_OR {
+        let (l, r) = (p.e(e2).p_left, p.e(e2).p_right);
+        if sqlite3_expr_implies_expr(p, e1, l, i_tab) || sqlite3_expr_implies_expr(p, e1, r, i_tab) {
+            return true;
+        }
+    }
+    if p.e(e2).op == TK_NOTNULL && expr_implies_not_null(p, e1, p.e(e2).p_left, i_tab, false) {
+        return true;
+    }
+    if sqlite3_expr_is_iif(p, e1) {
+        let first = p.l(p.e(e1).x_list()).a[0].p_expr;
+        return sqlite3_expr_implies_expr(p, first, e2, i_tab);
+    }
+    false
+}
+
+/// `bothImplyNotNullRow(pWalker, pE1, pE2)`: this is a helper function to
+/// impliesNotNullRow(). In this routine, set pWalker->eCode to one only if *both* of the
+/// input expressions separately have the implies-not-null-row property.
+fn both_imply_not_null_row(p: &mut Parse, w: &mut Walker, e1: ExprId, e2: ExprId) {
+    if w.e_code == 0 {
+        sqlite3_walk_expr(p, w, e1);
+        if w.e_code != 0 {
+            w.e_code = 0;
+            sqlite3_walk_expr(p, w, e2);
+        }
+    }
+}
+
+/// `impliesNotNullRow(pWalker, pExpr)`: this is the Expr node callback for
+/// sqlite3ExprImpliesNonNullRow().
+///
+/// If the expression node requires that the table at pWalker->iCur have one or more non-NULL
+/// column, then set pWalker->eCode to 1 and abort. If the expression node will always
+/// evaluate to TRUE, then return WRC_Prune. Otherwise, continue.
+fn implies_not_null_row(p: &mut Parse, w: &mut Walker, e: ExprId) -> i32 {
+    if p.e(e).has(EP_OuterON) {
+        return WRC_Prune;
+    }
+    if p.e(e).has(EP_InnerON) && w.m_w_flags != 0 {
+        // If iCur is used in an inner-join ON clause to the left of a RIGHT JOIN, that does
+        // *not* mean that the table must be non-null. But it is difficult to check for that
+        // condition precisely. To keep things simple, any use of iCur from any inner-join
+        // is ignored while attempting to simplify a RIGHT JOIN.
+        return WRC_Prune;
+    }
+    match p.e(e).op {
+        TK_ISNOT | TK_ISNULL | TK_NOTNULL | TK_IS | TK_VECTOR | TK_FUNCTION | TK_TRUTH | TK_CASE => WRC_Prune,
+        TK_COLUMN => {
+            if w.n == p.e(e).i_table {
+                w.e_code = 1;
+                return WRC_Abort;
+            }
+            WRC_Prune
+        }
+        TK_OR | TK_AND => {
+            // Both sides of an AND or OR must separately imply non-null-row. Consider these
+            // cases:
+            //    1.  NOT (x AND y)
+            //    2.  x OR y
+            // If only one of x or y is non-null-row, then the overall expression can be true
+            // if the other arm is false (case 1) or true (case 2).
+            let (l, r) = (p.e(e).p_left, p.e(e).p_right);
+            both_imply_not_null_row(p, w, l, r);
+            WRC_Prune
+        }
+        TK_IN => {
+            // Beware of "x NOT IN ()" and "x NOT IN (SELECT 1 WHERE false)", both of which
+            // can be true. But also be careful about subqueries.
+            if p.e(e).use_x_list() && p.l(p.e(e).x_list()).n_expr() > 0 {
+                let l = p.e(e).p_left;
+                sqlite3_walk_expr(p, w, l);
+            }
+            WRC_Prune
+        }
+        TK_BETWEEN => {
+            // In "x NOT BETWEEN y AND z" either x must be non-null-row or else both y and z
+            // must be non-null row
+            let l = p.e(e).p_left;
+            sqlite3_walk_expr(p, w, l);
+            let list = p.e(e).x_list();
+            let (a, b) = (p.l(list).a[0].p_expr, p.l(list).a[1].p_expr);
+            both_imply_not_null_row(p, w, a, b);
+            WRC_Prune
+        }
+        // Virtual tables are allowed to use constraints like x=NULL. So a term of the form
+        // x=y does not prove that y is not null if x is the column of a virtual table
+        TK_EQ | TK_NE | TK_LT | TK_LE | TK_GT | TK_GE => {
+            let (l, r) = (p.e(e).p_left, p.e(e).p_right);
+            if (p.e(l).op == TK_COLUMN && p.e(l).y_tab.nn() && p.tab(p.e(l).y_tab).is_virtual())
+                || (p.e(r).op == TK_COLUMN && p.e(r).y_tab.nn() && p.tab(p.e(r).y_tab).is_virtual())
+            {
+                return WRC_Prune;
+            }
+            WRC_Continue
+        }
+        _ => WRC_Continue,
+    }
+}
+
+/// `sqlite3ExprImpliesNonNullRow(p, iTab, isRJ)`: return true (non-zero) if expression p can
+/// only be true if at least one column of table iTab is non-null. In other words, if all
+/// columns of iTab are NULL, then the p expression will be NULL or false.
+///
+/// This routine is used to check if a LEFT JOIN can be converted into an ordinary JOIN. The
+/// p argument is the WHERE clause. If the WHERE clause requires that some column of the
+/// right table of the LEFT JOIN be non-NULL, then the LEFT JOIN can be safely converted into
+/// an ordinary join.
+pub fn sqlite3_expr_implies_non_null_row(p: &mut Parse, e: ExprId, i_tab: i32, is_rj: bool) -> bool {
+    let mut e = sqlite3_expr_skip_collate_and_likely(p, e);
+    if e.is_null() {
+        return false;
+    }
+    if p.e(e).op == TK_NOTNULL {
+        e = p.e(e).p_left;
+    } else {
+        while p.e(e).op == TK_AND {
+            let l = p.e(e).p_left;
+            if sqlite3_expr_implies_non_null_row(p, l, i_tab, is_rj) {
+                return true;
+            }
+            e = p.e(e).p_right;
+        }
+    }
+    let mut w = Walker {
+        x_expr_callback: Some(implies_not_null_row),
+        x_select_callback: None,
+        x_select_callback2: None,
+        e_code: 0,
+        m_w_flags: is_rj as u16,
+        n: i_tab,
+        ..Walker::default()
+    };
+    sqlite3_walk_expr(p, &mut w, e);
+    w.e_code != 0
+}
+
+/// `exprIdxCover(pWalker, pExpr)`: check to see if there are references to columns in table
+/// pWalker->u.pIdxCover->iCur can be satisfied using the index pWalker->u.pIdxCover->pIdx.
+fn expr_idx_cover(p: &mut Parse, w: &mut Walker, e: ExprId) -> i32 {
+    if p.e(e).op == TK_COLUMN
+        && p.e(e).i_table == w.n
+        && crate::schema::sqlite3_table_column_to_index(p.idx(w.p_idx), p.e(e).i_column as i32) < 0
+    {
+        w.e_code = 1;
+        return WRC_Abort;
+    }
+    WRC_Continue
+}
+
+/// `sqlite3ExprCoveredByIndex(pExpr, iCur, pIdx)`: determine if an index pIdx on table with
+/// cursor iCur contains will the expression pExpr. Return true if the index does cover the
+/// expression and false if the pExpr expression references table columns that are not found
+/// in the index pIdx.
+///
+/// An index covering an expression means that the expression can be evaluated using only
+/// the index and without having to lookup the corresponding table entry.
+pub fn sqlite3_expr_covered_by_index(p: &mut Parse, e: ExprId, i_cur: i32, idx: IndexId) -> bool {
+    let mut w = Walker {
+        x_expr_callback: Some(expr_idx_cover),
+        x_select_callback: None,
+        n: i_cur,
+        p_idx: idx,
+        ..Walker::default()
+    };
+    sqlite3_walk_expr(p, &mut w, e);
+    w.e_code == 0
 }
 
 /// `exprNodeIsConstantOrGroupBy(pWalker, pExpr)`: sqlite3WalkExpr() callback used by

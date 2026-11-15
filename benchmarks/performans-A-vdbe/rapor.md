@@ -12,6 +12,7 @@
 | Adım | Commit | Kapsam | `EXPLAIN` C ile aynı (adımın sınıfı) | Tüm ifade türlerinde üreticinin kabul ettiği | Testler |
 | :--- | :--- | :--- | ---: | ---: | :--- |
 | V1 — temel, ifadeler, `FROM`'suz `SELECT` | `bdffdc1` | program gösterimi ve kurucu, `EXPLAIN` listesi, C'nin ayrıştırma ağacı, `resolve.c`, `expr.c`, `VALUES`, işlem ifadeleri | 54.469 / 54.469 kabul edilen (144 desteklenmiyor) | 3.954 / 39.300 (%10,1) | 907 geçti, bilinen 4 başarısız, 337 yok sayıldı |
+| V2 — tablolar: şema bağdaştırıcısı, sıralayıcı, `where.c` ailesi, birleşimler | V2COMMIT | `whereexpr.c`, `where.c`, `wherecode.c`, `select.c` (GROUP BY hariç), alt sorgu düzleştirme, görünümler, `EXPLAIN QUERY PLAN` | 35.525 / 35.526 kabul edilen (3.474 desteklenmiyor) | 13.659 / 39.300 (%34,8) | 929 geçti, bilinen 4 başarısız, 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -43,6 +44,37 @@ Desteklenmeyen 144 ifadenin nedenleri: `ORDER BY`da `COLLATE` içeren bileşik s
 **Taşınmayan (üretici "desteklenmiyor" der, yaklaşık üretim yok).** Sıralayıcı; tablo içeren her `FROM` terimi ve `where.c` planlaması; pencere işlevleri; CTE'ler; tetikleyiciler; tüm DDL, DML, `PRAGMA`; sonuç sütun adları; şema nesnesi bağdaştırıcısı.
 
 Ayrıntı: `karar_esligi_v1.md` (işlev eşlemesi, karar tabloları, kapsam tabloları).
+
+## V2 — `FROM` içinde tablolar
+
+**Taşınan** (`crates/sqliters-codegen/src/`, 274 C işlevi; ayrıntı `karar_esligi_v2.md`).
+- `schema.rs`: şema bağdaştırıcısı — motorun şemasından C'nin `Table` / `Column` / `Index` nesneleri (`build.c` mantığıyla; indeks metni iç içe ayrıştırıcıyla çözülüyor; `sqlite_stat1` yüklemesi `sqlite3AnalysisLoad` gibi).
+- `whereexpr.rs` (sanal tablo kısımları hariç tamamı), `where_.rs` (`whereLoopAddBtree`, OR döngüleri, otomatik indeks, Bloom süzgeçleri, `wherePathSolver`, gereksiz birleşimin atılması, yıldız sorgu sezgisi), `wherecode.rs` (sanal tablolar dışındaki tüm plan türleri, OR iyileştirmesi, sağ birleşim, EQP metni).
+- `select.rs`: tam `sqlite3Select` (GROUP BY hariç), `selectExpander`, birleşim işleme, sıralayıcı (`pushOntoSorter`, `generateSortTail`), `convertCompoundSelectToSubquery`, eş yordam / somutlaştırma kararı; `flatten.rs`: `flattenSubquery`, `pushDownWhereTerms`, `propagateConstants`, `countOfViewOptimization`, `existsToJoin`.
+- Motor tarafı: `EXPLAIN QUERY PLAN` da artık aynı kuralla yeni üreticiden geliyor; bağlantı başına C'nin şema çerezi / nesil / "şema yüklendi" durumu; `PRAGMA automatic_index`, `reverse_unordered_selects`, `short_column_names`, `full_column_names` artık değer tutuyor ve sorgu biçiminde C'nin çıktısını veriyor.
+
+**Kanıt (katmanlı).** Planlayıcı derlemi: 780 üretilmiş şema üzerinde 39.000 ifade.
+
+| Katman | Karşılaştırılan | Aynı | Farklı |
+| :--- | ---: | ---: | ---: |
+| `sqlite3WhereExprAnalyze` sonrası WHERE terimleri | 32.008 | 32.008 | 0 |
+| `whereLoopInsert`e sunulan her `WhereLoop` (maliyetlerle) | 31.443 | 31.435 | 8 |
+| Her `wherePathSolver` çağrısının sonucu | 31.513 | 31.509 | 4 |
+| `EXPLAIN QUERY PLAN` baytları (CLI) | 35.526 | 35.525 | 1 |
+| `EXPLAIN` baytları (CLI) | 35.526 | 35.525 | 1 |
+
+- Tek liste farkı ve döngü/yol farklarının izlenen dördü motorun `ANALYZE` kusurundan (tek sütunlu, NULL içeren `UNIQUE` indeks için `N 2` yazıyor, C `N 1`); kalan döngü farkları aynı imzayı taşıyor ama tek tek izlenmedi.
+- Desteklenmeyen 3.474: tablo üzerinde GROUP BY 3.243; WITHOUT ROWID + tek sütunlu INTEGER birincil anahtarda otomatik indeks numaralaması kusuru 189; birincil anahtardan önce yazılmış `UNIQUE` 42.
+- **Bağımsız kontrol** (C'nin kurduğu 40 rastgele şema, 2.400 ifade: tek tablo, 2–4 tablolu birleşimler, alt sorgular, bileşik seçimler): `EXPLAIN` C ile aynı 2.390, önceki çıktıya düşen 10, yeni ama farklı 0; `EXPLAIN QUERY PLAN` aynı 2.392, düşen 8, farklı 0.
+- **Tüm ifade türleri** (39.300): üretici kabul **%10,1 → %34,8** (13.659). `EXPLAIN` aynı 13.279, farklı 380: 214'ü yalnız C kabuğunda olan işlev/sıralama, 39'u yalnız C kabuğunda olan sanal tablo modülleri, 82'si yalnız `OP_Transaction` çerez/nesil işleneni, kalanı kök sayfa / varsayılan değer gibi eski motor farkları. Bu sınıflar örneklenerek açıklandı, 380'in tamamı tek tek izlenmedi.
+- **C tarafı kapsamı** (gcov; 274 işlev): satır %79,8, dal %71,4 (`where.c` %93,2 / %85,8; `wherecode.c` %89,5 / %82,6). Alınmayan dallar "doğrulanmadı" listesinde: sanal tablo dalları, GROUP BY / pencere / özyinelemeli CTE dalları, `UPDATE`/`DELETE` çağıranları, STAT4, hata dalları.
+- **Yürütme değişmedi:** ayrışma bulucu 241 / 245; DML farksalı 377 / 400; speedbench özetleri C ile eşit; testler 929 geçti (22 yeni), bilinen 4 başarısız, 337 yok sayıldı.
+
+**Değişen test beklentileri (3; C ile doğrulandı).** WITHOUT ROWID `SELECT`inde `OpenReadIdx` yerine C'nin `OpenRead` + KeyInfo'su; kapsayan indeks planında C'nin işlem kodu listesi; kısmi indeks: `b > 10` ve `b = 7` için C `SCAN ptest` verir (eski beklenti motorun kendi aralık çıkarımıydı).
+
+**C'nin planı ile eski yürütücünün planı.** Kabul edilen 10.680 ifadenin 8.067'sinde plan metni farklı (birleşim sırası; C'nin otomatik indeks + Bloom süzgeci kullandığı yerde eski yürütücü tarıyor; C'nin indeks/satır kimliğiyle aradığı yerde tarama). `EXPLAIN QUERY PLAN` artık C'nin planını basıyor, yürütme taşıma bitene kadar eski planla çalışıyor.
+
+**Bilinen eksikler.** `OP_Transaction` nesil işleneni şu durumlarda izlenmiyor: başka bağlantının şema değişikliği, çerez değiştikten sonra başarısız olan diğer DDL, `ATTACH`/`DETACH` hataları. Üretici "desteklenmiyor" diyor: tablo üzerinde GROUP BY / HAVING, pencere işlevleri, özyinelemeli CTE, sanal tablolar, DML, DDL, `PRAGMA`, VIRTUAL üretilmiş sütunlu tablolar, `COLLATE BINARY` açıkça yazılmış tablolar. Bu adımda görülen eski motor farkları: `gorulen_farklar_v2.md`.
 
 ## Bu adımda görülen, eski motora ait C farkları (dokunulmadı)
 

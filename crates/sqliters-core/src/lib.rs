@@ -2696,6 +2696,8 @@ impl ConnectionInner {
                         }
                     }
                     if stmt_changed_schema || self.schema_changed_in_tx {
+                        // sqlite3RollbackAll(): schemaChange -> all schemas are reset
+                        self.db_set.c_reset_all_schemas();
                         self.restore_schemas_snapshot(&snap.schemas_before);
                         self.schema_generation += 1;
                         self.v1_expire_generation += 1;
@@ -4991,8 +4993,13 @@ thread_local! {
 }
 
 /// The column names of `EXPLAIN`.
-fn explain_column_names() -> Vec<String> {
-    sqliters_vdbe::vdbeaux::EXPLAIN_COLUMN_NAMES[..8].iter().map(|s| (*s).to_owned()).collect()
+fn explain_column_names(explain: u8) -> Vec<String> {
+    let names = if explain == 2 {
+        &sqliters_vdbe::vdbeaux::EXPLAIN_COLUMN_NAMES[8..]
+    } else {
+        &sqliters_vdbe::vdbeaux::EXPLAIN_COLUMN_NAMES[..8]
+    };
+    names.iter().map(|s| (*s).to_owned()).collect()
 }
 
 /// The artifacts of an `EXPLAIN <stmt>` statement whose listing comes from C's code generator
@@ -5009,7 +5016,7 @@ fn explain_artifacts(stmt: Option<Stmt>) -> CompiledArtifacts {
         category: Some(StmtCategory::Read),
         compiled_vdbe: None,
         compiled_fast_read: None,
-        column_names: explain_column_names(),
+        column_names: explain_column_names(1),
         max_param,
         named_params,
         ignored_fk_parent_tables: Vec::new(),
@@ -6663,7 +6670,7 @@ impl Statement {
         stmt: Option<&Stmt>,
         raw_sql: &str,
     ) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
-        let Some(Stmt::Explain { query_plan: false, .. }) = stmt else {
+        let Some(Stmt::Explain { .. }) = stmt else {
             return Ok(None);
         };
         match cgen::c_explain(inner, raw_sql) {
@@ -6671,7 +6678,7 @@ impl Statement {
             cgen::CExplain::Unsupported => Ok(None),
             cgen::CExplain::Error { message, offset } => {
                 let e = SqliteError::new(ErrorCode::Error, message);
-                Err(if offset >= 0 { e.with_offset(offset as usize) } else { e })
+                Err(e.with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }))
             }
         }
     }
@@ -6686,6 +6693,9 @@ impl Statement {
         // generator (the port) handle it: the listing (or the error) is C's. The statement
         // object is then built around a stand-in parse tree; only C's program is listed.
         let mut c_explain_of_rejected: Option<Arc<sqliters_vdbe::vdbeaux::Program>> = None;
+        // C's schema-load state (DB_SchemaLoaded) when this prepare starts
+        let c_unloaded = inner.db_set.c_any_schema_unloaded();
+        inner.db_set.set_c_prepare_unloaded(c_unloaded);
         let (stmt_opt, tail) = match parse_one(sql) {
             Ok(x) => x,
             Err(e) => {
@@ -6695,7 +6705,7 @@ impl Statement {
                 match cgen::c_explain_tail(inner, sql) {
                     (cgen::CExplain::Error { message, offset }, _) => {
                         let ce = SqliteError::new(ErrorCode::Error, message);
-                        return Err(if offset >= 0 { ce.with_offset(offset as usize) } else { ce });
+                        return Err(ce.with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }));
                     }
                     (cgen::CExplain::Program(prog), tail_ofs) => {
                         c_explain_of_rejected = Some(prog);
@@ -6711,6 +6721,31 @@ impl Statement {
         let unparsed_tail = tail.to_owned();
 
         let needs_schema = stmt_opt.as_ref().is_some_and(stmt_loads_schema_on_prepare);
+        // A statement that writes sqlite_stat1: C's in-memory statistics and the engine's may
+        // differ until the next ANALYZE.
+        {
+            let target = match &stmt_opt {
+                Some(Stmt::Insert(i)) => Some(i.table.name.as_str()),
+                Some(Stmt::Update(u)) => Some(u.table.name.as_str()),
+                Some(Stmt::Delete(d)) => Some(d.table.name.as_str()),
+                Some(Stmt::DropTable { name, .. }) => Some(name.name.as_str()),
+                _ => None,
+            };
+            if target.is_some_and(|t| t.eq_ignore_ascii_case("sqlite_stat1")) {
+                inner.db_set.c_mark_stat_dirty();
+            }
+        }
+        let c_first_load = (needs_schema || matches!(stmt_opt, Some(Stmt::AttachDatabase { .. })))
+            && inner.db_set.c_any_schema_unloaded();
+        if needs_schema && !matches!(stmt_opt, Some(Stmt::Explain { .. })) {
+            // (a statement that will be stepped: its OP_Transaction checks the cookie. EXPLAIN
+            // does not run the program, so it still lists the cookie that is ahead.)
+            inner.db_set.c_apply_cookie_ahead();
+        }
+        if needs_schema || matches!(stmt_opt, Some(Stmt::AttachDatabase { .. })) {
+            // sqlite3ReadSchema() -> sqlite3Init(): every schema is loaded from here on
+            inner.db_set.c_mark_schemas_loaded();
+        }
         if !inner.db_set.is_temp_open()
             && let Some(ref st) = stmt_opt
             && stmt_references_temp_catalog(st, &inner.db_set)
@@ -6728,6 +6763,11 @@ impl Statement {
             if any_unloaded {
                 let _ = inner.ensure_schemas_loaded_for_prepare(false)?;
             }
+        }
+
+        if c_first_load {
+            // sqlite3Init() -> sqlite3AnalysisLoad() on fresh schema objects
+            inner.db_set.c_note_stats(false);
         }
 
         // `EXPLAIN <stmt>`: C's listing (or C's compile error) when the port of C's code
@@ -6783,8 +6823,35 @@ impl Statement {
                 );
             }
         };
+        let is_create_vtab = matches!(stmt_opt, Some(Stmt::CreateVirtualTable { .. }));
         let mut artifacts = match try_compile(inner, stmt_opt.clone()) {
             Ok(a) => a,
+            // CREATE VIRTUAL TABLE with an unknown module: C compiles the statement and fails
+            // at OP_VCreate, after OP_ParseSchema changed the schema; in autocommit mode
+            // sqlite3RollbackAll() then resets all schemas (the engine fails at prepare).
+            Err(err)
+                if is_create_vtab
+                    && (err.message.starts_with("no such module:")
+                        || err.message.starts_with("vtable constructor failed")) =>
+            {
+                if inner.is_autocommit() {
+                    inner.db_set.c_reset_all_schemas();
+                } else {
+                    // Inside a transaction only the statement is rolled back: C's in-memory
+                    // schema cookie stays ahead of the file until the next cookie check.
+                    let i_db = match &stmt_opt {
+                        Some(Stmt::CreateVirtualTable { name, .. }) => name
+                            .schema
+                            .as_deref()
+                            .and_then(|s| inner.db_set.find_db_id(s))
+                            .map_or(0, |id| id.index()),
+                        _ => 0,
+                    };
+                    inner.db_set.c_note_cookie_ahead(i_db);
+                }
+                tr_failed(inner);
+                return Err(err);
+            }
             // (C compiles the statement: an error of the engine's own validation is the
             // engine's defect, not a reason for EXPLAIN to fail)
             Err(err) if c_explain.is_some() && err.code == ErrorCode::Error => {
@@ -6821,6 +6888,7 @@ impl Statement {
 
         apply_prepare_auto_vacuum_pragma(inner, &mut artifacts);
         if let Some(prog) = &c_explain {
+            artifacts.column_names = explain_column_names(prog.explain);
             // The parameters of the statement as C numbers them.
             artifacts.max_param = artifacts.max_param.max(prog.n_var as usize);
             for (name, num) in &prog.p_vlist.a {
@@ -7449,6 +7517,9 @@ impl Statement {
                 Err(err) => return Err(err),
             };
             apply_prepare_auto_vacuum_pragma(inner, &mut artifacts);
+            if let Some(prog) = &c_explain {
+                artifacts.column_names = explain_column_names(prog.explain);
+            }
             let mut transferred = vec![Value::Null; artifacts.max_param];
             let copy_len = self.params.len().min(artifacts.max_param);
             transferred[..copy_len].clone_from_slice(&self.params[..copy_len]);
@@ -8233,6 +8304,17 @@ impl Statement {
                     },
                 );
                 inner.activity.remove(hid);
+                // sqlite3RunVacuum() ends (`end_of_vacuum:`) with
+                // sqlite3ResetAllSchemasOfConnection(), except for the errors it returns
+                // before it starts.
+                let early = matches!(
+                    &res,
+                    Err(engine::VacuumFail::Clean(e))
+                        if e.message.starts_with("cannot VACUUM") || e.message == "non-text filename"
+                );
+                if !early {
+                    inner.db_set.c_reset_all_schemas();
+                }
                 if let Some(sim_err) = inner.take_simulated_cleanup_error() {
                     let p_err = inner.poison_with(sim_err);
                     self.lifecycle = StatementLifecycle::Halted {
@@ -8732,8 +8814,8 @@ impl Statement {
                 // rows are C's listing.
                 let exec_res = match &self.c_explain {
                     Some(prog) => Ok(engine::QueryOutput {
-                        column_names: exec_res.map(|o| o.column_names).unwrap_or_else(|_| explain_column_names()),
-                        rows: prog.list(1),
+                        column_names: explain_column_names(prog.explain),
+                        rows: prog.list(prog.explain.max(1)),
                     }),
                     None => exec_res,
                 };
@@ -13223,6 +13305,8 @@ mod c_align_h6_tests;
 mod c_align_h6b_tests;
 #[cfg(test)]
 mod c_align_v1_tests;
+#[cfg(test)]
+mod c_align_v2_tests;
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
 /// value below is what the reference `sqlite3` produces for the same statements.
 #[cfg(test)]

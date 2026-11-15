@@ -48,6 +48,7 @@ define_id!(WindowId);
 define_id!(AggInfoId);
 define_id!(TableId);
 define_id!(NcId);
+define_id!(IndexId);
 
 /// `LogEst`
 pub type LogEst = i16;
@@ -300,6 +301,12 @@ pub struct SrcItem {
     pub z_database: Option<String>,
     /// `u4.pSubq`
     pub p_subq: Option<Box<Subquery>>,
+    /// `u2.pIBIndex`: index structure corresponding to u1.zIndexedBy
+    pub p_ib_index: IndexId,
+    /// `u2.pCteUse`: CTE usage info when `is_cte` is true (index into `Parse::a_cte_use`, +1)
+    pub p_cte_use: u32,
+    /// `u4.pSchema` when `fixed_schema`: index of the database the item is fixed to
+    pub i_fixed_db: i32,
 }
 
 /// `struct OnOrUsing`
@@ -418,6 +425,43 @@ pub struct Cte {
     pub z_cte_err: Option<&'static str>,
     /// The MATERIALIZED flag (`M10d_*`)
     pub e_m10d: u8,
+    /// `pUse`: usage information for this CTE (index into `Parse::a_cte_use`, +1; 0 = NULL)
+    pub p_use: u32,
+}
+
+/// `struct CteUse`: bookkeeping about all uses of one CTE of a query.
+#[derive(Debug, Clone, Default)]
+pub struct CteUse {
+    /// Number of users of this CTE
+    pub n_use: i32,
+    /// Start of subroutine to compute materialization
+    pub addr_m9e: i32,
+    /// Return address register for addrM9e subroutine
+    pub reg_rtn: i32,
+    /// Ephemeral table holding the materialization
+    pub i_cur: i32,
+    /// Estimated number of rows in the table
+    pub n_row_est: LogEst,
+    /// The MATERIALIZED flag
+    pub e_m10d: u8,
+}
+
+/// `struct IndexedExpr`: an expression that is the value of a column of an index in use
+/// (`Parse.pIdxEpr`) or a column constrained by a partial-index WHERE (`Parse.pIdxPartExpr`).
+#[derive(Debug, Clone, Default)]
+pub struct IndexedExpr {
+    /// The expression contained in the index
+    pub p_expr: ExprId,
+    /// The data cursor associated with the index
+    pub i_data_cur: i32,
+    /// The index cursor
+    pub i_idx_cur: i32,
+    /// The index column that contains value of pExpr
+    pub i_idx_col: i32,
+    /// True if we need an OP_IfNullRow check
+    pub b_maybe_null_row: bool,
+    /// Affinity of the pExpr expression
+    pub aff: u8,
 }
 
 /// `struct With`
@@ -538,6 +582,10 @@ pub struct Column {
     pub z_type: Option<String>,
     /// The collating sequence name (stored after the type in C when COLFLAG_HASCOLL)
     pub z_coll: Option<String>,
+    /// `sqlite3ValueFromExpr(sqlite3ColumnExpr(pTab,pCol), enc, affinity)`: the constant the
+    /// DEFAULT clause stands for (`None` when there is no DEFAULT or it is not a constant);
+    /// the P4 of an OP_Column that reads this column (`sqlite3ColumnDefault`)
+    pub dflt_value: Option<sqliters_types::Value>,
 }
 
 /// `struct Table` as far as the V1 code generator reads it. Tables come from one adapter
@@ -562,14 +610,140 @@ pub struct Table {
     pub e_tab_type: u8,
     /// `u.view.pSelect`
     pub p_select: SelectId,
-    /// Index of the schema (database) that contains this table
+    /// Index of the schema (database) that contains this table (`pSchema`; -1: none)
     pub i_db: i32,
+    /// `pIndex`: the indexes of the table in the order of C's linked list
+    pub p_index: Vec<IndexId>,
+    /// `pCheck` of a view: the explicit column names of `CREATE VIEW v(a,b,..)`
+    pub p_check: ExprListId,
+    /// `pTrigger!=0`
+    /// A property of the declaration that the schema adapter cannot represent yet: a statement
+    /// that uses the table is reported as unsupported.
+    pub unsupported_decl: Option<&'static str>,
+    pub has_trigger: bool,
+    /// The text of the CREATE VIEW statement of a view (parsed when the view is used)
+    pub z_sql: Option<String>,
+    /// True once `sqlite3ViewGetColumnNames()` has filled `a_col` of a view in this statement
+    pub view_cols_done: bool,
+    /// C's `nCol<0` marker of a view: its column names are being computed, or its SELECT is
+    /// being expanded (detects circular view definitions)
+    pub view_busy: bool,
 }
 
 impl Table {
     #[inline]
     pub fn n_col(&self) -> i16 {
         self.a_col.len() as i16
+    }
+    /// `HasRowid(X)`
+    #[inline]
+    pub fn has_rowid(&self) -> bool {
+        self.tab_flags & TF_WithoutRowid == 0
+    }
+    /// `VisibleRowid(X)`
+    #[inline]
+    pub fn visible_rowid(&self) -> bool {
+        self.tab_flags & TF_NoVisibleRowid == 0
+    }
+    /// `IsView(X)`
+    #[inline]
+    pub fn is_view(&self) -> bool {
+        self.e_tab_type == TABTYP_VIEW as u8
+    }
+    /// `IsVirtual(X)`
+    #[inline]
+    pub fn is_virtual(&self) -> bool {
+        self.e_tab_type == TABTYP_VTAB as u8
+    }
+    /// `IsOrdinaryTable(X)`
+    #[inline]
+    pub fn is_ordinary(&self) -> bool {
+        self.e_tab_type == TABTYP_NORM as u8
+    }
+}
+
+/// `struct Index`: an SQL index (or the PRIMARY KEY of a WITHOUT ROWID table, or an automatic
+/// index built by the query planner).
+#[derive(Debug, Clone, Default)]
+pub struct Index {
+    /// Name of this index
+    pub z_name: String,
+    /// Which columns are used by this index. 1st is 0 (`XN_ROWID`, `XN_EXPR`)
+    pub ai_column: Vec<i16>,
+    /// From ANALYZE: Est. rows selected by each column
+    pub ai_row_log_est: Vec<LogEst>,
+    /// The SQL table being indexed
+    pub p_table: TableId,
+    /// String defining the affinity of each column (computed on first use)
+    pub z_col_aff: Option<Vec<u8>>,
+    /// for each column: True==DESC, False==ASC
+    pub a_sort_order: Vec<u8>,
+    /// Array of collation sequence names for index
+    pub az_coll: Vec<String>,
+    /// For each entry of `az_coll`: true if C's pointer is the static `sqlite3StrBINARY`
+    /// (the KeyInfo then has a NULL collation, shown as an empty name in EXPLAIN)
+    pub a_coll_static: Vec<bool>,
+    /// The index was declared with a WHERE clause (`pPartIdxWhere!=0`, also before the
+    /// expression is parsed)
+    pub b_partial: bool,
+    /// WHERE clause for partial indices
+    pub p_part_idx_where: ExprId,
+    /// Column expressions
+    pub a_col_expr: ExprListId,
+    /// DB Page containing root of this index
+    pub tnum: u32,
+    /// Estimated average row size in bytes
+    pub sz_idx_row: LogEst,
+    /// Number of columns forming the key
+    pub n_key_col: u16,
+    /// Nr columns in btree. Can be 2*Table.nCol
+    pub n_column: u16,
+    /// OE_Abort, OE_Ignore, OE_Replace, or OE_None
+    pub on_error: u8,
+    /// 0:Normal 1:UNIQUE, 2:PRIMARY KEY, 3:IPK
+    pub idx_type: u8,
+    /// Use this index for == or IN queries only
+    pub b_unordered: bool,
+    /// True if UNIQUE and NOT NULL for all columns
+    pub uniq_not_null: bool,
+    /// True if this is a covering index
+    pub is_covering: bool,
+    /// Do not try to use skip-scan if true
+    pub no_skip_scan: bool,
+    /// aiRowLogEst values come from sqlite_stat1
+    pub has_stat1: bool,
+    /// Do not use this index to optimize queries
+    pub b_no_query: bool,
+    /// True if the bba7b69f9849b5bf bug applies
+    pub b_asc_key_bug: bool,
+    /// `isResized`: resizeIndexObject() reallocated the arrays (WITHOUT ROWID conversion). The
+    /// new `aiRowLogEst[]` has nColumn entries, so C's read of `aiRowLogEst[nColumn]` lands on
+    /// `aiColumn[0]`, which follows it in the same allocation.
+    pub is_resized: bool,
+    /// Index references one or more VIRTUAL columns
+    pub b_has_v_col: bool,
+    /// Index contains an expression, either a literal expression or a reference to a VIRTUAL column
+    pub b_has_expr: bool,
+    /// Unindexed columns in pTab
+    pub col_not_idxed: Bitmask,
+    /// The text of the CREATE INDEX statement when the index has expression columns or a
+    /// WHERE clause that are not parsed yet (`a_col_expr` / `p_part_idx_where` are filled from
+    /// it on first use)
+    pub z_sql: Option<String>,
+    /// True once the expressions of `z_sql` were parsed and resolved
+    pub exprs_done: bool,
+}
+
+impl Index {
+    /// `IsPrimaryKeyIndex(X)`
+    #[inline]
+    pub fn is_primary_key(&self) -> bool {
+        self.idx_type == SQLITE_IDXTYPE_PRIMARYKEY as u8
+    }
+    /// `IsUniqueIndex(X)`
+    #[inline]
+    pub fn is_unique(&self) -> bool {
+        self.on_error != OE_None as u8
     }
 }
 
@@ -601,6 +775,26 @@ pub struct Walker {
     pub p_group_by: ExprListId,
     /// `u.pSelect`
     pub p_select: SelectId,
+    /// `u.pIdxCover->pIdx` / `u.pCovIdxCk->pIdx`: an index
+    pub p_idx: IndexId,
+    /// Second integer of a callback-specific structure (`CoveringIndexCheck.iTabCur`, …)
+    pub i2: i32,
+    /// Flags of a callback-specific structure (`CoveringIndexCheck.bExpr` / `bUnidx`, …)
+    pub b1: bool,
+    pub b2: bool,
+    /// `u.pExpr` / a table of a callback-specific structure
+    pub p_expr: ExprId,
+    pub p_tab: TableId,
+    /// An expression array of a callback-specific structure (`WhereConst.apExpr`, …)
+    pub v_expr: Vec<ExprId>,
+    /// A context stack of a callback-specific structure (`CheckOnCtx` chain: pSrc, iJoin,
+    /// bFuncArg; `SubstContext`-like integer triples)
+    pub v_ctx: Vec<(SrcListId, i32, bool)>,
+    /// A flag mask of a callback-specific structure (`WhereConst.mExcludeOn`, …)
+    pub m: u32,
+    /// An integer array of a callback-specific structure (`u.aiCol`: the cursor map of
+    /// renumberCursors())
+    pub v_int: Vec<i32>,
 }
 
 impl Default for Walker {
@@ -618,6 +812,16 @@ impl Default for Walker {
             p_src_list: SrcListId::NULL,
             p_group_by: ExprListId::NULL,
             p_select: SelectId::NULL,
+            p_idx: IndexId::NULL,
+            i2: 0,
+            b1: false,
+            b2: false,
+            p_expr: ExprId::NULL,
+            p_tab: TableId::NULL,
+            v_expr: Vec::new(),
+            v_ctx: Vec::new(),
+            m: 0,
+            v_int: Vec::new(),
         }
     }
 }
@@ -638,6 +842,8 @@ pub struct DbInfo {
     pub schema_cookie: i32,
     /// `pSchema->iGeneration`
     pub i_generation: i32,
+    /// `pSchema->file_format`
+    pub file_format: u8,
 }
 
 /// What the code generator asks of the engine: the schema adapter and the registries of
@@ -650,6 +856,20 @@ pub trait Host {
     /// (`sqlite3FindCollSeq`; the lookup ignores ASCII case). BINARY, NOCASE and RTRIM are
     /// known to the code generator itself.
     fn find_collation(&self, name: &str) -> Option<String>;
+    /// `sqlite3HashFind(&db->aDb[i_db].pSchema->tblHash, name)`: the table or view `name`
+    /// (compared without regard to ASCII case) of database `i_db`, as a declaration from which
+    /// [`crate::schema`] builds C's `Table` and `Index` objects.
+    fn find_table(&self, _i_db: usize, _name: &str) -> Option<crate::schema::TableDef> {
+        None
+    }
+    /// True if C's connection has already computed the column names of view `name` of
+    /// database `i_db` (`sqlite3ViewGetColumnNames()` ran since the schema was last reset):
+    /// the first use of a view in a connection advances `Parse.nSelect`.
+    fn view_columns_known(&self, _i_db: usize, _name: &str) -> bool {
+        false
+    }
+    /// The code generator computed the column names of view `name` of database `i_db`.
+    fn set_view_columns_known(&self, _i_db: usize, _name: &str) {}
 }
 
 /// A [`Host`] with no application-defined functions or collations.
@@ -681,6 +901,12 @@ pub struct Db<'a> {
     pub auto_commit: bool,
     /// `aDb[]` / `nDb`
     pub a_db: Vec<DbInfo>,
+    /// True if C's connection would still have to read the schema (`sqlite3Init()` runs at the
+    /// first `sqlite3ReadSchema()` of the statement and resets `db->errByteOffset`)
+    pub schema_not_loaded: bool,
+    /// `PRAGMA case_sensitive_like = x` was run on the connection: like() was re-registered
+    /// (`sqlite3RegisterLikeFunctions`)
+    pub case_sensitive_like: bool,
     /// The engine side
     pub host: &'a dyn Host,
 }
@@ -713,9 +939,11 @@ impl<'a> Db<'a> {
             init_busy: false,
             auto_commit: true,
             a_db: vec![
-                DbInfo { z_db_s_name: "main".into(), has_bt: true, ..DbInfo::default() },
-                DbInfo { z_db_s_name: "temp".into(), has_bt: false, ..DbInfo::default() },
+                DbInfo { z_db_s_name: "main".into(), has_bt: true, file_format: 4, ..DbInfo::default() },
+                DbInfo { z_db_s_name: "temp".into(), has_bt: false, file_format: 4, ..DbInfo::default() },
             ],
+            schema_not_loaded: false,
+            case_sensitive_like: false,
             host,
         }
     }
@@ -853,6 +1081,31 @@ pub struct Parse<'a> {
     /// for OP_BeginSubrtn with P4_SUBRTNSIG; the P4 copy is updated when `bComplete` is set)
     pub a_subrtn_sig_addr: Vec<i32>,
 
+    /// `Index` objects (schema indexes of the tables in use, automatic indexes, the fake
+    /// PRIMARY KEY index of `whereLoopAddBtree`)
+    pub a_idx: Vec<Index>,
+    /// `CteUse` objects
+    pub a_cte_use: Vec<CteUse>,
+    /// `pIdxEpr`: list of expressions used by active indexes (C: linked list, newest first;
+    /// here the newest is the last element)
+    pub p_idx_epr: Vec<IndexedExpr>,
+    /// `pIdxPartExpr`: expressions constrained by a partial index in use
+    pub p_idx_part_expr: Vec<IndexedExpr>,
+    /// The schema tables already converted to `Table` objects, by (database, lower-case name)
+    pub tab_cache: std::collections::HashMap<(usize, String), TableId>,
+    /// `u1.d.pReturning` etc. are not ported; `nTableLock`/`aTableLock` only matter with a
+    /// shared cache.
+    /// Depth of nested `sqlite3Select()` calls for which `OP_Explain` nodes are open
+    /// (`addrExplain` is the parent node of new `OP_Explain` rows)
+    pub explain_dummy: i32,
+    /// Verification aid: when `Some`, the WHERE-term and WhereLoop dumps of where.c are
+    /// collected here.
+    pub where_dump: Option<Vec<String>>,
+
+    /// `Some` while the text of a schema object is parsed (`db->init.busy` in C, where it is a
+    /// separate Parse): `cmd ::= select` stores the Select here instead of coding it.
+    pub capture_select: Option<SelectId>,
+
     /// Verification aid: when `Some`, the tree dumps of [`crate::treedump`] are collected here.
     pub tree_dump: Option<Vec<String>>,
     /// `db->suppressErr`: do not record error messages (while an ORDER BY term of a compound
@@ -925,6 +1178,14 @@ impl<'a> Parse<'a> {
             a_coll: Vec::new(),
             a_func: Vec::new(),
             a_subrtn_sig_addr: Vec::new(),
+            a_idx: vec![Index::default()],
+            a_cte_use: Vec::new(),
+            p_idx_epr: Vec::new(),
+            p_idx_part_expr: Vec::new(),
+            tab_cache: std::collections::HashMap::new(),
+            explain_dummy: 0,
+            where_dump: None,
+            capture_select: None,
             tree_dump: None,
             suppress_err: false,
             unsupported: None,
@@ -980,6 +1241,28 @@ impl<'a> Parse<'a> {
     #[inline]
     pub fn tab(&self, id: TableId) -> &Table {
         &self.a_tab[id.ix()]
+    }
+    #[inline]
+    pub fn tabm(&mut self, id: TableId) -> &mut Table {
+        debug_assert!(id.nn());
+        &mut self.a_tab[id.ix()]
+    }
+    #[inline]
+    pub fn idx(&self, id: IndexId) -> &Index {
+        &self.a_idx[id.ix()]
+    }
+    #[inline]
+    pub fn idxm(&mut self, id: IndexId) -> &mut Index {
+        debug_assert!(id.nn());
+        &mut self.a_idx[id.ix()]
+    }
+    pub fn new_tab(&mut self, t: Table) -> TableId {
+        self.a_tab.push(t);
+        TableId(self.a_tab.len() as u32 - 1)
+    }
+    pub fn new_idx(&mut self, i: Index) -> IndexId {
+        self.a_idx.push(i);
+        IndexId(self.a_idx.len() as u32 - 1)
     }
     #[inline]
     pub fn agg(&self, id: AggInfoId) -> &AggInfo {

@@ -87,6 +87,138 @@ fn visible_rowid(p: &Parse, tab: TableId) -> bool {
     (p.tab(tab).tab_flags & TF_NoVisibleRowid) == 0
 }
 
+/// `sqlite3MatchEName(pItem, zCol, zTab, zDb, pbRowid)`: subqueries store the original
+/// database, table and column names for their result sets in ExprList.a[].zEName, in the
+/// form "DATABASE.TABLE.COLUMN", and mark the expression-list item by setting
+/// ExprList.a[].fg.eEName to ENAME_TAB or ENAME_ROWID. This routine returns non-zero if
+/// zEName matches zDb, zTab, and zCol. If any of zDb, zTab, and zCol are NULL then those
+/// fields will match anything.
+pub fn sqlite3_match_e_name(
+    p: &Parse,
+    list: ExprListId,
+    j: usize,
+    z_col: Option<&str>,
+    z_tab: Option<&str>,
+    z_db: Option<&str>,
+    pb_rowid: Option<&mut bool>,
+) -> bool {
+    let item = &p.l(list).a[j];
+    let e_e_name = item.e_e_name as i32;
+    if e_e_name != ENAME_TAB && (e_e_name != ENAME_ROWID || pb_rowid.is_none()) {
+        return false;
+    }
+    let z_span = item.z_e_name.as_deref().unwrap_or("");
+    let mut parts = z_span.splitn(3, '.');
+    let (s_db, s_tab, s_col) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    if let Some(d) = z_db
+        && !s_db.eq_ignore_ascii_case(d)
+    {
+        return false;
+    }
+    if let Some(t) = z_tab
+        && !s_tab.eq_ignore_ascii_case(t)
+    {
+        return false;
+    }
+    if let Some(c) = z_col {
+        if e_e_name == ENAME_TAB && !s_col.eq_ignore_ascii_case(c) {
+            return false;
+        }
+        if e_e_name == ENAME_ROWID && !sqlite3_is_rowid(c) {
+            return false;
+        }
+    }
+    if e_e_name == ENAME_ROWID
+        && let Some(b) = pb_rowid
+    {
+        *b = true;
+    }
+    true
+}
+
+/// `sqlite3ExprColUsed(pExpr)`: return the Bitmask of columns used by a TK_COLUMN expression
+/// node: the bit of the column, or every column of the table if the column is generated.
+pub fn sqlite3_expr_col_used(p: &Parse, e: ExprId) -> Bitmask {
+    let mut n = p.e(e).i_column as i32;
+    let t = p.tab(p.e(e).y_tab);
+    if (t.tab_flags & TF_HasGenerated) != 0 && (t.a_col[n as usize].col_flags & COLFLAG_GENERATED as u16) != 0 {
+        if t.n_col() as i32 >= BMS { u64::MAX } else { (1u64 << t.n_col()) - 1 }
+    } else {
+        if n >= BMS {
+            n = BMS - 1;
+        }
+        1u64 << n
+    }
+}
+
+/// `extendFJMatch(pParse, ppList, pMatch, iColumn)`: create a new expression term for the
+/// column specified by pMatch and iColumn. Append this new expression term to the FULL JOIN
+/// Match set in *ppList. Create a new *ppList if this is the first term in the set.
+fn extend_fj_match(p: &mut Parse, list: &mut ExprListId, m: (SrcListId, usize), i_column: i16) {
+    let new = sqlite3_expr_alloc(p, TK_COLUMN, None, 0);
+    let (i_cursor, tab) = {
+        let it = &p.src(m.0).a[m.1];
+        (it.i_cursor, it.p_s_tab)
+    };
+    let x = p.em(new);
+    x.i_table = i_cursor;
+    x.i_column = i_column;
+    x.y_tab = tab;
+    x.flags |= EP_CanBeNull;
+    *list = sqlite3_expr_list_append(p, *list, new);
+}
+
+/// `isValidSchemaTableName(zTab, pTab, zDb)`: return TRUE (non-zero) if zTab is a valid name
+/// for the schema table pTab.
+fn is_valid_schema_table_name(z_tab: &str, z_legacy: &str, has_db: bool) -> bool {
+    if z_tab.len() < 7 || !z_tab.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_") {
+        return false;
+    }
+    let tail = &z_tab[7..];
+    if z_legacy.len() >= 7 && &z_legacy[7..] == "temp_master" {
+        if tail.eq_ignore_ascii_case("temp_schema") {
+            return true;
+        }
+        if !has_db {
+            return false;
+        }
+        if tail.eq_ignore_ascii_case("master") {
+            return true;
+        }
+        if tail.eq_ignore_ascii_case("schema") {
+            return true;
+        }
+    } else if tail.eq_ignore_ascii_case("schema") {
+        return true;
+    }
+    false
+}
+
+/// `sqlite3CreateColumnExpr(db, pSrc, iSrc, iCol)`: allocate and return a pointer to an
+/// expression to load the column iCol from datasource iSrc in SrcList pSrc.
+pub fn sqlite3_create_column_expr(p: &mut Parse, src: SrcListId, i_src: usize, i_col: i32) -> ExprId {
+    let e = sqlite3_expr_alloc(p, TK_COLUMN, None, 0);
+    let (tab, i_cursor) = {
+        let it = &p.src(src).a[i_src];
+        (it.p_s_tab, it.i_cursor)
+    };
+    p.em(e).y_tab = tab;
+    p.em(e).i_table = i_cursor;
+    if p.tab(tab).i_p_key as i32 == i_col {
+        p.em(e).i_column = -1;
+    } else {
+        p.em(e).i_column = i_col as i16;
+        let t = p.tab(tab);
+        if (t.tab_flags & TF_HasGenerated) != 0 && (t.a_col[i_col as usize].col_flags & COLFLAG_GENERATED as u16) != 0 {
+            let m = if t.n_col() >= 64 { u64::MAX } else { (1u64 << t.n_col()) - 1 };
+            p.srcm(src).a[i_src].col_used = m;
+        } else {
+            p.srcm(src).a[i_src].col_used |= 1u64 << (if i_col >= BMS { BMS - 1 } else { i_col });
+        }
+    }
+    e
+}
+
 /// `lookupName(pParse, zDb, zTab, pRight, pNC, pExpr)`: given the name of a column of the
 /// form X.Y.Z or Y.Z or just Z, look up that name in the set of source tables in `nc` and
 /// its parents. On success `e` becomes a TK_COLUMN (or the result-set expression it is an
@@ -136,25 +268,78 @@ fn lookup_name(p: &mut Parse, z_db: Option<String>, z_tab: Option<String>, right
 
     // Start at the inner-most context and move outward until a match is found
     let mut found_alias = false;
+    let mut fj_match = ExprListId::NULL; // Matches for FULL JOIN .. USING
     loop {
         let src_list = p.nc(nc).p_src_list;
         if src_list.nn() {
             for i in 0..p.src(src_list).a.len() {
-                let (tab, is_nested_from, is_using, z_alias, i_cursor_unused) = {
+                let (tab, is_nested_from, is_using, p_using, jointype, z_alias) = {
                     let it = &p.src(src_list).a[i];
-                    (it.p_s_tab, it.is_nested_from, it.is_using, it.z_alias.clone(), it.i_cursor)
+                    (it.p_s_tab, it.is_nested_from, it.is_using, it.p_using, it.jointype as i32, it.z_alias.clone())
                 };
-                let _ = i_cursor_unused;
-                if is_nested_from || is_using {
+                if is_nested_from {
                     // In this case, pItem is a subquery that has been formed from a
-                    // parenthesized subset of the FROM clause terms, or the join has a USING
-                    // clause (the FULL JOIN coalesce() handling).
-                    p.not_supported("lookupName: nested FROM clause or USING join");
-                    return WRC_Abort;
+                    // parenthesized subset of the FROM clause terms. Example:
+                    //   .... FROM t1 LEFT JOIN (t2 RIGHT JOIN t3 USING(x)) USING(y) ...
+                    //                          \_________________________/
+                    //             This pItem -------------^
+                    let mut hit = false;
+                    let sel = p.src(src_list).a[i].p_subq.as_ref().expect("subquery").p_select;
+                    let e_list = p.s(sel).p_e_list;
+                    for j in 0..p.l(e_list).a.len() {
+                        let mut b_rowid = false; // True if possible rowid match
+                        if !sqlite3_match_e_name(p, e_list, j, Some(&z_col), z_tab.as_deref(), z_db.as_deref(), Some(&mut b_rowid)) {
+                            continue;
+                        }
+                        if !b_rowid {
+                            if cnt > 0 {
+                                if !is_using
+                                    || crate::build::sqlite3_id_list_index(p, p_using, &z_col) < 0
+                                    || p_match == Some((src_list, i))
+                                {
+                                    // Two or more tables have the same column name which is
+                                    // not joined by USING. Or, a single table has two columns
+                                    // that match a USING term (if pMatch==pItem). These are
+                                    // both "ambiguous column name" errors. Signal as much by
+                                    // clearing pFJMatch and letting cnt go above 1.
+                                    fj_match = ExprListId::NULL;
+                                } else if (jointype & JT_RIGHT) == 0 {
+                                    // An INNER or LEFT JOIN. Use the left-most table
+                                    continue;
+                                } else if (jointype & JT_LEFT) == 0 {
+                                    // A RIGHT JOIN. Use the right-most table
+                                    cnt = 0;
+                                    fj_match = ExprListId::NULL;
+                                } else {
+                                    // For a FULL JOIN, we must construct a coalesce() func
+                                    let ic = p.e(e).i_column;
+                                    extend_fj_match(p, &mut fj_match, p_match.expect("match"), ic);
+                                }
+                            }
+                            cnt += 1;
+                            hit = true;
+                        } else if cnt > 0 {
+                            // This is a potential rowid match, but there has already been a
+                            // real match found. So this can be ignored.
+                            continue;
+                        }
+                        cnt_tab += 1;
+                        p_match = Some((src_list, i));
+                        p.em(e).i_column = j as i16;
+                        p.lm(e_list).a[j].b_used = true;
+                        // rowid cannot be part of a USING clause - assert() this.
+                        if p.l(e_list).a[j].b_using_term {
+                            break;
+                        }
+                    }
+                    if hit || z_tab.is_none() {
+                        continue;
+                    }
                 }
                 if let Some(ztab) = z_tab.as_deref() {
                     if z_db.is_some() {
-                        if Some(p.tab(tab).i_db) != schema {
+                        let tdb = p.tab(tab).i_db;
+                        if (if tdb < 0 { None } else { Some(tdb) }) != schema {
                             continue;
                         }
                         if schema.is_none() && z_db.as_deref() != Some("*") {
@@ -169,23 +354,45 @@ fn lookup_name(p: &mut Parse, z_db: Option<String>, z_tab: Option<String>, right
                         if p.tab(tab).tnum != 1 {
                             continue;
                         }
-                        // isValidSchemaTableName(): alternative names of the schema table
-                        p.not_supported("lookupName: alias names of the schema table");
-                        return WRC_Abort;
+                        if !is_valid_schema_table_name(ztab, &p.tab(tab).z_name, z_db.is_some()) {
+                            continue;
+                        }
                     }
                 }
                 let j = sqlite3_column_index(p, tab, &z_col);
                 if j >= 0 {
-                    // (cnt>0 with a USING clause was handled above: without USING a second
-                    // match is simply counted, giving "ambiguous column name")
+                    if cnt > 0 {
+                        if !is_using || crate::build::sqlite3_id_list_index(p, p_using, &z_col) < 0 {
+                            // Two or more tables have the same column name which is not
+                            // joined by USING. This is an error. Signal as much by clearing
+                            // pFJMatch and letting cnt go above 1.
+                            fj_match = ExprListId::NULL;
+                        } else if (jointype & JT_RIGHT) == 0 {
+                            // An INNER or LEFT JOIN. Use the left-most table
+                            continue;
+                        } else if (jointype & JT_LEFT) == 0 {
+                            // A RIGHT JOIN. Use the right-most table
+                            cnt = 0;
+                            fj_match = ExprListId::NULL;
+                        } else {
+                            // For a FULL JOIN, we must construct a coalesce() func
+                            let ic = p.e(e).i_column;
+                            extend_fj_match(p, &mut fj_match, p_match.expect("match"), ic);
+                        }
+                    }
                     cnt += 1;
                     p_match = Some((src_list, i));
                     // Substitute the rowid (column -1) for the INTEGER PRIMARY KEY
                     p.em(e).i_column = if j == p.tab(tab).i_p_key as i32 { -1 } else { j as i16 };
+                    if is_nested_from {
+                        crate::select::sqlite3_src_item_column_used(p, src_list, i, j);
+                    }
                 }
                 if cnt == 0 && visible_rowid(p, tab) {
                     // pTab is a potential ROWID match. Keep track of it and match the ROWID
-                    // only if all other column name resolution attempts fail.
+                    // later if that seems appropriate. (Search for "cntTab" to find related
+                    // code.) Only allow a ROWID match if there is a single ROWID match
+                    // candidate.
                     cnt_tab += 1;
                     p_match = Some((src_list, i));
                 }
@@ -201,7 +408,8 @@ fn lookup_name(p: &mut Parse, z_db: Option<String>, z_tab: Option<String>, right
                 if (jointype as i32 & (JT_LEFT | JT_LTORJ)) != 0 {
                     x.flags |= EP_CanBeNull;
                 }
-                schema = Some(p.tab(tab).i_db);
+                let tdb = p.tab(tab).i_db;
+                schema = if tdb < 0 { None } else { Some(tdb) };
             }
         } // if( pSrcList )
 
@@ -220,8 +428,12 @@ fn lookup_name(p: &mut Parse, z_db: Option<String>, z_tab: Option<String>, right
             && sqlite3_is_rowid(&z_col)
         {
             cnt = cnt_tab;
+            let (sl, i) = p_match.expect("match");
+            let nested = p.src(sl).a[i].is_nested_from;
             let x = p.em(e);
-            x.i_column = -1;
+            if !nested {
+                x.i_column = -1;
+            }
             x.aff_expr = SQLITE_AFF_INTEGER;
         }
 
@@ -326,6 +538,32 @@ fn lookup_name(p: &mut Parse, z_db: Option<String>, z_tab: Option<String>, right
         // cnt==0 is always an error. cnt>1 is often an error, but might be multiple matches
         // for a NATURAL LEFT JOIN or a LEFT JOIN USING (not ported: reported as unsupported
         // above).
+        let mut coalesced = false;
+        if cnt != 1 && fj_match.nn() {
+            if p.l(fj_match).n_expr() == cnt - 1 {
+                {
+                    let x = p.em(e);
+                    if x.has(EP_Leaf) {
+                        x.flags &= !EP_Leaf;
+                    } else {
+                        x.p_left = ExprId::NULL;
+                        x.p_right = ExprId::NULL;
+                    }
+                }
+                let ic = p.e(e).i_column;
+                extend_fj_match(p, &mut fj_match, p_match.expect("match"), ic);
+                let x = p.em(e);
+                x.op = TK_FUNCTION;
+                x.z_token = Some("coalesce".to_owned());
+                x.x = fj_match.0;
+                x.aff_expr = SQLITE_AFF_DEFER;
+                cnt = 1;
+                coalesced = true;
+            } else {
+                fj_match = ExprListId::NULL;
+            }
+        }
+        if !coalesced {
         if cnt != 1 {
             let z_err = if cnt == 0 { "no such column" } else { "ambiguous column name" };
             let msg = if let Some(zdb) = z_db.as_deref() {
@@ -360,18 +598,18 @@ fn lookup_name(p: &mut Parse, z_db: Option<String>, z_tab: Option<String>, right
         if let Some((sl, i)) = p_match {
             let i_column = p.e(e).i_column;
             if i_column >= 0 {
-                // sqlite3ExprColUsed(pExpr): no generated columns in the tables of step V1
-                let n = (i_column as i32).min(BMS - 1);
-                p.srcm(sl).a[i].col_used |= 1u64 << n;
+                let m = sqlite3_expr_col_used(p, e);
+                p.srcm(sl).a[i].col_used |= m;
             } else {
                 p.srcm(sl).a[i].rowid_used = true;
             }
         }
         p.em(e).op = e_new_expr_op;
+        }
     }
 
     // lookupname_end:
-    let _ = schema;
+    let _ = (schema, fj_match);
     if cnt == 1 {
         // (sqlite3AuthRead: authorization is done by the engine)
         // Increment the nRef value on all name contexts from TopNC up to the point where the
@@ -1217,7 +1455,16 @@ fn resolve_select_step(p: &mut Parse, w: &mut Walker, sel: SelectId) -> i32 {
             p.a_nc.truncate(nc_mark);
             return WRC_Abort;
         }
-        // (SF_OnToWhere: sqlite3SelectCheckOnClauses — joins are not ported in step V1)
+        // If the SELECT statement contains ON clauses that were moved into the WHERE clause,
+        // go through and verify that none of the terms in the ON clauses reference tables to
+        // the right of the ON clause.
+        if p.s(s).sel_flags & SF_OnToWhere != 0 {
+            crate::flatten::sqlite3_select_check_on_clauses(p, s);
+            if p.n_err != 0 {
+                p.a_nc.truncate(nc_mark);
+                return WRC_Abort;
+            }
+        }
 
         // Advance to the next term of the compound
         p.a_nc.truncate(nc_mark);
@@ -1348,4 +1595,38 @@ fn _unused(p: &mut Parse) {
     // keep `is_quote` reachable for later steps (schema-name comparisons use it)
     let _ = is_quote(b'"');
     let _ = sqlite3_get_coll_seq(p, "BINARY");
+}
+
+/// `sqlite3ResolveSelfReference(pParse, pTab, type, pExpr, pList)`: resolve names in
+/// expressions that can only reference a single table or not reference any tables at all:
+///
+///    "type" flag         Expression type
+///    ------------        -----------------------------
+///    NC_IsCheck          CHECK constraints
+///    NC_PartIdx          WHERE clause of a partial index
+///    NC_IdxExpr          Index expressions
+///    NC_GenCol           Expression for a generated column
+///
+/// The Expr.iTable value for Expr.op==TK_COLUMN nodes of the expression is set to -1 and the
+/// Expr.iColumn value is set to the column number.
+///
+/// Any errors cause an error message to be set in pParse.
+pub fn sqlite3_resolve_self_reference(p: &mut Parse, tab: TableId, mut ty: i32, e: ExprId, list: ExprListId) -> i32 {
+    let mut src = SrcList::default();
+    if tab.nn() {
+        src.a.push(SrcItem { z_name: Some(p.tab(tab).z_name.clone()), p_s_tab: tab, i_cursor: -1, ..SrcItem::default() });
+        if p.tab(tab).i_db != 1 {
+            // Cause EP_FromDDL to be set on TK_FUNCTION nodes of non-TEMP schema elements
+            ty |= NC_FromDDL;
+        }
+    }
+    let src = p.new_src(src);
+    let mark = p.a_nc.len();
+    let nc = p.new_nc(NameContext { p_src_list: src, nc_flags: ty | NC_IsDDL, ..NameContext::default() });
+    let mut rc = sqlite3_resolve_expr_names(p, nc, e);
+    if rc == SQLITE_OK && list.nn() {
+        rc = sqlite3_resolve_expr_list_names(p, nc, list);
+    }
+    p.a_nc.truncate(mark);
+    rc
 }

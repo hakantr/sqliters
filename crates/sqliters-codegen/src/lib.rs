@@ -17,10 +17,12 @@ pub mod callback;
 pub mod consts;
 pub mod expr;
 pub mod exprcode;
+pub mod flatten;
 pub mod merge;
 pub mod parse;
 pub mod parse_tables;
 pub mod resolve;
+pub mod schema;
 pub mod select;
 pub mod sqliteint;
 pub mod tk;
@@ -29,9 +31,14 @@ pub mod tokenize;
 pub mod util;
 pub mod walker;
 pub mod where_;
+pub mod wherecode;
+pub mod whereexpr;
+pub mod whereint;
 
 #[cfg(test)]
 mod explain_tests;
+#[cfg(test)]
+mod plan_tests;
 
 use sqliters_vdbe::vdbeaux::Program;
 
@@ -72,6 +79,17 @@ pub fn prepare_with_tree_dump(db: Db<'_>, z_sql: &str, want_dump: bool) -> (Prep
     tokenize::sqlite3_run_parser(&mut p);
     let tail = p.z_tail;
     let dump = p.tree_dump.take().unwrap_or_default();
+    (prepare_result(p), tail, dump)
+}
+
+/// [`prepare_tail`] that also returns the WHERE-clause term dump and the WhereLoop / path dump
+/// of the query planner (verification aid; see `where_.rs`).
+pub fn prepare_with_where_dump(db: Db<'_>, z_sql: &str) -> (PrepareResult, usize, Vec<String>) {
+    let mut p = Parse::new(db, z_sql);
+    p.where_dump = Some(Vec::new());
+    tokenize::sqlite3_run_parser(&mut p);
+    let tail = p.z_tail;
+    let dump = p.where_dump.take().unwrap_or_default();
     (prepare_result(p), tail, dump)
 }
 

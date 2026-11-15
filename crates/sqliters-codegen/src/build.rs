@@ -198,3 +198,307 @@ pub fn sqlite3_may_abort(p: &mut Parse) {
 
 #[allow(dead_code)]
 const _: i32 = SAVEPOINT_BEGIN;
+
+/// `sqlite3NameFromToken(db, pName)`: given a token, return a string that consists of the
+/// text of that token, dequoted. `None` for a NULL token.
+pub fn sqlite3_name_from_token(p: &Parse, name: Option<&Token>) -> Option<String> {
+    match name {
+        Some(t) if t.z != Token::NO_Z => Some(sqlite3_dequote(p.tok_str(t))),
+        _ => None,
+    }
+}
+
+/// `sqlite3IdListAppend(pParse, pList, pToken)`: append a new element to the given IdList.
+/// Create a new IdList if need be.
+pub fn sqlite3_id_list_append(p: &mut Parse, list: IdListId, token: &Token) -> IdListId {
+    let name = sqlite3_name_from_token(p, Some(token)).unwrap_or_default();
+    sqlite3_id_list_append_str(p, list, name)
+}
+
+/// [`sqlite3_id_list_append`] with the name given as a string (`sqlite3IdListAppend(pParse,
+/// pList, 0)` followed by the assignment of `zName`).
+pub fn sqlite3_id_list_append_str(p: &mut Parse, list: IdListId, name: String) -> IdListId {
+    let list = if list.is_null() {
+        p.a_idlist.push(IdList::default());
+        IdListId(p.a_idlist.len() as u32 - 1)
+    } else {
+        list
+    };
+    p.a_idlist[list.ix()].a.push(name);
+    list
+}
+
+/// `sqlite3IdListIndex(pList, zName)`: return the index in pList of the identifier named
+/// zId. Return -1 if not found.
+pub fn sqlite3_id_list_index(p: &Parse, list: IdListId, z_name: &str) -> i32 {
+    for (i, n) in p.a_idlist[list.ix()].a.iter().enumerate() {
+        if n.eq_ignore_ascii_case(z_name) {
+            return i as i32;
+        }
+    }
+    -1
+}
+
+/// `sqlite3SrcListAppend(pParse, pList, pTable, pDatabase)`: append a new table name to the
+/// given SrcList. Create a new SrcList if need be.
+///
+/// A SrcList is returned, or NULL if there is an OOM error or if the SrcList grows to large.
+/// The returned SrcList might be the same as the SrcList that was input or it might be a new
+/// one.
+///
+/// If pDatabase is not null, it means that the table has an optional database name prefix.
+/// Like this: "database.table". The pDatabase points to the table name and the pTable points
+/// to the database name. The SrcList.a[].zName field is filled with the table name which
+/// might come from pTable (if pDatabase is NULL) or from pDatabase. SrcList.a[].zDatabase is
+/// filled with the database name from pTable, or with NULL if no database is specified.
+///
+/// In other words, if call like this:
+///
+///         sqlite3SrcListAppend(D,A,B,0);
+///
+/// Then B is a table name and the database name is unspecified. If called like this:
+///
+///         sqlite3SrcListAppend(D,A,B,C);
+///
+/// Then C is the table name and B is the database name. If C is defined then so is B. In
+/// other words, we never have a case where:
+///
+///         sqlite3SrcListAppend(D,A,0,C);
+///
+/// Both pTable and pDatabase are assumed to be quoted. They are dequoted before being added
+/// to the SrcList.
+pub fn sqlite3_src_list_append(p: &mut Parse, list: SrcListId, table: Option<&Token>, database: Option<&Token>) -> SrcListId {
+    let list = if list.is_null() { p.new_src(SrcList::default()) } else { list };
+    // sqlite3SrcListEnlarge(): "too many FROM clause terms, max: %d"
+    if p.src(list).a.len() as i32 >= SQLITE_MAX_SRCLIST {
+        p.error_msg(format!("too many FROM clause terms, max: {SQLITE_MAX_SRCLIST}"));
+        return SrcListId::NULL;
+    }
+    let database = match database {
+        Some(d) if d.z != Token::NO_Z => Some(d),
+        _ => None,
+    };
+    let mut item = SrcItem { i_cursor: -1, ..SrcItem::default() };
+    if let Some(d) = database {
+        item.z_name = sqlite3_name_from_token(p, Some(d));
+        item.z_database = sqlite3_name_from_token(p, table);
+    } else {
+        item.z_name = sqlite3_name_from_token(p, table);
+        item.z_database = None;
+    }
+    p.srcm(list).a.push(item);
+    list
+}
+
+/// `SQLITE_MAX_SRCLIST`: maximum size of a SrcList object
+pub const SQLITE_MAX_SRCLIST: i32 = 200;
+
+/// `sqlite3SrcItemAttachSubquery(pParse, pItem, pSelect, dupSelect)`: attach a Subquery
+/// object to pItem->uv.pSubq. Set the pSelect value but leave all the other values
+/// initialized to zero.
+///
+/// A copy of the Select object is made if dupSelect is true, and the SrcItem takes
+/// responsibility for deleting the copy. If dupSelect is false, ownership of the Select
+/// passes to the SrcItem. Either way, the SrcItem will take responsibility for deleting the
+/// Select.
+///
+/// When dupSelect is zero, that means the Select might get deleted right away if there is an
+/// error. The pSelect might also be deleted even if there is no error, if the subquery is
+/// later flattened or otherwise optimized away.
+pub fn sqlite3_src_item_attach_subquery(p: &mut Parse, src: SrcListId, i: usize, select: SelectId, dup_select: bool) -> bool {
+    {
+        let it = &mut p.srcm(src).a[i];
+        if it.fixed_schema {
+            it.i_fixed_db = 0;
+            it.fixed_schema = false;
+        } else if it.z_database.is_some() {
+            it.z_database = None;
+        }
+    }
+    let select = if dup_select { crate::expr::sqlite3_select_dup(p, select, 0) } else { select };
+    if select.is_null() {
+        return false;
+    }
+    let it = &mut p.srcm(src).a[i];
+    it.is_subquery = true;
+    it.p_subq = Some(Box::new(Subquery { p_select: select, ..Subquery::default() }));
+    true
+}
+
+/// `sqlite3SrcListAppendFromTerm(pParse, p, pTable, pDatabase, pAlias, pSubquery,
+/// pOnUsing)`: this routine is called by the parser to add a new term to the end of a growing
+/// FROM clause. The "p" parameter is the part of the FROM clause that has already been
+/// constructed. "p" is NULL if this is the first term of the FROM clause. pTable and
+/// pDatabase are the name of the table and database named in the FROM clause term. pDatabase
+/// is NULL if the database name qualifier is missing - the usual case. If the term has an
+/// alias, then pAlias points to the alias token. If the term is a subquery, then pSubquery is
+/// the SELECT statement that the subquery encodes. The pTable and pDatabase parameters are
+/// NULL for subqueries. The pOnUsing parameter is the content of the ON and USING clauses.
+///
+/// Return a new SrcList which encodes is the FROM with the new term added.
+pub fn sqlite3_src_list_append_from_term(
+    p: &mut Parse,
+    list: SrcListId,
+    table: Option<&Token>,
+    database: Option<&Token>,
+    alias: &Token,
+    subquery: SelectId,
+    on_using: Option<&OnOrUsing>,
+) -> SrcListId {
+    if list.is_null()
+        && let Some(ou) = on_using
+        && (ou.p_on.nn() || ou.p_using.nn())
+    {
+        p.error_msg(format!("a JOIN clause is required before {}", if ou.p_on.nn() { "ON" } else { "USING" }));
+        return SrcListId::NULL;
+    }
+    let list = sqlite3_src_list_append(p, list, table, database);
+    if list.is_null() {
+        return SrcListId::NULL;
+    }
+    let i = p.src(list).a.len() - 1;
+    if alias.n != 0 {
+        let a = sqlite3_name_from_token(p, Some(alias));
+        p.srcm(list).a[i].z_alias = a;
+    }
+    if subquery.nn()
+        && sqlite3_src_item_attach_subquery(p, list, i, subquery, false)
+        && (p.s(subquery).sel_flags & SF_NestedFrom) != 0
+    {
+        p.srcm(list).a[i].is_nested_from = true;
+    }
+    let it = &mut p.srcm(list).a[i];
+    match on_using {
+        None => it.p_on = ExprId::NULL,
+        Some(ou) if ou.p_using.nn() => {
+            it.is_using = true;
+            it.p_using = ou.p_using;
+        }
+        Some(ou) => it.p_on = ou.p_on,
+    }
+    list
+}
+
+/// `sqlite3SrcListIndexedBy(pParse, p, pIndexedBy)`: add an INDEXED BY or NOT INDEXED clause
+/// to the most recently added element of the source-list passed as the second argument.
+pub fn sqlite3_src_list_indexed_by(p: &mut Parse, list: SrcListId, indexed_by: &Token) {
+    if list.nn() && indexed_by.n > 0 {
+        if indexed_by.n == 1 && indexed_by.z == Token::NO_Z {
+            // A "NOT INDEXED" clause was supplied. See parse.y construct "indexed_opt" for
+            // details.
+            p.srcm(list).a.last_mut().expect("item").not_indexed = true;
+        } else {
+            let name = sqlite3_name_from_token(p, Some(indexed_by));
+            let it = p.srcm(list).a.last_mut().expect("item");
+            it.z_indexed_by = name;
+            it.is_indexed_by = true;
+        }
+    }
+}
+
+/// `sqlite3SrcListAppendList(pParse, p1, p2)`: append the contents of SrcList p2 to SrcList
+/// p1 and return the resulting SrcList. Or, if an error occurs, return NULL. In all cases,
+/// p1 and p2 are freed by this function.
+pub fn sqlite3_src_list_append_list(p: &mut Parse, p1: SrcListId, p2: SrcListId) -> SrcListId {
+    if p2.nn() {
+        let items = std::mem::take(&mut p.srcm(p2).a);
+        let jt = items.first().map_or(0, |i| i.jointype) & JT_LTORJ as u8;
+        let l = &mut p.srcm(p1).a;
+        l.extend(items);
+        l[0].jointype |= jt;
+    }
+    p1
+}
+
+/// `sqlite3SrcListFuncArgs(pParse, p, pList)`: add the list of function arguments to the
+/// SrcList entry for a table-valued function.
+pub fn sqlite3_src_list_func_args(p: &mut Parse, list: SrcListId, args: ExprListId) {
+    if list.nn() {
+        let it = p.srcm(list).a.last_mut().expect("item");
+        it.p_func_arg = args;
+        it.is_tab_func = true;
+    }
+}
+
+/// `sqlite3SrcListShiftJoinType(pParse, p)`: when building up a FROM clause in the parser,
+/// the join operator is initially attached to the left operand. But the code generator
+/// expects the join operator to be on the right operand. This routine shifts all join
+/// operators from left to right for an entire FROM clause.
+///
+/// Example: Suppose the join is like this:
+///
+///           A natural cross join B
+///
+/// The operator is "natural cross join". The A and B operands are stored in p->a[0] and
+/// p->a[1], respectively. The parser initially stores the operator with A. This routine
+/// shifts that operator over to B.
+///
+/// Additional changes:
+///
+///   *   All tables to the left of the right-most RIGHT JOIN are tagged with JT_LTORJ (mnemonic:
+///       Left Table Of Right Join) so that the code generator can easily tell that the table
+///       is part of the left operand of at least one RIGHT JOIN.
+pub fn sqlite3_src_list_shift_join_type(p: &mut Parse, list: SrcListId) {
+    if list.nn() && p.src(list).a.len() > 1 {
+        let a = &mut p.srcm(list).a;
+        let mut i = a.len() - 1;
+        let mut all_flags: u8 = 0;
+        loop {
+            a[i].jointype = a[i - 1].jointype;
+            all_flags |= a[i].jointype;
+            i -= 1;
+            if i == 0 {
+                break;
+            }
+        }
+        a[0].jointype = 0;
+
+        // All terms to the left of a RIGHT JOIN should be tagged with the JT_LTORJ flags
+        if all_flags & JT_RIGHT as u8 != 0 {
+            let mut i = a.len() as isize - 1;
+            while i > 0 && (a[i as usize].jointype & JT_RIGHT as u8) == 0 {
+                i -= 1;
+            }
+            i -= 1;
+            loop {
+                a[i as usize].jointype |= JT_LTORJ as u8;
+                i -= 1;
+                if i < 0 {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// `sqlite3VdbeExplain(pParse, bPush, zFmt, ...)` (vdbeaux.c): add a new OP_Explain opcode.
+///
+/// If the bPush flag is true, then make this opcode the parent for subsequent Explains until
+/// sqlite3VdbeExplainPop() is called.
+///
+/// In a production build the opcode is only added for EXPLAIN QUERY PLAN (`explain==2`).
+pub fn sqlite3_vdbe_explain(p: &mut Parse, b_push: bool, z_msg: String) -> i32 {
+    let mut addr = 0;
+    if p.explain == 2 {
+        let i_this = p.v.current_addr();
+        addr = p.v.add_op4(OP_Explain, i_this, p.addr_explain, 0, P4::dynamic(&z_msg));
+        if b_push {
+            p.addr_explain = i_this;
+        }
+    }
+    addr
+}
+
+/// `sqlite3VdbeExplainPop(pParse)`: pop the EXPLAIN QUERY PLAN stack one level.
+pub fn sqlite3_vdbe_explain_pop(p: &mut Parse) {
+    p.addr_explain = sqlite3_vdbe_explain_parent(p);
+}
+
+/// `sqlite3VdbeExplainParent(pParse)`: return the address of the current EXPLAIN QUERY PLAN
+/// baseline. 0 means "none".
+pub fn sqlite3_vdbe_explain_parent(p: &Parse) -> i32 {
+    if p.addr_explain == 0 {
+        return 0;
+    }
+    p.v.get_op(p.addr_explain).p2
+}

@@ -267,19 +267,18 @@ fn covering_index_vdbe_no_table_cursor_and_execution() {
     let eqp = eqp_details(&mut conn, "SELECT b FROM cov_test WHERE a = 10 ORDER BY b;");
     assert_eq!(eqp[0], "SEARCH cov_test USING COVERING INDEX cov_ab (a=?)");
 
-    // Inspect VDBE EXPLAIN opcodes: must use OpenReadIdx on `cov_ab` and MUST NOT emit OpenRead or SeekRowid on `cov_test`!
+    // Inspect the EXPLAIN opcodes (C's listing since step V2): the only cursor is the one on
+    // index `cov_ab` (an OpenRead whose P4 is a KeyInfo) and the table `cov_test` is neither
+    // opened nor seeked.
     let explain_rows = eval_rows(&mut conn, "EXPLAIN SELECT b FROM cov_test WHERE a = 10;");
     let opcodes: Vec<&str> = explain_rows.iter().map(|r| r[1].as_str()).collect();
-    assert!(
-        opcodes.contains(&"OpenReadIdx"),
-        "expected OpenReadIdx in covering index plan: {opcodes:?}"
+    assert_eq!(
+        opcodes,
+        ["Init", "OpenRead", "Integer", "SeekGE", "IdxGT", "Column", "ResultRow", "Next", "Halt", "Transaction", "Goto"]
     );
+    assert_eq!(explain_rows[1][5], "k(3,,,)", "the cursor of a covering index plan is the index");
     assert!(
-        !opcodes.contains(&"OpenRead"),
-        "covering index VDBE program must not open table cursor: {opcodes:?}"
-    );
-    assert!(
-        !opcodes.contains(&"SeekRowid"),
+        !opcodes.contains(&"SeekRowid") && !opcodes.contains(&"DeferredSeek"),
         "covering index VDBE program must not seek table rowid: {opcodes:?}"
     );
 
@@ -344,14 +343,20 @@ fn partial_and_expression_indexes_and_skip_scan() {
     )
     .unwrap();
 
-    // Partial index usable when implied (`b > 10` implies `b > 5`; `b = 7` implies `b > 5`)
+    // Partial index usable when the WHERE clause has the index's own term. C does no range
+    // reasoning (`sqlite3ExprImpliesExpr`): `b > 10` and `b = 7` do not make `p_gt5` usable
+    // (C SQLite 3.54.1: SCAN ptest for both).
     assert_eq!(
-        eqp_details(&mut conn, "SELECT a, c FROM ptest WHERE a = 2 AND b > 10;"),
+        eqp_details(&mut conn, "SELECT a, c FROM ptest WHERE a = 2 AND b > 5;"),
         vec!["SEARCH ptest USING INDEX p_gt5 (a=?)"]
     );
     assert_eq!(
+        eqp_details(&mut conn, "SELECT a, c FROM ptest WHERE a = 2 AND b > 10;"),
+        vec!["SCAN ptest"]
+    );
+    assert_eq!(
         eqp_details(&mut conn, "SELECT a, c FROM ptest WHERE a = 2 AND b = 7;"),
-        vec!["SEARCH ptest USING INDEX p_gt5 (a=?)"]
+        vec!["SCAN ptest"]
     );
     // Not usable when `b > 3` does not imply `b > 5`
     assert_eq!(
