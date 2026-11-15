@@ -3,6 +3,7 @@ name = "sqliters-tcltest"
 description = "Pure safe Rust SQLite TCL/testfixture test runner for executing SQLite .test suites 1-to-1"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [lints]

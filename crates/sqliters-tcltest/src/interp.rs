@@ -4271,6 +4271,12 @@ pub fn resolve_testfixture_binary() -> PathBuf {
                 if let Some(parent) = exe.parent() {
                     let profile_dir = if parent.file_name().is_some_and(|n| n == "deps") {
                         parent.parent().unwrap_or(parent)
+                    } else if parent.file_name().is_some_and(|n| n == "out")
+                        && parent.ancestors().nth(3).is_some_and(|b| b.file_name().is_some_and(|n| n == "build"))
+                    {
+                        // Cargo 1.100 build-dir layout of test binaries:
+                        // <profile>/build/<package>/<hash>/out/<test binary>
+                        parent.ancestors().nth(4).unwrap_or(parent)
                     } else {
                         parent
                     };

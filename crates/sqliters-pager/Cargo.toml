@@ -3,6 +3,7 @@ name = "sqliters-pager"
 description = "Page cache, 100-byte SQLite header codec, transactions, savepoints, and rollback journal ported from SQLite pager.c/pcache1.c"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [lints]

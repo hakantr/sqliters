@@ -3,6 +3,7 @@ name = "sqliters-cli"
 description = "Interactive and batch SQLite 3.54.1 command-line shell (ported from shell.c.in)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]

@@ -3,6 +3,7 @@ name = "sqliters-core"
 description = "Schema catalog, SQL-to-VDBE compiler, query engine, PRAGMAs, and Connection/Statement API for sqliters"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [lints]

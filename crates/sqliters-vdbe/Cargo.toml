@@ -3,6 +3,7 @@ name = "sqliters-vdbe"
 description = "Virtual Database Engine (VDBE) bytecode VM, opcodes, registers, cursors, sorters, and built-in SQL functions ported from vdbe.c/func.c"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [lints]

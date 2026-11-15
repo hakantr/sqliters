@@ -18,6 +18,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.100"
 license = "Unlicense OR CC0-1.0 OR 0BSD"
 authors = ["sqliters contributors"]
 repository = "https://github.com/hakantr/sqliters"
@@ -30,7 +31,10 @@ name = "sqliters"
 description = "Pure safe Rust port of SQLite 3.54.1, binary-compatible with SQLite format 3"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [lints]
 workspace = true

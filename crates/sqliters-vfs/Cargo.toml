@@ -3,6 +3,7 @@ name = "sqliters-vfs"
 description = "Virtual File System (VFS) abstraction, OS filesystem backend, and in-memory VFS ported from SQLite os.c/os_unix.c/memdb.c"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [lints.rust]

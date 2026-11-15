@@ -3,6 +3,7 @@ name = "sqliters-codegen"
 description = "Port of SQLite 3.54.1's SQL code generator (parse.y, tokenize.c, resolve.c, expr.c, select.c, build.c): C's parse tree and VDBE program generation"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [lints]
