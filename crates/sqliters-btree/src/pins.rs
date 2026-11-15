@@ -587,6 +587,40 @@ impl Btree {
         Ok(v as i64)
     }
 
+    /// What a table cursor on cell `ix` of page `pg` sees when that page is a table leaf
+    /// with more than `ix` cells: the key of the cell, the key of the last cell, the number
+    /// of cells. `None` otherwise.
+    fn vcr_leaf_peek(&mut self, pg: Pgno, ix: usize) -> Result<Option<(i64, i64, usize)>> {
+        let hdr = if pg == 1 { 100 } else { 0 };
+        let d = self.pager.read_page(pg)?;
+        if hdr + 12 > d.len() {
+            return Err(sqliters_types::SqliteError::corrupt("b-tree page buffer too small"));
+        }
+        let n_cell = crate::balance::get2(d, hdr + 3);
+        if d[hdr] != 0x0d || ix >= n_cell {
+            return Ok(None);
+        }
+        let key = |i: usize| -> Result<i64> {
+            let bad = || sqliters_types::SqliteError::corrupt("cell extends past end of page");
+            let ptr = hdr + 8 + 2 * i;
+            if ptr + 2 > d.len() {
+                return Err(sqliters_types::SqliteError::corrupt("cell pointer out of range"));
+            }
+            let off = crate::balance::get2(d, ptr);
+            let cell = d.get(off..).ok_or_else(bad)?;
+            let mut p = 0;
+            while p < 8 && cell.get(p).is_some_and(|b| b & 0x80 != 0) {
+                p += 1;
+            }
+            p += 1;
+            match cell.get(p..).map(sqliters_types::get_varint) {
+                Some(Ok((v, _))) => Ok(v as i64),
+                _ => Err(bad()),
+            }
+        };
+        Ok(Some((key(ix)?, key(n_cell - 1)?, n_cell)))
+    }
+
     /// `moveToChild` of the real cursor: `aiIdx[iPage] = ix; ix = 0`.
     fn vcr_to_child(&mut self, vc: usize, child: Pgno) -> Result<()> {
         let n = self.vcursors[vc].n as usize;
@@ -891,12 +925,6 @@ impl Btree {
         Ok(done)
     }
 
-    /// Whether the cursor is on the last cell of the page it is on.
-    fn vc_is_last_cell(&mut self, vc: usize) -> Result<bool> {
-        let pg = self.vc_top(vc);
-        let (_, n_cell) = self.vcr_meta(pg)?;
-        Ok(n_cell > 0 && usize::from(self.vcursors[vc].ix) == n_cell - 1)
-    }
 
     /// `getCellInfo` ran on the row the cursor is on (`OP_Rowid`, `OP_Column`): the rowid is
     /// known to the cursor (`BTCF_ValidNKey`).
@@ -918,16 +946,24 @@ impl Btree {
     /// entry with rowid `key` (`0`), or to an entry next to where it would be (`-1`: a
     /// smaller one or the tree is empty, `1`: a larger one).
     pub fn vc_table_moveto(&mut self, vc: usize, key: i64, bias_right: bool) -> Result<i32> {
+        // One look at the leaf the cursor says it is on: the key of its cell, the last key
+        // of the page, the number of cells.
+        let mut peek: Option<(i64, i64, usize)> = None;
         if self.vcursors[vc].valid
             && self.vc_depth(vc) > 0
             && let Some(nk) = self.vcursors[vc].nkey
-            && !self.vc_cell_rowid_is(vc, nk)?
         {
-            // (what the cursor remembers does not describe the page any more: forget it)
-            let c = &mut self.vcursors[vc];
-            c.valid = false;
-            c.nkey = None;
-            c.at_last = false;
+            let pg = self.vc_top(vc);
+            let ix = usize::from(self.vcursors[vc].ix);
+            peek = self.vcr_leaf_peek(pg, ix)?;
+            if !peek.is_some_and(|(k, _, _)| k == nk) {
+                // (what the cursor remembers does not describe the page any more: forget it)
+                peek = None;
+                let c = &mut self.vcursors[vc];
+                c.valid = false;
+                c.nkey = None;
+                c.at_last = false;
+            }
         }
         if self.vcursors[vc].valid
             && self.vc_depth(vc) > 0
@@ -937,21 +973,43 @@ impl Btree {
                 return Ok(0);
             }
             if nk < key {
-                if self.vcursors[vc].at_last && self.vc_is_last_cell(vc)? {
+                if self.vcursors[vc].at_last
+                    && peek.is_some_and(|(_, _, n)| usize::from(self.vcursors[vc].ix) == n - 1)
+                {
                     return Ok(-1);
                 }
                 // "If the requested key is one more than the previous key, then try to get
                 // there using sqlite3BtreeNext() rather than a full binary search."
-                if nk.checked_add(1) == Some(key) && self.vc_next(vc)? {
-                    let k = self.vc_rowid(vc)?;
-                    self.vcursors[vc].nkey = Some(k);
-                    if k == key {
-                        return Ok(0);
+                if nk.checked_add(1) == Some(key) {
+                    peek = None;
+                    if self.vc_next(vc)? {
+                        let k = self.vc_rowid(vc)?;
+                        self.vcursors[vc].nkey = Some(k);
+                        if k == key {
+                            return Ok(0);
+                        }
                     }
                 }
             }
         }
-        if !self.vcr_root(vc)? {
+        // The key lies on the leaf the cursor is on (it is larger than the key the cursor is
+        // on and not larger than the last key of that leaf): `moveToRoot` and the searches on
+        // the interior pages lead down the very pages the cursor holds. The references are
+        // given back and taken again as C does it; the interior searches are not repeated.
+        let same_leaf = self.vcursors[vc].valid
+            && self.vc_depth(vc) >= 2
+            && self.vcursors[vc].nkey.is_some_and(|nk| nk < key)
+            && peek.is_some_and(|(_, last, _)| last >= key);
+        if same_leaf {
+            let n = self.vc_depth(vc);
+            let pages = self.vcursors[vc].pages;
+            let ai = self.vcursors[vc].ai;
+            self.vc_move_to_root(vc)?;
+            for lvl in 1..n {
+                self.vcursors[vc].ix = ai[lvl - 1];
+                self.vcr_to_child(vc, pages[lvl])?;
+            }
+        } else if !self.vcr_root(vc)? {
             return Ok(-1);
         }
         self.vcursors[vc].valid = true;
@@ -972,35 +1030,32 @@ impl Btree {
                 if ptr0 + 2 * n_cell > d.len() {
                     return Err(sqliters_types::SqliteError::corrupt("cell pointer out of range"));
                 }
+                let ptrs = &d[ptr0..ptr0 + 2 * n_cell];
                 let key_at = |i: usize| -> Result<i64> {
-                    let mut off = crate::balance::get2(d, ptr0 + 2 * i);
-                    if leaf {
+                    let off = (usize::from(ptrs[2 * i]) << 8) | usize::from(ptrs[2 * i + 1]);
+                    let bad = || sqliters_types::SqliteError::corrupt("cell extends past end of page");
+                    let cell = d.get(off..).ok_or_else(bad)?;
+                    // (in front of the key: the payload size of a leaf cell, a varint; the
+                    // child pointer of an interior cell)
+                    let p = if !leaf {
+                        4
+                    } else if cell.first().is_some_and(|b| b & 0x80 == 0) {
+                        1
+                    } else {
                         let mut k = 0;
-                        while off < d.len() && d[off] & 0x80 != 0 && k < 8 {
-                            off += 1;
+                        while k < 8 && cell.get(k).is_some_and(|b| b & 0x80 != 0) {
                             k += 1;
                         }
-                        off += 1;
-                    } else {
-                        off += 4;
+                        k + 1
+                    };
+                    match cell.get(p) {
+                        Some(&b) if b < 0x80 => Ok(i64::from(b)),
+                        Some(_) => match sqliters_types::get_varint(&cell[p..]) {
+                            Ok((v, _)) => Ok(v as i64),
+                            Err(_) => Err(bad()),
+                        },
+                        None => Err(bad()),
                     }
-                    let mut v: u64 = 0;
-                    for j in 0..9 {
-                        let Some(&b) = d.get(off + j) else {
-                            return Err(sqliters_types::SqliteError::corrupt(
-                                "cell extends past end of page",
-                            ));
-                        };
-                        if j == 8 {
-                            v = (v << 8) | u64::from(b);
-                            break;
-                        }
-                        v = (v << 7) | u64::from(b & 0x7f);
-                        if b & 0x80 == 0 {
-                            break;
-                        }
-                    }
-                    Ok(v as i64)
                 };
                 let mut lwr: i64 = 0;
                 let mut upr: i64 = n_cell as i64 - 1;
@@ -1224,14 +1279,20 @@ impl Btree {
         }
     }
 
-    /// `OP_SeekRowid` of a point lookup on `root`.
-    pub(crate) fn emu_seek_rowid(&mut self, root: Pgno, rowid: i64) -> Result<()> {
+    /// `OP_SeekRowid` of a point lookup on `root`, and where the cursor ended when it is on the row: the leaf
+    /// page and the cell (checked against the page: the cell there holds `rowid`). `None`:
+    /// no cursor is modelled here, or the row was not found by it.
+    pub(crate) fn emu_seek_rowid_pos(&mut self, root: Pgno, rowid: i64) -> Result<Option<(Pgno, usize)>> {
         if self.pager.page_count() == 0 || root == 0 || self.c_silent > 0 {
-            return Ok(());
+            return Ok(None);
         }
         let vc = self.vc_open_read(root);
-        self.vc_table_moveto(vc, rowid, false)?;
-        Ok(())
+        let res = self.vc_table_moveto(vc, rowid, false)?;
+        // (`0` is only returned for a cell whose key was just read from the page)
+        if res == 0 && self.vcursors[vc].valid {
+            return Ok(Some((self.vc_top(vc), usize::from(self.vcursors[vc].ix))));
+        }
+        Ok(None)
     }
 
     /// A forward scan of table b-tree `root` starts: `OP_Rewind`, or `OP_SeekGE` / `OP_SeekGT`

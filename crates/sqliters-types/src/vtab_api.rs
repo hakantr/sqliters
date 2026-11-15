@@ -24,6 +24,14 @@ pub enum VTabConfigOption {
     Innocuous,
     /// `SQLITE_VTAB_DIRECTONLY`
     DirectOnly,
+    /// Not an `sqlite3_vtab_config` option: the module implements xFindFunction (the
+    /// host hands it function calls whose first argument is a column of the table).
+    FindFunction,
+    /// Not an `sqlite3_vtab_config` option: the module's xColumn returns no value for a
+    /// column an UPDATE does not assign (`sqlite3_vtab_nochange`) and its xUpdate does not
+    /// use the value of such a column (`sqlite3_value_nochange`), as FTS5 does. The scan of
+    /// an UPDATE then reads only the columns the statement names.
+    NochangeUnread,
 }
 
 /// Active conflict-resolution mode reported by [`VTabHostContext::vtab_on_conflict`] (`sqlite3_vtab_on_conflict`).
@@ -195,27 +203,33 @@ pub trait VTabHostContext {
     /// Executes an internal SQL query within the active connection/transaction context and returns all rows.
     fn query_sql(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>>;
 
-    /// The bytes of the blob (or text) stored in column `col_idx` of row `rowid` of a rowid
-    /// shadow table — one row lookup, like `sqlite3_blob_reopen` + `sqlite3_blob_read` of the
-    /// whole value. `None`: no such row, or the value is neither a blob nor text.
-    /// `hint`: see [`ShadowHint`] (one per table, kept by the caller).
+    /// Reads the bytes of the blob (or text) stored in column `col_idx` of row `rowid` of a
+    /// rowid shadow table into `out` (cleared first) — one row lookup, like
+    /// `sqlite3_blob_reopen` + `sqlite3_blob_read` of the whole value. `false`: no such row,
+    /// or the value is neither a blob nor text. `hint`: see [`ShadowHint`] (one per table,
+    /// kept by the caller).
     fn shadow_blob_get(
         &mut self,
         shadow_table: &str,
         _hint: &mut ShadowHint,
         rowid: i64,
         col_idx: usize,
-    ) -> Result<Option<Vec<u8>>> {
-        let Some(mut row) = self.shadow_get_rowid(shadow_table, rowid)? else {
-            return Ok(None);
+        out: &mut Vec<u8>,
+    ) -> Result<bool> {
+        out.clear();
+        let Some(row) = self.shadow_get_rowid(shadow_table, rowid)? else {
+            return Ok(false);
         };
-        if col_idx >= row.len() {
-            return Ok(None);
-        }
-        Ok(match row.swap_remove(col_idx) {
-            Value::Blob(b) => Some(b),
-            Value::Text(s) => Some(s.into_bytes()),
-            _ => None,
+        Ok(match row.get(col_idx) {
+            Some(Value::Blob(b)) => {
+                out.extend_from_slice(b);
+                true
+            }
+            Some(Value::Text(s)) => {
+                out.extend_from_slice(s.as_bytes());
+                true
+            }
+            _ => false,
         })
     }
 
@@ -581,6 +595,12 @@ pub trait VirtualTableModule: Send + Sync + 'static {
         false
     }
 
+    /// True if the module has no `xUpdate` method: its tables cannot be written
+    /// (`vtabIsReadOnly`: "table %s may not be modified" when the statement is prepared).
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
     /// Creates a new persistent virtual table (`xCreate`).
     fn create(
         &self,
@@ -736,6 +756,18 @@ pub trait VirtualCursor: Send + Sync {
     }
 
     /// [`Self::column`] with access to the host.
+    /// The subtypes (`sqlite3_value_subtype`) of the values the next `filter` call gets, one
+    /// per argument; only called when one of them is not 0.
+    fn set_arg_subtypes(&mut self, _subtypes: &[u8]) {}
+
+    /// Passes over rows without reading them: counts the row the cursor is on and steps
+    /// (`xNext`), again and again, until `max` rows are counted or the cursor is at its end.
+    /// The steps are exactly the `next_ctx` calls the caller would make. `None`: not
+    /// offered, the caller steps row by row. Must not be called at `eof()`.
+    fn count_rows(&mut self, _ctx: &mut dyn VTabHostContext, _max: u64) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
     fn column_ctx(&mut self, _ctx: &mut dyn VTabHostContext, col_idx: usize) -> Result<Value> {
         self.column(col_idx)
     }

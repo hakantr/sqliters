@@ -198,6 +198,33 @@ impl FunctionRegistry {
         self.user_modified
     }
 
+    /// [`Self::register_scalar`] for a callback that is already shared. Not generic: a
+    /// registration through it adds no instantiation of `register_scalar` to the binary
+    /// (three more of those moved hot code of unrelated workloads — W01 / W08 +3 % cycles
+    /// at identical instruction counts; measured in step H7b).
+    pub(crate) fn register_scalar_shared(
+        &mut self,
+        name: &str,
+        arity: Option<usize>,
+        flags: FunctionFlags,
+        callback: ScalarFunctionCallback,
+    ) {
+        self.user_modified = true;
+        let key = name.to_ascii_uppercase();
+        let def = ScalarFunctionDef {
+            name: name.to_owned(),
+            arity,
+            flags,
+            callback,
+        };
+        let overloads = self.scalars.entry(key).or_default();
+        if let Some(existing) = overloads.iter_mut().find(|d| d.arity == arity) {
+            *existing = def;
+        } else {
+            overloads.push(def);
+        }
+    }
+
     /// Registers or replaces a scalar function (`arity: Some(n)` for fixed arity, `None` for variadic).
     pub fn register_scalar<F>(
         &mut self,
@@ -422,6 +449,12 @@ impl FunctionRegistry {
 
     /// Returns metadata `(name, type_str, narg, flags)` for all registered custom functions.
     pub fn custom_function_entries(&self) -> Vec<(String, &'static str, i64, i64)> {
+        // pragma.c `pragmaFunclistLine`: the flags column shows SQLITE_DETERMINISTIC,
+        // SQLITE_DIRECTONLY, SQLITE_SUBTYPE and SQLITE_INNOCUOUS only.
+        const MASK: u32 = FunctionFlags::DETERMINISTIC.0
+            | FunctionFlags::DIRECTONLY.0
+            | FunctionFlags::SUBTYPE.0
+            | FunctionFlags::INNOCUOUS.0;
         let mut out = Vec::new();
         for overloads in self.scalars.values() {
             for def in overloads {
@@ -429,7 +462,7 @@ impl FunctionRegistry {
                     def.name.clone(),
                     "s",
                     def.arity.map_or(-1, |a| a as i64),
-                    i64::from(def.flags.0),
+                    i64::from(def.flags.0 & MASK),
                 ));
             }
         }
@@ -440,7 +473,7 @@ impl FunctionRegistry {
                     def.name.clone(),
                     kind,
                     def.arity.map_or(-1, |a| a as i64),
-                    i64::from(def.flags.0),
+                    i64::from(def.flags.0 & MASK),
                 ));
             }
         }

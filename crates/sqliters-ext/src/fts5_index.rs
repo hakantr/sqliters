@@ -322,9 +322,39 @@ fn hash_doclist_copy(detail: Detail, p: &HashEntry) -> Vec<u8> {
 }
 
 #[derive(Debug)]
+/// The hash function of the pending-terms table (`fts5HashKey`: `h = (h << 3) ^ h ^ p[i]`,
+/// here over the bytes in the order they are fed), spread over the word at the end. The
+/// table is only ever looked up by key or enumerated into a sorted list, so the function
+/// decides nothing but speed.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct Fts5KeyHasher(u64);
+
+impl std::hash::Hasher for Fts5KeyHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0 ^ 13;
+        for &b in bytes {
+            h = (h << 3) ^ h ^ u64::from(b);
+        }
+        self.0 = h;
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (self.0 << 3) ^ self.0 ^ (i as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        let h = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^ (h >> 29)
+    }
+}
+
+type Fts5KeyMap = HashMap<Vec<u8>, HashEntry, std::hash::BuildHasherDefault<Fts5KeyHasher>>;
+
+#[derive(Debug)]
 pub(crate) struct Fts5Hash {
     detail: Detail,
-    map: HashMap<Vec<u8>, HashEntry>,
+    map: Fts5KeyMap,
     key_buf: Vec<u8>,
 }
 
@@ -332,7 +362,7 @@ impl Fts5Hash {
     fn new(detail: Detail) -> Self {
         Self {
             detail,
-            map: HashMap::new(),
+            map: Fts5KeyMap::default(),
             key_buf: Vec::new(),
         }
     }
@@ -347,7 +377,10 @@ impl Fts5Hash {
         self.key_buf.push(b_byte);
         self.key_buf.extend_from_slice(token);
         let n_key = self.key_buf.len();
-        if !self.map.contains_key(self.key_buf.as_slice()) {
+        // (one lookup for a key that is there; a new key is entered and looked up again)
+        if let Some(p) = self.map.get(self.key_buf.as_slice()) {
+            n_incr -= p.n_data(n_key);
+        } else {
             let mut e = HashEntry::default();
             put_varint(&mut e.data, rowid as u64);
             e.i_rowid = rowid;
@@ -357,8 +390,6 @@ impl Fts5Hash {
                 e.i_col = if detail == Detail::Full { 0 } else { -1 };
             }
             self.map.insert(self.key_buf.clone(), e);
-        } else if let Some(p) = self.map.get(self.key_buf.as_slice()) {
-            n_incr -= p.n_data(n_key);
         }
         let Some(p) = self.map.get_mut(self.key_buf.as_slice()) else {
             return 0;
@@ -464,7 +495,7 @@ impl Fts5Hash {
 
     fn clear(&mut self) {
         // (`sqlite3Fts5HashClear` frees every entry; the slot array is kept.)
-        self.map = HashMap::new();
+        self.map = Fts5KeyMap::default();
     }
 }
 
@@ -1378,9 +1409,11 @@ impl Fts5Index {
     fn data_read(&mut self, ctx: &mut dyn VTabHostContext, i_rowid: i64) -> Result<Data> {
         self.n_read += 1;
         sqliters_types::dtrace!("TR|f5q|rd|k={}", i_rowid);
-        match ctx.shadow_blob_get(&self.data_tbl, &mut self.data_rd_hint, i_rowid, 1)? {
-            Some(b) => Ok(Data::from_blob(b)),
-            None => Err(self.corrupt_rowid(i_rowid)),
+        let mut b = Vec::new();
+        if ctx.shadow_blob_get(&self.data_tbl, &mut self.data_rd_hint, i_rowid, 1, &mut b)? {
+            Ok(Data::from_blob(b))
+        } else {
+            Err(self.corrupt_rowid(i_rowid))
         }
     }
 
@@ -2685,15 +2718,13 @@ impl Fts5Index {
         loop {
             let i_first = mi.first();
             let mut b_new_term = false;
-            let mut seg = std::mem::take(&mut mi.a_seg[i_first]);
-            let r = if b_use_from && seg.dlidx.is_some() {
-                self.seg_iter_next_from(ctx, &mut seg, i_from)
+            let seg = &mut mi.a_seg[i_first];
+            if b_use_from && seg.dlidx.is_some() {
+                self.seg_iter_next_from(ctx, seg, i_from)?;
             } else {
-                self.seg_iter_next(ctx, &mut seg, Some(&mut b_new_term))
-            };
+                self.seg_iter_next(ctx, seg, Some(&mut b_new_term))?;
+            }
             let at_eof = seg.leaf.is_none();
-            mi.a_seg[i_first] = seg;
-            r?;
             let mut cur = i_first;
             let advanced = if at_eof || b_new_term {
                 true
@@ -4261,7 +4292,8 @@ impl Fts5Index {
     fn index_flush(&mut self, ctx: &mut dyn VTabHostContext) -> Result<()> {
         // Unless it is empty, flush the hash table to disk
         if let Some(e) = &self.flush_rc {
-            return Err(e.clone());
+            // `p->rc = p->flushRc`: only the code is kept, no message is produced again
+            return Err(rc_only(e.clone()));
         }
         if self.n_pending_data != 0 || self.n_contentless_delete != 0 {
             let mut hash = match self.hash.take() {
@@ -4580,15 +4612,19 @@ impl Fts5Index {
             u8::from(c2),
             u8::from(c3)
         );
-        if c1 || c2 || c3 {
-            self.index_flush(ctx)?;
-        }
+        // (C sets iWriteRowid / bDelete / nPendingRow after the flush whatever `p->rc` is:
+        // after a failed flush the next write starts from this rowid)
+        let flushed = if c1 || c2 || c3 {
+            self.index_flush(ctx)
+        } else {
+            Ok(())
+        };
         self.i_write_rowid = i_rowid;
         self.b_delete = b_delete;
         if !b_delete {
             self.n_pending_row += 1;
         }
-        Ok(())
+        flushed
     }
 
     /// `sqlite3Fts5IndexWrite`.

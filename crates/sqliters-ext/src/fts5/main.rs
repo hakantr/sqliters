@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 
 use super::expr::{Fts5Expr, PoslistPopulator};
 use super::*;
+use crate::FTS5_INSTTOKEN_SUBTYPE;
 use crate::fts5_index::{PoslistReader, get_varint32, rc_only};
 
 pub(super) const FTS5_PLAN_MATCH: i32 = 1;
@@ -30,6 +31,22 @@ const FTS5_DEFAULT_RANK: &str = "bm25";
 /// The expression of a cursor. An `ORDER BY rank` cursor and the cursor of its sorter
 /// statement (`FTS5_PLAN_SOURCE`) use the same object.
 pub(super) type ExprSlot = Arc<Mutex<Option<Fts5Expr>>>;
+
+/// How a cursor holds its expression: its own (reached without a lock), or the shared
+/// object of an `ORDER BY rank` cursor and its source cursor.
+#[derive(Debug, Default)]
+pub(super) enum ExprHold {
+    #[default]
+    None,
+    Own(Box<Fts5Expr>),
+    Shared(ExprSlot),
+}
+
+impl ExprHold {
+    fn is_some(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
 
 /// `Fts5FullTable.pSortCsr` as the source cursor sees it.
 #[derive(Debug, Clone)]
@@ -99,7 +116,7 @@ pub(super) struct CsrCore {
     i_first_rowid: i64,
     i_last_rowid: i64,
     stmt: Option<ContentStmt>,
-    pub(super) expr: Option<ExprSlot>,
+    pub(super) expr: ExprHold,
     sorter: Option<Sorter>,
     csrflags: i32,
     i_special: i64,
@@ -119,6 +136,14 @@ pub(super) struct CsrCore {
     /// `%_docsize` of the table and where the host found it last time.
     docsize_tbl: String,
     docsize_hint: sqliters_types::ShadowHint,
+    docsize_buf: Vec<u8>,
+    /// The subtypes of the xFilter arguments (`fts5_insttoken()`).
+    arg_subtypes: Vec<u8>,
+    /// The rowid the expression is on (plans MATCH / SOURCE): set whenever this cursor
+    /// moves it.
+    expr_rowid: i64,
+    /// The readers of `fts5CacheInstArray` (kept for their allocation).
+    inst_readers: Vec<PoslistReader>,
 }
 
 fn csr_err(rc: i32) -> SqliteError {
@@ -195,7 +220,7 @@ impl CsrCore {
             i_first_rowid: 0,
             i_last_rowid: 0,
             stmt: None,
-            expr: None,
+            expr: ExprHold::None,
             sorter: None,
             csrflags: 0,
             i_special: 0,
@@ -210,6 +235,10 @@ impl CsrCore {
             replay: None,
             docsize_tbl: String::new(),
             docsize_hint: sqliters_types::ShadowHint::NONE,
+            docsize_buf: Vec::new(),
+            arg_subtypes: Vec::new(),
+            expr_rowid: 0,
+            inst_readers: Vec::new(),
         }
     }
 
@@ -241,7 +270,7 @@ impl CsrCore {
         self.replay = None;
         // (`ePlan!=FTS5_PLAN_SOURCE`: the expression of a source cursor belongs to the
         // cursor whose sorter statement it runs)
-        self.expr = None;
+        self.expr = ExprHold::None;
         self.auxdata.clear();
         self.ap_rank_arg = Vec::new();
         self.z_rank = None;
@@ -262,25 +291,36 @@ impl CsrCore {
 
     /// Runs `f` on the expression and the index of the table.
     fn with_expr<T>(
-        &self,
+        &mut self,
         f: impl FnOnce(&mut Fts5Expr, &mut Fts5Index) -> Result<T>,
     ) -> Result<T> {
-        let Some(slot) = self.expr.as_ref() else {
-            return Err(csr_err(1));
-        };
-        let mut eg = slot.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(expr) = eg.as_mut() else {
-            return Err(csr_err(1));
-        };
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        f(expr, &mut st.index)
+        match &mut self.expr {
+            ExprHold::None => Err(csr_err(1)),
+            ExprHold::Own(expr) => {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                f(expr, &mut st.index)
+            }
+            ExprHold::Shared(slot) => {
+                let mut eg = slot.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(expr) = eg.as_mut() else {
+                    return Err(csr_err(1));
+                };
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                f(expr, &mut st.index)
+            }
+        }
     }
 
     /// Reads from the expression (`None` when the cursor has none).
     fn expr_ref<T>(&self, f: impl FnOnce(&Fts5Expr) -> T) -> Option<T> {
-        let slot = self.expr.as_ref()?;
-        let eg = slot.lock().unwrap_or_else(|e| e.into_inner());
-        eg.as_ref().map(f)
+        match &self.expr {
+            ExprHold::None => None,
+            ExprHold::Own(e) => Some(f(e)),
+            ExprHold::Shared(slot) => {
+                let eg = slot.lock().unwrap_or_else(|e| e.into_inner());
+                eg.as_ref().map(f)
+            }
+        }
     }
 
     fn expr_phrase_count(&self) -> i32 {
@@ -340,10 +380,23 @@ impl CsrCore {
             a_idx: vec![0; n_phrase.max(0) as usize],
             ..Sorter::default()
         };
+        // (from here on the expression is shared with the cursor of the sorter statement)
+        let shared_expr: ExprSlot = match std::mem::take(&mut self.expr) {
+            ExprHold::None => ExprSlot::default(),
+            ExprHold::Own(e) => {
+                let slot: ExprSlot = Arc::new(Mutex::new(Some(*e)));
+                self.expr = ExprHold::Shared(Arc::clone(&slot));
+                slot
+            }
+            ExprHold::Shared(slot) => {
+                self.expr = ExprHold::Shared(Arc::clone(&slot));
+                slot
+            }
+        };
         {
             let mut st = self.lock_state();
             st.p_sort_csr = Some(SortCsr {
-                expr: self.expr.clone().unwrap_or_default(),
+                expr: shared_expr,
                 b_desc: self.b_desc,
                 i_first_rowid: self.i_first_rowid,
                 i_last_rowid: self.i_last_rowid,
@@ -378,15 +431,64 @@ impl CsrCore {
         Ok(())
     }
 
+    /// `max` times (or until the end): the current row is counted and `fts5NextMethod`
+    /// runs — the same steps as [`Self::next`] called that often, the expression and the
+    /// index taken once for all of them. Only for the plans that walk the expression and
+    /// while no reseek is pending; `None` otherwise.
+    pub(super) fn count_rows(
+        &mut self,
+        ctx: &mut dyn VTabHostContext,
+        max: u64,
+    ) -> Result<Option<u64>> {
+        if self.e_plan == 0
+            || self.e_plan >= 3
+            || self.cfg.tokendata
+            || self.flag_test(FTS5CSR_REQUIRE_RESEEK)
+            || self.eof()
+        {
+            return Ok(None);
+        }
+        let i_last = self.i_last_rowid;
+        let (res, n, eof, rowid) = self.with_expr(|e, ix| {
+            let mut n = 0u64;
+            let mut res = Ok(());
+            let mut eof = false;
+            while n < max {
+                n += 1;
+                res = e.next(ix, ctx, i_last);
+                eof = e.eof();
+                sqliters_types::dtrace!(
+                    "TR|f5q|next|eof={} rowid={}",
+                    i32::from(eof),
+                    if eof { 0 } else { e.rowid() }
+                );
+                if eof || res.is_err() {
+                    break;
+                }
+            }
+            Ok((res, n, eof, e.rowid()))
+        })?;
+        self.expr_rowid = rowid;
+        if eof {
+            self.csrflags |= FTS5CSR_EOF;
+        }
+        self.csr_newrow();
+        res?;
+        Ok(Some(n))
+    }
+
     /// `fts5CursorFirst`.
     fn cursor_first(&mut self, ctx: &mut dyn VTabHostContext, b_desc: bool) -> Result<()> {
         let (i_first, i_last) = (self.i_first_rowid, self.i_last_rowid);
         let r = self.with_expr(|e, ix| {
             let r = e.first(ix, ctx, i_first, i_last, b_desc);
-            Ok((r, e.eof()))
+            Ok((r, e.eof(), e.rowid()))
         });
         let (res, eof) = match r {
-            Ok(v) => v,
+            Ok((r, eof, rowid)) => {
+                self.expr_rowid = rowid;
+                (r, eof)
+            }
             Err(e) => (Err(e), false),
         };
         if eof {
@@ -407,12 +509,13 @@ impl CsrCore {
         if self.flag_test(FTS5CSR_REQUIRE_RESEEK) {
             let b_desc = self.b_desc;
             let i_last = self.i_last_rowid;
-            let (res, changed, eof) = self.with_expr(|e, ix| {
+            let (res, changed, eof, rowid) = self.with_expr(|e, ix| {
                 let i_rowid = e.rowid();
                 sqliters_types::dtrace!("TR|f5q|reseek|rowid={}", i_rowid);
                 let r = e.first(ix, ctx, i_rowid, i_last, b_desc);
-                Ok((r, i_rowid != e.rowid(), e.eof()))
+                Ok((r, i_rowid != e.rowid(), e.eof(), e.rowid()))
             })?;
+            self.expr_rowid = rowid;
             if res.is_ok() && changed {
                 b_skip = true;
             }
@@ -442,10 +545,11 @@ impl CsrCore {
                 return Ok(());
             }
             let i_last = self.i_last_rowid;
-            let (res, eof) = self.with_expr(|e, ix| {
+            let (res, eof, rowid) = self.with_expr(|e, ix| {
                 let r = e.next(ix, ctx, i_last);
-                Ok((r, e.eof()))
+                Ok((r, e.eof(), e.rowid()))
             })?;
+            self.expr_rowid = rowid;
             if eof {
                 self.csrflags |= FTS5CSR_EOF;
             }
@@ -760,7 +864,11 @@ impl CsrCore {
         idx_str: Option<&str>,
         ap_val: &[Value],
     ) -> Result<()> {
+        // ("int bPrefixInsttoken = pConfig->bPrefixInsttoken;" ... restored at filter_out)
+        let b_prefix_insttoken = self.lock_state().index.config.b_prefix_insttoken;
         let r = self.filter_inner(ctx, idx_num, idx_str, ap_val);
+        self.lock_state().index.config.b_prefix_insttoken = b_prefix_insttoken;
+        self.arg_subtypes.clear();
         sqliters_types::dtrace!(
             "TR|f5q|filter|plan={} desc={} err={} eof={}",
             self.e_plan,
@@ -793,7 +901,7 @@ impl CsrCore {
         let mut p_expr: Option<Fts5Expr> = None;
 
         // Decode the arguments passed through to this function.
-        for val in ap_val {
+        for (i_arg, val) in ap_val.iter().enumerate() {
             let c = z.get(i_idx_str).copied().unwrap_or(b'>');
             i_idx_str += 1;
             match c {
@@ -809,9 +917,21 @@ impl CsrCore {
                         }
                     }
                     if c == b'M' {
-                        let z_text = fts5_value_bytes(val);
+                        // fts5ExtractExprText: an fts5_locale() value is its text (the
+                        // locale is for the tokenizer)
+                        let z_text = if cfg.is_locale_value(val)
+                            && let Value::Blob(b) = val
+                        {
+                            Some(std::borrow::Cow::Borrowed(cfg.decode_locale_value(b)?.0))
+                        } else {
+                            fts5_value_bytes(val)
+                        };
                         let z_text: &[u8] = z_text.as_deref().unwrap_or(b"");
                         let z_text = &z_text[..z_text.iter().position(|&b| b == 0).unwrap_or(z_text.len())];
+                        if self.arg_subtypes.get(i_arg) == Some(&FTS5_INSTTOKEN_SUBTYPE) {
+                            // sqlite3_value_subtype(apVal[i])==FTS5_INSTTOKEN_SUBTYPE
+                            self.lock_state().index.config.b_prefix_insttoken = true;
+                        }
                         if z_text.first() == Some(&b'*') {
                             // The user has issued a query of the form "MATCH '*...'". This
                             // indicates that the MATCH expression is not a full text
@@ -872,10 +992,10 @@ impl CsrCore {
                 self.i_first_rowid = sc.i_first_rowid;
             }
             self.e_plan = FTS5_PLAN_SOURCE;
-            self.expr = Some(sc.expr);
+            self.expr = ExprHold::Shared(sc.expr);
             self.cursor_first(ctx, b_desc)
         } else if let Some(e) = p_expr {
-            self.expr = Some(Arc::new(Mutex::new(Some(e))));
+            self.expr = ExprHold::Own(Box::new(e));
             self.cursor_parse_rank(p_rank)?;
             if b_order_by_rank {
                 self.e_plan = FTS5_PLAN_SORTED_MATCH;
@@ -923,8 +1043,11 @@ impl CsrCore {
             self.stmt_row()
                 .and_then(|r| r.first())
                 .map_or(0, Value::to_integer_lossy)
+        } else if self.expr.is_some() {
+            // (`sqlite3Fts5ExprRowid`: kept from the last time this cursor moved it)
+            self.expr_rowid
         } else {
-            self.expr_ref(Fts5Expr::rowid).unwrap_or(0)
+            0
         }
     }
 
@@ -979,6 +1102,14 @@ impl CsrCore {
     fn text_from_stmt(&self, i_col: usize) -> Option<Vec<u8>> {
         let row = self.stmt_row()?;
         let v = row.get(i_col + 1)?;
+        // (an fts5_locale() value kept in an external content table: its text)
+        if self.cfg.locale
+            && matches!(self.cfg.content_mode, ContentMode::External { .. })
+            && self.cfg.is_locale_value(v)
+            && let Value::Blob(b) = v
+        {
+            return self.cfg.decode_locale_value(b).ok().map(|(t, _)| t.to_vec());
+        }
         fts5_value_bytes(v).map(std::borrow::Cow::into_owned)
     }
 
@@ -1047,11 +1178,18 @@ impl CsrCore {
         } else if self.cfg.content_mode != ContentMode::Contentless || self.cfg.unindexed_content
         {
             self.seek_cursor(ctx)?;
-            Ok(self
-                .stmt_row()
-                .and_then(|r| r.get(i_col + 1))
-                .cloned()
-                .unwrap_or(Value::Null))
+            let v = self.stmt_row().and_then(|r| r.get(i_col + 1));
+            // (an fts5_locale() value kept in an external content table is returned as
+            // its text)
+            if let Some(Value::Blob(b)) = v
+                && self.cfg.locale
+                && matches!(self.cfg.content_mode, ContentMode::External { .. })
+                && self.cfg.is_locale_value(&Value::Blob(b.clone()))
+            {
+                let (text, _) = self.cfg.decode_locale_value(b)?;
+                return Ok(Value::Text(String::from_utf8_lossy(text).into_owned()));
+            }
+            Ok(v.cloned().unwrap_or(Value::Null))
         } else {
             Ok(Value::Null)
         }
@@ -1218,6 +1356,65 @@ impl CsrCore {
     /// `fts5CacheInstArray`.
     fn cache_inst_array(&mut self, ctx: &mut dyn VTabHostContext) -> Result<()> {
         let n_col = self.cfg.columns.len() as i32;
+        // detail=full, live cursor: the lists are those of the expression (`fts5CsrPoslist`
+        // has nothing to rebuild); they are read where they are.
+        if self.cfg.detail == DetailMode::Full && self.cur_sorter().is_none() && self.expr.is_some()
+        {
+            self.csrflags &= !FTS5CSR_REQUIRE_POSLIST;
+            let mut a_inst = std::mem::take(&mut self.a_inst);
+            let mut a_iter = std::mem::take(&mut self.inst_readers);
+            a_inst.clear();
+            a_iter.clear();
+            let mut n_inst = 0i32;
+            let mut res: Result<()> = Ok(());
+            let mut run = |e: &Fts5Expr| {
+            let n_iter = e.phrase_count();
+            for i in 0..n_iter {
+                let a = e.poslist(i);
+                a_iter.push(PoslistReader::init(a, a.len() as i32));
+            }
+            loop {
+                let mut i_best: i32 = -1;
+                for (i, it) in a_iter.iter().enumerate() {
+                    if !it.b_eof
+                        && (i_best < 0 || it.i_pos < a_iter[i_best as usize].i_pos)
+                    {
+                        i_best = i as i32;
+                    }
+                }
+                if i_best < 0 {
+                    break;
+                }
+                n_inst += 1;
+                let pos = a_iter[i_best as usize].i_pos;
+                let c = ((pos >> 32) & 0x7FFF_FFFF) as i32;
+                a_inst.push(i_best);
+                a_inst.push(c);
+                a_inst.push((pos & 0x7FFF_FFFF) as i32);
+                if c >= n_col {
+                    res = Err(corrupt_err());
+                    break;
+                }
+                a_iter[i_best as usize].next(e.poslist(i_best as usize));
+            }
+            };
+            match &self.expr {
+                ExprHold::None => {}
+                ExprHold::Own(e) => run(e),
+                ExprHold::Shared(slot) => {
+                    let eg = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(e) = eg.as_ref() {
+                        run(e);
+                    }
+                }
+            }
+            self.a_inst = a_inst;
+            self.inst_readers = a_iter;
+            self.n_inst_count = n_inst;
+            self.csrflags &= !FTS5CSR_REQUIRE_INST;
+            sqliters_types::dtrace!("TR|f5q|inst|n={}", n_inst);
+            return res;
+        }
         let n_iter = self.expr_phrase_count().max(0) as usize;
         let mut lists: Vec<Vec<u8>> = Vec::with_capacity(n_iter);
         let mut res: Result<()> = Ok(());
@@ -1299,10 +1496,19 @@ impl CsrCore {
             self.docsize_tbl = name;
         }
         sqliters_types::dtrace!("TR|f5q|docsize|rowid={}", i_rowid);
-        let row = ctx.shadow_blob_get(&self.docsize_tbl, &mut self.docsize_hint, i_rowid, 1)?;
+        let mut buf = std::mem::take(&mut self.docsize_buf);
+        let found =
+            ctx.shadow_blob_get(&self.docsize_tbl, &mut self.docsize_hint, i_rowid, 1, &mut buf);
+        let found = match found {
+            Ok(f) => f,
+            Err(e) => {
+                self.docsize_buf = buf;
+                return Err(e);
+            }
+        };
         let mut b_corrupt = true;
-        if let Some(r) = row {
-            let blob: &[u8] = &r;
+        if found {
+            let blob: &[u8] = &buf;
             // fts5StorageDecodeSizeArray
             let mut i_off = 0usize;
             let mut ok = true;
@@ -1319,6 +1525,7 @@ impl CsrCore {
                 b_corrupt = false;
             }
         }
+        self.docsize_buf = buf;
         if b_corrupt {
             return Err(corrupt_err());
         }
@@ -1331,20 +1538,24 @@ impl CsrCore {
         ctx: &mut dyn VTabHostContext,
         i_col: i32,
     ) -> Result<i32> {
-        let cfg = Arc::clone(&self.cfg);
-        let n_col = cfg.columns.len();
+        let n_col = self.cfg.columns.len();
         let mut res: Result<()> = Ok(());
         if self.flag_test(FTS5CSR_REQUIRE_DOCSIZE) {
-            if cfg.columnsize {
+            if self.cfg.columnsize {
                 let i_rowid = self.cursor_rowid();
                 res = self.storage_docsize(ctx, i_rowid);
-            } else if self.z_content().is_none() || cfg.unindexed_content {
+            } else if {
+                let cfg = Arc::clone(&self.cfg);
+                self.z_content().is_none() || cfg.unindexed_content
+            } {
+                let cfg = Arc::clone(&self.cfg);
                 for i in 0..n_col {
                     if !cfg.unindexed[i] {
                         self.a_column_size[i] = -1;
                     }
                 }
             } else {
+                let cfg = Arc::clone(&self.cfg);
                 res = self.seek_cursor(ctx).map_err(rc_only_keep_ext);
                 if res.is_ok() {
                     for i in 0..n_col {
@@ -1441,18 +1652,64 @@ impl CsrCore {
                     .and_then(|v| fts5_value_bytes(v).map(std::borrow::Cow::into_owned));
                 return Ok(loc);
             }
+            // fts5TextFromStmt: an fts5_locale() value of an external content table
+            if let Some(Value::Blob(b)) = self.stmt_row().and_then(|r| r.get(i_col as usize + 1))
+                && self.cfg.is_locale_value(&Value::Blob(b.clone()))
+            {
+                let (_, loc) = self.cfg.decode_locale_value(b).map_err(rc_only_keep_ext)?;
+                return Ok(Some(loc.to_vec()));
+            }
         }
         Ok(None)
     }
 
     /// `fts5ApiQueryPhrase`: runs `cb` for every row phrase `i_phrase` matches on its own;
     /// the callback returns false to stop (SQLITE_DONE).
+    #[allow(dead_code)] // (xQueryPhrase with a callback: bm25 uses the counting form)
     pub(super) fn api_query_phrase(
         &mut self,
         ctx: &mut dyn VTabHostContext,
         i_phrase: i32,
         cb: &mut dyn FnMut(&mut CsrCore, &mut dyn VTabHostContext) -> Result<bool>,
     ) -> Result<()> {
+        let mut new = self.query_phrase_cursor(ctx, i_phrase)?;
+        while !new.eof() {
+            if !cb(&mut new, ctx)? {
+                break;
+            }
+            new.next(ctx)?;
+        }
+        Ok(())
+    }
+
+    /// `fts5ApiQueryPhrase` with a callback that only counts the rows (`fts5CountCb` of
+    /// bm25): the number of rows of phrase `i_phrase`.
+    pub(super) fn api_query_phrase_count(
+        &mut self,
+        ctx: &mut dyn VTabHostContext,
+        i_phrase: i32,
+    ) -> Result<i64> {
+        let mut new = self.query_phrase_cursor(ctx, i_phrase)?;
+        let mut n: i64 = 0;
+        while !new.eof() {
+            match new.count_rows(ctx, u64::MAX)? {
+                Some(k) => n += k as i64,
+                None => {
+                    n += 1;
+                    new.next(ctx)?;
+                }
+            }
+        }
+        Ok(n)
+    }
+
+    /// The cursor `fts5ApiQueryPhrase` opens on a copy of phrase `i_phrase`, on its first
+    /// row.
+    fn query_phrase_cursor(
+        &mut self,
+        ctx: &mut dyn VTabHostContext,
+        i_phrase: i32,
+    ) -> Result<CsrCore> {
         // fts5OpenMethod
         let id = self.aux_registry.alloc_id();
         let mut new = CsrCore::new(
@@ -1474,15 +1731,9 @@ impl CsrCore {
         if i_phrase < 0 {
             return Err(range_err());
         }
-        new.expr = Some(Arc::new(Mutex::new(Some(cloned))));
+        new.expr = ExprHold::Own(Box::new(cloned));
         new.cursor_first(ctx, false)?;
-        while !new.eof() {
-            if !cb(&mut new, ctx)? {
-                break;
-            }
-            new.next(ctx)?;
-        }
-        Ok(())
+        Ok(new)
     }
 
     /// `fts5TripCursors` for this cursor.
@@ -1622,6 +1873,27 @@ struct RegInner {
 #[derive(Debug)]
 pub struct Fts5AuxRegistry {
     inner: Mutex<RegInner>,
+    /// `Fts5Global.aLocaleHdr`: the 16 bytes an `fts5_locale()` value of this connection
+    /// starts with ("a 128-bit pseudo-random vector").
+    locale_hdr: [u8; 16],
+}
+
+/// `sqlite3_randomness(sizeof(pGlobal->aLocaleHdr), ...)` xor the constants of `fts5Init`.
+fn new_locale_hdr() -> [u8; 16] {
+    use std::hash::{BuildHasher, Hasher};
+    let rs = std::collections::hash_map::RandomState::new();
+    let mut out = [0u8; 16];
+    for (i, chunk) in out.chunks_mut(8).enumerate() {
+        let mut h = rs.build_hasher();
+        h.write_u64(0x6c6f_6361_6c65_0000 + i as u64);
+        chunk.copy_from_slice(&h.finish().to_le_bytes());
+    }
+    for (i, k) in [0xF924_976Du32, 0x1659_6E13, 0x7C80_BEAA, 0x9B03_A67F].iter().enumerate() {
+        for (j, b) in k.to_le_bytes().iter().enumerate() {
+            out[i * 4 + j] ^= b;
+        }
+    }
+    out
 }
 
 impl Default for Fts5AuxRegistry {
@@ -1634,6 +1906,7 @@ impl Default for Fts5AuxRegistry {
                 snaps: (0..FTS5_AUX_RING_SLOTS).map(|_| None).collect(),
                 tables: Vec::new(),
             }),
+            locale_hdr: new_locale_hdr(),
         }
     }
 }
@@ -1655,6 +1928,35 @@ impl Fts5AuxRegistry {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RegInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `FTS5_LOCALE_HDR(pConfig)`.
+    pub(super) fn locale_hdr(&self) -> [u8; 16] {
+        self.locale_hdr
+    }
+
+    /// `fts5LocaleFunc`: `fts5_locale(LOCALE, TEXT)`. With a NULL or empty LOCALE the TEXT
+    /// (as text); otherwise the blob header + LOCALE + 0x00 + TEXT.
+    pub fn eval_fts5_locale(&self, locale: &Value, text: &Value) -> Value {
+        let z_locale = super::fts5_value_bytes(locale);
+        let z_text = super::fts5_value_bytes(text);
+        match z_locale {
+            Some(loc) if !loc.is_empty() && loc[0] != 0 => {
+                // (the locale is a C string: it ends at its first 0x00)
+                let loc = &loc[..loc.iter().position(|&b| b == 0).unwrap_or(loc.len())];
+                let t = z_text.as_deref().unwrap_or(&[]);
+                let mut blob = Vec::with_capacity(16 + loc.len() + 1 + t.len());
+                blob.extend_from_slice(&self.locale_hdr);
+                blob.extend_from_slice(loc);
+                blob.push(0);
+                blob.extend_from_slice(t);
+                Value::Blob(blob)
+            }
+            _ => match z_text {
+                Some(t) => Value::Text(String::from_utf8_lossy(&t).into_owned()),
+                None => Value::Null,
+            },
+        }
     }
 
     /// `++pGlobal->iNextId`.
@@ -1845,6 +2147,10 @@ pub(super) struct Fts5Cursor {
     core: Arc<Mutex<CsrCore>>,
     i_csr_id: i64,
     lazy: bool,
+    /// The rowid of the row a lazy cursor is on.
+    lazy_rowid: i64,
+    /// Argument subtypes for the next xFilter.
+    pending_arg_subtypes: Vec<u8>,
     b_eof: bool,
     /// `fts5NewTransaction` found no other cursor open: `sqlite3Fts5IndexReset` is due.
     need_reset: bool,
@@ -1884,6 +2190,8 @@ impl Fts5Cursor {
             core,
             i_csr_id: id,
             lazy: false,
+            lazy_rowid: 0,
+            pending_arg_subtypes: Vec::new(),
             b_eof: true,
             need_reset,
             plan_hint: 0,
@@ -2040,9 +2348,11 @@ impl VirtualCursor for Fts5Cursor {
         }
         {
             let mut core = self.core.lock().unwrap_or_else(|e| e.into_inner());
+            core.arg_subtypes = std::mem::take(&mut self.pending_arg_subtypes);
             core.filter(ctx, idx_num, idx_str, args)?;
             if self.lazy {
                 self.b_eof = core.eof();
+                self.lazy_rowid = core.rowid();
                 return Ok(());
             }
         }
@@ -2073,6 +2383,7 @@ impl VirtualCursor for Fts5Cursor {
         let mut core = self.core.lock().unwrap_or_else(|e| e.into_inner());
         let r = core.next(ctx);
         self.b_eof = core.eof() || r.is_err();
+        self.lazy_rowid = core.rowid();
         r
     }
 
@@ -2096,6 +2407,21 @@ impl VirtualCursor for Fts5Cursor {
         }
     }
 
+    fn set_arg_subtypes(&mut self, subtypes: &[u8]) {
+        self.pending_arg_subtypes = subtypes.to_vec();
+    }
+
+    fn count_rows(&mut self, ctx: &mut dyn VTabHostContext, max: u64) -> Result<Option<u64>> {
+        if !self.lazy {
+            return Ok(None);
+        }
+        let mut core = self.core.lock().unwrap_or_else(|e| e.into_inner());
+        let r = core.count_rows(ctx, max);
+        self.b_eof = core.eof() || r.is_err();
+        self.lazy_rowid = core.rowid();
+        r
+    }
+
     fn column_ctx(&mut self, ctx: &mut dyn VTabHostContext, col_idx: usize) -> Result<Value> {
         if !self.lazy {
             return self.column(col_idx);
@@ -2106,7 +2432,8 @@ impl VirtualCursor for Fts5Cursor {
 
     fn rowid(&self) -> Result<i64> {
         if self.lazy {
-            return Ok(self.lock_core().rowid());
+            // (`fts5RowidMethod`: taken when the cursor last moved)
+            return Ok(self.lazy_rowid);
         }
         Ok(self.rows.get(self.pos).map_or(0, |r| r.rowid))
     }

@@ -197,6 +197,9 @@ pub struct StmtTxTracker {
     /// The column names of the dropped ORDER BY of an aggregate query without GROUP BY
     /// (read on the first row of its loop, like C's `OP_VColumn` behind the first-row flag).
     pub(crate) agg_order_cols: Vec<String>,
+    /// Result expressions are being checked against an all-NULL row because the scan
+    /// produced no row.
+    pub(crate) dummy_row_eval: bool,
     /// The row a lazily stepped virtual-table scan is on, handed to the SELECT core that
     /// runs once per row (rows, the WHERE terms the scan's plan covers).
     pub(crate) lazy_vtab_preset: Option<(Vec<EvalRow>, Vec<Expr>)>,
@@ -1666,6 +1669,8 @@ pub(crate) struct ScopedColumn {
     pub(crate) merged_using: bool,
     pub(crate) is_vtab: bool,
     pub(crate) hidden_vtab: bool,
+    /// The column's table is a virtual table whose module implements xFindFunction.
+    pub(crate) vtab_find_fn: bool,
 }
 
 impl ScopedColumn {
@@ -1773,12 +1778,13 @@ impl EvalRow {
             .map(|idx| &self.vals[idx]))
     }
 
-    fn lookup_cref_is_vtab(&self, cref: &ColumnRef) -> bool {
+    /// The column belongs to a virtual table whose module implements xFindFunction.
+    fn lookup_cref_has_find_function(&self, cref: &ColumnRef) -> bool {
         self.lookup_qual_idx(cref.schema.as_deref(), cref.table.as_deref(), &cref.column)
             .ok()
             .flatten()
             .and_then(|idx| self.cols.get(idx))
-            .is_some_and(|sc| sc.is_vtab)
+            .is_some_and(|sc| sc.is_vtab && sc.vtab_find_fn)
     }
 
     fn lookup_cref_full(
@@ -4561,9 +4567,10 @@ pub fn shadow_get_rowid_direct(
     Ok(rows.pop())
 }
 
-/// The blob / text bytes of column `col_idx` of row `rowid` of a rowid shadow table (see
-/// `VTabHostContext::shadow_blob_get`): the same row lookup as `shadow_get_rowid_direct`,
-/// without decoding the other columns and without a second copy of the value.
+/// The blob / text bytes of column `col_idx` of row `rowid` of a rowid shadow table, copied
+/// into `out` (see `VTabHostContext::shadow_blob_get`): one row lookup, the value copied
+/// once from the page (or from the assembled record when it has overflow pages).
+#[allow(clippy::too_many_arguments)]
 pub fn shadow_blob_get_direct(
     ctx: &mut ExecContext<'_>,
     db_name: &str,
@@ -4571,7 +4578,9 @@ pub fn shadow_blob_get_direct(
     hint: &mut sqliters_types::ShadowHint,
     rowid: i64,
     col_idx: usize,
-) -> Result<Option<Vec<u8>>> {
+    out: &mut Vec<u8>,
+) -> Result<bool> {
+    out.clear();
     // (the two-column shadow tables `(id INTEGER PRIMARY KEY, blob)`: found through the hint)
     if col_idx == 1
         && let Some(target) = shadow_locate(ctx, db_name, shadow_table, hint, false)
@@ -4592,66 +4601,32 @@ pub fn shadow_blob_get_direct(
             .and_then(|s| s.btree.as_mut())
             && bt.encoding() == TextEncoding::Utf8
         {
-            let Some(mut raw) = bt.seek_table_rowid(target.root_pgno, rowid)? else {
-                return Ok(None);
-            };
-            let Some((st, off, len)) = record_column_span(&raw, col_idx)? else {
-                return Ok(None);
-            };
-            if st < 12 {
-                return Ok(None);
-            }
-            raw.truncate(off + len);
-            raw.drain(..off);
-            return Ok(Some(raw));
+            let found = bt.with_table_row_payload(target.root_pgno, rowid, |payload| {
+                let Some((st, off, len)) = record_column_span(payload, col_idx)? else {
+                    return Ok(false);
+                };
+                if st < 12 {
+                    return Ok(false);
+                }
+                out.extend_from_slice(&payload[off..off + len]);
+                Ok(true)
+            })?;
+            return Ok(found.unwrap_or(false));
         }
     }
-    if let Some(db_id) = ctx.db_set.find_db_id(db_name) {
-        let check_schema = ctx.db_set.slot(db_id).is_some_and(|s| !s.schema.loaded);
-        ctx.ensure_read_db(db_id, check_schema)?;
-        if let Some(slot) = ctx.db_set.slot_mut(db_id)
-            && let Some(root_pgno) = slot
-                .schema
-                .tables
-                .iter()
-                .find(|t| t.name.eq_ignore_ascii_case(shadow_table))
-                .filter(|t| {
-                    !t.without_rowid
-                        && t.root_pgno > 0
-                        && col_idx < t.columns.len()
-                        && t.rowid_alias_col != Some(col_idx)
-                        && t.columns
-                            .iter()
-                            .all(|c| c.generated.is_none() && c.default_expr.is_none())
-                })
-                .map(|t| t.root_pgno)
-            && let Some(ref mut bt) = slot.btree
-            && bt.encoding() == TextEncoding::Utf8
-        {
-            let Some(mut raw) = bt.seek_table_rowid(root_pgno, rowid)? else {
-                return Ok(None);
-            };
-            let Some((st, off, len)) = record_column_span(&raw, col_idx)? else {
-                return Ok(None);
-            };
-            if st < 12 {
-                return Ok(None);
-            }
-            raw.truncate(off + len);
-            raw.drain(..off);
-            return Ok(Some(raw));
-        }
-    }
-    let Some(mut row) = shadow_get_rowid_direct(ctx, db_name, shadow_table, rowid)? else {
-        return Ok(None);
+    let Some(row) = shadow_get_rowid_direct(ctx, db_name, shadow_table, rowid)? else {
+        return Ok(false);
     };
-    if col_idx >= row.len() {
-        return Ok(None);
-    }
-    Ok(match row.swap_remove(col_idx) {
-        Value::Blob(b) => Some(b),
-        Value::Text(s) => Some(s.into_bytes()),
-        _ => None,
+    Ok(match row.get(col_idx) {
+        Some(Value::Blob(b)) => {
+            out.extend_from_slice(b);
+            true
+        }
+        Some(Value::Text(t)) => {
+            out.extend_from_slice(t.as_bytes());
+            true
+        }
+        _ => false,
     })
 }
 
@@ -6508,6 +6483,7 @@ fn exec_recursive_cte(
                     merged_using: false,
                     is_vtab: false,
                     hidden_vtab: false,
+                    vtab_find_fn: false,
                 }
             })
             .collect::<Vec<_>>()
@@ -7602,22 +7578,30 @@ fn exec_single_select_core_inner(
                         scope_buf = push_scope(outer_scopes, &dummy_row);
                         &scope_buf
                     };
-                    let mut dummy_proj = Vec::with_capacity(expanded_proj.len());
-                    for (pe, _, _) in &expanded_proj {
-                        dummy_proj.push(eval_expr(ctx, pe, params, scopes, ctes, None)?);
-                    }
-                    for ob in order_by {
-                        let _ = eval_order_term_in_scope(
-                            ctx,
-                            &ob.expr,
-                            &dummy_proj,
-                            &expanded_proj,
-                            scopes,
-                            params,
-                            ctes,
-                            None,
-                        )?;
-                    }
+                    // (`dummy_row_eval`: no row exists; a function that needs one — an
+                    // auxiliary function of a virtual table — is not called)
+                    let was_dummy = std::mem::replace(&mut ctx.stmt_tx.dummy_row_eval, true);
+                    let dummy_res = (|| -> Result<()> {
+                        let mut dummy_proj = Vec::with_capacity(expanded_proj.len());
+                        for (pe, _, _) in &expanded_proj {
+                            dummy_proj.push(eval_expr(ctx, pe, params, scopes, ctes, None)?);
+                        }
+                        for ob in order_by {
+                            let _ = eval_order_term_in_scope(
+                                ctx,
+                                &ob.expr,
+                                &dummy_proj,
+                                &expanded_proj,
+                                scopes,
+                                params,
+                                ctes,
+                                None,
+                            )?;
+                        }
+                        Ok(())
+                    })();
+                    ctx.stmt_tx.dummy_row_eval = was_dummy;
+                    dummy_res?;
                 }
                 result_rows_with_sort.reserve(filtered.len());
                 for row in filtered {
@@ -8126,6 +8110,52 @@ fn expr_can_eval_with_cols(
 }
 
 /// [`strip_omitted_conjuncts`] that hands back `expr` itself when nothing was omitted.
+/// expr.c `ExprAlwaysTrue` / `ExprAlwaysFalse`: a 32-bit integer literal (`sqlite3ExprInt32`)
+/// or the TRUE / FALSE keywords; `x IN ()` is the literal FALSE and `x NOT IN ()` TRUE
+/// (parse.y).
+fn expr_always(e: &Expr) -> Option<bool> {
+    match e {
+        Expr::Bool(b) => Some(*b),
+        Expr::Integer(i) if i32::try_from(*i).is_ok() => Some(*i != 0),
+        Expr::InList { list, negated, .. } if list.is_empty() => Some(*negated),
+        _ => None,
+    }
+}
+
+/// expr.c `sqlite3ExprSimplifiedAndOr`: an AND / OR expression without the operands that
+/// are always true or always false (`(y=22 OR false)` is `y=22`); the expression itself when
+/// nothing can be left out. whereexpr.c `exprAnalyze` looks at an OR term of the WHERE
+/// clause in this form.
+fn expr_simplified_and_or(e: &Expr) -> &Expr {
+    if let Expr::Binary {
+        left,
+        op: op @ (BinaryOp::And | BinaryOp::Or),
+        right,
+    } = e
+    {
+        let r = expr_simplified_and_or(right);
+        let l = expr_simplified_and_or(left);
+        let is_and = matches!(op, BinaryOp::And);
+        if expr_always(l) == Some(true) || expr_always(r) == Some(false) {
+            return if is_and { r } else { l };
+        }
+        if expr_always(r) == Some(true) || expr_always(l) == Some(false) {
+            return if is_and { l } else { r };
+        }
+    }
+    e
+}
+
+/// The form of WHERE term `conj` the planner works with (`exprAnalyze`).
+#[inline]
+fn where_term_form(conj: &Expr) -> &Expr {
+    if matches!(conj, Expr::Binary { op: BinaryOp::Or, .. }) {
+        expr_simplified_and_or(conj)
+    } else {
+        conj
+    }
+}
+
 fn strip_omitted_conjuncts_cow<'a>(
     expr: &'a Expr,
     omitted: &[Expr],
@@ -8137,11 +8167,31 @@ fn strip_omitted_conjuncts_cow<'a>(
     }
 }
 
+/// `expr` without the conjuncts of `omitted`. Every entry of `omitted` stands for one term of
+/// the WHERE clause (wherecode.c `disableTerm`): of several equal terms only as many are
+/// left out as there are entries (where.c lets a table omit its first 16 constraints only —
+/// a 17th equal term is still evaluated).
 fn strip_omitted_conjuncts(expr: &Expr, omitted: &[Expr]) -> Option<Expr> {
     if omitted.is_empty() {
         return Some(expr.clone());
     }
-    if omitted.contains(expr) {
+    let mut used = [false; 64];
+    let mut used_vec: Vec<bool> = Vec::new();
+    let used: &mut [bool] = if omitted.len() <= 64 {
+        &mut used[..omitted.len()]
+    } else {
+        used_vec.resize(omitted.len(), false);
+        &mut used_vec
+    };
+    strip_omitted_conjuncts_rec(expr, omitted, used)
+}
+
+fn strip_omitted_conjuncts_rec(expr: &Expr, omitted: &[Expr], used: &mut [bool]) -> Option<Expr> {
+    let form = where_term_form(expr);
+    if let Some(i) = (0..omitted.len())
+        .find(|&i| !used[i] && (omitted[i] == *expr || omitted[i] == *form))
+    {
+        used[i] = true;
         return None;
     }
     if let Expr::Binary {
@@ -8150,8 +8200,8 @@ fn strip_omitted_conjuncts(expr: &Expr, omitted: &[Expr]) -> Option<Expr> {
         right,
     } = expr
     {
-        let l = strip_omitted_conjuncts(left, omitted);
-        let r = strip_omitted_conjuncts(right, omitted);
+        let l = strip_omitted_conjuncts_rec(left, omitted, used);
+        let r = strip_omitted_conjuncts_rec(right, omitted, used);
         return match (l, r) {
             (Some(le), Some(re)) => Some(Expr::Binary {
                 left: Box::new(le),
@@ -9062,6 +9112,7 @@ fn vtab_scoped_cols(
             merged_using: false,
             is_vtab: true,
             hidden_vtab: declared.is_hidden(idx),
+            vtab_find_fn: declared.find_function,
         })
         .collect();
     if !tbl.without_rowid {
@@ -9081,6 +9132,7 @@ fn vtab_scoped_cols(
             merged_using: false,
             is_vtab: true,
             hidden_vtab: false,
+            vtab_find_fn: declared.find_function,
         });
     }
     cols
@@ -9493,9 +9545,17 @@ fn where_has_or_conjunct(e: &Expr) -> bool {
             op: BinaryOp::And,
             right,
         } => where_has_or_conjunct(left) || where_has_or_conjunct(right),
+        // (an OR term whose simplified form — `sqlite3ExprSimplifiedAndOr` — is a plain
+        // term is that term: `0 OR x`)
         Expr::Binary {
             op: BinaryOp::Or, ..
-        } => true,
+        } => matches!(
+            where_term_form(e),
+            Expr::Binary {
+                op: BinaryOp::Or | BinaryOp::And,
+                ..
+            }
+        ),
         _ => false,
     }
 }
@@ -9835,6 +9895,190 @@ impl sqliters_types::VirtualCursor for BufferedVtabCursor {
     }
 }
 
+/// A virtual-table scan that C runs as a loop over the values of an `IN (...)` constraint,
+/// stepped row by row: `OP_VFilter` runs for the next combination of values when the scan of
+/// the current one is at its end (`OP_VNext` falls through to the `OP_Next` of the IN loop),
+/// so the rows of one value are handed out before the next value is looked up.
+struct InLoopVtabCursor {
+    inner: Box<dyn sqliters_types::VirtualCursor>,
+    /// (argv slot, distinct values ascending); the first is the outermost loop.
+    in_loops: Vec<(usize, Vec<Value>)>,
+    odo: Vec<usize>,
+    argv: Vec<Value>,
+    idx_num: i32,
+    idx_str: Option<String>,
+    plan_hint: u64,
+    arg_subtypes: Vec<u8>,
+    /// Every combination has been scanned.
+    done: bool,
+    /// The rest of the loop, read at once (`unlazy`).
+    buffered: Option<BufferedVtabCursor>,
+    n_cols: usize,
+    has_rowid: bool,
+}
+
+impl InLoopVtabCursor {
+    fn run_filter(&mut self, ctx: &mut dyn sqliters_types::VTabHostContext) -> Result<()> {
+        for (k, (slot, vals)) in self.in_loops.iter().enumerate() {
+            self.argv[*slot] = vals[self.odo[k]].clone();
+        }
+        self.inner.set_plan_hint(self.plan_hint);
+        if !self.arg_subtypes.is_empty() {
+            self.inner.set_arg_subtypes(&self.arg_subtypes);
+        }
+        self.inner
+            .filter(ctx, self.idx_num, self.idx_str.as_deref(), &self.argv)
+    }
+
+    /// The next combination of values (the last constraint varies fastest); false after
+    /// the last one.
+    fn advance(&mut self) -> bool {
+        let mut k = self.odo.len();
+        while k > 0 {
+            k -= 1;
+            self.odo[k] += 1;
+            if self.odo[k] < self.in_loops[k].1.len() {
+                return true;
+            }
+            self.odo[k] = 0;
+        }
+        false
+    }
+
+    /// Moves on to the first combination whose scan has a row.
+    fn settle(&mut self, ctx: &mut dyn sqliters_types::VTabHostContext) -> Result<()> {
+        while !self.done && self.inner.eof() {
+            if !self.advance() {
+                self.done = true;
+                break;
+            }
+            self.run_filter(ctx)?;
+        }
+        Ok(())
+    }
+
+    fn start(&mut self, ctx: &mut dyn sqliters_types::VTabHostContext) -> Result<()> {
+        if self.in_loops.iter().any(|l| l.1.is_empty()) {
+            self.done = true;
+            return Ok(());
+        }
+        self.run_filter(ctx)?;
+        self.settle(ctx)
+    }
+}
+
+impl sqliters_types::VirtualCursor for InLoopVtabCursor {
+    fn filter(
+        &mut self,
+        _ctx: &mut dyn sqliters_types::VTabHostContext,
+        _idx_num: i32,
+        _idx_str: Option<&str>,
+        _args: &[Value],
+    ) -> Result<()> {
+        Err(SqliteError::new(
+            ErrorCode::Internal,
+            "IN loop over a virtual table filtered twice",
+        ))
+    }
+
+    fn set_fetch_mask(&mut self, mask: u64) {
+        self.inner.set_fetch_mask(mask);
+    }
+
+    fn unlazy(&mut self, ctx: &mut dyn sqliters_types::VTabHostContext) -> Result<()> {
+        if self.buffered.is_some() {
+            return Ok(());
+        }
+        // The rest of the loop is read at once: the module reads the rest of the current
+        // scan and every later scan in `filter` (its rows stay addressable for the
+        // auxiliary functions of the module).
+        let mut rows: Vec<(i64, Vec<Value>, Option<Vec<u8>>)> = Vec::new();
+        if !self.done {
+            self.inner.unlazy(ctx)?;
+            loop {
+                while !self.inner.eof() {
+                    let mut vals = Vec::with_capacity(self.n_cols);
+                    let mut subtypes: Option<Vec<u8>> = None;
+                    for col_idx in 0..self.n_cols {
+                        vals.push(self.inner.column(col_idx)?);
+                        let st = self.inner.column_subtype(col_idx);
+                        if st != 0 {
+                            subtypes.get_or_insert_with(|| vec![0u8; self.n_cols])[col_idx] = st;
+                        }
+                    }
+                    let rowid = if self.has_rowid { self.inner.rowid()? } else { 0 };
+                    rows.push((rowid, vals, subtypes));
+                    self.inner.next()?;
+                }
+                if !self.advance() {
+                    break;
+                }
+                self.run_filter(ctx)?;
+            }
+            self.done = true;
+        }
+        self.buffered = Some(BufferedVtabCursor { rows, pos: 0 });
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<()> {
+        match self.buffered.as_mut() {
+            Some(b) => b.next(),
+            None => Err(SqliteError::new(
+                ErrorCode::Internal,
+                "IN loop over a virtual table stepped without its host",
+            )),
+        }
+    }
+
+    fn next_ctx(&mut self, ctx: &mut dyn sqliters_types::VTabHostContext) -> Result<()> {
+        if let Some(b) = self.buffered.as_mut() {
+            return b.next();
+        }
+        self.inner.next_ctx(ctx)?;
+        self.settle(ctx)
+    }
+
+    fn column_ctx(
+        &mut self,
+        ctx: &mut dyn sqliters_types::VTabHostContext,
+        col_idx: usize,
+    ) -> Result<Value> {
+        match self.buffered.as_ref() {
+            Some(b) => b.column(col_idx),
+            None => self.inner.column_ctx(ctx, col_idx),
+        }
+    }
+
+    fn eof(&self) -> bool {
+        match self.buffered.as_ref() {
+            Some(b) => b.eof(),
+            None => self.done || self.inner.eof(),
+        }
+    }
+
+    fn column(&self, col_idx: usize) -> Result<Value> {
+        match self.buffered.as_ref() {
+            Some(b) => b.column(col_idx),
+            None => self.inner.column(col_idx),
+        }
+    }
+
+    fn column_subtype(&self, col_idx: usize) -> u8 {
+        match self.buffered.as_ref() {
+            Some(b) => b.column_subtype(col_idx),
+            None => self.inner.column_subtype(col_idx),
+        }
+    }
+
+    fn rowid(&self) -> Result<i64> {
+        match self.buffered.as_ref() {
+            Some(b) => b.rowid(),
+            None => self.inner.rowid(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn eval_vtab_scan(
     ctx: &mut ExecContext<'_>,
@@ -10152,6 +10396,7 @@ fn open_filtered_vtab_cursor_inner(
                 )
             };
             for (conj_pos, conj) in conjs.into_iter().enumerate() {
+                let conj = where_term_form(conj);
                 let virt = virtual_conjs.iter().find(|v| v.0 == conj_pos);
                 let conj_no = virt.map_or(conj_pos, |v| v.1);
                 let conj_class: u8 = match conj {
@@ -10312,7 +10557,10 @@ fn open_filtered_vtab_cursor_inner(
                                     in_values: true,
                                 });
                                 rhs_exprs.push(None);
-                                source_conjuncts.push(None);
+                                // (wherecode.c: a term the module asked to omit is
+                                // disabled, IN term or not; one it did not is compared
+                                // with the value of the loop for every row)
+                                source_conjuncts.push(usable.then_some(conj));
                             }
                         }
                     }
@@ -10495,6 +10743,50 @@ fn open_filtered_vtab_cursor_inner(
     })?;
     let mut cursor = open_res.expect("checked best_res")?;
 
+    // where.c `sqlite3WhereBegin`: "Special case: a WHERE clause that is constant. Evaluate
+    // the expression and either jump over all of the code or fall thru" — a term that
+    // names no column of the table is tested once, before the arguments of xFilter are
+    // computed; when it is false or NULL the scan is never started (no xFilter).
+    if let Some(wh) = where_hint {
+        let mut conjs = Vec::new();
+        split_where_conjuncts(wh, &mut conjs);
+        for conj in conjs {
+            if matches!(conj, Expr::Binary { left, .. } | Expr::Like { expr: left, .. } if matches!(**left, Expr::Column(_)))
+            {
+                continue;
+            }
+            let written = conj;
+            let conj = where_term_form(conj);
+            let never = match expr_always(conj) {
+                Some(b) => {
+                    // (an OR term that is always true is the literal: its other operands
+                    // are not evaluated for the rows)
+                    if b && !std::ptr::eq(written, conj) && !omitted_conjuncts.contains(written) {
+                        omitted_conjuncts.push(written.clone());
+                    }
+                    !b
+                }
+                None => {
+                    expr_can_eval_with_cols(conj, &[], cols, outer_scopes)
+                        && eval_expr(ctx, conj, params, outer_scopes, ctes, None)?.truthiness()
+                            != Some(true)
+                }
+            };
+            if never {
+                ctx.stmt_tx.vtab_lazy_req = 0;
+                ctx.stmt_tx.vtab_lazy_on = false;
+                ctx.stmt_tx.vtab_order_consumed = false;
+                return Ok((
+                    Box::new(BufferedVtabCursor {
+                        rows: Vec::new(),
+                        pos: 0,
+                    }),
+                    col_used,
+                ));
+            }
+        }
+    }
+
     let max_argv = info
         .constraint_usage
         .iter()
@@ -10511,6 +10803,8 @@ fn open_filtered_vtab_cursor_inner(
     let mut seen_argv_vec: Option<Vec<bool>> = (max_argv > 16).then(|| vec![false; max_argv]);
     let mut argv = Vec::with_capacity(max_argv);
     argv.resize(max_argv, Value::Null);
+    let mut argv_subtypes: Vec<u8> = Vec::new();
+    let mut local_omits: Vec<&Expr> = Vec::new();
     for (ci, usage) in info.constraint_usage.iter().enumerate() {
         if usage.argv_index >= 1 {
             let slot_idx = usage.argv_index - 1;
@@ -10528,17 +10822,34 @@ fn open_filtered_vtab_cursor_inner(
             let val = match rhs_exprs.get(ci).copied().flatten() {
                 Some(re) => match re {
                     Expr::Bind(bp) => eval_bind_param(bp, params),
-                    _ => eval_expr(ctx, re, params, outer_scopes, ctes, None)?,
+                    _ => {
+                        let rv = eval_expr_rt(ctx, re, params, outer_scopes, ctes, None)?;
+                        if rv.subtype != 0 {
+                            argv_subtypes.resize(max_argv, 0);
+                            argv_subtypes[slot_idx] = rv.subtype;
+                        }
+                        rv.value
+                    }
                 },
                 None => Value::Null,
             };
             argv[slot_idx] = val;
         }
+        // where.c `whereLoopAddVirtualOne`: "if( pUsage[i].omit ){ if( i<16 && ... ) omitMask
+        // |= 1<<iTerm" — only the first 16 constraints can be left to the table; a later
+        // one is tested by the engine as well.
         if usage.omit
+            && ci < 16
             && let Some(Some(conj_expr)) = source_conjuncts.get(ci).copied()
-            && !omitted_conjuncts.contains(conj_expr)
         {
-            omitted_conjuncts.push(conj_expr.clone());
+            // (one entry per omitted term: equal terms are counted, see
+            // `strip_omitted_conjuncts`)
+            local_omits.push(conj_expr);
+            let n_local = local_omits.iter().filter(|e| **e == conj_expr).count();
+            let n_have = omitted_conjuncts.iter().filter(|e| *e == conj_expr).count();
+            if n_have < n_local {
+                omitted_conjuncts.push(conj_expr.clone());
+            }
         }
     }
     for &(lo, hi, conj_expr) in &between_pairs {
@@ -10640,6 +10951,9 @@ fn open_filtered_vtab_cursor_inner(
             let res = {
                 let mut host_ctx = crate::vtab::CoreVTabHostContext::new(ctx, db_name, vt_name);
                 cursor.set_plan_hint(info.plan_hint);
+                if !argv_subtypes.is_empty() {
+                    cursor.set_arg_subtypes(&argv_subtypes);
+                }
                 crate::vtab::catch_callback_panic("vtab xFilter", || {
                     cursor.filter(&mut host_ctx, info.idx_num, info.idx_str.as_deref(), &argv)
                 })
@@ -10655,6 +10969,38 @@ fn open_filtered_vtab_cursor_inner(
             in_loops.sort_by_key(|l| l.0);
             let n_cols = declared.table_schema.columns.len();
             let has_rowid = !declared.table_schema.without_rowid;
+            // (row by row when nothing has to be sorted afterwards, or when the caller
+            // computes its rows as they come)
+            let want_lazy = match lazy_req {
+                1 => true,
+                2 => order_by_hint.is_empty(),
+                _ => false,
+            };
+            if want_lazy && cursor.set_lazy(true) {
+                let n_loops = in_loops.len();
+                let mut lc = InLoopVtabCursor {
+                    inner: cursor,
+                    in_loops,
+                    odo: vec![0usize; n_loops],
+                    argv,
+                    idx_num: info.idx_num,
+                    idx_str: info.idx_str.clone(),
+                    plan_hint: info.plan_hint,
+                    arg_subtypes: argv_subtypes,
+                    done: false,
+                    buffered: None,
+                    n_cols,
+                    has_rowid,
+                };
+                let res = {
+                    let mut host_ctx = crate::vtab::CoreVTabHostContext::new(ctx, db_name, vt_name);
+                    crate::vtab::catch_callback_panic("vtab xFilter", || lc.start(&mut host_ctx))
+                };
+                ctx.stmt_tx.vtab_lazy_on = true;
+                ctx.stmt_tx.vtab_order_consumed = false;
+                res?;
+                return Ok((Box::new(lc), col_used));
+            }
             let mut rows: Vec<(i64, Vec<Value>, Option<Vec<u8>>)> = Vec::new();
             let mut odo = vec![0usize; in_loops.len()];
             let any_empty = in_loops.iter().any(|l| l.1.is_empty());
@@ -11383,6 +11729,10 @@ pub(crate) fn call_fts5_aux(ctx: &mut ExecContext<'_>, name: &str, args: &[Value
 /// (table-name) column it is called on, its name, its constant trailing arguments.
 type FastAuxCall = (usize, String, Vec<Value>);
 
+/// The live cursor an auxiliary function of the scan was resolved to: its id, the cursor,
+/// the registry it is in.
+type FastAuxTarget = (i64, sqliters_ext::Fts5AuxTarget, Arc<sqliters_ext::Fts5AuxRegistry>);
+
 fn call_fts5_aux_const(
     ctx: &mut ExecContext<'_>,
     name: &str,
@@ -11513,7 +11863,7 @@ impl FastVtabRowExpr {
         cached_rowid: &mut Option<i64>,
         bm25_calls: &[FastAuxCall],
         bm25_vals: &mut [Option<Value>],
-        aux_tgt: &mut Option<(i64, sqliters_ext::Fts5AuxTarget)>,
+        aux_tgt: &mut Option<FastAuxTarget>,
     ) -> Result<Value> {
         match self {
             Self::Const(v) => Ok(v.clone()),
@@ -11551,20 +11901,20 @@ impl FastVtabRowExpr {
                     return Ok(v.clone());
                 }
                 let (hidx, name, weights) = &bm25_calls[*bidx];
+                // (the handle column of a live cursor is its id for the whole scan: once
+                // the cursor is known it is not asked again)
+                if let Some((_, tgt, aux)) = aux_tgt.as_ref() {
+                    let mut host =
+                        crate::vtab::CoreVTabHostContext::new(ctx, &tgt.db_name, &tgt.table_name);
+                    let v = aux.invoke(&mut host, tgt, name, weights)?;
+                    bm25_vals[*bidx] = Some(v.clone());
+                    return Ok(v);
+                }
                 let hval = vtab_cursor_column(ctx, cursor, db_name, vt_name, *hidx)?;
                 // (the cursor the handle names is looked up once per scan: a live cursor
                 // keeps its id until it is closed)
-                let v = match (&hval, aux_tgt.as_ref()) {
-                    (Value::Integer(id), Some((cid, tgt))) if id == cid => {
-                        let aux = ctx.db_set.vtab_registry().fts5_aux_registry();
-                        let mut host = crate::vtab::CoreVTabHostContext::new(
-                            ctx,
-                            &tgt.db_name,
-                            &tgt.table_name,
-                        );
-                        aux.invoke(&mut host, tgt, name, weights)?
-                    }
-                    (Value::Integer(id), _) if *id > 0 && (*id >> 62) == 0 => {
+                let v = match &hval {
+                    Value::Integer(id) if *id > 0 && (*id >> 62) == 0 => {
                         let aux = ctx.db_set.vtab_registry().fts5_aux_registry();
                         let Some(tgt) = aux.resolve(&hval) else {
                             return Err(sqliters_ext::Fts5AuxRegistry::no_such_cursor(&hval));
@@ -11577,7 +11927,7 @@ impl FastVtabRowExpr {
                             );
                             aux.invoke(&mut host, &tgt, name, weights)
                         };
-                        *aux_tgt = Some((*id, tgt));
+                        *aux_tgt = Some((*id, tgt, aux));
                         res?
                     }
                     _ => call_fts5_aux_const(ctx, name, hval, weights)?,
@@ -11740,7 +12090,8 @@ where
     split_where_conjuncts(residual_where, &mut conjs);
     let mut preds = Vec::with_capacity(conjs.len());
     for conj in conjs {
-        match conj {
+        // (the term in the form the planner works with: `x OR 0` is x)
+        match where_term_form(conj) {
             Expr::Binary { left, op, right } => {
                 let vdbe_op = match op {
                     BinaryOp::Lt => Opcode::Lt,
@@ -12272,9 +12623,30 @@ fn try_exec_fast_single_vtab_select(
             .collect();
         first_row_cols.dedup();
         let mut first_row_done = first_row_cols.is_empty();
+        // Rows that are only counted (no WHERE term left to the engine, every aggregate is
+        // count(*)) are passed over in blocks when the cursor offers it: the same xNext
+        // calls, without the per-row way through the layers.
+        let count_only = residual_preds.is_empty()
+            && !minmax_early_out
+            && accumulators.iter().all(|(_, arg)| arg.is_none());
         crate::vtab::catch_callback_panic("vtab scan", || {
             while !cursor.eof() {
                 ctx.step_tick()?;
+                if count_only && first_row_done {
+                    let counted = {
+                        let mut host =
+                            crate::vtab::CoreVTabHostContext::new(ctx, &db_name, &vt_name);
+                        cursor.count_rows(&mut host, 4096)?
+                    };
+                    if let Some(n) = counted {
+                        for (acc, _) in &mut accumulators {
+                            for _ in 0..n {
+                                acc.step(&[])?;
+                            }
+                        }
+                        continue;
+                    }
+                }
                 let mut cached_rowid: Option<i64> = None;
                 let mut row_ok = true;
                 for pred in &residual_preds {
@@ -12375,7 +12747,7 @@ fn try_exec_fast_single_vtab_select(
                     let FastVtabColRef::Col(hidx) = resolve_fast_col(cref)? else {
                         return None;
                     };
-                    if !declared.is_hidden(hidx) {
+                    if !declared.is_hidden(hidx) || !declared.find_function {
                         return None;
                     }
                     let is_bm25 = name.eq_ignore_ascii_case("bm25");
@@ -12585,7 +12957,7 @@ fn try_exec_fast_single_vtab_select(
     let mut partial: Vec<Vec<Value>> = Vec::new();
     let rows_res: Result<Vec<Vec<Value>>> = crate::vtab::catch_callback_panic("vtab scan", || {
         let mut bm25_vals: Vec<Option<Value>> = vec![None; bm25_calls.len()];
-        let mut aux_tgt: Option<(i64, sqliters_ext::Fts5AuxTarget)> = None;
+        let mut aux_tgt: Option<FastAuxTarget> = None;
 
         if sort_specs.is_empty() {
             let out = &mut partial;
@@ -12639,6 +13011,8 @@ fn try_exec_fast_single_vtab_select(
         if lim_val > 0 {
             let k = (lim_val as usize).saturating_add(off_val);
             let mut top_k: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(k.min(256));
+            // (the key buffer of a row that does not go in is used for the next row)
+            let mut sort_vals: Vec<Value> = Vec::with_capacity(sort_exprs.len());
             while !cursor.eof() {
                 ctx.step_tick()?;
                 let mut cached_rowid: Option<i64> = None;
@@ -12654,7 +13028,7 @@ fn try_exec_fast_single_vtab_select(
                     continue;
                 }
                 bm25_vals.fill(None);
-                let mut sort_vals = Vec::with_capacity(sort_exprs.len());
+                sort_vals.clear();
                 for se in &sort_exprs {
                     sort_vals.push(se.eval(ctx, &mut *cursor, &db_name, &vt_name, rowid_alias_col, &mut cached_rowid, &bm25_calls, &mut bm25_vals, &mut aux_tgt)?);
                 }
@@ -12685,7 +13059,8 @@ fn try_exec_fast_single_vtab_select(
                 for pe in &proj_exprs {
                     proj_vals.push(pe.eval(ctx, &mut *cursor, &db_name, &vt_name, rowid_alias_col, &mut cached_rowid, &bm25_calls, &mut bm25_vals, &mut aux_tgt)?);
                 }
-                top_k.insert(lo, (proj_vals, sort_vals));
+                let key = std::mem::replace(&mut sort_vals, Vec::with_capacity(sort_exprs.len()));
+                top_k.insert(lo, (proj_vals, key));
                 vtab_cursor_next(ctx, &mut *cursor, &db_name, &vt_name)?;
             }
             return Ok(top_k.into_iter().map(|(p, _)| p).skip(off_val).collect());
@@ -12889,6 +13264,7 @@ fn eval_table_or_subquery(
                             merged_using: false,
                             is_vtab: false,
                             hidden_vtab: false,
+                            vtab_find_fn: false,
                         }
                     })
                     .collect::<Vec<_>>()
@@ -12931,6 +13307,7 @@ fn eval_table_or_subquery(
                             merged_using: false,
                             is_vtab: false,
                             hidden_vtab: false,
+                            vtab_find_fn: false,
                         }
                     })
                     .collect::<Vec<_>>()
@@ -12985,6 +13362,7 @@ fn eval_table_or_subquery(
                     merged_using: false,
                     is_vtab: false,
                     hidden_vtab: false,
+                    vtab_find_fn: false,
                 })
                 .collect();
             if !tbl.without_rowid {
@@ -13004,6 +13382,7 @@ fn eval_table_or_subquery(
                     merged_using: false,
                     is_vtab: false,
                     hidden_vtab: false,
+                    vtab_find_fn: false,
                 });
             }
             let shared_cols: Rc<[ScopedColumn]> = cols.into();
@@ -13290,6 +13669,7 @@ fn eval_table_or_subquery(
                         merged_using: false,
                         is_vtab: false,
                         hidden_vtab: false,
+                        vtab_find_fn: false,
                     }
                 })
                 .collect::<Vec<_>>()
@@ -14475,6 +14855,7 @@ fn schema_cols_for_tos(
                                 merged_using: false,
                                 is_vtab: false,
                                 hidden_vtab: false,
+                                vtab_find_fn: false,
                             }
                         })
                         .collect(),
@@ -14522,6 +14903,7 @@ fn schema_cols_for_tos(
                     merged_using: false,
                     is_vtab: false,
                     hidden_vtab: false,
+                    vtab_find_fn: false,
                 })
                 .collect();
             if !tbl.without_rowid {
@@ -14541,6 +14923,7 @@ fn schema_cols_for_tos(
                     merged_using: false,
                     is_vtab: false,
                     hidden_vtab: false,
+                    vtab_find_fn: false,
                 });
             }
             Some(cols)
@@ -14574,6 +14957,7 @@ fn schema_cols_for_tos(
                             merged_using: false,
                             is_vtab: false,
                             hidden_vtab: false,
+                            vtab_find_fn: false,
                         }
                     })
                     .collect(),
@@ -15538,6 +15922,7 @@ pub(crate) fn build_table_scoped_columns_pub(
             merged_using: false,
             is_vtab: false,
             hidden_vtab: false,
+            vtab_find_fn: false,
         })
         .collect();
     if !tbl.without_rowid {
@@ -15557,6 +15942,7 @@ pub(crate) fn build_table_scoped_columns_pub(
             merged_using: false,
             is_vtab: false,
             hidden_vtab: false,
+            vtab_find_fn: false,
         });
     }
     cols
@@ -16445,6 +16831,7 @@ fn static_view_scoped_cols(
                         merged_using: false,
                         is_vtab: false,
                         hidden_vtab: false,
+                        vtab_find_fn: false,
                     }
                 })
                 .collect(),
@@ -16468,6 +16855,7 @@ fn static_view_scoped_cols(
                         merged_using: false,
                         is_vtab: false,
                         hidden_vtab: false,
+                        vtab_find_fn: false,
                     }
                 })
                 .collect(),
@@ -16512,6 +16900,7 @@ fn static_view_scoped_cols(
                     merged_using: false,
                     is_vtab: false,
                     hidden_vtab: false,
+                    vtab_find_fn: false,
                 }
             })
             .collect(),
@@ -16593,6 +16982,7 @@ fn static_schema_cols_for_tos(
                                 merged_using: false,
                                 is_vtab: false,
                                 hidden_vtab: false,
+                                vtab_find_fn: false,
                             }
                         })
                         .collect(),
@@ -16626,6 +17016,7 @@ fn static_schema_cols_for_tos(
                     merged_using: false,
                     is_vtab: false,
                     hidden_vtab: false,
+                    vtab_find_fn: false,
                 })
                 .collect();
             if !tbl.without_rowid {
@@ -16645,6 +17036,7 @@ fn static_schema_cols_for_tos(
                     merged_using: false,
                     is_vtab: false,
                     hidden_vtab: false,
+                    vtab_find_fn: false,
                 });
             }
             Some(cols)
@@ -16679,6 +17071,7 @@ fn static_schema_cols_for_tos(
                             merged_using: false,
                             is_vtab: false,
                             hidden_vtab: false,
+                            vtab_find_fn: false,
                         }
                     })
                     .collect(),
@@ -18300,19 +18693,22 @@ fn eval_expr_rt(
             if sqliters_ext::Fts5AuxRegistry::is_aux_function(name)
                 && let Some(Expr::Column(cref)) = expr_list.first()
             {
+                // (only a table whose module answers xFindFunction — FTS5 — takes the call;
+                // on any other column the function is the overload stub)
                 let mut is_vtab_col = false;
                 for s in scopes.iter().rev() {
                     if s.lookup_cref_val_ref(cref)?.is_some() {
-                        is_vtab_col = s.lookup_cref_is_vtab(cref);
+                        is_vtab_col = s.lookup_cref_has_find_function(cref);
                         break;
                     }
                 }
-                // (a NULL first argument: the engine evaluates result expressions over
-                // an all-NULL row when a scan is empty; C never calls the function then)
                 if ctx.stmt_tx.vtab_fn_agg {
                     is_vtab_col = false;
                 }
-                if is_vtab_col && a_vals.first().is_some_and(|v| v.value.is_null()) {
+                // (the engine checks result expressions over an all-NULL row when a scan
+                // is empty; C never calls the function then. A real NULL row — the null
+                // side of an outer join — names cursor 0: "no such cursor: 0")
+                if is_vtab_col && ctx.stmt_tx.dummy_row_eval {
                     return Ok(RuntimeValue::null());
                 }
                 if is_vtab_col {
@@ -19245,6 +19641,7 @@ fn make_single_table_scope(
             merged_using: false,
             is_vtab: false,
             hidden_vtab: false,
+            vtab_find_fn: false,
         })
         .collect();
     let mut row_vals = vals.to_vec();
@@ -19261,6 +19658,7 @@ fn make_single_table_scope(
             merged_using: false,
             is_vtab: false,
             hidden_vtab: false,
+            vtab_find_fn: false,
         });
         row_vals.push(Value::Integer(rowid));
     }
@@ -19286,6 +19684,7 @@ fn make_returning_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> 
             merged_using: false,
             is_vtab: false,
             hidden_vtab: false,
+            vtab_find_fn: false,
         })
         .collect();
     let mut row_vals = vals.to_vec();
@@ -19302,6 +19701,7 @@ fn make_returning_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> 
             merged_using: false,
             is_vtab: false,
             hidden_vtab: false,
+            vtab_find_fn: false,
         });
         row_vals.push(Value::Integer(rowid));
     }
@@ -19326,6 +19726,7 @@ fn make_excluded_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> E
             merged_using: false,
             is_vtab: false,
             hidden_vtab: false,
+            vtab_find_fn: false,
         })
         .collect();
     let mut row_vals = vals.to_vec();
@@ -19342,6 +19743,7 @@ fn make_excluded_table_scope(tbl: &TableSchema, rowid: i64, vals: &[Value]) -> E
             merged_using: false,
             is_vtab: false,
             hidden_vtab: false,
+            vtab_find_fn: false,
         });
         row_vals.push(Value::Integer(rowid));
     }
@@ -19960,6 +20362,7 @@ fn make_runtime_table_pseudo_scope(
                 merged_using: false,
                 is_vtab: false,
                 hidden_vtab: false,
+                vtab_find_fn: false,
             });
             // expr.c TK_TRIGGER: "If the column has REAL affinity, it may currently be stored
             // as an integer. Use OP_RealAffinity to make sure it is really real."
@@ -19982,6 +20385,7 @@ fn make_runtime_table_pseudo_scope(
                 merged_using: false,
                 is_vtab: false,
                 hidden_vtab: false,
+                vtab_find_fn: false,
             });
             vals.push(Value::Integer(rowid));
         }
@@ -20024,6 +20428,7 @@ fn make_runtime_view_pseudo_scope(
                 merged_using: false,
                 is_vtab: false,
                 hidden_vtab: false,
+                vtab_find_fn: false,
             });
             // (OP_RealAffinity, as for a table column)
             let v = rvals.get(i).cloned().unwrap_or(Value::Null);
@@ -20069,6 +20474,7 @@ fn make_returning_view_scope(
             merged_using: false,
             is_vtab: false,
             hidden_vtab: false,
+            vtab_find_fn: false,
         });
         rvals.push(vals.get(i).cloned().unwrap_or(Value::Null));
     }
@@ -23199,21 +23605,39 @@ fn resolve_dml_target_in_set(
                 format!("UPSERT not implemented for virtual table \"{table_name}\""),
             ));
         }
+        // (delete.c `sqlite3IsReadOnly` -> `sqlite3ErrorMsg`: an SQLITE_ERROR of the parser)
         if db_set
             .vtab_registry()
             .is_connected_read_only(&db_name, &table_name)
         {
             return Err(SqliteError::new(
-                ErrorCode::ReadOnly,
+                ErrorCode::Error,
                 format!("table {table_name} may not be modified"),
             ));
         }
+        // (kept as it was: C refuses such a declaration in `sqlite3_declare_vtab` when the
+        // module has xUpdate; not compared with C in this step)
         if declared.table_schema.without_rowid
             && declared.table_schema.without_rowid_pk_cols.len() != 1
         {
             return Err(SqliteError::new(
                 ErrorCode::ReadOnly,
                 format!("table {table_name} may not be modified"),
+            ));
+        }
+        // trigger.c `sqlite3TriggersExist`: the RETURNING trigger of a virtual table can only
+        // run before the row is written, which UPDATE and DELETE cannot use.
+        if has_returning && event_kind != TriggerEventKind::Insert {
+            return Err(SqliteError::new(
+                ErrorCode::Error,
+                format!(
+                    "{} RETURNING is not available on virtual tables",
+                    if event_kind == TriggerEventKind::Delete {
+                        "DELETE"
+                    } else {
+                        "UPDATE"
+                    }
+                ),
             ));
         }
         return Ok(DmlTarget::VirtualTable {
@@ -25572,6 +25996,7 @@ fn make_single_view_scope(
             merged_using: false,
             is_vtab: false,
             hidden_vtab: false,
+            vtab_find_fn: false,
         });
         rvals.push(vals.get(i).cloned().unwrap_or(Value::Null));
     }
@@ -28954,6 +29379,53 @@ fn prepare_update_exec<'a>(
 
             let eff_alias = upd.alias.as_deref().unwrap_or(&table_name);
             let mut omitted = Vec::new();
+            // The loop of an UPDATE reads the columns its WHERE terms, its SET expressions
+            // and its RETURNING clause name; the columns it does not assign are read with
+            // `OPFLAG_NOCHNG`: a module whose xColumn honours the flag (FTS5,
+            // `VTabConfigOption::NochangeUnread`) returns nothing for them and takes them
+            // from its own storage in xUpdate. With a FROM clause the join may name any
+            // column: everything is read.
+            let upd_exprs: Vec<ResultColumn> = upd
+                .assignments
+                .iter()
+                .map(|sa| ResultColumn::Expr {
+                    expr: sa.expr.clone(),
+                    alias: None,
+                    span_text: None,
+                })
+                .chain(upd.returning.iter().cloned())
+                // (the hidden columns are read for every row like any column the statement
+                // does not assign: FTS5's xColumn runs the rank function for the `rank`
+                // column of a MATCH cursor whatever the no-change flag says)
+                .chain(
+                    declared
+                        .table_schema
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| declared.is_hidden(*i))
+                        .map(|(_, c)| ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef {
+                                schema: None,
+                                table: None,
+                                column: c.name.clone(),
+                                double_quoted: false,
+                            }),
+                            alias: None,
+                            span_text: None,
+                        }),
+                )
+                .collect();
+            let upd_qinfo = SingleVtabQueryInfo::from_single_select(
+                &upd_exprs,
+                upd.selection.as_ref(),
+                None,
+                &[],
+                None,
+                &[],
+                &[],
+                None,
+            );
             ctx.stmt_tx.vtab_dml_scan = true;
             let scan_res = eval_vtab_scan(
                 ctx,
@@ -28971,7 +29443,13 @@ fn prepare_update_exec<'a>(
                 outer_scopes,
                 &dml_ctes,
                 &mut omitted,
-                None,
+                // (a module that needs the old values of the unassigned columns — R-Tree —
+                // gets every column read, as its xColumn ignores the no-change flag)
+                if upd.from.is_none() && declared.nochange_unread {
+                    Some(&upd_qinfo)
+                } else {
+                    None
+                },
             );
             ctx.stmt_tx.vtab_dml_scan = false;
             let scan_rows = scan_res?;
@@ -30992,6 +31470,7 @@ fn exec_create_virtual_table(
             module_risk_flags: module.risk_flags(),
             is_eponymous: module.is_eponymous(),
             is_eponymous_only: module.is_eponymous_only(),
+            is_read_only: module.is_read_only(),
             shadow_suffixes,
             declared,
             state: crate::vtab::VTabInstanceState::Available(vt),
@@ -34020,6 +34499,7 @@ fn make_static_trigger_pseudo_scope(
                 merged_using: false,
                 is_vtab: false,
                 hidden_vtab: false,
+                vtab_find_fn: false,
             });
         }
         if has_hidden_rowid {
@@ -34035,6 +34515,7 @@ fn make_static_trigger_pseudo_scope(
                 merged_using: false,
                 is_vtab: false,
                 hidden_vtab: false,
+                vtab_find_fn: false,
             });
         }
     };
@@ -34104,6 +34585,7 @@ fn resolve_trigger_step_target_scope_static(
                     merged_using: false,
                     is_vtab: false,
                     hidden_vtab: false,
+                    vtab_find_fn: false,
                 });
             }
             Ok((scope, excl_cols))
@@ -34134,6 +34616,7 @@ fn resolve_trigger_step_target_scope_static(
                     merged_using: false,
                     is_vtab: false,
                     hidden_vtab: false,
+                    vtab_find_fn: false,
                 });
                 excl_cols.push(ScopedColumn {
                     schema_name: None,
@@ -34147,6 +34630,7 @@ fn resolve_trigger_step_target_scope_static(
                     merged_using: false,
                     is_vtab: false,
                     hidden_vtab: false,
+                    vtab_find_fn: false,
                 });
             }
             let n = scols.len();
@@ -50610,6 +51094,7 @@ fn validate_tos_static(
                             merged_using: false,
                             is_vtab: false,
                             hidden_vtab: false,
+                            vtab_find_fn: false,
                         }
                     })
                     .collect());
@@ -50650,6 +51135,7 @@ fn validate_tos_static(
                             merged_using: false,
                             is_vtab: false,
                             hidden_vtab: false,
+                            vtab_find_fn: false,
                         }
                     })
                     .collect());
@@ -50700,6 +51186,7 @@ fn validate_tos_static(
                     merged_using: false,
                     is_vtab: false,
                     hidden_vtab: false,
+                    vtab_find_fn: false,
                 })
                 .collect();
             if !tbl.without_rowid {
@@ -50719,6 +51206,7 @@ fn validate_tos_static(
                     merged_using: false,
                     is_vtab: false,
                     hidden_vtab: false,
+                    vtab_find_fn: false,
                 });
             }
             Ok(cols)
@@ -50755,6 +51243,7 @@ fn validate_tos_static(
                         merged_using: false,
                         is_vtab: false,
                         hidden_vtab: false,
+                        vtab_find_fn: false,
                     }
                 })
                 .collect())
@@ -50999,7 +51488,7 @@ fn expr_is_vtab_column_in_scopes(mut expr: &Expr, scopes: &[EvalRow]) -> bool {
     };
     for scope in scopes.iter().rev() {
         if let Ok(Some(_)) = scope.lookup_cref(cref) {
-            return scope.lookup_cref_is_vtab(cref);
+            return scope.lookup_cref_has_find_function(cref);
         }
     }
     false

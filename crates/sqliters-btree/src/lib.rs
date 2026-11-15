@@ -1972,7 +1972,27 @@ impl Btree {
 
     /// Point-lookup by `rowid` in O(log N) page reads (`sqlite3BtreeTableMoveto`).
     pub fn seek_table_rowid(&mut self, root_pgno: Pgno, rowid: i64) -> Result<Option<Vec<u8>>> {
-        self.emu_seek_rowid(root_pgno, rowid)?;
+        // (see `locate_table_leaf_cell_layout`: the modelled cursor already found the row)
+        if let Some((pg, ix)) = self.emu_seek_rowid_pos(root_pgno, rowid)? {
+            let usable = self.pager.usable_size();
+            let hit = {
+                let raw = self.pager.read_page(pg)?;
+                let (_, n_cell, _) = raw_page_header(pg, usable, raw)?;
+                if ix < n_cell {
+                    let (_, start, len, total, ovfl) =
+                        table_leaf_cell_layout(pg, usable, raw, n_cell, ix)?;
+                    if ovfl.is_none() {
+                        return Ok(Some(raw[start..start + len].to_vec()));
+                    }
+                    Some((total, raw[start..start + len].to_vec(), ovfl))
+                } else {
+                    None
+                }
+            };
+            if let Some((total, local, ovfl)) = hit {
+                return self.read_full_payload(total, &local, ovfl).map(Some);
+            }
+        }
         if self.pager.page_count() == 0 {
             return Ok(None);
         }
@@ -2442,7 +2462,27 @@ impl Btree {
         root_pgno: Pgno,
         rowid: i64,
     ) -> Result<Option<(Pgno, usize, usize, u32, Option<Pgno>)>> {
-        self.emu_seek_rowid(root_pgno, rowid)?;
+        // The modelled cursor of the lookup has done C's `sqlite3BtreeTableMoveto`; when it
+        // stands on the row, that is where the row is (no second descent).
+        if let Some((pg, ix)) = self.emu_seek_rowid_pos(root_pgno, rowid)? {
+            let usable = self.pager.usable_size();
+            let raw = self.pager.read_page(pg)?;
+            let (_, n_cell, _) = raw_page_header(pg, usable, raw)?;
+            if ix < n_cell {
+                return table_leaf_cell_layout(pg, usable, raw, n_cell, ix).map(Some);
+            }
+        }
+        self.locate_table_leaf_cell_by_descent(root_pgno, rowid)
+    }
+
+    /// [`Self::locate_table_leaf_cell_layout`] by a plain descent from the root (no cursor
+    /// is modelled by it).
+    #[allow(clippy::type_complexity)]
+    fn locate_table_leaf_cell_by_descent(
+        &mut self,
+        root_pgno: Pgno,
+        rowid: i64,
+    ) -> Result<Option<(Pgno, usize, usize, u32, Option<Pgno>)>> {
         if self.pager.page_count() == 0 {
             return Ok(None);
         }
@@ -2459,40 +2499,7 @@ impl Btree {
                     else {
                         return Ok(None);
                     };
-                    let cell_off = raw_cell_offset(cur_pgno, usable, raw, 8, n_cell, cell_idx)?;
-                    let slice = &raw[cell_off..usable as usize];
-                    let (payload_u64, n1) = get_varint(slice)?;
-                    let total_payload_len = u32::try_from(payload_u64)
-                        .map_err(|_| SqliteError::corrupt("table cell payload > 4GiB"))?;
-                    let (_, n2) = get_varint_i64(&slice[n1..])?;
-                    let bounds = PayloadBounds::for_table_leaf(usable);
-                    let local_start = cell_off + n1 + n2;
-                    let local_len = bounds.local_len(total_payload_len);
-                    let local_end = local_start + local_len;
-                    let has_ovfl = (local_len as u32) < total_payload_len;
-                    let needed = local_end + if has_ovfl { 4 } else { 0 };
-                    if needed > usable as usize {
-                        return Err(SqliteError::corrupt(format!(
-                            "table leaf cell extends past end of page {cur_pgno}"
-                        )));
-                    }
-                    let overflow_page = if has_ovfl {
-                        Some(u32::from_be_bytes([
-                            raw[local_end],
-                            raw[local_end + 1],
-                            raw[local_end + 2],
-                            raw[local_end + 3],
-                        ]))
-                    } else {
-                        None
-                    };
-                    return Ok(Some((
-                        cur_pgno,
-                        local_start,
-                        local_len,
-                        total_payload_len,
-                        overflow_page,
-                    )));
+                    return table_leaf_cell_layout(cur_pgno, usable, raw, n_cell, cell_idx).map(Some);
                 }
                 BtreePageType::TableInterior => {
                     let (_, next_pgno) = find_table_interior_child(cur_pgno, usable, raw, rowid)?;
@@ -2516,18 +2523,38 @@ impl Btree {
         rowid: i64,
         f: impl FnOnce(&[u8]) -> Result<R>,
     ) -> Result<Option<R>> {
-        let Some((leaf_pgno, local_start, local_len, total_payload_len, overflow_page)) =
-            self.locate_table_leaf_cell_layout(root_pgno, rowid)?
-        else {
+        let Some((leaf_pgno, local_start, local_len, total_payload_len, overflow_page)) = ({
+            // (the usual case in one look at the page: the modelled cursor is on the row
+            // and the record has no overflow pages)
+            match self.emu_seek_rowid_pos(root_pgno, rowid)? {
+                Some((pg, ix)) => {
+                    let usable = self.pager.usable_size();
+                    let raw = self.pager.read_page(pg)?;
+                    let (_, n_cell, _) = raw_page_header(pg, usable, raw)?;
+                    if ix < n_cell {
+                        let l = table_leaf_cell_layout(pg, usable, raw, n_cell, ix)?;
+                        if l.4.is_none() && (l.2 as u32) == l.3 {
+                            return f(&raw[l.1..l.1 + l.2]).map(Some);
+                        }
+                        Some(l)
+                    } else {
+                        self.locate_table_leaf_cell_by_descent(root_pgno, rowid)?
+                    }
+                }
+                None => self.locate_table_leaf_cell_by_descent(root_pgno, rowid)?,
+            }
+        }) else {
             return Ok(None);
         };
         if overflow_page.is_none() && (local_len as u32) == total_payload_len {
             let raw = self.pager.read_page(leaf_pgno)?;
             return f(&raw[local_start..local_start + local_len]).map(Some);
         }
-        let Some(full) = self.seek_table_rowid(root_pgno, rowid)? else {
-            return Ok(None);
+        let local = {
+            let raw = self.pager.read_page(leaf_pgno)?;
+            raw[local_start..local_start + local_len].to_vec()
         };
+        let full = self.read_full_payload(total_payload_len, &local, overflow_page)?;
         f(&full).map(Some)
     }
 
@@ -7624,4 +7651,44 @@ mod tests {
             }
         }
     }
+}
+
+/// Where the record of cell `cell_idx` of table-leaf page `pgno` lies: `(pgno, start of the
+/// local part, its length, total record length, first overflow page)`.
+#[allow(clippy::type_complexity)]
+fn table_leaf_cell_layout(
+    pgno: Pgno,
+    usable: u32,
+    raw: &[u8],
+    n_cell: usize,
+    cell_idx: usize,
+) -> Result<(Pgno, usize, usize, u32, Option<Pgno>)> {
+    let cell_off = raw_cell_offset(pgno, usable, raw, 8, n_cell, cell_idx)?;
+    let slice = &raw[cell_off..usable as usize];
+    let (payload_u64, n1) = get_varint(slice)?;
+    let total_payload_len = u32::try_from(payload_u64)
+        .map_err(|_| SqliteError::corrupt("table cell payload > 4GiB"))?;
+    let (_, n2) = get_varint_i64(&slice[n1..])?;
+    let bounds = PayloadBounds::for_table_leaf(usable);
+    let local_start = cell_off + n1 + n2;
+    let local_len = bounds.local_len(total_payload_len);
+    let local_end = local_start + local_len;
+    let has_ovfl = (local_len as u32) < total_payload_len;
+    let needed = local_end + if has_ovfl { 4 } else { 0 };
+    if needed > usable as usize {
+        return Err(SqliteError::corrupt(format!(
+            "table leaf cell extends past end of page {pgno}"
+        )));
+    }
+    let overflow_page = if has_ovfl {
+        Some(u32::from_be_bytes([
+            raw[local_end],
+            raw[local_end + 1],
+            raw[local_end + 2],
+            raw[local_end + 3],
+        ]))
+    } else {
+        None
+    };
+    Ok((pgno, local_start, local_len, total_payload_len, overflow_page))
 }

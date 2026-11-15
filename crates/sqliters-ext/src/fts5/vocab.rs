@@ -237,6 +237,8 @@ impl Fts5VocabCursor {
                 self.a_doc.fill(0);
                 self.i_col = 0;
                 let detail = cfg.detail;
+                // (the index is taken once for all the rows of the term)
+                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                 loop {
                     {
                         let Some(it) = self.iter.as_ref() else {
@@ -295,11 +297,8 @@ impl Fts5VocabCursor {
                             VocabType::Instance => {}
                         }
                     }
-                    {
-                        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(it) = self.iter.as_mut() {
-                            st.index.iter_next_scan(ctx, it)?;
-                        }
+                    if let Some(it) = self.iter.as_mut() {
+                        st.index.iter_next_scan(ctx, it)?;
                     }
                     let Some(it) = self.iter.as_ref() else {
                         break;

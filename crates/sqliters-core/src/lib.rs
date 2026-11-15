@@ -173,9 +173,8 @@ fn register_builtin_extension_functions(
     // The auxiliary functions of FTS5 (`sqlite3_overload_function`): called with a column
     // of an FTS5 table as first argument they run on that table's cursor (the engine
     // dispatches those calls, `fts5ApiCallback`); anywhere else they are not usable.
-    let _ = fts5_aux;
     for name in ["bm25", "highlight", "snippet", "fts5_get_locale"] {
-        functions.register_scalar(name, None, FunctionFlags::INNOCUOUS, move |_args| {
+        functions.register_scalar(name, None, FunctionFlags::NONE, move |_args| {
             Err(SqliteError::new(
                 ErrorCode::Error,
                 format!("unable to use function {name} in the requested context"),
@@ -190,7 +189,46 @@ fn register_builtin_extension_functions(
         |_args| Ok(RuntimeValue::plain(Fts5AuxRegistry::eval_fts5_source_id())),
     );
 
-    functions.register_scalar("fts5", Some(1), FunctionFlags::INNOCUOUS, |args| {
+    // fts5_locale(LOCALE, TEXT) and fts5_insttoken(X) (`fts5LocaleFunc`, `fts5InsttokenFunc`).
+    {
+        let aux = Arc::clone(&fts5_aux);
+        let cb: crate::execution_context::ScalarFunctionCallback = Arc::new(move |args: &[RuntimeValue]| {
+            Ok(RuntimeValue::plain(aux.eval_fts5_locale(&args[0].value, &args[1].value)))
+        });
+        functions.register_scalar_shared(
+            "fts5_locale",
+            Some(2),
+            FunctionFlags::INNOCUOUS | FunctionFlags::RESULT_SUBTYPE | FunctionFlags::SUBTYPE,
+            cb,
+        );
+    }
+    functions.register_scalar_shared(
+        "fts5_insttoken",
+        Some(1),
+        FunctionFlags::INNOCUOUS | FunctionFlags::RESULT_SUBTYPE,
+        Arc::new(|args: &[RuntimeValue]| {
+            Ok(RuntimeValue {
+                value: args[0].value.clone(),
+                subtype: sqliters_ext::FTS5_INSTTOKEN_SUBTYPE,
+            })
+        }),
+    );
+
+    // `sqlite3_overload_function(db, "MATCH", 2)`: the MATCH operator on anything but a
+    // virtual table that implements it.
+    functions.register_scalar_shared(
+        "match",
+        Some(2),
+        FunctionFlags::NONE,
+        Arc::new(|_args: &[RuntimeValue]| {
+            Err(SqliteError::new(
+                ErrorCode::Error,
+                "unable to use function MATCH in the requested context",
+            ))
+        }),
+    );
+
+    functions.register_scalar("fts5", Some(1), FunctionFlags::NONE, |args| {
         Ok(RuntimeValue::plain(Fts5AuxRegistry::eval_fts5_ptr_func(
             &args[0].value,
         )))
@@ -199,7 +237,7 @@ fn register_builtin_extension_functions(
     functions.register_scalar(
         "rtreedepth",
         Some(1),
-        FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS,
+        FunctionFlags::NONE,
         |args| {
             Ok(RuntimeValue::plain(sqliters_ext::eval_rtreedepth(
                 &args[0].value,
@@ -210,7 +248,7 @@ fn register_builtin_extension_functions(
     functions.register_scalar(
         "rtreenode",
         Some(2),
-        FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS,
+        FunctionFlags::NONE,
         |args| {
             Ok(RuntimeValue::plain(sqliters_ext::eval_rtreenode(
                 &args[0].value,
@@ -228,7 +266,7 @@ fn register_builtin_extension_functions(
     );
 
     // rtree.c registers rtreecheck with nArg = -1 and checks the count when it is called.
-    functions.register_scalar("rtreecheck", None, FunctionFlags::INNOCUOUS, |_| {
+    functions.register_scalar("rtreecheck", None, FunctionFlags::NONE, |_| {
         Err(SqliteError::new(
             ErrorCode::Internal,
             "__sqliters_builtin_rtreecheck__",
@@ -9341,6 +9379,13 @@ impl Statement {
                 Ok(StepResult::Done)
             }
             RunningExec::Vdbe { vm, read_instances } => {
+                // `db->nChange`, `db->nTotalChange` and `db->lastRowid` belong to the
+                // connection: statements that ran since this one last returned a row have
+                // moved them, and this statement goes on from their values.
+                vm.runtime_ctx.last_insert_rowid = inner.runtime.last_insert_rowid;
+                vm.runtime_ctx.last_changes = inner.runtime.last_changes;
+                vm.runtime_ctx.total_changes = inner.runtime.total_changes;
+                vm.runtime_ctx.nested_changes = inner.runtime.nested_changes;
                 let step_res = {
                     let encoding = inner.effective_encoding();
                     let rt_snapshot = vm.runtime_ctx;
@@ -13118,6 +13163,8 @@ mod c_align_h5_tests;
 mod c_align_h6_tests;
 #[cfg(test)]
 mod c_align_h7_tests;
+#[cfg(test)]
+mod c_align_h7b_tests;
 #[cfg(test)]
 mod c_align_h6b_tests;
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected

@@ -10,6 +10,9 @@ pub mod json_vtab;
 pub mod rtree;
 
 pub use fts5::{Fts5AuxRegistry, Fts5AuxTarget, Fts5Module, Fts5VocabModule};
+
+/// `FTS5_INSTTOKEN_SUBTYPE`: the subtype `fts5_insttoken()` gives its result.
+pub const FTS5_INSTTOKEN_SUBTYPE: u8 = 73;
 pub use generate_series::GenerateSeriesModule;
 pub use json_vtab::{JsonEachModule, JsonTreeModule, JsonbEachModule, JsonbTreeModule};
 pub use rtree::{RTreeCoordMode, RTreeModule, eval_rtreedepth, eval_rtreenode, run_rtreecheck};

@@ -80,6 +80,8 @@ pub(super) struct Fts5Expr {
     pub(super) b_desc: bool,
     detail: DetailMode,
     b_tokendata: bool,
+    /// Buffers of `fts5ExprNearIsMatch` kept for their allocation.
+    near_pool: Vec<Vec<u8>>,
 }
 
 /// `Fts5PoslistPopulator`.
@@ -119,6 +121,30 @@ impl LookaheadReader {
         r.next(a);
         r.next(a);
         r
+    }
+}
+
+/// The phrases of a nearset, copied out of the node (on the stack when there are few).
+enum PhraseList {
+    Inline([usize; 8], usize),
+    Heap(Vec<usize>),
+}
+
+impl PhraseList {
+    fn of(ap: &[usize]) -> Self {
+        if ap.len() <= 8 {
+            let mut a = [0usize; 8];
+            a[..ap.len()].copy_from_slice(ap);
+            Self::Inline(a, ap.len())
+        } else {
+            Self::Heap(ap.to_vec())
+        }
+    }
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            Self::Inline(a, n) => &a[..*n],
+            Self::Heap(v) => v,
+        }
     }
 }
 
@@ -251,6 +277,7 @@ impl Fts5Expr {
             b_desc: false,
             detail: cfg.detail,
             b_tokendata: cfg.tokendata,
+            near_pool: Vec::new(),
         };
         e.root = e.build(cfg, &parsed, b_phrase_to_and);
         Ok(e)
@@ -562,6 +589,7 @@ impl Fts5Expr {
             b_desc: false,
             detail: self.detail,
             b_tokendata: self.b_tokendata,
+            near_pool: Vec::new(),
         })
     }
 
@@ -595,7 +623,57 @@ impl Fts5Expr {
         let mut out = std::mem::take(&mut self.phrases[k].poslist);
         out.clear();
         let mut writer_prev: i64 = 0;
+        if self.phrases[k].a_term.len() <= 8 && self.phrases[k].a_term.iter().all(|t| t.syn.is_empty())
         {
+            // (the usual phrase: no synonyms, a few terms — the readers live on the stack)
+            let ph = &self.phrases[k];
+            let b_first = ph.a_term.first().is_some_and(|t| t.b_first);
+            let n_term = ph.a_term.len();
+            let mut srcs: [&[u8]; 8] = [&[]; 8];
+            let mut a_iter: [PoslistReader; 8] = [PoslistReader::default(); 8];
+            let mut done = false;
+            for (i, t) in ph.a_term.iter().enumerate() {
+                let a = t.iter_data();
+                a_iter[i] = PoslistReader::init(a, a.len() as i32);
+                srcs[i] = a;
+                if a_iter[i].b_eof {
+                    done = true;
+                    break;
+                }
+            }
+            'ismatch: while !done {
+                let mut i_pos = a_iter[0].i_pos;
+                loop {
+                    let mut b_match = true;
+                    for i in 0..n_term {
+                        let i_adj = i_pos + i as i64;
+                        if a_iter[i].i_pos != i_adj {
+                            b_match = false;
+                            while a_iter[i].i_pos < i_adj {
+                                if a_iter[i].next(srcs[i]) {
+                                    break 'ismatch;
+                                }
+                            }
+                            if a_iter[i].i_pos > i_adj {
+                                i_pos = a_iter[i].i_pos - i as i64;
+                            }
+                        }
+                    }
+                    if b_match {
+                        break;
+                    }
+                }
+                // Append position iPos to the output
+                if !b_first || (i_pos & 0x7FFF_FFFF) == 0 {
+                    poslist_safe_append(&mut out, &mut writer_prev, i_pos);
+                }
+                for i in 0..n_term {
+                    if a_iter[i].next(srcs[i]) {
+                        break 'ismatch;
+                    }
+                }
+            }
+        } else {
             let ph = &self.phrases[k];
             let b_first = ph.a_term.first().is_some_and(|t| t.b_first);
             let n_term = ph.a_term.len();
@@ -664,73 +742,115 @@ impl Fts5Expr {
     /// poslists are populated; true if the row has instances close enough together. The
     /// poslists are trimmed to the entries that meet the constraint.
     fn expr_near_is_match(&mut self, i_node: usize) -> bool {
-        let (ap, n_near) = match self.nodes[i_node].near.as_ref() {
-            Some(n) => (n.ap_phrase.clone(), i64::from(n.n_near)),
+        let (ap_list, n_near) = match self.nodes[i_node].near.as_ref() {
+            Some(n) => (PhraseList::of(&n.ap_phrase), i64::from(n.n_near)),
             None => return false,
         };
+        let ap = ap_list.as_slice();
         let n_phrase = ap.len();
-        // Initialize a lookahead iterator for each phrase.
-        let mut inputs: Vec<Vec<u8>> = Vec::with_capacity(n_phrase);
-        for &k in &ap {
-            let v = self.phrase_poslist(k).to_vec();
-            inputs.push(v);
+        // (the output lists: buffers kept from earlier rows)
+        let mut outs_inline: [Vec<u8>; 4] = std::array::from_fn(|_| Vec::new());
+        let mut outs_heap: Vec<Vec<u8>> = Vec::new();
+        let outs: &mut [Vec<u8>] = if n_phrase <= 4 {
+            &mut outs_inline[..n_phrase]
+        } else {
+            outs_heap.resize(n_phrase, Vec::new());
+            &mut outs_heap
+        };
+        for o in outs.iter_mut() {
+            if let Some(mut b) = self.near_pool.pop() {
+                b.clear();
+                *o = b;
+            }
         }
-        let mut readers: Vec<LookaheadReader> =
-            inputs.iter().map(|a| LookaheadReader::init(a)).collect();
-        let mut outs: Vec<Vec<u8>> = vec![Vec::new(); n_phrase];
-        let mut writers: Vec<i64> = vec![0; n_phrase];
-        let n_terms: Vec<i64> = ap
-            .iter()
-            .map(|&k| self.phrases[k].a_term.len() as i64)
-            .collect();
-        'ismatch: loop {
-            // This block advances the phrase iterators until they point to a set of
-            // entries that together comprise a match.
-            let mut i_max = readers[0].i_pos;
-            loop {
-                let mut b_match = true;
-                for i in 0..n_phrase {
-                    let i_min = i_max - n_terms[i] - n_near;
-                    if readers[i].i_pos < i_min || readers[i].i_pos > i_max {
-                        b_match = false;
-                        while readers[i].i_pos < i_min {
-                            if readers[i].next(&inputs[i]) {
-                                break 'ismatch;
+        let b_ret = {
+            // Initialize a lookahead iterator for each phrase (the lists are read where they
+            // are; the trimmed lists are written to `outs` and replace them afterwards).
+            let mut inputs_inline: [&[u8]; 4] = [&[]; 4];
+            let mut readers_inline = [LookaheadReader::default(); 4];
+            let mut writers_inline = [0i64; 4];
+            let mut n_terms_inline = [0i64; 4];
+            let (inputs_heap, mut readers_heap, mut writers_heap, n_terms_heap);
+            let (inputs, readers, writers, n_terms): (
+                &[&[u8]],
+                &mut [LookaheadReader],
+                &mut [i64],
+                &[i64],
+            ) = if n_phrase <= 4 {
+                for (i, &k) in ap.iter().enumerate() {
+                    let a = self.phrase_poslist(k);
+                    inputs_inline[i] = a;
+                    readers_inline[i] = LookaheadReader::init(a);
+                    n_terms_inline[i] = self.phrases[k].a_term.len() as i64;
+                }
+                (
+                    &inputs_inline[..n_phrase],
+                    &mut readers_inline[..n_phrase],
+                    &mut writers_inline[..n_phrase],
+                    &n_terms_inline[..n_phrase],
+                )
+            } else {
+                inputs_heap = ap.iter().map(|&k| self.phrase_poslist(k)).collect::<Vec<&[u8]>>();
+                readers_heap =
+                    inputs_heap.iter().map(|a| LookaheadReader::init(a)).collect::<Vec<_>>();
+                writers_heap = vec![0i64; n_phrase];
+                n_terms_heap =
+                    ap.iter().map(|&k| self.phrases[k].a_term.len() as i64).collect::<Vec<_>>();
+                (&inputs_heap[..], &mut readers_heap[..], &mut writers_heap[..], &n_terms_heap[..])
+            };
+            'ismatch: loop {
+                // This block advances the phrase iterators until they point to a set of
+                // entries that together comprise a match.
+                let mut i_max = readers[0].i_pos;
+                loop {
+                    let mut b_match = true;
+                    for i in 0..n_phrase {
+                        let i_min = i_max - n_terms[i] - n_near;
+                        if readers[i].i_pos < i_min || readers[i].i_pos > i_max {
+                            b_match = false;
+                            while readers[i].i_pos < i_min {
+                                if readers[i].next(inputs[i]) {
+                                    break 'ismatch;
+                                }
+                            }
+                            if readers[i].i_pos > i_max {
+                                i_max = readers[i].i_pos;
                             }
                         }
-                        if readers[i].i_pos > i_max {
-                            i_max = readers[i].i_pos;
-                        }
+                    }
+                    if b_match {
+                        break;
                     }
                 }
-                if b_match {
-                    break;
+                // Add an entry to each output position list
+                for i in 0..n_phrase {
+                    let i_pos = readers[i].i_pos;
+                    if outs[i].is_empty() || i_pos != writers[i] {
+                        poslist_safe_append(&mut outs[i], &mut writers[i], i_pos);
+                    }
+                }
+                let mut i_adv = 0usize;
+                let mut i_min = readers[0].i_lookahead;
+                for i in 0..n_phrase {
+                    if readers[i].i_lookahead < i_min {
+                        i_min = readers[i].i_lookahead;
+                        i_adv = i;
+                    }
+                }
+                if readers[i_adv].next(inputs[i_adv]) {
+                    break 'ismatch;
                 }
             }
-            // Add an entry to each output position list
-            for i in 0..n_phrase {
-                let i_pos = readers[i].i_pos;
-                if outs[i].is_empty() || i_pos != writers[i] {
-                    poslist_safe_append(&mut outs[i], &mut writers[i], i_pos);
-                }
-            }
-            let mut i_adv = 0usize;
-            let mut i_min = readers[0].i_lookahead;
-            for i in 0..n_phrase {
-                if readers[i].i_lookahead < i_min {
-                    i_min = readers[i].i_lookahead;
-                    i_adv = i;
-                }
-            }
-            if readers[i_adv].next(&inputs[i_adv]) {
-                break 'ismatch;
-            }
-        }
-        let b_ret = !outs[0].is_empty();
+            !outs[0].is_empty()
+        };
         sqliters_types::dtrace!("TR|f5q|near|n={} match={}", n_phrase, i32::from(b_ret));
         for (i, &k) in ap.iter().enumerate() {
             let o = std::mem::take(&mut outs[i]);
+            let old = std::mem::take(&mut self.phrases[k].poslist);
             self.set_phrase_poslist(k, o);
+            if old.capacity() > 0 && self.near_pool.len() < 16 {
+                self.near_pool.push(old);
+            }
         }
         b_ret
     }
@@ -741,7 +861,8 @@ impl Fts5Expr {
         let Some(near) = self.nodes[i_node].near.as_ref() else {
             return false;
         };
-        let ap = near.ap_phrase.clone();
+        let ap_list = PhraseList::of(&near.ap_phrase);
+        let ap = ap_list.as_slice();
         let has_colset = near.colset.is_some();
         if self.detail != DetailMode::Full {
             let k = ap[0];
@@ -780,8 +901,12 @@ impl Fts5Expr {
                         break;
                     }
                 } else {
-                    let d = ph.a_term.first().map_or(&[][..], ExprTerm::iter_data).to_vec();
-                    self.set_phrase_poslist(k, d);
+                    // fts5BufferSet(&rc, &pPhrase->poslist, pIter->nData, pIter->pData)
+                    let ph = &mut self.phrases[k];
+                    let mut buf = std::mem::take(&mut ph.poslist);
+                    buf.clear();
+                    buf.extend_from_slice(ph.a_term.first().map_or(&[][..], ExprTerm::iter_data));
+                    self.set_phrase_poslist(k, buf);
                 }
                 i += 1;
             }
@@ -894,11 +1019,10 @@ impl Fts5Expr {
         i_node: usize,
     ) -> Result<()> {
         let b_desc = self.b_desc;
-        let ap = self.nodes[i_node]
-            .near
-            .as_ref()
-            .map(|n| n.ap_phrase.clone())
-            .unwrap_or_default();
+        let ap_list = PhraseList::of(
+            self.nodes[i_node].near.as_ref().map_or(&[][..], |n| n.ap_phrase.as_slice()),
+        );
+        let ap = ap_list.as_slice();
         // Initialize iLast, the "lastest" rowid any iterator points to.
         let left0 = &self.phrases[ap[0]].a_term[0];
         let mut i_last = if !left0.syn.is_empty() {
@@ -908,7 +1032,7 @@ impl Fts5Expr {
         };
         loop {
             let mut b_match = true;
-            for &k in &ap {
+            for &k in ap {
                 for j in 0..self.phrases[k].a_term.len() {
                     let term = &mut self.phrases[k].a_term[j];
                     if !term.syn.is_empty() {
@@ -1107,7 +1231,8 @@ impl Fts5Expr {
         i_from: i64,
     ) -> Result<()> {
         let i_last = self.nodes[i_node].i_rowid;
-        for c in self.nodes[i_node].children.clone() {
+        for ci in 0..self.nodes[i_node].children.len() {
+            let c = self.nodes[i_node].children[ci];
             if !self.nodes[c].b_eof
                 && (self.nodes[c].i_rowid == i_last
                     || (b_from_valid && self.rowid_cmp(self.nodes[c].i_rowid, i_from) < 0))
@@ -1127,11 +1252,12 @@ impl Fts5Expr {
         i_and: usize,
     ) -> Result<()> {
         let mut i_last = self.nodes[i_and].i_rowid;
-        let children = self.nodes[i_and].children.clone();
+        let n_child = self.nodes[i_and].children.len();
         loop {
             self.nodes[i_and].b_nomatch = false;
             let mut b_match = true;
-            for &c in &children {
+            for ci in 0..n_child {
+                let c = self.nodes[i_and].children[ci];
                 let cmp = self.rowid_cmp(i_last, self.nodes[c].i_rowid);
                 if cmp > 0 {
                     // Advance pChild until it points to iLast or laster

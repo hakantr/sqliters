@@ -122,6 +122,8 @@ struct Fts5Config {
     locale: bool,
     /// `tokendata=1` (`bTokendata`).
     tokendata: bool,
+    /// `pGlobal->aLocaleHdr` of the connection the table belongs to.
+    locale_hdr: [u8; 16],
 }
 
 /// `FTS5_MAX_PREFIX_INDEXES`.
@@ -535,7 +537,43 @@ impl Fts5Config {
             unindexed_content,
             locale: b.locale,
             tokendata: b.tokendata,
+            locale_hdr: [0; 16],
         })
+    }
+
+    /// `sqlite3Fts5IsLocaleValue`: a blob longer than the header that starts with it.
+    fn is_locale_value(&self, v: &Value) -> bool {
+        matches!(v, Value::Blob(b) if b.len() > 16 && b[..16] == self.locale_hdr)
+    }
+
+    /// `sqlite3Fts5DecodeLocaleValue`: (text, locale) of an `fts5_locale()` blob;
+    /// SQLITE_MISMATCH when no 0x00 ends the locale before the last byte.
+    fn decode_locale_value<'a>(&self, blob: &'a [u8]) -> Result<(&'a [u8], &'a [u8])> {
+        let n = blob.len();
+        let mut n_loc = 16usize;
+        while blob.get(n_loc).is_some_and(|&b| b != 0) {
+            if n_loc == n - 1 {
+                return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
+            }
+            n_loc += 1;
+        }
+        if n_loc >= n {
+            return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
+        }
+        Ok((&blob[n_loc + 1..], &blob[16..n_loc]))
+    }
+
+    /// The text a column value is tokenized as (`sqlite3_value_text`, or the text part of
+    /// an `fts5_locale()` value on a locale=1 table).
+    fn doc_text<'a>(&self, v: &'a Value) -> Result<Option<std::borrow::Cow<'a, [u8]>>> {
+        if self.locale
+            && self.is_locale_value(v)
+            && let Value::Blob(b) = v
+        {
+            let (text, _) = self.decode_locale_value(b)?;
+            return Ok(Some(std::borrow::Cow::Borrowed(text)));
+        }
+        Ok(fts5_value_bytes(v))
     }
 
     fn declare_sql(&self, table_name: &str) -> String {
@@ -572,24 +610,39 @@ impl Fts5Config {
         defn
     }
 
-    /// The `%_content` row for `col_vals` (`FTS5_STMT_INSERT_CONTENT` bindings).
-    fn content_row(&self, rowid: i64, col_vals: &[Value]) -> Vec<Value> {
+    /// The `%_content` row for `col_vals` (`FTS5_STMT_INSERT_CONTENT` bindings in
+    /// `sqlite3Fts5StorageContentInsert`): an `fts5_locale()` value is stored as its text
+    /// in `c<N>` and its locale in `l<N>`; `locs` are the `l<N>` values of the columns
+    /// taken from the saved row of an UPDATE.
+    fn content_row(&self, rowid: i64, col_vals: &[Value], locs: &[Value]) -> Result<Vec<Value>> {
         let n = self.columns.len();
         let mut row = Vec::with_capacity(1 + 2 * n);
+        let mut row_locs: Vec<Value> = (0..n)
+            .map(|i| locs.get(i).cloned().unwrap_or(Value::Null))
+            .collect();
         row.push(Value::Integer(rowid));
         for i in 0..n {
             if self.content_mode == ContentMode::Normal || self.unindexed[i] {
-                row.push(col_vals.get(i).cloned().unwrap_or(Value::Null));
-            }
-        }
-        if self.locale {
-            for i in 0..n {
-                if !self.unindexed[i] {
-                    row.push(Value::Null);
+                match col_vals.get(i) {
+                    Some(v) if self.is_locale_value(v) => {
+                        let Value::Blob(b) = v else { unreachable!() };
+                        let (text, loc) = self.decode_locale_value(b)?;
+                        row.push(Value::Text(String::from_utf8_lossy(text).into_owned()));
+                        row_locs[i] = Value::Text(String::from_utf8_lossy(loc).into_owned());
+                    }
+                    Some(v) => row.push(v.clone()),
+                    None => row.push(Value::Null),
                 }
             }
         }
-        row
+        if self.locale {
+            for (i, l) in row_locs.into_iter().enumerate() {
+                if !self.unindexed[i] {
+                    row.push(l);
+                }
+            }
+        }
+        Ok(row)
     }
 
     /// Maps a raw `%_content` row (as returned by `SELECT *`) to one value per user column.
@@ -1328,6 +1381,15 @@ impl Fts5ShadowNames {
     }
 }
 
+/// A row of the content source as `FTS5_STMT_LOOKUP` returns it.
+#[derive(Debug, Clone)]
+struct SavedRow {
+    /// One value per user column.
+    cols: Vec<Value>,
+    /// The `l<N>` values (NULL where there is none).
+    locs: Vec<Value>,
+}
+
 /// The state of one FTS5 table: C's `Fts5Index` (pending-terms hash, cached structure,
 /// configuration), the totals of `Fts5Storage`, `Fts5FullTable.iSavepoint` and the read
 /// caches of this implementation.
@@ -1350,6 +1412,10 @@ struct Fts5SharedState {
     content_hint: ShadowHint,
     /// `Fts5FullTable.pSortCsr`: the cursor whose sorter statement is being run.
     p_sort_csr: Option<main::SortCsr>,
+    /// `Fts5Storage.pSavedRow`: the old row of the UPDATE being applied.
+    saved_row: Option<SavedRow>,
+    /// The next row lookup of a delete keeps its row in `saved_row` (`bSaveRow`).
+    want_saved_row: bool,
     /// The number of cursors open on the table (`fts5NewTransaction`).
     n_open_csr: usize,
     sql_replace_docsize3: String,
@@ -1386,6 +1452,8 @@ impl Fts5SharedState {
             docsize_origin_binding: None,
             content_hint: ShadowHint::NONE,
             p_sort_csr: None,
+            saved_row: None,
+            want_saved_row: false,
             n_open_csr: 0,
             sql_replace_docsize3: String::new(),
             sql_replace_config: String::new(),
@@ -1411,7 +1479,8 @@ impl Fts5SharedState {
         self.sql_replace_docsize3 = format!("REPLACE INTO {db_q}.{docsize_q} VALUES(?,?,?)");
         self.sql_replace_config = format!("REPLACE INTO {db_q}.{config_q} VALUES(?,?)");
         let n_content = cfg
-            .content_row(0, &vec![Value::Null; cfg.columns.len()])
+            .content_row(0, &vec![Value::Null; cfg.columns.len()], &[])
+            .unwrap_or_default()
             .len();
         let binds: Vec<String> = (1..=n_content).map(|i| format!("?{i}")).collect();
         let binds = binds.join(",");
@@ -1526,7 +1595,8 @@ impl VirtualTableModule for Fts5Module {
     ) -> Result<Box<dyn VirtualTable>> {
         let tbl_name = ctx.table_name().to_owned();
         let db_name = ctx.db_name().to_owned();
-        let cfg = Fts5Config::parse(&tbl_name, args)?;
+        let mut cfg = Fts5Config::parse(&tbl_name, args)?;
+        cfg.locale_hdr = self.aux_registry.locale_hdr();
 
         let db_q = quote_ident(&db_name);
         let data_sq = quote_single(&format!("{tbl_name}_data"));
@@ -1583,6 +1653,8 @@ impl VirtualTableModule for Fts5Module {
             let _ = ctx.set_vtab_config(VTabConfigOption::ConstraintSupport);
         }
         let _ = ctx.set_vtab_config(VTabConfigOption::Innocuous);
+        let _ = ctx.set_vtab_config(VTabConfigOption::FindFunction);
+        let _ = ctx.set_vtab_config(VTabConfigOption::NochangeUnread);
 
         // "Load the initial configuration": `sqlite3Fts5ConfigLoad(pConfig, iCookie-1)`.
         state.index.config_load(ctx, -1)?;
@@ -1604,12 +1676,15 @@ impl VirtualTableModule for Fts5Module {
         args: &[String],
     ) -> Result<Box<dyn VirtualTable>> {
         let tbl_name = ctx.table_name().to_owned();
-        let cfg = Fts5Config::parse(&tbl_name, args)?;
+        let mut cfg = Fts5Config::parse(&tbl_name, args)?;
+        cfg.locale_hdr = self.aux_registry.locale_hdr();
         ctx.declare_vtab(&cfg.declare_sql(&tbl_name))?;
         if cfg.content_mode == ContentMode::Normal {
             let _ = ctx.set_vtab_config(VTabConfigOption::ConstraintSupport);
         }
         let _ = ctx.set_vtab_config(VTabConfigOption::Innocuous);
+        let _ = ctx.set_vtab_config(VTabConfigOption::FindFunction);
+        let _ = ctx.set_vtab_config(VTabConfigOption::NochangeUnread);
         // fts5InitVtab -> sqlite3Fts5ConfigLoad(pConfig, iCookie-1): the `version` row of
         // %_config must be 4 or 5 (5 = secure-delete has been used). A config table that
         // cannot be read at this point is left to the first statement that needs it.
@@ -1697,6 +1772,38 @@ impl Fts5Table {
         }
     }
 
+    /// The row `FTS5_STMT_LOOKUP` / `LOOKUP2` finds for `rowid`: one value per user column
+    /// and, for a locale=1 table with its own content, the `l<N>` value of each.
+    fn read_saved_row(
+        &self,
+        state: &Fts5SharedState,
+        ctx: &mut dyn VTabHostContext,
+        rowid: i64,
+    ) -> Result<Option<SavedRow>> {
+        let n = self.cfg.columns.len();
+        if self.cfg.content_mode == ContentMode::Normal && self.cfg.locale {
+            let Some(raw) = ctx.shadow_get_rowid(&state.shadows.content, rowid)? else {
+                return Ok(None);
+            };
+            let mut locs = vec![Value::Null; n];
+            let mut k = 1 + n;
+            for (i, l) in locs.iter_mut().enumerate() {
+                if !self.cfg.unindexed[i] {
+                    *l = raw.get(k).cloned().unwrap_or(Value::Null);
+                    k += 1;
+                }
+            }
+            return Ok(Some(SavedRow {
+                cols: self.cfg.content_row_to_cols(raw),
+                locs,
+            }));
+        }
+        Ok(self.read_content_row(state, ctx, rowid)?.map(|cols| SavedRow {
+            cols,
+            locs: vec![Value::Null; n],
+        }))
+    }
+
     /// `fts5StorageNewRowid`: `REPLACE INTO %_docsize VALUES(NULL, NULL[, NULL])` and the
     /// rowid it was given. Without a %_docsize table the caller has to supply the rowid.
     fn storage_new_rowid(
@@ -1732,6 +1839,7 @@ impl Fts5Table {
         replace: bool,
         new_rowid: Option<&Value>,
         col_vals: &[Value],
+        locs: &[Value],
     ) -> Result<i64> {
         if !self.cfg.has_content_table() {
             if let Some(Value::Integer(rid)) = new_rowid {
@@ -1775,7 +1883,7 @@ impl Fts5Table {
                 )
                 .map_err(rc_only);
         }
-        let row = self.cfg.content_row(0, col_vals);
+        let row = self.cfg.content_row(0, col_vals, locs)?;
         ctx.shadow_insert_row(
             &content,
             &mut state.content_hint,
@@ -1837,7 +1945,17 @@ impl Fts5Table {
                 if delete && res.is_err() {
                     break;
                 }
-                if let Some(text) = col_vals.get(i_col).and_then(fts5_value_bytes) {
+                let text = match col_vals.get(i_col) {
+                    Some(v) => match self.cfg.doc_text(v) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            res = Err(e);
+                            break;
+                        }
+                    },
+                    None => None,
+                };
+                if let Some(text) = text {
                     let index = &mut state.index;
                     let col_arg = if delete { -1 } else { i_col as i32 };
                     self.cfg.tokenizer.for_each_doc_token(&text, |tok| {
@@ -1872,12 +1990,19 @@ impl Fts5Table {
         rowid: i64,
         col_vals: &[Value],
     ) -> Result<()> {
-        state.load_totals(ctx)?;
-        state.index.begin_write(ctx, false, rowid)?;
+        let mut res = state.load_totals(ctx);
+        if res.is_ok() {
+            res = state.index.begin_write(ctx, false, rowid);
+        }
         let mut buf: Vec<u8> = Vec::with_capacity(self.cfg.columns.len() + 4);
         let mut sizes: Vec<u64> = Vec::with_capacity(self.cfg.columns.len());
-        self.index_tokens(state, col_vals, false, &mut buf, &mut sizes)?;
+        if res.is_ok() {
+            res = self.index_tokens(state, col_vals, false, &mut buf, &mut sizes);
+        }
+        // `p->nTotalRow++` is not guarded by `rc`: the row is counted even when the write
+        // could not begin (the statement fails, the in-memory totals keep the count).
         state.n_total_row += 1;
+        res?;
         // Write the %_docsize record
         self.insert_docsize(state, ctx, rowid, &buf)?;
         Ok(())
@@ -1890,8 +2015,9 @@ impl Fts5Table {
         ctx: &mut dyn VTabHostContext,
         new_rowid: Option<&Value>,
         col_vals: &[Value],
+        locs: &[Value],
     ) -> Result<i64> {
-        let rid = self.content_insert(state, ctx, false, new_rowid, col_vals)?;
+        let rid = self.content_insert(state, ctx, false, new_rowid, col_vals, locs)?;
         self.index_insert(state, ctx, rid, col_vals)?;
         Ok(rid)
     }
@@ -1908,8 +2034,13 @@ impl Fts5Table {
         let old_vals: &[Value] = match vals {
             Some(v) => v,
             None => {
-                // FTS5_STMT_LOOKUP: without a row there is nothing to remove.
-                looked_up = self.read_content_row(state, ctx, rowid)?;
+                // FTS5_STMT_LOOKUP (+bSaveRow): without a row there is nothing to remove.
+                let save = std::mem::take(&mut state.want_saved_row);
+                let row = self.read_saved_row(state, ctx, rowid)?;
+                looked_up = row.as_ref().map(|r| r.cols.clone());
+                if save {
+                    state.saved_row = row;
+                }
                 match looked_up.as_deref() {
                     Some(v) => v,
                     None => return Ok(()),
@@ -1945,7 +2076,13 @@ impl Fts5Table {
         // Delete the index records
         state.index.begin_write(ctx, true, rowid)?;
         if self.cfg.contentless_delete {
+            let save = std::mem::take(&mut state.want_saved_row);
             self.contentless_delete_row(state, ctx, rowid)?;
+            // "if( rc==SQLITE_OK && bSaveRow && eContent==FTS5_CONTENT_UNINDEXED )
+            //    rc = sqlite3Fts5StorageFindDeleteRow(p, iDel);"
+            if save && self.cfg.unindexed_content {
+                state.saved_row = self.read_saved_row(state, ctx, rowid)?;
+            }
         } else {
             self.delete_from_index(state, ctx, rowid, vals)?;
         }
@@ -2011,8 +2148,10 @@ impl Fts5Table {
             i_origin = i64::from(row.get(2).map_or(0, Value::to_integer_lossy) as i32);
         }
         if i_origin != 0 {
-            state.index.contentless_delete(ctx, i_origin, rowid)?;
+            let res = state.index.contentless_delete(ctx, i_origin, rowid);
+            // `p->nTotalRow--` follows the call whatever it returned
             state.n_total_row -= 1;
+            res?;
         }
         Ok(())
     }
@@ -2178,11 +2317,15 @@ impl Fts5Table {
         for row in src_rows {
             let rid = row.first().map_or(0, Value::to_integer_lossy);
             let cvals = &row[1..];
-            state.index.begin_write(ctx, false, rid)?;
+            let mut res = state.index.begin_write(ctx, false, rid);
             let mut buf: Vec<u8> = Vec::with_capacity(self.cfg.columns.len() + 4);
             let mut sizes: Vec<u64> = Vec::with_capacity(self.cfg.columns.len());
-            self.index_tokens(state, cvals, false, &mut buf, &mut sizes)?;
+            if res.is_ok() {
+                res = self.index_tokens(state, cvals, false, &mut buf, &mut sizes);
+            }
+            // `p->nTotalRow++` is not guarded by `rc` (as in `index_insert`)
             state.n_total_row += 1;
+            res?;
             self.insert_docsize(state, ctx, rid, &buf)?;
         }
         // Write the averages record
@@ -2719,7 +2862,8 @@ impl VirtualTable for Fts5Table {
     fn savepoint(&mut self, ctx: &mut dyn VTabHostContext, idx: usize) -> Result<()> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         sqliters_types::dtrace!("TR|f5|hook|savepoint i={}", idx as i64);
-        Self::flush_to_disk(&mut st, ctx)?;
+        // `pConfig->pzErrmsg` is not set in xSavepoint / xRelease: only the code survives.
+        Self::flush_to_disk(&mut st, ctx).map_err(rc_only)?;
         st.i_savepoint = idx as i64 + 1;
         Ok(())
     }
@@ -2734,7 +2878,7 @@ impl VirtualTable for Fts5Table {
             u8::from(flush)
         );
         if flush {
-            Self::flush_to_disk(&mut st, ctx)?;
+            Self::flush_to_disk(&mut st, ctx).map_err(rc_only)?;
             st.i_savepoint = idx as i64;
         }
         Ok(())
@@ -2821,6 +2965,19 @@ impl VirtualTable for Fts5Table {
             } else {
                 VTabConflictMode::Abort
             };
+        // It is an error to write an fts5_locale() value to a table without the locale=1
+        // option.
+        // (a "special" INSERT — a value in the table-name column — is not checked)
+        let special = matches!(&op, VTabUpdateOperation::Insert { values, .. }
+            if values.get(n_cols).is_some_and(|v| !v.is_null()));
+        if !self.cfg.locale
+            && !special
+            && let VTabUpdateOperation::Insert { values, .. }
+            | VTabUpdateOperation::Update { values, .. } = &op
+            && values.iter().take(n_cols).any(|v| self.cfg.is_locale_value(v))
+        {
+            return Err(SqliteError::new(ErrorCode::Mismatch, "fts5_locale() requires locale=1"));
+        }
         match op {
             VTabUpdateOperation::Insert { new_rowid, values } => {
                 // A "special" INSERT: any non-NULL value in the table-name column.
@@ -2839,7 +2996,7 @@ impl VirtualTable for Fts5Table {
                     self.storage_delete(&mut st, ctx, rid, None)?;
                 }
                 let rid =
-                    self.storage_insert(&mut st, ctx, new_rowid.as_ref(), &values[..n_cols])?;
+                    self.storage_insert(&mut st, ctx, new_rowid.as_ref(), &values[..n_cols], &[])?;
                 Ok(Some(rid))
             }
             VTabUpdateOperation::Delete { old_rowid } => {
@@ -2902,29 +3059,67 @@ impl VirtualTable for Fts5Table {
                     return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
                 }
                 let new_val = Value::Integer(new_rid);
-                if old_rid != new_rid {
-                    if conflict == VTabConflictMode::Replace {
-                        self.storage_delete(&mut st, ctx, old_rid, None)?;
-                        self.storage_delete(&mut st, ctx, new_rid, None)?;
-                        self.storage_insert(&mut st, ctx, Some(&new_val), col_vals)?;
+                // `Fts5Storage.pSavedRow`: once the old row was looked up with "save", the
+                // columns the UPDATE does not assign (`sqlite3_value_nochange`) are taken
+                // from it, with their `l<N>` values; without a saved row they are NULL.
+                let nochange: Vec<bool> = (0..n_cols).map(|i| ctx.vtab_nochange(i)).collect();
+                let resolve = |st: &Fts5SharedState| -> (Vec<Value>, Vec<Value>) {
+                    let mut cols = Vec::with_capacity(n_cols);
+                    let mut locs = vec![Value::Null; n_cols];
+                    for i in 0..n_cols {
+                        if nochange[i] {
+                            match st.saved_row.as_ref() {
+                                Some(saved) => {
+                                    cols.push(saved.cols.get(i).cloned().unwrap_or(Value::Null));
+                                    locs[i] = saved.locs.get(i).cloned().unwrap_or(Value::Null);
+                                }
+                                None => cols.push(Value::Null),
+                            }
+                        } else {
+                            cols.push(col_vals[i].clone());
+                        }
+                    }
+                    (cols, locs)
+                };
+                let res = (|| -> Result<()> {
+                    if old_rid != new_rid {
+                        if conflict == VTabConflictMode::Replace {
+                            st.want_saved_row = true;
+                            self.storage_delete(&mut st, ctx, old_rid, None)?;
+                            self.storage_delete(&mut st, ctx, new_rid, None)?;
+                            let (cols, locs) = resolve(&st);
+                            self.storage_insert(&mut st, ctx, Some(&new_val), &cols, &locs)?;
+                        } else {
+                            // sqlite3Fts5StorageFindDeleteRow, then: a conflict on the new
+                            // rowid is detected before the index is touched.
+                            st.saved_row = self.read_saved_row(&st, ctx, old_rid)?;
+                            let (cols, locs) = resolve(&st);
+                            self.content_insert(&mut st, ctx, false, Some(&new_val), &cols, &locs)?;
+                            self.storage_delete(&mut st, ctx, old_rid, None)?;
+                            self.index_insert(&mut st, ctx, new_rid, &cols)?;
+                        }
+                    } else if content_only {
+                        // Only UNINDEXED columns of a contentless table change: a write to
+                        // %_content for contentless_unindexed=1 tables, a no-op otherwise.
+                        if self.cfg.unindexed_content {
+                            st.saved_row = self.read_saved_row(&st, ctx, old_rid)?;
+                            if st.saved_row.is_some() {
+                                let (cols, locs) = resolve(&st);
+                                self.content_insert(&mut st, ctx, true, Some(&new_val), &cols, &locs)?;
+                            }
+                        }
                     } else {
-                        // Detect a conflict on the new rowid before the index is touched.
-                        self.content_insert(&mut st, ctx, false, Some(&new_val), col_vals)?;
+                        st.want_saved_row = true;
                         self.storage_delete(&mut st, ctx, old_rid, None)?;
-                        self.index_insert(&mut st, ctx, new_rid, col_vals)?;
+                        let (cols, locs) = resolve(&st);
+                        self.storage_insert(&mut st, ctx, Some(&new_val), &cols, &locs)?;
                     }
-                } else if content_only {
-                    // Only UNINDEXED columns of a contentless table change: a write to
-                    // %_content for contentless_unindexed=1 tables, a no-op otherwise.
-                    if self.cfg.unindexed_content
-                        && self.read_content_row(&st, ctx, old_rid)?.is_some()
-                    {
-                        self.content_insert(&mut st, ctx, true, Some(&new_val), col_vals)?;
-                    }
-                } else {
-                    self.storage_delete(&mut st, ctx, old_rid, None)?;
-                    self.storage_insert(&mut st, ctx, Some(&new_val), col_vals)?;
-                }
+                    Ok(())
+                })();
+                // sqlite3Fts5StorageReleaseDeleteRow
+                st.saved_row = None;
+                st.want_saved_row = false;
+                res?;
                 Ok(Some(new_rid))
             }
         }
@@ -2996,6 +3191,11 @@ impl Fts5VocabModule {
 impl VirtualTableModule for Fts5VocabModule {
     fn name(&self) -> &str {
         "fts5vocab"
+    }
+
+    /// (`fts5Vocab` has no `xUpdate`)
+    fn is_read_only(&self) -> bool {
+        true
     }
 
     fn risk_flags(&self) -> VTabRiskFlags {

@@ -317,9 +317,16 @@ fn snippet_function(
 
     let mut rc: Result<()> = Ok(());
     let mut n_inst = 0i32;
-    match core.api_inst_count(ctx) {
-        Ok(n) => n_inst = n,
-        Err(e) => rc = Err(e),
+    if n_phrase == 0 {
+        // `aSeen = sqlite3_malloc64(nPhrase)` is NULL for a cursor without phrases (a scan
+        // or a rowid lookup): `rc = SQLITE_NOMEM`, xInstCount is not called. The value
+        // survives only when no column is visited below (a column number out of range).
+        rc = Err(SqliteError::new(ErrorCode::NoMem, "out of memory"));
+    } else {
+        match core.api_inst_count(ctx) {
+            Ok(n) => n_inst = n,
+            Err(e) => rc = Err(e),
+        }
     }
 
     // (the loop over the columns runs even when xInstCount failed: its first API call
@@ -545,11 +552,7 @@ fn bm25_get_data(core: &mut CsrCore, ctx: &mut dyn VTabHostContext) -> Result<Bo
     p.avgdl = (n_token as f64) / (n_row as f64);
     // Calculate an IDF for each phrase in the query
     for i in 0..n_phrase {
-        let mut n_hit: i64 = 0;
-        core.api_query_phrase(ctx, i as i32, &mut |_, _| {
-            n_hit += 1;
-            Ok(true)
-        })?;
+        let n_hit: i64 = core.api_query_phrase_count(ctx, i as i32)?;
         // Calculate the IDF (Inverse Document Frequency) for phrase i. This is done using
         // the standard BM25 formula as found on wikipedia:
         //
