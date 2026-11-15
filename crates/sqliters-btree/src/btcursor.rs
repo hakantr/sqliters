@@ -1684,6 +1684,12 @@ impl Btree {
         Ok(())
     }
 
+    /// `BTREE_PREFORMAT` for the next [`Self::bc_insert`]: the payload is a cell that
+    /// `sqlite3BtreeTransferRow` copied (its overflow pages are allocated with `nearby` 0).
+    pub fn bc_set_preformat(&mut self, on: bool) {
+        self.preformat = on;
+    }
+
     /// `sqlite3BtreeDelete(pCur, flags)`: the entry the cursor is on. An index cursor in
     /// `CURSOR_REQUIRESEEK` must have been restored by the caller.
     pub fn bc_delete(&mut self, cur: &mut BtCursor, flags: u8) -> Result<()> {

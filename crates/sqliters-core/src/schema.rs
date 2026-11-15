@@ -1732,7 +1732,9 @@ pub fn build_table_schema_from_ast(
                 }
                 ColumnConstraint::Null => {}
                 ColumnConstraint::Unique { conflict } => {
-                    unique_constraints.push(*conflict);
+                    // (C creates the automatic indexes in the order of the constraints:
+                    // a UNIQUE written before the PRIMARY KEY of the column comes first)
+                    unique_constraints.push((*conflict, !is_pk));
                 }
                 ColumnConstraint::Default(expr) => {
                     reject_window_in_ddl_expr(expr)?;
@@ -1815,6 +1817,28 @@ pub fn build_table_schema_from_ast(
             pk_order,
         });
 
+        let unique_index = |u_conflict: ConflictAction| {
+            (
+                u_conflict,
+                vec![IndexedColSchema {
+                    col_idx: Some(col_idx),
+                    expr: None,
+                    name: cdef.name.clone(),
+                    sort_order: KeySortOrder {
+                        desc: false,
+                        nulls_last: false,
+                        collation,
+                        custom_collation: custom_collation.as_deref().map(CustomCollation::unbound),
+                    },
+                }],
+            )
+        };
+        for &(u_conflict, before_pk) in &unique_constraints {
+            if is_pk && before_pk {
+                let (c, cols) = unique_index(u_conflict);
+                push_inline_autoindex(tbl_name, &mut inline_autos, c, "u", cols)?;
+            }
+        }
         if is_pk {
             // In SQLite, `col INTEGER PRIMARY KEY` (exact declared type `INTEGER` and not `WITHOUT ROWID` and not `DESC`)
             // aliases the B+Tree rowid (`pTab->iPKey = col_idx`) and does NOT create an autoindex!
@@ -1863,24 +1887,11 @@ pub fn build_table_schema_from_ast(
             }
         }
 
-        for u_conflict in unique_constraints {
-            push_inline_autoindex(
-                tbl_name,
-                &mut inline_autos,
-                u_conflict,
-                "u",
-                vec![IndexedColSchema {
-                    col_idx: Some(col_idx),
-                    expr: None,
-                    name: cdef.name.clone(),
-                    sort_order: KeySortOrder {
-                        desc: false,
-                        nulls_last: false,
-                        collation,
-                        custom_collation: custom_collation.as_deref().map(CustomCollation::unbound),
-                    },
-                }],
-            )?;
+        for &(u_conflict, before_pk) in &unique_constraints {
+            if !(is_pk && before_pk) {
+                let (c, cols) = unique_index(u_conflict);
+                push_inline_autoindex(tbl_name, &mut inline_autos, c, "u", cols)?;
+            }
         }
     }
 
@@ -2159,9 +2170,13 @@ fn push_inline_autoindex(
                         .eq_ignore_ascii_case(b.sort_order.collation_name())
             })
         {
+            // "Two UNIQUE or PRIMARY KEY constraints are considered equivalent (and thus
+            // suppressing the second one) even if they have different sort orders": the
+            // index that exists keeps its columns and sort orders; a PRIMARY KEY only makes it
+            // the PRIMARY KEY index ("if( idxType==SQLITE_IDXTYPE_PRIMARYKEY ) pIdx->idxType =
+            // idxType").
             if origin == "pk" {
                 existing.origin = "pk";
-                existing.columns = columns;
             }
             if existing.conflict != conflict {
                 if existing.conflict == ConflictAction::Abort {

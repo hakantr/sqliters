@@ -29,7 +29,7 @@ use sqliters_types::{ConflictResolutionEffect, ErrorCode, KeySortOrder, Pgno, Re
 
 use crate::opcodes::*;
 use crate::vdbeaux::{
-    CollSeq, FuncDef, KEYINFO_ORDER_BIGNULL, KEYINFO_ORDER_DESC, KeyInfo, P4, Program, SubProgram, VdbeOp, int32_to_64,
+    CollSeq, FuncDef, KEYINFO_ORDER_BIGNULL, KEYINFO_ORDER_DESC, KeyInfo, P4, P4Vtab, Program, SubProgram, VdbeOp, int32_to_64,
 };
 use crate::vdbeaux_rt::{
     KeyInfoRt, UnpackedRecord, corrupt, get_varint32, put_varint, sqlite3_varint_len, sqlite3_vdbe_idx_key_compare,
@@ -58,6 +58,10 @@ const OPFLAG_NCHANGE: u16 = 0x01;
 const OPFLAG_LASTROWID: u16 = 0x20;
 const OPFLAG_APPEND: u16 = 0x08;
 const OPFLAG_SAVEPOSITION: u16 = 0x02;
+/// `OPFLAG_ISUPDATE`: this OP_Insert is an sql UPDATE
+const OPFLAG_ISUPDATE: u16 = 0x04;
+/// `OPFLAG_NOCHNG`: OP_VColumn nochange for UPDATE
+const OPFLAG_NOCHNG: u16 = 0x01;
 const OPFLAG_PREFORMAT: u16 = 0x80;
 const OPFLAG_P2ISREG: u16 = 0x10;
 /// `OE_Rollback`, `OE_Fail`: `OP_Halt.p2` (`Vdbe.errorAction`)
@@ -165,6 +169,70 @@ pub trait VdbeHost {
     }
     /// `db->nDeferredCons += n` (`imm == false`) or `db->nDeferredImmCons += n` (`OP_FkCounter`).
     fn add_deferred_cons(&mut self, _imm: bool, _n: i64) {}
+    /// The mask `sqlite3VdbeFindIndexKey` computes for the index a `P4_INDEX` operand names in
+    /// database `i_db`: bit `ii` (of the first 64 of `pIdx->nColumn`) is set when column `ii`
+    /// of the index is an expression (`XN_EXPR`) or a VIRTUAL generated column of the table.
+    fn index_expr_mask(&mut self, _i_db: usize, _name: &str) -> u64 {
+        0
+    }
+    /// `pPager->mxPgno` of database `i_db` (`PRAGMA max_page_count`); `None`: no limit known.
+    fn max_page_count(&self, _i_db: usize) -> Option<u32> {
+        None
+    }
+    /// `HAS_UPDATE_HOOK(db)`: `db->xUpdateCallback!=0` (the pre-update hook is not part of the
+    /// build).
+    fn has_update_hook(&self) -> bool {
+        false
+    }
+    /// `db->xUpdateCallback(db->pUpdateArg, op, zDb, pTab->zName, iRowid)` with `op`
+    /// `SQLITE_INSERT` (18), `SQLITE_UPDATE` (23) or `SQLITE_DELETE` (9); `zDb` is the name of
+    /// database `i_db`. For `SQLITE_DELETE` the host checks `HasRowid(pTab)`.
+    fn update_hook(&mut self, _op: i32, _i_db: usize, _table: &str, _rowid: i64) -> Result<()> {
+        Ok(())
+    }
+    /// `sqlite3VtabBegin(db, pVTab)` for the table a `P4_VTAB` operand names (`OP_VBegin`).
+    fn vtab_begin(&mut self, _vt: &P4Vtab) -> Result<()> {
+        Err(internal("virtual tables are not reachable from this statement"))
+    }
+    /// `pModule->xUpdate(pVtab, nArg, apArg, &rowid)` with `db->vtabOnConflict = on_conflict`
+    /// (`OE_*`); `nochange[i]`: `sqlite3_value_nochange(apArg[i])`. Returns the rowid the
+    /// module set.
+    fn vtab_update(&mut self, _vt: &P4Vtab, _args: &[Value], _nochange: &[bool], _on_conflict: u8) -> Result<i64> {
+        Err(internal("virtual tables are not reachable from this statement"))
+    }
+    /// `pOp->p4.pVtab->bConstraint`: the module declared SQLITE_VTAB_CONSTRAINT_SUPPORT.
+    fn vtab_constraint_support(&self, _vt: &P4Vtab) -> bool {
+        false
+    }
+    /// `pModule->xOpen(pVtab, &pVCur)`
+    fn vtab_open(&mut self, _vt: &P4Vtab) -> Result<Box<dyn sqliters_types::VirtualCursor>> {
+        Err(internal("virtual tables are not reachable from this statement"))
+    }
+    /// `pModule->xFilter(pVCur, iQuery, idxStr, nArg, apArg)`
+    fn vtab_filter(
+        &mut self,
+        _vt: &P4Vtab,
+        _cur: &mut dyn sqliters_types::VirtualCursor,
+        _idx_num: i32,
+        _idx_str: Option<&str>,
+        _args: &[Value],
+    ) -> Result<()> {
+        Err(internal("virtual tables are not reachable from this statement"))
+    }
+    /// `pModule->xColumn(pVCur, &sContext, iCol)`
+    fn vtab_column(&mut self, _vt: &P4Vtab, _cur: &mut dyn sqliters_types::VirtualCursor, _i_col: usize) -> Result<Value> {
+        Err(internal("virtual tables are not reachable from this statement"))
+    }
+    /// `pModule->xNext(pVCur)`
+    fn vtab_next(&mut self, _vt: &P4Vtab, _cur: &mut dyn sqliters_types::VirtualCursor) -> Result<()> {
+        Err(internal("virtual tables are not reachable from this statement"))
+    }
+    /// The module's `xColumn` returns without a result for column `i_col` when
+    /// `sqlite3_vtab_nochange()` is true (fts5: a column that is not hidden; geopoly: column
+    /// 0): the register keeps `MEM_Null|MEM_Zero`. Other modules (rtree) ignore the flag.
+    fn vtab_column_skips_nochange(&self, _vt: &P4Vtab, _i_col: usize) -> bool {
+        false
+    }
 }
 
 /// `COLTYPE_*`: `Column.eCType`.
@@ -210,9 +278,24 @@ struct VdbeTxtBlbCache {
     col_cache_ctr: u32,
 }
 
+/// `uc.pVCur`: the cursor of a virtual table (`CURTYPE_VTAB`) and the table it was opened
+/// on (`pVCur->pVtab`).
+pub struct VCursor {
+    pub vt: Arc<P4Vtab>,
+    pub cur: Box<dyn sqliters_types::VirtualCursor>,
+}
+
+impl std::fmt::Debug for VCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VCursor").field("vt", &self.vt).finish()
+    }
+}
+
 /// `struct VdbeCursor`.
 #[derive(Debug)]
 pub struct VdbeCursor {
+    /// `uc.pVCur`
+    pub vcur: Option<VCursor>,
     /// `eCurType`
     pub e_cur_type: u8,
     /// `iDb`
@@ -612,6 +695,10 @@ struct VdbeFrame {
 pub struct Vdbe {
     /// The program (`aOp`)
     pub prog: Arc<Program>,
+    /// `pBt->pTmpSpace` / `pBt->nPreformatSize` after `OP_RowCell`
+    /// (`sqlite3BtreeTransferRow`): the payload of the source cell, which the next
+    /// `OP_Insert` / `OP_IdxInsert` with `OPFLAG_PREFORMAT` inserts.
+    preformat_cell: Vec<u8>,
     /// `aMem[]`
     pub a_mem: Vec<Mem>,
     /// `apCsr[]`
@@ -901,13 +988,20 @@ fn unsupported(prog: &Program, write: bool) -> Option<String> {
                     | OP_FkCheck
                     | OP_CursorLock
                     | OP_CursorUnlock
+                    | OP_RowCell
+                    | OP_VBegin
+                    | OP_VUpdate
+                    | OP_VOpen
+                    | OP_VFilter
+                    | OP_VColumn
+                    | OP_VNext
             ));
         if !ok {
             return Some(format!("opcode {}", sqlite3_opcode_name(op.opcode)));
         }
         match op.opcode {
             OP_Transaction if op.p2 != 0 && !write => return Some("write transaction".to_owned()),
-            OP_Insert | OP_IdxInsert if op.p5 & OPFLAG_PREFORMAT != 0 => return Some("OPFLAG_PREFORMAT".to_owned()),
+            OP_IdxInsert if op.p5 & OPFLAG_PREFORMAT != 0 => return Some("OPFLAG_PREFORMAT (index)".to_owned()),
             OP_Function | OP_PureFunc => {
                 if let P4::FuncCtx(c) = &op.p4
                     && c.p_func.func_flags & SQLITE_FUNC_NEEDCOLL != 0
@@ -943,6 +1037,141 @@ fn unsupported(prog: &Program, write: bool) -> Option<String> {
         }
     }
     None
+}
+
+/// `getPageNormal`: "if( pgno>pPager->mxPgno ){ rc = SQLITE_FULL; ... }" — a b-tree that grew
+/// past `PRAGMA max_page_count` while the last insert allocated pages.
+fn check_max_page_count<H: VdbeHost>(host: &mut H, i_db: usize) -> Result<()> {
+    let Some(mx) = host.max_page_count(i_db) else {
+        return Ok(());
+    };
+    if let Some(bt) = host.btree(i_db)
+        && bt.pager().page_count() > mx
+    {
+        return Err(SqliteError::new(ErrorCode::Full, "database or disk is full"));
+    }
+    Ok(())
+}
+
+/// `BTREE_FDK_RANGE`
+const BTREE_FDK_RANGE: i32 = 10;
+
+/// `vdbeSkipField(mask, iCol, pMem1, pMem2, bIntegrity)`
+fn vdbe_skip_field(mask: u64, i_col: usize, m1: &Mem, m2: &Mem, b_integrity: bool) -> bool {
+    // BTREE_ULPDISTORTION
+    if i_col >= 64 || mask & (1u64 << i_col) == 0 {
+        return false;
+    }
+    if !b_integrity {
+        return true;
+    }
+    if m1.flags & MEM_REAL != 0 && m2.flags & MEM_REAL != 0 {
+        let (a, b) = (m1.r.to_bits(), m2.r.to_bits());
+        if (if a < b { b - a } else { a - b }) <= 2 {
+            return true;
+        }
+    }
+    false
+}
+
+/// `vdbeIsMatchingIndexKey(pCur, bInt, mask, p, &res)`: `Ok(res)`, 0 for a match.
+fn vdbe_is_matching_index_key(
+    bt: &mut Btree,
+    cur: &mut BtCursor,
+    b_int: bool,
+    mask: u64,
+    ki: &KeyInfoRt,
+    a_mem: &[Mem],
+) -> Result<i32> {
+    let n_rec = bt.bc_payload_size(cur)?;
+    if n_rec > 0x7fff_ffff {
+        return Err(corrupt());
+    }
+    // (5 extra zero bytes: getVarint32 may read past the end of a corrupt record)
+    let mut a_rec = vec![0u8; n_rec as usize + 5];
+    bt.bc_payload(cur, 0, &mut a_rec[..n_rec as usize])?;
+    let (sz_hdr, mut idx_hdr) = get_varint32(&a_rec, 0);
+    if sz_hdr > 98307 {
+        // rc = SQLITE_CORRUPT
+        return Err(corrupt());
+    }
+    let mut res = 0;
+    let mut idx_rec = sz_hdr;
+    let mut m = Mem::default();
+    for ii in 0..usize::from(ki.n_all_field) {
+        if idx_hdr as u32 >= sz_hdr {
+            return Err(corrupt());
+        }
+        let (i_serial, n) = get_varint32(&a_rec, idx_hdr);
+        idx_hdr += n;
+        let n_serial = sqlite3_vdbe_serial_type_len(i_serial);
+        if idx_rec + n_serial > n_rec {
+            return Err(corrupt());
+        }
+        sqlite3_vdbe_serial_get(&a_rec[idx_rec as usize..], i_serial, &mut m);
+        let Some(p_mem) = a_mem.get(ii) else {
+            break;
+        };
+        if !vdbe_skip_field(mask, ii, p_mem, &m, b_int) {
+            let coll = ki.a_coll.get(ii).and_then(|c| c.as_deref());
+            res = sqlite3_mem_compare(&m, p_mem, coll);
+            if res != 0 {
+                break;
+            }
+        }
+        idx_rec += n_serial;
+    }
+    Ok(res)
+}
+
+/// `sqlite3VdbeFindIndexKey(pCur, pIdx, p, &res, bIntegrity)` with the mask of `pIdx`
+/// computed by the host ([`VdbeHost::index_expr_mask`]): `Ok(res)`, 0 when the cursor was left
+/// on a matching entry.
+fn find_index_key(
+    bt: &mut Btree,
+    cur: &mut BtCursor,
+    mask: u64,
+    ki: &KeyInfoRt,
+    a_mem: &[Mem],
+    b_integrity: bool,
+) -> Result<i32> {
+    let mut res = 1;
+    if mask != 0 {
+        // Move the cursor back BTREE_FDK_RANGE entries; at EOF scan the whole index.
+        let mut done = false;
+        let mut ii = 0;
+        while !cur.eof() && ii < BTREE_FDK_RANGE {
+            done = !bt.bc_previous(cur)?;
+            ii += 1;
+        }
+        let mut n_step: i32 = if done {
+            res = i32::from(bt.bc_first(cur)?);
+            -1
+        } else {
+            BTREE_FDK_RANGE * 2
+        };
+        while cur.is_valid() {
+            let mut ii = 0;
+            while ii < n_step || n_step < 0 {
+                res = vdbe_is_matching_index_key(bt, cur, b_integrity, mask, ki, a_mem)?;
+                if res == 0 {
+                    break;
+                }
+                if !bt.bc_next(cur)? {
+                    // SQLITE_DONE -> SQLITE_OK
+                    break;
+                }
+                ii += 1;
+            }
+            if n_step < 0 || res == 0 || b_integrity {
+                break;
+            }
+            // the first, non-exhaustive search failed: search the entire index
+            n_step = -1;
+            res = i32::from(bt.bc_first(cur)?);
+        }
+    }
+    Ok(res)
 }
 
 /// `sqlite3VdbeFinishMoveto`
@@ -1083,6 +1312,7 @@ impl Vdbe {
         let mwf = prog.min_write_file_format;
         Vdbe {
             prog,
+            preformat_cell: Vec::new(),
             a_mem: vec![Mem { flags: MEM_UNDEFINED, enc: 1, ..Mem::default() }; n_mem + 1],
             ap_csr: (0..n_cursor).map(|_| None).collect(),
             a_var: vec![Mem::null(); n_var],
@@ -1195,6 +1425,7 @@ impl Vdbe {
         let n = n_field.max(0) as usize;
         let dummy = Box::new(BtCursor::detached());
         self.ap_csr[i_cur] = Some(Box::new(VdbeCursor {
+            vcur: None,
             e_cur_type,
             i_db: 0,
             null_row: false,
@@ -3554,9 +3785,11 @@ impl Vdbe {
                 OP_Insert => {
                     let ci = op.p1 as usize;
                     let n_key = self.a_mem[op.p3 as usize].i;
-                    if op.p5 & OPFLAG_PREFORMAT != 0 {
-                        return Err(internal("OPFLAG_PREFORMAT is not ported"));
-                    }
+                    // "if( pOp->p4type==P4_TABLE && HAS_UPDATE_HOOK(db) ) pTab = pOp->p4.pTab"
+                    let hook_tab = match &op.p4 {
+                        P4::Table(t) if host.has_update_hook() => Some(Arc::clone(t)),
+                        _ => None,
+                    };
                     if op.p5 & OPFLAG_NCHANGE != 0 {
                         self.n_change += 1;
                         if op.p5 & OPFLAG_LASTROWID != 0 {
@@ -3568,25 +3801,187 @@ impl Vdbe {
                     let c = csr!(ci);
                     let seek_result = if op.p5 & OPFLAG_USESEEKRESULT != 0 { c.seek_result } else { 0 };
                     let bt = btree_of!(c);
+                    // BTREE_PREFORMAT: the cell sqlite3BtreeTransferRow prepared (OP_RowCell)
+                    let preformat = op.p5 & OPFLAG_PREFORMAT != 0;
+                    let data: &[u8] = if preformat { &self.preformat_cell } else { &self.a_mem[op.p2 as usize].z };
+                    bt.bc_set_preformat(preformat);
                     let rc = bt.bc_insert(
                         &mut c.cur,
                         n_key,
-                        &self.a_mem[op.p2 as usize].z,
+                        data,
                         (op.p5 & (OPFLAG_APPEND | OPFLAG_SAVEPOSITION)) as u8,
                         seek_result,
                         None,
                     );
+                    bt.bc_set_preformat(false);
                     c.deferred_moveto = false;
                     c.cache_status = CACHE_STALE;
                     col_cache_ctr = col_cache_ctr.wrapping_add(1);
                     rc?;
+                    if c.btx.is_none() {
+                        check_max_page_count(host, c.i_db as usize)?;
+                    }
+                    // Invoke the update-hook if required.
+                    if let Some(t) = hook_tab {
+                        let i_db = c.i_db as usize;
+                        let op_code = if op.p5 & OPFLAG_ISUPDATE != 0 { 23 } else { 18 };
+                        host.update_hook(op_code, i_db, &t.name, n_key)?;
+                    }
+                }
+
+                OP_RowCell => {
+                    // rc = sqlite3BtreeTransferRow(pDest->uc.pCursor, pSrc->uc.pCursor, iKey): the
+                    // payload of the source cell (local part and overflow chain). The cell of the
+                    // destination is built by the OP_Insert / OP_IdxInsert with OPFLAG_PREFORMAT
+                    // that follows; its overflow pages are allocated as sqlite3BtreeTransferRow
+                    // allocates them (`nearby` 0), before that insert changes any page.
+                    let src = csr!(op.p2);
+                    let bt = btree_of!(src);
+                    if !src.cur.is_valid() {
+                        return Err(corrupt());
+                    }
+                    let n = bt.bc_payload_size(&mut src.cur)? as usize;
+                    self.preformat_cell.clear();
+                    self.preformat_cell.resize(n, 0);
+                    bt.bc_payload(&mut src.cur, 0, &mut self.preformat_cell)?;
+                }
+
+                OP_VOpen => {
+                    let P4::Vtab(vt) = &op.p4 else {
+                        return Err(internal("OP_VOpen without P4_VTAB"));
+                    };
+                    let ci = op.p1 as usize;
+                    // a cursor already open on this table is reused
+                    let reuse = self.ap_csr[ci]
+                        .as_deref()
+                        .is_some_and(|c| c.e_cur_type == CURTYPE_VTAB && c.vcur.as_ref().is_some_and(|v| v.vt.id == vt.id));
+                    if !reuse {
+                        let cur = host.vtab_open(vt)?;
+                        self.allocate_cursor(host, ci, 0, CURTYPE_VTAB)?;
+                        csr!(ci).vcur = Some(VCursor { vt: Arc::clone(vt), cur });
+                    }
+                }
+
+                OP_VFilter => {
+                    let p3 = op.p3 as usize;
+                    let i_query = self.a_mem[p3].i as i32;
+                    let n_arg = self.a_mem[p3 + 1].i.max(0) as usize;
+                    let args: Vec<Value> = self.a_mem[p3 + 2..p3 + 2 + n_arg].iter().map(Mem::to_value).collect();
+                    let idx_str = p4_text(&op.p4).map(|z| String::from_utf8_lossy(z).into_owned());
+                    let c = csr!(op.p1);
+                    let Some(vc) = c.vcur.as_mut() else {
+                        return Err(internal("OP_VFilter on a cursor that is not a virtual-table cursor"));
+                    };
+                    host.vtab_filter(&vc.vt, vc.cur.as_mut(), i_query, idx_str.as_deref(), &args)?;
+                    let res = vc.cur.eof();
+                    c.null_row = false;
+                    if res {
+                        jump!(op.p2);
+                    }
+                }
+
+                OP_VColumn => {
+                    let c = csr!(op.p1);
+                    let p3 = op.p3 as usize;
+                    if c.null_row {
+                        self.a_mem[p3].set_null();
+                    } else {
+                        let Some(vc) = c.vcur.as_mut() else {
+                            return Err(internal("OP_VColumn on a cursor that is not a virtual-table cursor"));
+                        };
+                        if op.p5 & OPFLAG_NOCHNG != 0 && host.vtab_column_skips_nochange(&vc.vt, op.p2 as usize) {
+                            // "sqlite3VdbeMemSetNull(pDest); pDest->flags = MEM_Null|MEM_Zero;
+                            //  pDest->u.nZero = 0;" (the module leaves the result unset)
+                            let m = &mut self.a_mem[p3];
+                            m.set_null();
+                            m.flags = MEM_NULL | MEM_ZERO;
+                            m.n_zero = 0;
+                        } else {
+                            let v = host.vtab_column(&vc.vt, vc.cur.as_mut(), op.p2 as usize)?;
+                            self.a_mem[p3].set_from_value(&v);
+                        }
+                    }
+                }
+
+                OP_VNext => {
+                    let c = csr!(op.p1);
+                    if c.null_row {
+                        pc += 1;
+                        continue;
+                    }
+                    let Some(vc) = c.vcur.as_mut() else {
+                        return Err(internal("OP_VNext on a cursor that is not a virtual-table cursor"));
+                    };
+                    host.vtab_next(&vc.vt, vc.cur.as_mut())?;
+                    if !vc.cur.eof() {
+                        jump!(op.p2);
+                    }
+                }
+
+                OP_VBegin => {
+                    // rc = sqlite3VtabBegin(db, pVTab); sqlite3VtabImportErrmsg(p, pVTab->pVtab)
+                    let P4::Vtab(vt) = &op.p4 else {
+                        return Err(internal("OP_VBegin without P4_VTAB"));
+                    };
+                    host.vtab_begin(vt)?;
+                }
+
+                OP_VUpdate => {
+                    let P4::Vtab(vt) = &op.p4 else {
+                        return Err(internal("OP_VUpdate without P4_VTAB"));
+                    };
+                    let n_arg = op.p2 as usize;
+                    let p3 = op.p3 as usize;
+                    let args: Vec<Value> = self.a_mem[p3..p3 + n_arg].iter().map(Mem::to_value).collect();
+                    // sqlite3_value_nochange(): "(p->flags&(MEM_Null|MEM_Zero))==(MEM_Null|MEM_Zero)"
+                    let nochange: Vec<bool> = self.a_mem[p3..p3 + n_arg]
+                        .iter()
+                        .map(|m| m.flags & (MEM_NULL | MEM_ZERO) == (MEM_NULL | MEM_ZERO))
+                        .collect();
+                    let on_conflict = op.p5 as u8;
+                    let r = host.vtab_update(vt, &args, &nochange, on_conflict);
+                    let r = match r {
+                        Ok(rowid) => {
+                            if op.p1 != 0 {
+                                host.set_last_rowid(rowid);
+                            }
+                            self.n_change += 1;
+                            Ok(())
+                        }
+                        Err(mut e) if e.code == ErrorCode::Constraint && host.vtab_constraint_support(vt) => {
+                            if i32::from(on_conflict) == OE_IGNORE {
+                                Ok(())
+                            } else {
+                                // p->errorAction = ((pOp->p5==OE_Replace) ? OE_Abort : pOp->p5)
+                                e.conflict_effect = match i32::from(on_conflict) {
+                                    OE_ROLLBACK => ConflictResolutionEffect::Rollback,
+                                    OE_FAIL => ConflictResolutionEffect::Fail,
+                                    _ => ConflictResolutionEffect::Abort,
+                                };
+                                Err(e)
+                            }
+                        }
+                        Err(e) => {
+                            self.n_change += 1;
+                            Err(e)
+                        }
+                    };
+                    r?;
                 }
 
                 OP_Delete => {
                     let ci = op.p1 as usize;
                     save_cursors!(ci);
+                    let hook_tab = match &op.p4 {
+                        P4::Table(t) if host.has_update_hook() => Some(Arc::clone(t)),
+                        _ => None,
+                    };
                     let c = csr!(ci);
                     let bt = btree_of!(c);
+                    if hook_tab.is_some() && op.p5 & OPFLAG_SAVEPOSITION != 0 && c.is_table {
+                        // pC->movetoTarget = sqlite3BtreeIntegerKey(pC->uc.pCursor)
+                        c.moveto_target = bt.bc_integer_key(&mut c.cur)?;
+                    }
                     if c.cur.e_state >= CURSOR_REQUIRESEEK && bt.bc_needs_index_restore(&c.cur) {
                         // (sqlite3BtreeDelete: btreeRestoreCursorPosition of an index cursor)
                         restore_cursor_position(bt, c)?;
@@ -3598,6 +3993,11 @@ impl Vdbe {
                     rc?;
                     if op.p2 as u16 & OPFLAG_NCHANGE != 0 {
                         self.n_change += 1;
+                        // "if( db->xUpdateCallback && ALWAYS(pTab!=0) && HasRowid(pTab) )"
+                        if let Some(t) = hook_tab {
+                            let (i_db, target) = (c.i_db as usize, c.moveto_target);
+                            host.update_hook(9, i_db, &t.name, target)?;
+                        }
                     }
                 }
 
@@ -3647,6 +4047,12 @@ impl Vdbe {
                     let p2 = op.p2 as usize;
                     if pc_.null_row {
                         self.a_mem[p2].set_null();
+                    } else if let Some(vc) = pc_.vcur.as_mut() {
+                        // "else if( pC->eCurType==CURTYPE_VTAB ){ rc = pModule->xRowid(pC->uc.pVCur, &v); }"
+                        let v = vc.cur.rowid()?;
+                        let out = &mut self.a_mem[p2];
+                        out.flags = MEM_INT;
+                        out.i = v;
                     } else {
                         let v: i64;
                         if pc_.deferred_moveto {
@@ -3827,6 +4233,9 @@ impl Vdbe {
                     };
                     c.cache_status = CACHE_STALE;
                     rc?;
+                    if c.btx.is_none() {
+                        check_max_page_count(host, c.i_db as usize)?;
+                    }
                 }
 
                 OP_IdxDelete => {
@@ -3844,10 +4253,20 @@ impl Vdbe {
                         r.find_compare();
                         bt.bc_index_moveto(&mut c.cur, &mut r)?
                     };
+                    let res = if res != 0 {
+                        // rc = sqlite3VdbeFindIndexKey(pCrsr, pOp->p4.pIdx, &r, &res, 0)
+                        let mask = match &op.p4 {
+                            P4::Index(x) => host.index_expr_mask(c.i_db as usize, &x.name),
+                            _ => 0,
+                        };
+                        let bt = btree_of!(c);
+                        find_index_key(bt, &mut c.cur, mask, &ki, &self.a_mem[p2..p2 + n_field], false)?
+                    } else {
+                        0
+                    };
+                    let c = csr!(ci);
+                    let bt = btree_of!(c);
                     if res != 0 {
-                        // sqlite3VdbeFindIndexKey: the search among the neighbours for an index
-                        // on expressions or virtual columns is not ported (mask==0 here: "do
-                        // not search for a match").
                         if !host.writable_schema() {
                             // sqlite3ReportError(SQLITE_CORRUPT_INDEX, __LINE__, "index corruption")
                             return Err(SqliteError::with_extended(779, "database disk image is malformed"));

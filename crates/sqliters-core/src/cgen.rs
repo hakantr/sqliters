@@ -376,6 +376,36 @@ fn make_db<'a>(inner: &ConnectionInner, host: &'a EngineHost<'a>) -> Db<'a> {
             db.flags |= SQLITE_WriteSchema;
         }
     }
+    // sqlite3_db_config(SQLITE_DBCONFIG_ENABLE_VIEW / _ENABLE_TRIGGER / _DEFENSIVE)
+    {
+        use sqliters_codegen::consts::{SQLITE_Defensive, SQLITE_EnableTrigger, SQLITE_EnableView};
+        if inner.db_set.enable_view() {
+            db.flags |= SQLITE_EnableView;
+        } else {
+            db.flags &= !SQLITE_EnableView;
+        }
+        if inner.db_set.enable_trigger() {
+            db.flags |= SQLITE_EnableTrigger;
+        } else {
+            db.flags &= !SQLITE_EnableTrigger;
+        }
+        if inner.db_set.defensive() {
+            db.flags |= SQLITE_Defensive;
+        } else {
+            db.flags &= !SQLITE_Defensive;
+        }
+    }
+    // sqlite3_limit(): the limits the engine keeps per connection
+    {
+        use sqliters_codegen::consts::{
+            SQLITE_LIMIT_COLUMN, SQLITE_LIMIT_EXPR_DEPTH, SQLITE_LIMIT_TRIGGER_DEPTH, SQLITE_LIMIT_TRIGGER_STEPS,
+        };
+        let clamp = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+        db.a_limit[SQLITE_LIMIT_COLUMN as usize] = clamp(inner.db_set.column_limit());
+        db.a_limit[SQLITE_LIMIT_EXPR_DEPTH as usize] = clamp(inner.db_set.expr_depth_limit());
+        db.a_limit[SQLITE_LIMIT_TRIGGER_DEPTH as usize] = clamp(inner.db_set.trigger_depth_limit());
+        db.a_limit[SQLITE_LIMIT_TRIGGER_STEPS as usize] = clamp(inner.db_set.trigger_steps_limit());
+    }
     db.x_auth = inner.authorizer.is_some();
     db.case_sensitive_like = inner.db_set.c_case_sensitive_like();
     db.schema_not_loaded = inner.db_set.c_prepare_unloaded();

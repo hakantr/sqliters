@@ -369,6 +369,16 @@ impl VTabRegistry {
         }
     }
 
+    /// The entry the port of C's code generator named by its address (`P4_VTAB` operand id,
+    /// see `cgen.rs` `vtab_connect`), else the first connected table of that name.
+    pub fn get_connected_by_id(&self, table_name: &str, id: u64) -> Option<&ConnectedVTabEntry> {
+        let bucket = self.get_bucket(table_name)?;
+        bucket
+            .iter()
+            .find(|e| (*e as *const ConnectedVTabEntry) as usize as u64 == id)
+            .or_else(|| bucket.iter().find(|e| name_eq_ignore_case(&e.table_name, table_name)))
+    }
+
     /// Returns a reference to a connected virtual table entry if present.
     #[inline]
     pub fn get_connected(&self, db_name: &str, table_name: &str) -> Option<&ConnectedVTabEntry> {
@@ -444,11 +454,22 @@ impl VTabRegistry {
             // C reconnects the table after a rename and the module declares its schema
             // again: a hidden column named after the table (FTS5: `ft MATCH ...`) carries the
             // new name from then on.
+            let mut renamed_hidden = false;
             for (i, col) in decl.table_schema.columns.iter_mut().enumerate() {
                 if decl.hidden_cols.get(i).copied().unwrap_or(false)
                     && col.name.eq_ignore_ascii_case(old_name)
                 {
                     col.name = new_name.to_owned();
+                    renamed_hidden = true;
+                }
+            }
+            // The text the port of C's code generator builds its Table object from: the
+            // hidden column `"<old>" HIDDEN` the module declared is `"<new>" HIDDEN` now.
+            if renamed_hidden {
+                let quote = |n: &str| format!("\"{}\" HIDDEN", n.replace('"', "\"\""));
+                let (from, to) = (quote(old_name).to_ascii_lowercase(), quote(new_name));
+                if let Some(pos) = decl.declare_sql.to_ascii_lowercase().find(&from) {
+                    decl.declare_sql.replace_range(pos..pos + from.len(), &to);
                 }
             }
             self.insert_connected(entry);

@@ -5137,6 +5137,28 @@ fn explain_artifacts(stmt: Option<Stmt>) -> CompiledArtifacts {
     }
 }
 
+/// The statement object of an INSERT / UPDATE / DELETE that C compiles and the engine's
+/// prepare rejects: the machine runs C's program ([`Statement::apply_c_write`] fills in the
+/// rest).
+fn write_artifacts(stmt: Option<Stmt>) -> CompiledArtifacts {
+    let mut max_param = 0usize;
+    let mut named_params = HashMap::new();
+    if let Some(st) = &stmt {
+        collect_stmt_params(st, &mut max_param, &mut named_params);
+    }
+    CompiledArtifacts {
+        stmt,
+        requires_schema: true,
+        category: Some(StmtCategory::Write),
+        compiled_vdbe: None,
+        compiled_fast_read: None,
+        column_names: Vec::new(),
+        max_param,
+        named_params,
+        ignored_fk_parent_tables: Vec::new(),
+    }
+}
+
 struct CompiledArtifacts {
     stmt: Option<Stmt>,
     requires_schema: bool,
@@ -6016,6 +6038,7 @@ impl ConnectionInner {
         sql: &'a str,
     ) -> Option<(Result<()>, &'a str)> {
         if !matches!(self.state, ConnectionState::Open)
+            || vdbe_host::exec_switch_on()
             || self.trace_hook.is_some()
             || self.authorizer.is_some()
             || self.count_changes
@@ -7033,6 +7056,59 @@ impl Statement {
         Some(prog)
     }
 
+    /// Diagnostic switch `SQLITERS_VDBE_EXEC`: an INSERT / UPDATE / DELETE is compiled by the
+    /// port of C's code generator before the engine prepares it. C's program is returned (the
+    /// machine runs it); C's compile error is the error of the prepare; `None` leaves the
+    /// statement to the engine (switch off, or something the generator / machine does not
+    /// support yet).
+    fn c_write_of(
+        shared: &Arc<ConnectionShared>,
+        inner: &mut ConnectionInner,
+        stmt: Option<&Stmt>,
+        raw_sql: &str,
+    ) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
+        if !vdbe_host::exec_switch_on() || !matches!(stmt, Some(Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_))) {
+            return Ok(None);
+        }
+        // (C connects the virtual tables a statement names while it prepares it; the port of
+        // the generator reaches them through the engine's connected instances)
+        if let Some(st) = stmt {
+            let _ = inner.with_default_exec_ctx(shared, ActivitySummary::default(), |ctx| {
+                crate::vtab::ensure_stmt_vtabs_connected(ctx, st)
+            });
+        }
+        let (route, loaded) = vdbe_host::machine_write_program(inner, stmt, raw_sql);
+        match route {
+            vdbe_host::WriteRoute::Engine => Ok(None),
+            vdbe_host::WriteRoute::Program(p) => Ok(Some(p)),
+            vdbe_host::WriteRoute::Error { message, offset } => {
+                if loaded {
+                    // C's sqlite3ReadSchema() loaded the schemas before the error
+                    inner.db_set.c_mark_schemas_loaded();
+                }
+                let e = SqliteError::new(ErrorCode::Error, message);
+                Err(e.with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }))
+            }
+        }
+    }
+
+    /// The statement as the engine knows it once C's program decides it (see
+    /// [`Self::c_write_of`]): result column names (RETURNING) and parameters are C's, and the
+    /// engine's compiled forms are dropped.
+    fn apply_c_write(artifacts: &mut CompiledArtifacts, prog: &sqliters_vdbe::vdbeaux::Program) {
+        // (the engine's compiled program goes: its fast write paths run before the machine)
+        artifacts.compiled_vdbe = None;
+        artifacts.compiled_fast_read = None;
+        artifacts.category = Some(StmtCategory::Write);
+        artifacts.column_names = vdbe_host::column_names(prog).unwrap_or_default();
+        artifacts.max_param = artifacts.max_param.max(prog.n_var as usize);
+        for (name, num) in &prog.p_vlist.a {
+            if !name.starts_with('?') {
+                artifacts.named_params.entry(name.clone()).or_insert(*num as usize);
+            }
+        }
+    }
+
     /// `EXPLAIN <stmt>` (not `EXPLAIN QUERY PLAN`): the program C's code generator builds for
     /// the statement, `None` when the port of the generator does not support the statement
     /// yet (the engine's own listing is then used), or C's compile error.
@@ -7181,6 +7257,10 @@ impl Statement {
             None => Self::c_explain_of(inner, stmt_opt.as_ref(), &raw_sql)?,
         };
 
+        // Diagnostic switch SQLITERS_VDBE_EXEC: C's compile result of an INSERT / UPDATE /
+        // DELETE decides before the engine's prepare (C's error is the error of the prepare).
+        let c_write = Self::c_write_of(shared, inner, stmt_opt.as_ref(), &raw_sql)?;
+
         let try_compile =
             |inner: &mut ConnectionInner, stmt_opt: Option<Stmt>| -> Result<CompiledArtifacts> {
                 if let Some(ref st) = stmt_opt {
@@ -7261,6 +7341,9 @@ impl Statement {
             Err(err) if c_explain.is_some() && err.code == ErrorCode::Error => {
                 explain_artifacts(stmt_opt.clone())
             }
+            // (C compiled the statement and the machine runs C's program: the engine's own
+            // rejection does not count)
+            Err(_) if c_write.is_some() => write_artifacts(stmt_opt.clone()),
             Err(err)
                 if needs_schema
                     && err.code == ErrorCode::Error
@@ -7303,6 +7386,9 @@ impl Statement {
         }
 
         let c_machine = Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some());
+        if let Some(prog) = &c_write {
+            Self::apply_c_write(&mut artifacts, prog);
+        }
 
         let hid = inner.register_handle(HandleKind::Statement);
         Ok(Self {
@@ -7318,7 +7404,7 @@ impl Statement {
             c_explain,
             c_machine,
             c_machine_vm: None,
-            c_machine_write: None,
+            c_machine_write: c_write,
             c_machine_fixed: false,
             cached_read_vm: None,
             write_vm_scratch: sqliters_vdbe::VdbeWriteScratch::default(),
@@ -7924,11 +8010,17 @@ impl Statement {
                     &mut inner.authorizer,
                 )
             };
+            let c_write = if self.c_machine_fixed {
+                None
+            } else {
+                Self::c_write_of(&shared, inner, parsed_stmt.as_ref(), &self.raw_sql)?
+            };
             let mut artifacts = match try_compile(inner, &parsed_stmt) {
                 Ok(a) => a,
                 Err(err) if c_explain.is_some() && err.code == ErrorCode::Error => {
                     explain_artifacts(parsed_stmt.clone())
                 }
+                Err(_) if c_write.is_some() => write_artifacts(parsed_stmt.clone()),
                 Err(err)
                     if err.code == ErrorCode::Error
                         && inner.db_set.slots().iter().any(|s| {
@@ -7950,6 +8042,9 @@ impl Statement {
                 artifacts.column_names = explain_column_names(prog.explain);
             }
             let c_machine = Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some());
+            if let Some(prog) = &c_write {
+                Self::apply_c_write(&mut artifacts, prog);
+            }
             let mut transferred = vec![Value::Null; artifacts.max_param];
             let copy_len = self.params.len().min(artifacts.max_param);
             transferred[..copy_len].clone_from_slice(&self.params[..copy_len]);
@@ -7967,6 +8062,7 @@ impl Statement {
                 self.compiled_fast_read = None;
             } else {
                 self.c_machine = c_machine;
+                self.c_machine_write = c_write;
             }
             self.c_machine_vm = None;
             self.column_names = artifacts.column_names;
@@ -13824,6 +13920,8 @@ mod c_align_v3_tests;
 mod c_align_m1_tests;
 #[cfg(test)]
 mod c_align_m2_tests;
+#[cfg(test)]
+mod c_align_m3_tests;
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
 /// value below is what the reference `sqlite3` produces for the same statements.
 #[cfg(test)]

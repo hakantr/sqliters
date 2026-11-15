@@ -27,7 +27,7 @@ use sqliters_vdbe::vdbe::{
 };
 use sqliters_vdbe::vdbeaux::{COLNAME_NAME, FuncDef, Program};
 use sqliters_vdbe::vdbemem::{CollRt, Mem};
-use sqliters_vdbe::vdbeaux::P4;
+use sqliters_vdbe::vdbeaux::{P4, P4Vtab};
 
 use crate::ConnectionInner;
 use crate::engine::ExecContext;
@@ -152,6 +152,113 @@ pub(crate) fn machine_program(
             None
         }
     }
+}
+
+/// What C's compile result decides for a statement that writes, with the switch on.
+pub(crate) enum WriteRoute {
+    /// The engine prepares and runs the statement (switch off, a statement kind or a
+    /// connection state the generator / the machine does not support yet).
+    Engine,
+    /// C's program: the machine runs it inside the engine's write statement.
+    Program(Arc<Program>),
+    /// C's compile error (`sqlite3_prepare` fails): message and byte offset (-1: none).
+    Error { message: String, offset: i32 },
+}
+
+/// The route of an INSERT / UPDATE / DELETE (also with a WITH prefix): C's compile result —
+/// the program or C's error — decides before the engine's own prepare (diagnostic switch
+/// `SQLITERS_VDBE_EXEC`). The second value: C's `sqlite3Init()` loaded the schemas during the
+/// compilation.
+pub(crate) fn machine_write_program(inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str) -> (WriteRoute, bool) {
+    if !exec_switch_on() {
+        return (WriteRoute::Engine, false);
+    }
+    if !matches!(stmt, Some(Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_))) {
+        return (WriteRoute::Engine, false);
+    }
+    if inner.authorizer.is_some() {
+        trace("fallback: authorizer", raw_sql);
+        return (WriteRoute::Engine, false);
+    }
+    if inner.mutation_pipeline.is_trace_enabled() {
+        // (the engine's own row-mutation trace, `Connection::set_mutation_trace_enabled`: not
+        // a C feature; the machine does not record it)
+        trace("fallback: mutation trace", raw_sql);
+        return (WriteRoute::Engine, false);
+    }
+    if !inner.db_set.open_blobs().is_empty() {
+        // (an open incremental blob handle: the engine invalidates it when its row changes)
+        trace("fallback: open blob handle", raw_sql);
+        return (WriteRoute::Engine, false);
+    }
+    let custom_coll = inner.db_set.slots().iter().any(|slot| {
+        slot.schema.tables.iter().any(|t| t.columns.iter().any(|c| c.custom_collation.is_some()))
+            || slot.schema.indexes.iter().any(|ix| ix.columns.iter().any(|ic| ic.sort_order.custom_collation.is_some()))
+    });
+    if custom_coll {
+        trace("fallback: schema with an application-defined collation", raw_sql);
+        return (WriteRoute::Engine, false);
+    }
+    if inner.effective_encoding() != TextEncoding::Utf8 {
+        trace("fallback: UTF-16 database", raw_sql);
+        return (WriteRoute::Engine, false);
+    }
+    let (r, _, loaded) = crate::cgen::c_prepare(inner, raw_sql);
+    let route = match r {
+        PrepareResult::Program(p) => {
+            if p.explain != 0 {
+                return (WriteRoute::Engine, loaded);
+            }
+            if let Some(why) = sqliters_vdbe::vdbe::unsupported_reason_write(&p) {
+                trace(&format!("fallback: {why}"), raw_sql);
+                return (WriteRoute::Engine, loaded);
+            }
+            if p.a_op.iter().any(|op| matches!(&op.p4, P4::FuncCtx(c) if c.p_func.name.eq_ignore_ascii_case("rtreecheck"))) {
+                trace("fallback: rtreecheck()", raw_sql);
+                return (WriteRoute::Engine, loaded);
+            }
+            // A virtual table the program scans (OP_VOpen) must belong to a module whose
+            // xFilter takes C's idxNum / idxStr (the ports of fts5 and rtree); the engine's
+            // other modules still expect the engine's own plan (D35).
+            let reg = inner.db_set.vtab_registry();
+            let scanned = p.a_op.iter().chain(p.p_program.iter().flat_map(|s| s.a_op.iter())).filter(|op| op.opcode == sqliters_vdbe::opcodes::OP_VOpen);
+            for op in scanned {
+                if let P4::Vtab(vt) = &op.p4 {
+                    let module = reg.get_connected_by_id(&vt.name, vt.id).map(|e| e.module_name.to_ascii_lowercase());
+                    if !matches!(module.as_deref(), Some("fts5" | "rtree" | "rtree_i32")) {
+                        trace(&format!("fallback: virtual table module {} scanned", module.unwrap_or_default()), raw_sql);
+                        return (WriteRoute::Engine, loaded);
+                    }
+                }
+            }
+            if p.a_op.iter().any(|op| op.opcode == sqliters_vdbe::opcodes::OP_RowCell) {
+                // insert.c xferOptimization: "#ifdef SQLITE_TEST sqlite3_xferopt_count++" (the
+                // transfer is coded)
+                inner.db_set.record_xferopt();
+            }
+            trace("machine", raw_sql);
+            WriteRoute::Program(Arc::new(*p))
+        }
+        PrepareResult::Error { message, offset } => {
+            // A function the engine's library has and the generator's function table does not
+            // (testfixture functions of `enable_test_functions`): the engine runs the statement.
+            if let Some(name) = message.strip_prefix("no such function: ")
+                && (inner.functions.has_scalar_name(name)
+                    || inner.functions.has_aggregate_name(name)
+                    || sqliters_vdbe::builtin_scalar_flags(name, inner.runtime.enable_test_functions).is_some())
+            {
+                trace(&format!("fallback: generator error: {message}"), raw_sql);
+                return (WriteRoute::Engine, loaded);
+            }
+            trace(&format!("machine: C compile error: {message}"), raw_sql);
+            WriteRoute::Error { message, offset }
+        }
+        PrepareResult::Unsupported(why) => {
+            trace(&format!("fallback: generator: {why}"), raw_sql);
+            WriteRoute::Engine
+        }
+    };
+    (route, loaded)
 }
 
 /// The names of the result columns of `prog` (`sqlite3_column_name`), when it has them all.
@@ -352,6 +459,33 @@ macro_rules! host_common {
             None
         }
 
+        fn index_expr_mask(&mut self, i_db: usize, name: &str) -> u64 {
+            // sqlite3VdbeFindIndexKey: "for(ii=0; ii<MIN(pIdx->nColumn, BMS); ii++){ iCol =
+            // pIdx->aiColumn[ii]; if( iCol==XN_EXPR || (iCol>=0 && (pIdx->pTable->aCol[iCol]
+            // .colFlags & COLFLAG_VIRTUAL)) ) mask |= MASKBIT(ii); }" (the trailing rowid / PRIMARY
+            // KEY columns of an index are never expressions or generated columns)
+            let Some(slot) = self.dbs().slot(DatabaseId(i_db)) else {
+                return 0;
+            };
+            let Some(ix) = slot.schema.indexes.iter().find(|ix| ix.name.eq_ignore_ascii_case(name)) else {
+                return 0;
+            };
+            let tab = slot.schema.tables.iter().find(|t| t.name.eq_ignore_ascii_case(&ix.table_name));
+            let mut mask = 0u64;
+            for (ii, ic) in ix.columns.iter().enumerate().take(64) {
+                let is_virtual = match ic.col_idx {
+                    None => true,
+                    Some(ci) => tab
+                        .and_then(|t| t.columns.get(ci))
+                        .is_some_and(|c| c.generated.as_ref().is_some_and(|(_, stored)| !*stored)),
+                };
+                if is_virtual {
+                    mask |= 1u64 << ii;
+                }
+            }
+            mask
+        }
+
         fn sorter_config(&mut self) -> (i64, i64, bool) {
             let bt = self.dbs().main_btree();
             (i64::from(bt.pager().page_size()), i64::from(bt.cache_size()), self.dbs().temp_store().is_memory())
@@ -420,6 +554,15 @@ impl WriteHost<'_, '_> {
             collations: self.ctx.collations,
             progress: &mut *self.ctx.progress,
             strict_subtype: self.ctx.strict_subtype,
+        }
+    }
+
+    /// The database of the connected virtual table a `P4_VTAB` operand names.
+    fn vtab_db(&self, vt: &P4Vtab) -> Result<String> {
+        match self.ctx.db_set.vtab_registry().get_connected_by_id(&vt.name, vt.id) {
+            Some(e) => Ok(e.db_name.clone()),
+            // (C: "if( pVtab==0 ) rc = SQLITE_LOCKED")
+            None => Err(SqliteError::new(ErrorCode::Locked, "database table is locked")),
         }
     }
 
@@ -501,6 +644,128 @@ impl VdbeHost for WriteHost<'_, '_> {
         *self.ctx.writable_schema
     }
 
+    fn vtab_begin(&mut self, vt: &P4Vtab) -> Result<()> {
+        let db = self.vtab_db(vt)?;
+        crate::vtab::vtab_begin_if_needed(self.ctx, &db, &vt.name)
+    }
+
+    fn vtab_update(&mut self, vt: &P4Vtab, args: &[Value], nochange: &[bool], on_conflict: u8) -> Result<i64> {
+        use sqliters_types::{VTabConflictMode, VTabUpdateOperation};
+        let db = self.vtab_db(vt)?;
+        // xUpdate's argv: one argument = DELETE argv[0]; argv[0] NULL = INSERT; else UPDATE
+        let op = if args.len() == 1 {
+            VTabUpdateOperation::Delete { old_rowid: args[0].clone() }
+        } else if matches!(args[0], Value::Null) {
+            VTabUpdateOperation::Insert {
+                new_rowid: if matches!(args[1], Value::Null) { None } else { Some(args[1].clone()) },
+                values: args[2..].to_vec(),
+            }
+        } else {
+            VTabUpdateOperation::Update {
+                old_rowid: args[0].clone(),
+                new_rowid: args[1].clone(),
+                values: args[2..].to_vec(),
+            }
+        };
+        let mode = match on_conflict {
+            1 => VTabConflictMode::Rollback,
+            3 => VTabConflictMode::Fail,
+            4 => VTabConflictMode::Ignore,
+            5 => VTabConflictMode::Replace,
+            _ => VTabConflictMode::Abort,
+        };
+        let nochange_cols = if args.len() > 2 { nochange[2..].to_vec() } else { Vec::new() };
+        let r = crate::vtab::vtab_perform_update_with_nochange(self.ctx, &db, &vt.name, op, mode, &nochange_cols)?;
+        Ok(r.unwrap_or(0))
+    }
+
+    fn vtab_constraint_support(&self, vt: &P4Vtab) -> bool {
+        self.ctx
+            .db_set
+            .vtab_registry()
+            .get_connected_by_id(&vt.name, vt.id)
+            .is_some_and(|e| e.declared.constraint_support)
+    }
+
+    fn vtab_open(&mut self, vt: &P4Vtab) -> Result<Box<dyn sqliters_types::VirtualCursor>> {
+        let db = self.vtab_db(vt)?;
+        let reg = self.ctx.db_set.vtab_registry_mut();
+        let table = reg.checkout_vtab_instance(&db, &vt.name)?;
+        let r = crate::vtab::catch_callback_panic("vtab xOpen", || table.open());
+        self.ctx.db_set.vtab_registry_mut().restore_vtab(&db, &vt.name, table);
+        let mut cur = r?;
+        // (the machine asks for any column, row by row, as OP_VColumn / OP_VNext do)
+        cur.set_fetch_mask(u64::MAX);
+        let _ = cur.set_lazy(true);
+        Ok(cur)
+    }
+
+    fn vtab_filter(
+        &mut self,
+        vt: &P4Vtab,
+        cur: &mut dyn sqliters_types::VirtualCursor,
+        idx_num: i32,
+        idx_str: Option<&str>,
+        args: &[Value],
+    ) -> Result<()> {
+        let db = self.vtab_db(vt)?;
+        let mut host_ctx = crate::vtab::CoreVTabHostContext::new(self.ctx, &db, &vt.name);
+        crate::vtab::catch_callback_panic("vtab xFilter", || cur.filter(&mut host_ctx, idx_num, idx_str, args))
+    }
+
+    fn vtab_column(&mut self, vt: &P4Vtab, cur: &mut dyn sqliters_types::VirtualCursor, i_col: usize) -> Result<Value> {
+        let db = self.vtab_db(vt)?;
+        let mut host_ctx = crate::vtab::CoreVTabHostContext::new(self.ctx, &db, &vt.name);
+        crate::vtab::catch_callback_panic("vtab xColumn", || cur.column_ctx(&mut host_ctx, i_col))
+    }
+
+    fn vtab_next(&mut self, vt: &P4Vtab, cur: &mut dyn sqliters_types::VirtualCursor) -> Result<()> {
+        let db = self.vtab_db(vt)?;
+        let mut host_ctx = crate::vtab::CoreVTabHostContext::new(self.ctx, &db, &vt.name);
+        crate::vtab::catch_callback_panic("vtab xNext", || cur.next_ctx(&mut host_ctx))
+    }
+
+    fn vtab_column_skips_nochange(&self, vt: &P4Vtab, i_col: usize) -> bool {
+        // fts5ColumnMethod: "if( !sqlite3_vtab_nochange(pCtx) && pConfig->eContent!=
+        // FTS5_CONTENT_NONE )" for a column below nCol (the hidden table and rank columns are
+        // always read); geopolyColumn: "if( i==0 && sqlite3_vtab_nochange(ctx) ) return".
+        let Some(e) = self.ctx.db_set.vtab_registry().get_connected_by_id(&vt.name, vt.id) else {
+            return false;
+        };
+        match e.module_name.to_ascii_lowercase().as_str() {
+            "fts5" => !e.declared.hidden_cols.get(i_col).copied().unwrap_or(true),
+            "geopoly" => i_col == 0,
+            _ => false,
+        }
+    }
+
+    fn has_update_hook(&self) -> bool {
+        self.ctx.mutation_pipeline.has_update_hook()
+    }
+
+    fn max_page_count(&self, i_db: usize) -> Option<u32> {
+        self.ctx.db_set.slot(DatabaseId(i_db)).map(|s| s.max_page_count)
+    }
+
+    fn update_hook(&mut self, op: i32, i_db: usize, table: &str, rowid: i64) -> Result<()> {
+        let Some(slot) = self.ctx.db_set.slot(DatabaseId(i_db)) else {
+            return Ok(());
+        };
+        if op == 9
+            && slot.schema.tables.iter().any(|t| t.name.eq_ignore_ascii_case(table) && t.without_rowid)
+        {
+            // (HasRowid(pTab) is false)
+            return Ok(());
+        }
+        let db_name = slot.name.clone();
+        let op = match op {
+            18 => sqliters_types::RowMutationOp::Insert,
+            23 => sqliters_types::RowMutationOp::Update,
+            _ => sqliters_types::RowMutationOp::Delete,
+        };
+        self.ctx.mutation_pipeline.invoke_update_hook(op, &db_name, table, rowid)
+    }
+
     host_common!();
 }
 
@@ -520,9 +785,13 @@ pub(crate) fn run_write(
     // `Vdbe.usesStmtJournal` (C: `isMultiWrite && mayAbort`): without it C opens no
     // statement transaction (see `engine::apply_stmt_journal_policy`).
     sqliters_types::dtrace!("TR|stmt|usj|v={}", u8::from(prog.uses_stmt_journal));
-    if ctx.stmt_tx.stmt_sp_slot.is_some() {
+    if let Some(sp_slot) = ctx.stmt_tx.stmt_sp_slot {
         if prog.uses_stmt_journal {
             sqliters_types::dtrace!("TR|stmt|journal|open");
+            // OP_Transaction: "rc = sqlite3VtabSavepoint(db, SAVEPOINT_BEGIN, p->iStatement-1)"
+            if ctx.db_set.vtab_registry().has_any_in_tx() {
+                crate::engine::vtab_savepoint_before_stmt(ctx, sp_slot)?;
+            }
         } else {
             ctx.stmt_tx.stmt_sp_slot = None;
             ctx.stmt_tx.no_stmt_journal = true;

@@ -1382,6 +1382,15 @@ impl MutationPipeline {
         }
     }
 
+    /// `db->xUpdateCallback(db->pUpdateArg, op, zDb, zTbl, iRowid)`, called by the port of
+    /// C's virtual machine (`OP_Insert`, `OP_Delete`).
+    pub fn invoke_update_hook(&mut self, op: RowMutationOp, db_name: &str, table: &str, rowid: i64) -> Result<()> {
+        if let Some(cb) = self.update_hook.as_mut() {
+            catch_infallible_callback_panic("update_hook", || cb(op, db_name, table, rowid))?;
+        }
+        Ok(())
+    }
+
     /// Dispatches a completed physical row mutation, recording trace metadata and invoking any
     /// registered `sqlite3_update_hook` when `ctx.emit_update_hook` is true.
     pub fn dispatch_with_db_name(&mut self, ctx: MutationContext, db_name: &str) -> Result<()> {
