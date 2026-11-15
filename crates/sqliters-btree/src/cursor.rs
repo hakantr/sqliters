@@ -818,6 +818,10 @@ impl Btree {
         if !self.in_place_rows.is_empty() {
             self.drop_in_place_rows(root_filter);
         }
+        if !self.bcs.is_empty() {
+            // (the cursors of suspended statements of the machine)
+            self.bc_save_parked(root_filter)?;
+        }
         if !self.vcursors.is_empty() {
             // (the page references of the other C cursors on the tree)
             let keep = self.vc_keep;
@@ -845,6 +849,9 @@ impl Btree {
     ///   cursors to `RequireSeek`. If saving any read-only cursor fails with `err`, immediately
     ///   escalates ALL open cursors on this `Btree` to `Fault(err.extended_code)` and returns `Err(err)`.
     pub fn trip_cursors(&mut self, trip_code: i32, write_only: bool) -> Result<()> {
+        if !self.bcs.is_empty() {
+            self.bc_trip_parked(trip_code, write_only);
+        }
         if self.open_cursor_count == 0 {
             return Ok(());
         }

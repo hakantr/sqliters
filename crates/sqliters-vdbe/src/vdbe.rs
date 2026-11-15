@@ -24,11 +24,13 @@
 use std::sync::Arc;
 
 use sqliters_btree::Btree;
-use sqliters_btree::btcursor::{BTREE_SEEK_EQ, BtCursor, CURSOR_REQUIRESEEK};
-use sqliters_types::{ErrorCode, KeySortOrder, Pgno, Result, RuntimeValue, SqliteError, Value};
+use sqliters_btree::btcursor::{BTREE_AUXDELETE, BTREE_SEEK_EQ, BcParked, BtCursor, CURSOR_REQUIRESEEK};
+use sqliters_types::{ConflictResolutionEffect, ErrorCode, KeySortOrder, Pgno, Result, RuntimeValue, SqliteError, Value};
 
 use crate::opcodes::*;
-use crate::vdbeaux::{CollSeq, FuncDef, KEYINFO_ORDER_BIGNULL, KEYINFO_ORDER_DESC, KeyInfo, P4, Program, VdbeOp, int32_to_64};
+use crate::vdbeaux::{
+    CollSeq, FuncDef, KEYINFO_ORDER_BIGNULL, KEYINFO_ORDER_DESC, KeyInfo, P4, Program, SubProgram, VdbeOp, int32_to_64,
+};
 use crate::vdbeaux_rt::{
     KeyInfoRt, UnpackedRecord, corrupt, get_varint32, put_varint, sqlite3_varint_len, sqlite3_vdbe_idx_key_compare,
     sqlite3_vdbe_idx_rowid, sqlite3_vdbe_mem_from_btree, sqlite3_vdbe_mem_from_btree_zero_offset,
@@ -52,11 +54,23 @@ const OPFLAG_PERMUTE: u16 = 0x01;
 const OPFLAG_SEEKEQ: u16 = 0x02;
 const OPFLAG_BULKCSR: u16 = 0x01;
 const OPFLAG_USESEEKRESULT: u16 = 0x10;
+const OPFLAG_NCHANGE: u16 = 0x01;
+const OPFLAG_LASTROWID: u16 = 0x20;
+const OPFLAG_APPEND: u16 = 0x08;
+const OPFLAG_SAVEPOSITION: u16 = 0x02;
+const OPFLAG_PREFORMAT: u16 = 0x80;
+const OPFLAG_P2ISREG: u16 = 0x10;
+/// `OE_Rollback`, `OE_Fail`: `OP_Halt.p2` (`Vdbe.errorAction`)
+const OE_ROLLBACK: i32 = 1;
+const OE_FAIL: i32 = 3;
+const OE_IGNORE: i32 = 4;
 const OPFLAG_LENGTHARG: u16 = 0x40;
 const OPFLAG_TYPEOFARG: u16 = 0x80;
 const OPFLAG_BYTELENARG: u16 = 0xc0;
 const BTREE_UNORDERED: u16 = 8;
 const SQLITE_FUNC_NEEDCOLL: u32 = 0x0020;
+const SQLITE_FUNC_BUILTIN: u32 = 0x0080_0000;
+const SQLITE_FUNC_WINDOW: u32 = 0x0001_0000;
 
 /// `SQLITE_STMTSTATUS_*` (`Vdbe.aCounter[]`)
 pub const SQLITE_STMTSTATUS_FULLSCAN_STEP: usize = 1;
@@ -97,10 +111,93 @@ pub trait VdbeHost {
     fn open_ephemeral(&mut self) -> Result<Btree>;
     /// `db->aLimit[SQLITE_LIMIT_LENGTH]`
     fn limit_length(&self) -> i32;
-    /// `AtomicLoad(&db->u1.isInterrupted)` and the progress handler.
+    /// `AtomicLoad(&db->u1.isInterrupted)`: `Err(SQLITE_INTERRUPT)` when set.
     fn check_interrupt(&mut self) -> Result<()>;
+    /// `db->nProgressOps` when a progress handler is installed (`db->xProgress != 0`), else 0.
+    fn progress_ops(&self) -> u64;
+    /// `db->xProgress(db->pProgressArg)`: `true` asks for an interrupt.
+    fn progress_invoke(&mut self) -> Result<bool>;
     /// `(page size of the main database, db->aDb[0].pSchema->cache_size, sqlite3TempInMemory(db))`
     fn sorter_config(&mut self) -> (i64, i64, bool);
+    /// `OP_Transaction` with `P2!=0`: `sqlite3BtreeBeginTrans(pBt, p2, &iMeta)` and, when the
+    /// program uses a statement journal and the connection is in a transaction or has other
+    /// active statements, `sqlite3BtreeBeginStmt`. Returns `(iMeta, pSchema->iGeneration)`.
+    fn begin_write_trans(&mut self, _i_db: usize, _p2: i32) -> Result<(u32, i32)> {
+        Err(internal("write transaction on a host that only reads"))
+    }
+    /// `db->lastRowid = iKey` (`OP_Insert` with `OPFLAG_LASTROWID`)
+    fn set_last_rowid(&mut self, _rowid: i64) {}
+    /// `sqlite3VdbeSetChanges(db, nChange)`: `db->nChange = n; db->nTotalChange += n`
+    fn set_changes(&mut self, _n: i64) {}
+    /// `sqlite3_randomness(sizeof(v), &v)` of `OP_NewRowid`
+    fn randomness(&mut self) -> i64 {
+        0
+    }
+    /// `sqlite3WritableSchema(db)`
+    fn writable_schema(&self) -> bool {
+        false
+    }
+    /// The `Table` a `P4_TABLE` operand names (`OP_TypeCheck`).
+    fn table_info(&mut self, _name: &str) -> Option<Arc<TableRt>> {
+        None
+    }
+    /// `db->lastRowid`
+    fn last_rowid(&self) -> i64 {
+        0
+    }
+    /// `db->nChange`
+    fn db_changes(&self) -> i64 {
+        0
+    }
+    /// `db->nChange = n` (`sqlite3VdbeFrameRestore`; `db->nTotalChange` is not touched)
+    fn set_db_changes(&mut self, _n: i64) {}
+    /// `db->aLimit[SQLITE_LIMIT_TRIGGER_DEPTH]`
+    fn trigger_depth_limit(&self) -> usize {
+        1000
+    }
+    /// `db->flags & SQLITE_DeferFKs`
+    fn defer_fks(&self) -> bool {
+        false
+    }
+    /// `(db->nDeferredCons, db->nDeferredImmCons)`
+    fn deferred_cons(&self) -> (i64, i64) {
+        (0, 0)
+    }
+    /// `db->nDeferredCons += n` (`imm == false`) or `db->nDeferredImmCons += n` (`OP_FkCounter`).
+    fn add_deferred_cons(&mut self, _imm: bool, _n: i64) {}
+}
+
+/// `COLTYPE_*`: `Column.eCType`.
+pub const COLTYPE_CUSTOM: u8 = 0;
+pub const COLTYPE_ANY: u8 = 1;
+pub const COLTYPE_BLOB: u8 = 2;
+pub const COLTYPE_INT: u8 = 3;
+pub const COLTYPE_INTEGER: u8 = 4;
+pub const COLTYPE_REAL: u8 = 5;
+pub const COLTYPE_TEXT: u8 = 6;
+
+/// What the machine reads of a `Column` of a `Table`.
+#[derive(Debug, Clone)]
+pub struct TableColRt {
+    /// `zCnName`
+    pub name: String,
+    /// `affinity` (`SQLITE_AFF_*`)
+    pub affinity: u8,
+    /// `eCType` (`COLTYPE_*`)
+    pub e_ctype: u8,
+    /// `colFlags & COLFLAG_GENERATED`
+    pub generated: bool,
+    /// `colFlags & COLFLAG_VIRTUAL`
+    pub is_virtual: bool,
+}
+
+/// What the machine reads of a `Table` (`P4_TABLE`).
+#[derive(Debug, Clone)]
+pub struct TableRt {
+    /// `zName`
+    pub name: String,
+    /// `aCol[]`
+    pub cols: Vec<TableColRt>,
 }
 
 /// `VdbeTxtBlbCache`: the last large value read from overflow pages (`vdbeColumnFromOverflow`).
@@ -150,7 +247,10 @@ pub struct VdbeCursor {
     /// `pAltCursor`
     p_alt_cursor: Option<usize>,
     /// `uc.pCursor`
-    pub cur: BtCursor,
+    pub cur: Box<BtCursor>,
+    /// While the statement is suspended between two steps the cursor is in the cursor list
+    /// of its b-tree (`Btree::bc_park`).
+    parked: Option<BcParked>,
     /// `uc.pSorter`
     sorter: Option<Box<VdbeSorter>>,
     /// `pKeyInfo`
@@ -195,6 +295,269 @@ enum AggCtx {
     MinMax { best: Option<Mem>, is_max: bool, coll: Option<Arc<CollRt>> },
     /// An aggregate implemented by the engine
     Host(Option<usize>),
+    /// A built-in window function of window.c (`struct CallCount`, `NtileCtx`, `LastValueCtx`,
+    /// `NthValueCtx`; `alloc`: `sqlite3_aggregate_context(pCtx, nByte>0)` has allocated it)
+    Win(Box<WinCtx>),
+}
+
+/// The built-in window functions of window.c that are called through `OP_AggStep` /
+/// `OP_AggValue` / `OP_AggFinal` (`lead` / `lag` are coded in-line: `noopStepFunc`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WinFn {
+    RowNumber,
+    DenseRank,
+    Rank,
+    PercentRank,
+    CumeDist,
+    Ntile,
+    LastValue,
+    NthValue,
+    FirstValue,
+    Noop,
+}
+
+/// The accumulator of a window.c function: the fields of its C struct.
+#[derive(Debug)]
+struct WinCtx {
+    f: WinFn,
+    alloc: bool,
+    /// `CallCount.nValue` (`row_number`: the `i64` itself), `nStep`, `nTotal`
+    n_value: i64,
+    n_step: i64,
+    n_total: i64,
+    /// `NtileCtx.nParam`, `iRow` (`nTotal` above)
+    n_param: i64,
+    i_row: i64,
+    /// `LastValueCtx.pVal` / `NthValueCtx.pValue` and `LastValueCtx.nVal`
+    val: Option<Mem>,
+    n_val: i64,
+}
+
+impl WinFn {
+    /// The window.c function a built-in `FuncDef` names.
+    fn of(func: &FuncDef) -> Option<WinFn> {
+        if func.func_flags & (SQLITE_FUNC_BUILTIN | SQLITE_FUNC_WINDOW) != (SQLITE_FUNC_BUILTIN | SQLITE_FUNC_WINDOW) {
+            return None;
+        }
+        Some(match func.name.to_ascii_lowercase().as_str() {
+            "row_number" => WinFn::RowNumber,
+            "dense_rank" => WinFn::DenseRank,
+            "rank" => WinFn::Rank,
+            "percent_rank" => WinFn::PercentRank,
+            "cume_dist" => WinFn::CumeDist,
+            "ntile" => WinFn::Ntile,
+            "last_value" => WinFn::LastValue,
+            "nth_value" => WinFn::NthValue,
+            "first_value" => WinFn::FirstValue,
+            "lead" | "lag" => WinFn::Noop,
+            _ => return None,
+        })
+    }
+}
+
+impl WinCtx {
+    fn new(f: WinFn) -> WinCtx {
+        WinCtx { f, alloc: false, n_value: 0, n_step: 0, n_total: 0, n_param: 0, i_row: 0, val: None, n_val: 0 }
+    }
+
+    /// `xSFunc` (`inverse == false`) or `xInverse` of the function, `args` = `apArg`.
+    /// `Err(message)`: `sqlite3_result_error`.
+    fn step(&mut self, inverse: bool, args: &mut [Mem]) -> std::result::Result<(), &'static str> {
+        // every step / inverse function asks for sizeof(*p)
+        if self.f != WinFn::Noop {
+            self.alloc = true;
+        }
+        match (self.f, inverse) {
+            // row_numberStepFunc: (*p)++
+            (WinFn::RowNumber, false) => self.n_value += 1,
+            // dense_rankStepFunc
+            (WinFn::DenseRank, false) => self.n_step = 1,
+            // rankStepFunc
+            (WinFn::Rank, false) => {
+                self.n_step += 1;
+                if self.n_value == 0 {
+                    self.n_value = self.n_step;
+                }
+            }
+            // percent_rankStepFunc / cume_distStepFunc
+            (WinFn::PercentRank | WinFn::CumeDist, false) => self.n_total += 1,
+            // percent_rankInvFunc / cume_distInvFunc
+            (WinFn::PercentRank | WinFn::CumeDist, true) => self.n_step += 1,
+            // ntileStepFunc
+            (WinFn::Ntile, false) => {
+                let mut err = false;
+                if self.n_total == 0 {
+                    self.n_param = args.first().map_or(0, Mem::int_value);
+                    if self.n_param <= 0 {
+                        err = true;
+                    }
+                }
+                self.n_total += 1;
+                if err {
+                    return Err("argument of ntile must be a positive integer");
+                }
+            }
+            // ntileInvFunc
+            (WinFn::Ntile, true) => self.i_row += 1,
+            // last_valueStepFunc
+            (WinFn::LastValue, false) => {
+                self.val = Some(args.first().cloned().unwrap_or_else(Mem::null));
+                self.n_val += 1;
+            }
+            // last_valueInvFunc
+            (WinFn::LastValue, true) => {
+                self.n_val -= 1;
+                if self.n_val == 0 {
+                    self.val = None;
+                }
+            }
+            // nth_valueStepFunc
+            (WinFn::NthValue, false) => {
+                const E: &str = "second argument to nth_value must be a positive integer";
+                let Some(a1) = args.get_mut(1) else {
+                    return Err(E);
+                };
+                // sqlite3_value_numeric_type(apArg[1]): a TEXT argument gets numeric affinity in place
+                if a1.value_type() == 3 {
+                    a1.apply_numeric_affinity(false);
+                }
+                let i_val = match a1.value_type() {
+                    1 => a1.int_value(),
+                    2 => {
+                        let f = a1.real_value();
+                        if sqlite3_real_to_i64(f) as f64 != f {
+                            return Err(E);
+                        }
+                        f as i64
+                    }
+                    _ => return Err(E),
+                };
+                if i_val <= 0 {
+                    return Err(E);
+                }
+                self.n_step += 1;
+                if i_val == self.n_step {
+                    self.val = Some(args[0].clone());
+                }
+            }
+            // first_valueStepFunc
+            (WinFn::FirstValue, false) => {
+                if self.val.is_none() {
+                    self.val = Some(args.first().cloned().unwrap_or_else(Mem::null));
+                }
+            }
+            // noopStepFunc (nth_value / first_value inverse; row_number, dense_rank, rank: never
+            // called for an inverse; lead / lag)
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// `xValue` (`finalize == false`) or `xFinalize`: the result (`None`: no result, NULL).
+    fn value(&mut self, finalize: bool) -> Option<Mem> {
+        let int = |v: i64| {
+            let mut m = Mem::null();
+            m.set_int64(v);
+            Some(m)
+        };
+        let dbl = |v: f64| {
+            let mut m = Mem::null();
+            m.set_double(v);
+            Some(m)
+        };
+        match self.f {
+            // row_numberValueFunc (also xFinalize)
+            WinFn::RowNumber => {
+                self.alloc = true;
+                int(self.n_value)
+            }
+            // dense_rankValueFunc
+            WinFn::DenseRank => {
+                self.alloc = true;
+                if self.n_step != 0 {
+                    self.n_value += 1;
+                    self.n_step = 0;
+                }
+                int(self.n_value)
+            }
+            // rankValueFunc
+            WinFn::Rank => {
+                self.alloc = true;
+                let v = self.n_value;
+                self.n_value = 0;
+                int(v)
+            }
+            // percent_rankValueFunc (= percent_rankFinalizeFunc)
+            WinFn::PercentRank => {
+                self.alloc = true;
+                self.n_value = self.n_step;
+                if self.n_total > 1 {
+                    dbl(self.n_value as f64 / (self.n_total - 1) as f64)
+                } else {
+                    dbl(0.0)
+                }
+            }
+            // cume_distValueFunc: sqlite3_aggregate_context(pCtx, 0)
+            WinFn::CumeDist => {
+                if self.alloc {
+                    dbl(self.n_step as f64 / self.n_total as f64)
+                } else {
+                    None
+                }
+            }
+            // ntileValueFunc (= ntileFinalizeFunc)
+            WinFn::Ntile => {
+                self.alloc = true;
+                if self.n_param <= 0 {
+                    return None;
+                }
+                let n_size = self.n_total / self.n_param;
+                if n_size == 0 {
+                    int(self.i_row + 1)
+                } else {
+                    let n_large = self.n_total - self.n_param * n_size;
+                    let i_small = n_large * (n_size + 1);
+                    let i_row = self.i_row;
+                    if i_row < i_small {
+                        int(1 + i_row / (n_size + 1))
+                    } else {
+                        int(1 + n_large + (i_row - i_small) / n_size)
+                    }
+                }
+            }
+            WinFn::LastValue => {
+                if finalize {
+                    // last_valueFinalizeFunc
+                    self.alloc = true;
+                    self.val.take()
+                } else if self.alloc {
+                    // last_valueValueFunc: sqlite3_aggregate_context(pCtx, 0)
+                    self.val.clone()
+                } else {
+                    None
+                }
+            }
+            WinFn::NthValue => {
+                if finalize {
+                    // nth_valueFinalizeFunc: sqlite3_aggregate_context(pCtx, 0)
+                    if self.alloc { self.val.take() } else { None }
+                } else {
+                    // noopValueFunc
+                    None
+                }
+            }
+            WinFn::FirstValue => {
+                if finalize {
+                    // first_valueFinalizeFunc
+                    self.alloc = true;
+                    self.val.take()
+                } else {
+                    None
+                }
+            }
+            WinFn::Noop => None,
+        }
+    }
 }
 
 /// P4 operands bound to the connection when the program is made ready.
@@ -204,6 +567,45 @@ enum OpRt {
     None,
     Coll(Arc<CollRt>),
     KeyInfo(Arc<KeyInfoRt>),
+}
+
+/// The run time of a trigger sub-program kept in the register `P3` of its `OP_Program`
+/// between invocations (`pRt`: a `MEM_Blob` whose `z` is the `VdbeFrame` with
+/// `VdbeFrameMem(pFrame)` and the cursor slots behind it).
+struct FrameRt {
+    a_mem: Vec<Mem>,
+    ap_csr: Vec<Option<Box<VdbeCursor>>>,
+    a_agg: Vec<Option<AggCtx>>,
+    a_rowset: Vec<Option<Box<RowSet>>>,
+    a_frame: Vec<Option<Box<FrameRt>>>,
+}
+
+/// `struct VdbeFrame` while its sub-program runs: what `OP_Program` saved of the parent
+/// (`pFrame->aMem`, `apCsr`, `aOp`, `pc`, `token`, `lastRowid`, `nChange`, `nDbChange`) and
+/// the parent's side tables and bound operands.
+struct VdbeFrame {
+    /// `pFrame->aOp`: the parent's program (`None`: the main program)
+    parent_sub: Option<Arc<SubProgram>>,
+    a_mem: Vec<Mem>,
+    ap_csr: Vec<Option<Box<VdbeCursor>>>,
+    a_agg: Vec<Option<AggCtx>>,
+    a_rowset: Vec<Option<Box<RowSet>>>,
+    a_frame: Vec<Option<Box<FrameRt>>>,
+    rt: Vec<OpRt>,
+    once: Vec<i32>,
+    /// `pFrame->pc`: address of the `OP_Program`, with its `P1`, `P2` and `P3`
+    pc: usize,
+    prog_p1: i32,
+    prog_p2: i32,
+    reg: usize,
+    /// `pFrame->token`
+    token: u64,
+    /// The sub-program the frame runs (its bound operands go back to the cache at the end)
+    sub: Arc<SubProgram>,
+    /// `pFrame->lastRowid`, `pFrame->nChange`, `pFrame->nDbChange`
+    last_rowid: i64,
+    n_change: i64,
+    n_db_change: i64,
 }
 
 /// A running statement (`struct Vdbe` in `VDBE_RUN_STATE`).
@@ -242,17 +644,55 @@ pub struct Vdbe {
     min_write_file_format: u8,
     /// The statement has halted (`VDBE_HALT_STATE`).
     pub halted: bool,
+    /// `nChange`: rows changed by the statement so far (`OPFLAG_NCHANGE`)
+    pub n_change: i64,
+    /// `expired==1`: `sqlite3ExpirePreparedStatements(db, 0)` ran while the statement was
+    /// running.
+    pub expired: bool,
+    /// For the host: its expiry sequence number when the execution started.
+    pub expire_seq: u64,
     /// Executed instructions (`nVmStep`)
     pub n_vm_step: u64,
+    /// `nVmStep`, `nProgressLimit` and `db->nProgressOps` of the running `sqlite3VdbeExec` call
+    call_steps: u64,
+    progress_limit: u64,
+    progress_ops: u64,
     /// Opcode trace: address of the instruction being executed
     tr_pc: usize,
     /// Address of the instruction being executed (kept for error reports)
     err_pc: usize,
+    /// Trigger frames: `p->pFrame` chain (innermost last), `p->nFrame == frames.len()`
+    frames: Vec<VdbeFrame>,
+    /// The sub-program being run (`p->aOp` of the innermost frame), `None`: the main program
+    cur_sub: Option<Arc<SubProgram>>,
+    /// Frame registers of the current `aMem` (`pRt` of `OP_Program`), by register
+    a_frame: Vec<Option<Box<FrameRt>>>,
+    /// Bound P4 operands of the sub-programs that are not running, by sub-program address
+    sub_rt: Vec<(usize, Vec<OpRt>)>,
+    /// `nFkConstraint`: immediate foreign key violations of the statement
+    pub n_fk_constraint: i64,
+    /// Opcode trace: the statement text (printed again at the `OP_Init` of a sub-program)
+    tr_sql: String,
+    /// Opcode trace: print every register as `U` (unused: C prints the last instruction of a
+    /// halted statement after `releaseMemArray`, which leaves a register `MEM_Undefined` only
+    /// when it holds a heap buffer — `szMalloc`, which the machine does not model; the
+    /// comparison tools mask the registers of that line instead)
+    tr_undef: bool,
 }
 
 #[cold]
 fn internal(msg: &str) -> SqliteError {
     SqliteError::new(ErrorCode::Internal, format!("vdbe: {msg}"))
+}
+
+/// `vdbeFkError(p)` (prepared with `SQLITE_PREPARE_SAVESQL`): `SQLITE_CONSTRAINT_FOREIGNKEY`,
+/// `errorAction = OE_Abort`.
+#[cold]
+pub fn fk_error() -> SqliteError {
+    let mut e = SqliteError::with_extended(787, "FOREIGN KEY constraint failed".to_owned());
+    e.code = ErrorCode::Constraint;
+    e.conflict_effect = ConflictResolutionEffect::Abort;
+    e
 }
 
 #[cold]
@@ -282,10 +722,21 @@ fn sqlite3_log_est(mut x: u64) -> i16 {
 
 /// The reason why the machine does not run `prog` (`None`: every opcode is ported).
 pub fn unsupported_reason(prog: &Program) -> Option<String> {
-    if !prog.p_program.is_empty() {
+    unsupported(prog, false)
+}
+
+/// [`unsupported_reason`] for a program that writes (`OP_Transaction` with `P2!=0`, the
+/// write opcodes).
+pub fn unsupported_reason_write(prog: &Program) -> Option<String> {
+    unsupported(prog, true)
+}
+
+fn unsupported(prog: &Program, write: bool) -> Option<String> {
+    if !prog.p_program.is_empty() && !write {
         return Some("sub-programs".to_owned());
     }
-    for op in &prog.a_op {
+    let subs = prog.p_program.iter().flat_map(|s| s.a_op.iter());
+    for op in prog.a_op.iter().chain(subs) {
         let ok = matches!(
             op.opcode,
             OP_Init
@@ -435,12 +886,28 @@ pub fn unsupported_reason(prog: &Program) -> Option<String> {
                 | OP_CursorHint
                 | OP_ReleaseReg
                 | OP_Abortable
-        );
+                | OP_TypeCheck
+        ) || (write
+            && matches!(
+                op.opcode,
+                OP_OpenWrite
+                    | OP_IdxDelete
+                    | OP_Clear
+                    | OP_ResetCount
+                    | OP_Program
+                    | OP_Param
+                    | OP_FkCounter
+                    | OP_FkIfZero
+                    | OP_FkCheck
+                    | OP_CursorLock
+                    | OP_CursorUnlock
+            ));
         if !ok {
             return Some(format!("opcode {}", sqlite3_opcode_name(op.opcode)));
         }
         match op.opcode {
-            OP_Transaction if op.p2 != 0 => return Some("write transaction".to_owned()),
+            OP_Transaction if op.p2 != 0 && !write => return Some("write transaction".to_owned()),
+            OP_Insert | OP_IdxInsert if op.p5 & OPFLAG_PREFORMAT != 0 => return Some("OPFLAG_PREFORMAT".to_owned()),
             OP_Function | OP_PureFunc => {
                 if let P4::FuncCtx(c) = &op.p4
                     && c.p_func.func_flags & SQLITE_FUNC_NEEDCOLL != 0
@@ -634,9 +1101,22 @@ impl Vdbe {
             u_temp: Vec::new(),
             min_write_file_format: mwf,
             halted: false,
+            expired: false,
+            expire_seq: 0,
             n_vm_step: 0,
+            call_steps: 0,
+            n_change: 0,
+            progress_limit: u64::MAX,
+            progress_ops: 0,
             tr_pc: usize::MAX,
             err_pc: usize::MAX,
+            frames: Vec::new(),
+            cur_sub: None,
+            a_frame: Vec::new(),
+            sub_rt: Vec::new(),
+            n_fk_constraint: 0,
+            tr_sql: String::new(),
+            tr_undef: false,
         }
     }
 
@@ -664,6 +1144,14 @@ impl Vdbe {
     /// Binds the collations of the program to the connection.
     fn make_rt<H: VdbeHost>(&mut self, host: &mut H) -> Result<()> {
         let prog = Arc::clone(&self.prog);
+        self.rt = Self::bind_ops(&prog.a_op, host)?;
+        self.rt_ready = true;
+        Ok(())
+    }
+
+    /// The P4 operands of `a_op` bound to the connection (collations, key infos).
+    fn bind_ops<H: VdbeHost>(a_op: &[VdbeOp], host: &mut H) -> Result<Vec<OpRt>> {
+        let mut rt = vec![OpRt::None; a_op.len()];
         let find = |c: &CollSeq, host: &mut H| -> Result<Arc<CollRt>> {
             if let Some(b) = builtin_coll(&c.name) {
                 return Ok(Arc::new(b));
@@ -673,9 +1161,9 @@ impl Vdbe {
                 None => Err(SqliteError::new(ErrorCode::Error, format!("no such collation sequence: {}", c.name))),
             }
         };
-        for (i, op) in prog.a_op.iter().enumerate() {
+        for (i, op) in a_op.iter().enumerate() {
             match &op.p4 {
-                P4::CollSeq(c) => self.rt[i] = OpRt::Coll(find(c, host)?),
+                P4::CollSeq(c) => rt[i] = OpRt::Coll(find(c, host)?),
                 P4::KeyInfo(k) => {
                     let k: &KeyInfo = k;
                     let mut a_coll = Vec::with_capacity(k.a_coll.len());
@@ -685,7 +1173,7 @@ impl Vdbe {
                             None => None,
                         });
                     }
-                    self.rt[i] = OpRt::KeyInfo(Arc::new(KeyInfoRt {
+                    rt[i] = OpRt::KeyInfo(Arc::new(KeyInfoRt {
                         enc: k.enc,
                         n_key_field: k.n_key_field,
                         n_all_field: k.n_all_field,
@@ -696,8 +1184,7 @@ impl Vdbe {
                 _ => {}
             }
         }
-        self.rt_ready = true;
-        Ok(())
+        Ok(rt)
     }
 
     /// `allocateCursor(p, iCur, nField, eCurType)`
@@ -706,7 +1193,7 @@ impl Vdbe {
             self.free_cursor(host, i_cur);
         }
         let n = n_field.max(0) as usize;
-        let dummy = BtCursor::detached();
+        let dummy = Box::new(BtCursor::detached());
         self.ap_csr[i_cur] = Some(Box::new(VdbeCursor {
             e_cur_type,
             i_db: 0,
@@ -725,6 +1212,7 @@ impl Vdbe {
             seek_result: 0,
             p_alt_cursor: None,
             cur: dummy,
+            parked: None,
             sorter: None,
             key_info: None,
             orders: Vec::new(),
@@ -747,10 +1235,20 @@ impl Vdbe {
 
     /// `sqlite3VdbeFreeCursor(p, p->apCsr[i])`
     fn free_cursor<H: VdbeHost>(&mut self, host: &mut H, i_cur: usize) {
-        let Some(mut pc) = self.ap_csr[i_cur].take() else {
+        let Some(pc) = self.ap_csr[i_cur].take() else {
             return;
         };
+        self.free_cursor_nn(host, pc);
+    }
+
+    /// `sqlite3VdbeFreeCursorNN(p, pCx)`
+    fn free_cursor_nn<H: VdbeHost>(&mut self, host: &mut H, mut pc: Box<VdbeCursor>) {
         if pc.e_cur_type == CURTYPE_BTREE {
+            if let Some(id) = pc.parked.take()
+                && let Some(bt) = host.btree(pc.i_db as usize)
+            {
+                bt.bc_unpark(id, &mut pc.cur);
+            }
             match pc.btx {
                 Some(x) => {
                     let mut close = false;
@@ -777,9 +1275,31 @@ impl Vdbe {
     /// numbers. The end of the read transaction is the engine's (`sqlite3VdbeHalt` →
     /// `vdbeCommit` for an autocommit statement).
     pub fn halt<H: VdbeHost>(&mut self, host: &mut H) {
+        let mut later: Vec<Box<VdbeCursor>> = Vec::new();
+        if !self.frames.is_empty() {
+            // "for(pFrame=p->pFrame; pFrame->pParent; pFrame=pFrame->pParent);
+            //  sqlite3VdbeFrameRestore(pFrame);": the cursors of the innermost frame are closed,
+            // the root frame's state comes back; the frames in between are deleted after the
+            // cursors of the main program (`pDelFrame`, `sqlite3VdbeFrameDelete`), outermost
+            // first.
+            for i in 0..self.ap_csr.len() {
+                self.free_cursor(host, i);
+            }
+            for f in self.frames.iter_mut().skip(1) {
+                later.extend(f.ap_csr.drain(..).flatten());
+            }
+            while let Some(f) = self.frames.pop() {
+                self.restore_frame(host, f);
+            }
+            self.a_frame.clear();
+        }
         for i in 0..self.ap_csr.len() {
             self.free_cursor(host, i);
         }
+        for pc in later {
+            self.free_cursor_nn(host, pc);
+        }
+        self.a_frame.clear();
         for e in self.ephem.iter_mut() {
             if let Some(mut e) = e.take() {
                 let _ = e.bt.close();
@@ -798,7 +1318,7 @@ impl Vdbe {
     /// `saveAllCursors(pBt, iRoot, pExcept)` for the cursors of the machine on ephemeral
     /// b-tree `btx`, root `root`, before a write through cursor `except`.
     fn save_all_cursors(&mut self, btx: usize, root: Pgno, except: usize) -> Result<()> {
-        for i in 0..self.ap_csr.len() {
+        for i in (0..self.ap_csr.len()).rev() {
             if i == except {
                 continue;
             }
@@ -811,7 +1331,155 @@ impl Vdbe {
                 e.bt.bc_save_for_write(&mut pc.cur)?;
             }
         }
+        for f in self.frames.iter_mut().rev() {
+            for pc in f.ap_csr.iter_mut().rev().flatten() {
+                if pc.e_cur_type == CURTYPE_BTREE
+                    && pc.btx == Some(btx)
+                    && pc.pgno_root == root
+                    && let Some(e) = self.ephem.get_mut(btx).and_then(|e| e.as_mut())
+                {
+                    e.bt.bc_save_for_write(&mut pc.cur)?;
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// `saveAllCursors(pBt, iRoot, pExcept)` for the cursors of the machine on root `root` of
+    /// database `i_db`, before a write through cursor `except` (`usize::MAX`: none): the most
+    /// recently opened cursor first, as `BtShared.pCursor` lists them.
+    fn save_db_cursors<H: VdbeHost>(&mut self, host: &mut H, i_db: i8, root: Pgno, except: usize) -> Result<()> {
+        let Some(bt) = host.btree(i_db as usize) else {
+            return Ok(());
+        };
+        for i in (0..self.ap_csr.len()).rev() {
+            if i == except {
+                continue;
+            }
+            if let Some(pc) = self.ap_csr[i].as_deref_mut()
+                && pc.e_cur_type == CURTYPE_BTREE
+                && pc.btx.is_none()
+                && pc.i_db == i_db
+                && pc.pgno_root == root
+            {
+                bt.bc_save_for_write(&mut pc.cur)?;
+            }
+        }
+        // the cursors of the frames that called the running trigger program
+        for f in self.frames.iter_mut().rev() {
+            for pc in f.ap_csr.iter_mut().rev().flatten() {
+                if pc.e_cur_type == CURTYPE_BTREE && pc.btx.is_none() && pc.i_db == i_db && pc.pgno_root == root {
+                    bt.bc_save_for_write(&mut pc.cur)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `OP_Program` (the part after the recursion and depth checks): a frame for sub-program
+    /// `sp`, called by the instruction at `pc` whose `P3` register `reg` keeps the frame
+    /// (`pRt`). The sub-program runs from its first instruction afterwards.
+    fn push_frame<H: VdbeHost>(&mut self, host: &mut H, sp: Arc<SubProgram>, pc: usize, op: &VdbeOp) -> Result<()> {
+        let reg = op.p3 as usize;
+        if self.a_frame.len() <= reg {
+            self.a_frame.resize_with(reg + 1, || None);
+        }
+        // "if( (pRt->flags&MEM_Blob)==0 )": a new frame, its registers MEM_Undefined
+        let child = match self.a_frame[reg].take() {
+            Some(f) if self.a_mem[reg].flags & MEM_BLOB != 0 => f,
+            _ => {
+                let n_mem = (sp.n_mem + sp.n_csr + i32::from(sp.n_csr == 0)).max(1) as usize;
+                let m = &mut self.a_mem[reg];
+                m.z.clear();
+                m.flags = MEM_BLOB;
+                if let Some(r) = self.a_rowset.get_mut(reg) {
+                    *r = None;
+                }
+                Box::new(FrameRt {
+                    a_mem: vec![Mem { flags: MEM_UNDEFINED, enc: 1, ..Mem::default() }; n_mem + 1],
+                    ap_csr: (0..sp.n_csr.max(0)).map(|_| None).collect(),
+                    a_agg: Vec::new(),
+                    a_rowset: Vec::new(),
+                    a_frame: Vec::new(),
+                })
+            }
+        };
+        let key = Arc::as_ptr(&sp) as usize;
+        let rt = match self.sub_rt.iter().position(|(k, _)| *k == key) {
+            Some(i) => self.sub_rt.swap_remove(i).1,
+            None => Self::bind_ops(&sp.a_op, host)?,
+        };
+        let FrameRt { a_mem, ap_csr, a_agg, a_rowset, a_frame } = *child;
+        let n_op = sp.a_op.len();
+        let frame = VdbeFrame {
+            parent_sub: self.cur_sub.take(),
+            a_mem: std::mem::replace(&mut self.a_mem, a_mem),
+            ap_csr: std::mem::replace(&mut self.ap_csr, ap_csr),
+            a_agg: std::mem::replace(&mut self.a_agg, a_agg),
+            a_rowset: std::mem::replace(&mut self.a_rowset, a_rowset),
+            a_frame: std::mem::replace(&mut self.a_frame, a_frame),
+            rt: std::mem::replace(&mut self.rt, rt),
+            // "memset(pFrame->aOnce, 0, (pProgram->nOp + 7)/8)"
+            once: std::mem::replace(&mut self.once, vec![0; n_op]),
+            pc,
+            prog_p1: op.p1,
+            prog_p2: op.p2,
+            reg,
+            token: sp.token,
+            sub: Arc::clone(&sp),
+            last_rowid: host.last_rowid(),
+            n_change: self.n_change,
+            n_db_change: host.db_changes(),
+        };
+        self.frames.push(frame);
+        self.n_change = 0;
+        self.cur_sub = Some(sp);
+        Ok(())
+    }
+
+    /// `sqlite3VdbeFrameRestore(pFrame)`: the cursors of the running frame are closed and the
+    /// state of the frame's parent comes back. The run time of the frame goes back into the
+    /// parent's register `P3` of the `OP_Program`.
+    fn restore_frame<H: VdbeHost>(&mut self, host: &mut H, f: VdbeFrame) {
+        // closeCursorsInFrame(v)
+        for i in 0..self.ap_csr.len() {
+            self.free_cursor(host, i);
+        }
+        let child = Box::new(FrameRt {
+            a_mem: std::mem::replace(&mut self.a_mem, f.a_mem),
+            ap_csr: std::mem::replace(&mut self.ap_csr, f.ap_csr),
+            a_agg: std::mem::replace(&mut self.a_agg, f.a_agg),
+            a_rowset: std::mem::replace(&mut self.a_rowset, f.a_rowset),
+            a_frame: std::mem::replace(&mut self.a_frame, f.a_frame),
+        });
+        let rt = std::mem::replace(&mut self.rt, f.rt);
+        self.sub_rt.push((Arc::as_ptr(&f.sub) as usize, rt));
+        self.once = f.once;
+        self.cur_sub = f.parent_sub;
+        if self.a_frame.len() <= f.reg {
+            self.a_frame.resize_with(f.reg + 1, || None);
+        }
+        self.a_frame[f.reg] = Some(child);
+        host.set_last_rowid(f.last_rowid);
+        self.n_change = f.n_change;
+        host.set_db_changes(f.n_db_change);
+    }
+
+    /// `aMem[i]` of the root frame (`OP_NewRowid` P3, `OP_MemMax` P1: the AUTOINCREMENT
+    /// registers of the main program).
+    fn root_mem(&mut self, i: usize) -> &mut Mem {
+        match self.frames.first_mut() {
+            Some(f) => &mut f.a_mem[i],
+            None => &mut self.a_mem[i],
+        }
+    }
+
+    /// The instructions being run (`p->aOp`).
+    fn cur_ops(&self) -> &[VdbeOp] {
+        match &self.cur_sub {
+            Some(s) => &s.a_op,
+            None => &self.prog.a_op,
+        }
     }
 
     /// The collation of the `OP_CollSeq` in front of instruction `i_op`
@@ -826,6 +1494,86 @@ impl Vdbe {
         }
     }
 
+    /// `sqlite3VdbeRewind(p)`: the statement is ready to run (again) from its first
+    /// instruction. Bound parameters (`aVar`), the run counter of `OP_Init` and the
+    /// `sqlite3_stmt_status` counters are kept, as in C.
+    pub fn rewind(&mut self) {
+        self.pc = 0;
+        self.cache_ctr = 1;
+        self.result_row = (0, 0);
+        for m in &mut self.a_mem {
+            m.flags = MEM_UNDEFINED;
+            m.z.clear();
+        }
+        self.halted = false;
+        self.expired = false;
+        self.n_change = 0;
+        // sqlite3VdbeRewind: "p->nFkConstraint = 0"
+        self.n_fk_constraint = 0;
+        self.tr_pc = usize::MAX;
+        self.err_pc = usize::MAX;
+    }
+
+    /// `sqlite3_stmt_status(pStmt, op, resetFlag)` for the counters the machine keeps
+    /// (`SQLITE_STMTSTATUS_FULLSCAN_STEP` 1, `SORT` 2, `AUTOINDEX` 3, `VM_STEP` 4, `RUN` 6,
+    /// `FILTER_MISS` 7, `FILTER_HIT` 8).
+    pub fn stmt_status(&mut self, op: usize, reset: bool) -> u32 {
+        let Some(c) = self.a_counter.get_mut(op) else {
+            return 0;
+        };
+        let v = *c;
+        if reset {
+            *c = 0;
+        }
+        v
+    }
+
+    /// The statement is suspended at a result row: its cursors on the b-trees of the
+    /// connection join the cursor lists of those b-trees, so that a write or a rollback of
+    /// another statement reaches them (`saveAllCursors`, `sqlite3BtreeTripAllCursors`).
+    fn park_cursors<H: VdbeHost>(&mut self, host: &mut H) {
+        for pc in self.ap_csr.iter_mut().flatten() {
+            if pc.e_cur_type == CURTYPE_BTREE
+                && pc.btx.is_none()
+                && pc.parked.is_none()
+                && let Some(bt) = host.btree(pc.i_db as usize)
+            {
+                pc.parked = Some(bt.bc_park(&mut pc.cur));
+            }
+        }
+    }
+
+    /// The statement runs again: its cursors come back from the cursor lists.
+    fn unpark_cursors<H: VdbeHost>(&mut self, host: &mut H) {
+        for pc in self.ap_csr.iter_mut().flatten() {
+            if let Some(id) = pc.parked.take() {
+                match host.btree(pc.i_db as usize) {
+                    Some(bt) => {
+                        bt.bc_unpark(id, &mut pc.cur);
+                    }
+                    None => {
+                        *pc.cur = BtCursor::detached();
+                        pc.cur.e_state = sqliters_btree::btcursor::CURSOR_FAULT;
+                        pc.cur.skip_next = 4;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The progress handler at C's cadence: "while( nVmStep>=nProgressLimit && db->xProgress!=0 )".
+    #[cold]
+    fn progress_check<H: VdbeHost>(&mut self, host: &mut H) -> Result<()> {
+        while self.call_steps >= self.progress_limit && self.progress_ops != 0 {
+            self.progress_limit += self.progress_ops;
+            if host.progress_invoke()? {
+                self.progress_limit = u64::MAX;
+                return Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"));
+            }
+        }
+        Ok(())
+    }
+
     /// `sqlite3VdbeExec(p)`: runs until the next result row (`Ok(true)`, `SQLITE_ROW`) or to
     /// the end (`Ok(false)`, `SQLITE_DONE`). On an error the statement has been halted
     /// (`sqlite3VdbeHalt`: its cursors are closed).
@@ -833,13 +1581,35 @@ impl Vdbe {
         if self.halted {
             return Ok(false);
         }
-        match self.exec_inner(host) {
-            Ok(r) => Ok(r),
+        self.unpark_cursors(host);
+        // "if( db->xProgress ){ iPrior = p->aCounter[SQLITE_STMTSTATUS_VM_STEP];
+        //   nProgressLimit = db->nProgressOps - (iPrior % db->nProgressOps); }"
+        self.call_steps = 0;
+        self.progress_ops = host.progress_ops();
+        self.progress_limit = if self.progress_ops != 0 {
+            self.progress_ops - (u64::from(self.a_counter[SQLITE_STMTSTATUS_VM_STEP]) % self.progress_ops)
+        } else {
+            u64::MAX
+        };
+        let mut r = self.exec_inner(host);
+        // vdbe_return: the progress handler once more, then the step counter
+        if (r.is_ok() || self.halted) && self.call_steps >= self.progress_limit && self.progress_ops != 0 {
+            if let Err(e) = self.progress_check(host) {
+                r = Err(e);
+            }
+        }
+        self.a_counter[SQLITE_STMTSTATUS_VM_STEP] = self.a_counter[SQLITE_STMTSTATUS_VM_STEP].wrapping_add(self.call_steps as u32);
+        match r {
+            Ok(true) => {
+                self.park_cursors(host);
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
             Err(e) => {
                 // abort_due_to_error: sqlite3VdbeHalt(p)
                 #[cfg(sqliters_dtrace)]
                 {
-                    if sqliters_types::dtrace_enabled() && self.tr_pc < self.prog.a_op.len() {
+                    if sqliters_types::dtrace_enabled() && self.frames.is_empty() && self.tr_pc < self.cur_ops().len() && !self.halted {
                         self.trace_op(self.tr_pc);
                     }
                 }
@@ -855,7 +1625,6 @@ impl Vdbe {
             self.make_rt(host)?;
         }
         let prog = Arc::clone(&self.prog);
-        let a_op: &[VdbeOp] = &prog.a_op;
         let mut pc = self.pc as usize;
         // Locals of sqlite3VdbeExec: they start again at every call.
         let mut i_compare: i32 = 0;
@@ -872,10 +1641,19 @@ impl Vdbe {
                 continue;
             }};
         }
+        // check_for_interrupt: the interrupt flag, then the progress handler
+        macro_rules! check_int {
+            () => {{
+                host.check_interrupt()?;
+                if self.call_steps >= self.progress_limit {
+                    self.progress_check(host)?;
+                }
+            }};
+        }
         macro_rules! jump_check {
             ($to:expr) => {{
                 pc = $to as usize;
-                host.check_interrupt()?;
+                check_int!();
                 continue;
             }};
         }
@@ -886,6 +1664,20 @@ impl Vdbe {
                     None => return Err(internal("cursor not open")),
                 }
             };
+        }
+        // saveAllCursors(pBt, pgnoRoot, pCur) for the cursors of this statement, before a write
+        // through cursor $ci
+        macro_rules! save_cursors {
+            ($ci:expr) => {{
+                let (btx, i_db, root) = {
+                    let c = csr!($ci);
+                    (c.btx, c.i_db, c.pgno_root)
+                };
+                match btx {
+                    Some(x) => self.save_all_cursors(x, root, $ci)?,
+                    None => self.save_db_cursors(host, i_db, root, $ci)?,
+                }
+            }};
         }
         macro_rules! btree_of {
             ($pc:expr) => {
@@ -902,6 +1694,14 @@ impl Vdbe {
             };
         }
 
+        // One pass per frame switch: `a_op` is `p->aOp` (the main program or the sub-program of
+        // the innermost frame).
+        'frames: loop {
+        let hold_sub = self.cur_sub.clone();
+        let a_op: &[VdbeOp] = match &hold_sub {
+            Some(s) => &s.a_op,
+            None => &prog.a_op,
+        };
         loop {
             let op = &a_op[pc];
             #[cfg(sqliters_dtrace)]
@@ -915,6 +1715,7 @@ impl Vdbe {
                 }
             }
             self.n_vm_step += 1;
+            self.call_steps += 1;
             self.err_pc = pc;
             match op.opcode {
                 OP_Goto => jump_check!(op.p2),
@@ -962,11 +1763,41 @@ impl Vdbe {
                         pc += 1;
                         continue;
                     }
+                    if !self.frames.is_empty() && op.p1 == 0 {
+                        // Halt the sub-program: control returns to the parent frame.
+                        let f = self.frames.pop().ok_or_else(|| internal("frame"))?;
+                        // sqlite3VdbeSetChanges(db, p->nChange)
+                        host.set_changes(self.n_change);
+                        let mut pcx = f.pc;
+                        if op.p2 == OE_IGNORE {
+                            // the sub-program throws IGNORE: P2 of the calling OP_Program
+                            pcx = (f.prog_p2 - 1) as usize;
+                        }
+                        self.restore_frame(host, f);
+                        #[cfg(sqliters_dtrace)]
+                        {
+                            // (C prints the halted instruction against the parent's aOp: out of
+                            // range, unless the parent runs the same sub-program — recursion)
+                            let same = match (&hold_sub, &self.cur_sub) {
+                                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                                _ => false,
+                            };
+                            if !same {
+                                tr_prev = None;
+                            }
+                        }
+                        pc = pcx + 1;
+                        continue 'frames;
+                    }
                     #[cfg(sqliters_dtrace)]
                     {
-                        if sqliters_types::dtrace_enabled() {
+                        // (in a frame C prints the halted instruction against the main program's
+                        // aOp, which sqlite3VdbeHalt has restored: out of range)
+                        if sqliters_types::dtrace_enabled() && self.frames.is_empty() {
                             self.trace_op(pc);
                         }
+                        // (printed once: not again on the error path of `exec`)
+                        self.tr_pc = usize::MAX;
                     }
                     self.pc = pc as i32;
                     if op.p1 != 0 {
@@ -992,6 +1823,12 @@ impl Vdbe {
                         let ec = error_code_of(code);
                         let mut e = SqliteError::with_extended(op.p1, msg);
                         e.code = ec;
+                        // p->errorAction = (u8)pOp->p2
+                        e.conflict_effect = match op.p2 {
+                            OE_ROLLBACK => ConflictResolutionEffect::Rollback,
+                            OE_FAIL => ConflictResolutionEffect::Fail,
+                            _ => ConflictResolutionEffect::Abort,
+                        };
                         return Err(e);
                     }
                     self.halt(host);
@@ -1589,10 +2426,18 @@ impl Vdbe {
                 }
 
                 OP_Once => {
-                    if self.init_p1 == self.once[pc] {
-                        jump!(op.p2);
+                    if !self.frames.is_empty() {
+                        // pFrame->aOnce: one bit per instruction, cleared at every OP_Program
+                        if self.once[pc] != 0 {
+                            jump!(op.p2);
+                        }
+                        self.once[pc] = 1;
+                    } else {
+                        if self.init_p1 == self.once[pc] {
+                            jump!(op.p2);
+                        }
+                        self.once[pc] = self.init_p1;
                     }
-                    self.once[pc] = self.init_p1;
                 }
 
                 OP_If => {
@@ -1926,14 +2771,100 @@ impl Vdbe {
                         let m = &mut self.a_mem[i];
                         m.apply_affinity(aff);
                         if aff == SQLITE_AFF_REAL && m.flags & MEM_INT != 0 {
-                            // When applying REAL affinity, if the result is still an MEM_Int
-                            // that will fit in 6 bytes, then change the type to MEM_IntReal
-                            // so that we keep the high-resolution integer value but know that
-                            // the type really wants to be REAL.
+                            // (3.54.1: OP_Affinity makes the integer a MEM_Real; MEM_IntReal
+                            // is set by OP_MakeRecord's affinity string and by OP_TypeCheck)
                             m.r = m.i as f64;
                             m.flags |= MEM_REAL;
                             m.flags &= !(MEM_INT | MEM_STR);
                         }
+                        i += 1;
+                    }
+                }
+
+                OP_TypeCheck => {
+                    // Apply affinities to the range of P2 registers beginning with P1. Take
+                    // the affinities from the Table object in P4. If any value cannot be
+                    // coerced into the correct type, then raise an error.
+                    let P4::Table(t) = &op.p4 else {
+                        return Err(internal("OP_TypeCheck without a table"));
+                    };
+                    let Some(tab) = host.table_info(&t.name) else {
+                        return Err(internal("OP_TypeCheck: table not found"));
+                    };
+                    let mut r = op.p1 as usize;
+                    let (mut i, n_col) = if op.p3 < 2 { (0, tab.cols.len()) } else { ((op.p3 - 2) as usize, (op.p3 - 1) as usize) };
+                    while i < n_col {
+                        let col = &tab.cols[i];
+                        if col.generated && op.p3 < 2 {
+                            if col.is_virtual {
+                                i += 1;
+                                continue;
+                            }
+                            if op.p3 != 0 {
+                                r += 1;
+                                i += 1;
+                                continue;
+                            }
+                        }
+                        let m = &mut self.a_mem[r];
+                        m.apply_affinity(col.affinity);
+                        if m.flags & MEM_NULL == 0 {
+                            let ok = match col.e_ctype {
+                                COLTYPE_BLOB => m.flags & MEM_BLOB != 0,
+                                COLTYPE_INTEGER | COLTYPE_INT => m.flags & MEM_INT != 0,
+                                COLTYPE_TEXT => m.flags & MEM_STR != 0,
+                                COLTYPE_REAL => {
+                                    if m.flags & MEM_INT != 0 {
+                                        // When applying REAL affinity, if the result is still
+                                        // an MEM_Int that will fit in 6 bytes, then change the
+                                        // type to MEM_IntReal so that we keep the
+                                        // high-resolution integer value but know that the
+                                        // type really wants to be REAL.
+                                        if m.i <= 140_737_488_355_327 && m.i >= -140_737_488_355_328 {
+                                            m.flags |= MEM_INT_REAL;
+                                            m.flags &= !MEM_INT;
+                                        } else {
+                                            m.r = m.i as f64;
+                                            m.flags |= MEM_REAL;
+                                            m.flags &= !MEM_INT;
+                                        }
+                                        true
+                                    } else {
+                                        m.flags & (MEM_REAL | MEM_INT_REAL) != 0
+                                    }
+                                }
+                                // COLTYPE_ANY, COLTYPE_CUSTOM: accept anything
+                                _ => true,
+                            };
+                            if !ok {
+                                // vdbe_type_error:
+                                const STD_TYPE: [&str; 6] = ["ANY", "BLOB", "INT", "INTEGER", "REAL", "TEXT"];
+                                // vdbeMemTypeName: azTypes[sqlite3_value_type(pMem)-1]
+                                let ty = if m.flags & MEM_NULL != 0 {
+                                    "NULL"
+                                } else if m.flags & (MEM_INT | MEM_INT_REAL) != 0 && m.flags & MEM_REAL == 0 && m.flags & MEM_INT_REAL == 0 {
+                                    "INT"
+                                } else if m.flags & (MEM_REAL | MEM_INT_REAL) != 0 {
+                                    "REAL"
+                                } else if m.flags & MEM_STR != 0 {
+                                    "TEXT"
+                                } else {
+                                    "BLOB"
+                                };
+                                let msg = format!(
+                                    "cannot store {} value in {} column {}.{}",
+                                    ty,
+                                    STD_TYPE[(usize::from(col.e_ctype)).clamp(1, 6) - 1],
+                                    tab.name,
+                                    col.name
+                                );
+                                // rc = SQLITE_CONSTRAINT_DATATYPE
+                                let mut e = SqliteError::with_extended(3091, msg);
+                                e.code = ErrorCode::Constraint;
+                                return Err(e);
+                            }
+                        }
+                        r += 1;
                         i += 1;
                     }
                 }
@@ -2082,14 +3013,15 @@ impl Vdbe {
                     let out = &mut self.a_mem[op.p2 as usize];
                     out.flags = MEM_INT;
                     out.i = n_entry;
-                    host.check_interrupt()?;
+                    check_int!();
                 }
 
                 OP_Transaction => {
-                    if op.p2 != 0 {
-                        return Err(internal("write transaction"));
-                    }
-                    let (i_meta, i_gen) = host.begin_read_trans(op.p1 as usize)?;
+                    let (i_meta, i_gen) = if op.p2 != 0 {
+                        host.begin_write_trans(op.p1 as usize, op.p2)?
+                    } else {
+                        host.begin_read_trans(op.p1 as usize)?
+                    };
                     let p4 = match op.p4 {
                         P4::Int32(i) => i,
                         _ => 0,
@@ -2106,7 +3038,7 @@ impl Vdbe {
                     out.i = i64::from(v as i32);
                 }
 
-                OP_ReopenIdx | OP_OpenRead => {
+                OP_ReopenIdx | OP_OpenRead | OP_OpenWrite => {
                     let ci = op.p1 as usize;
                     let mut reopened = false;
                     if op.opcode == OP_ReopenIdx
@@ -2117,7 +3049,17 @@ impl Vdbe {
                         reopened = true;
                     }
                     if !reopened {
+                        if self.expired {
+                            // "if( p->expired==1 ){ rc = SQLITE_ABORT_ROLLBACK; goto abort_due_to_error; }"
+                            return Err(SqliteError::with_extended(516, "abort due to ROLLBACK"));
+                        }
                         let i_db = op.p3;
+                        let mut p2 = op.p2 as Pgno;
+                        if op.opcode == OP_OpenWrite && op.p5 & OPFLAG_P2ISREG != 0 {
+                            let m = &mut self.a_mem[op.p2 as usize];
+                            m.integerify();
+                            p2 = m.i as Pgno;
+                        }
                         let (n_field, key_info) = match (&op.p4, &self.rt[pc]) {
                             (P4::KeyInfo(k), OpRt::KeyInfo(rt)) => (i32::from(k.n_all_field), Some(Arc::clone(rt))),
                             (P4::Int32(n), _) => (*n, None),
@@ -2127,13 +3069,13 @@ impl Vdbe {
                         let Some(bt) = host.btree(i_db as usize) else {
                             return Err(internal("database has no b-tree"));
                         };
-                        let cur = bt.bc_cursor(op.p2 as Pgno, false, key_info.is_some());
+                        let cur = bt.bc_cursor(p2, op.opcode == OP_OpenWrite, key_info.is_some());
                         let c = csr!(ci);
                         c.i_db = i_db as i8;
                         c.null_row = true;
                         c.is_ordered = true;
-                        c.pgno_root = op.p2 as Pgno;
-                        c.cur = cur;
+                        c.pgno_root = p2;
+                        *c.cur = cur;
                         c.is_table = key_info.is_none();
                         c.key_info = key_info;
                     }
@@ -2168,7 +3110,7 @@ impl Vdbe {
                     c.is_ordered = is_ordered;
                     c.btx = Some(x);
                     c.no_reuse = true;
-                    c.cur = cur;
+                    *c.cur = cur;
                 }
 
                 OP_OpenAutoindex | OP_OpenEphemeral => {
@@ -2228,7 +3170,7 @@ impl Vdbe {
                         c.orders = orders;
                         c.pgno_root = root;
                         c.is_table = is_table;
-                        c.cur = cur;
+                        *c.cur = cur;
                         c.is_ordered = op.p5 != BTREE_UNORDERED;
                     }
                     csr!(ci).null_row = true;
@@ -2485,10 +3427,8 @@ impl Vdbe {
                             // For the OP_NoConflict opcode, take the jump if any of the input
                             // fields are NULL, since any key with a NULL will conflict with
                             // any other key.
-                            for ii in 0..n_field {
-                                if self.a_mem[p3 + ii].flags & MEM_NULL != 0 {
-                                    jump!(op.p2);
-                                }
+                            if self.a_mem[p3..p3 + n_field].iter().any(|m| m.flags & MEM_NULL != 0) {
+                                jump!(op.p2);
                             }
                         }
                         if op.opcode == OP_IfNoHope {
@@ -2552,9 +3492,6 @@ impl Vdbe {
 
                 OP_NewRowid => {
                     let pc_ = csr!(op.p1);
-                    if pc_.btx.is_none() || op.p3 != 0 {
-                        return Err(internal("OP_NewRowid on a table that is not ephemeral"));
-                    }
                     let bt = btree_of!(pc_);
                     let mut v: i64 = 0;
                     const MAX_ROWID: i64 = i64::MAX;
@@ -2571,8 +3508,41 @@ impl Vdbe {
                             }
                         }
                     }
+                    if op.p3 != 0 {
+                        // AUTOINCREMENT: the register of the largest rowid so far, in the root
+                        // frame when a trigger program runs
+                        let m = match self.frames.first_mut() {
+                            Some(f) => &mut f.a_mem[op.p3 as usize],
+                            None => &mut self.a_mem[op.p3 as usize],
+                        };
+                        m.integerify();
+                        if m.i == MAX_ROWID || pc_.use_random_rowid {
+                            return Err(SqliteError::new(ErrorCode::Full, "database or disk is full")); // IMP: R-17817-00630
+                        }
+                        if v < m.i + 1 {
+                            v = m.i + 1;
+                        }
+                        m.i = v;
+                    }
                     if pc_.use_random_rowid {
-                        return Err(SqliteError::new(ErrorCode::Full, "database or disk is full"));
+                        // IMP: R-07677-41881 The largest ROWID is in use: random rowids until
+                        // an unused one is found.
+                        let mut cnt = 0;
+                        let mut res;
+                        loop {
+                            v = host.randomness();
+                            v &= MAX_ROWID >> 1;
+                            v += 1; // Ensure that v is greater than zero
+                            let bt = btree_of!(pc_);
+                            res = bt.bc_table_moveto(&mut pc_.cur, v, false)?;
+                            cnt += 1;
+                            if !(res == 0 && cnt < 100) {
+                                break;
+                            }
+                        }
+                        if res == 0 {
+                            return Err(SqliteError::new(ErrorCode::Full, "database or disk is full")); // IMP: R-38219-53002
+                        }
                     }
                     pc_.deferred_moveto = false;
                     pc_.cache_status = CACHE_STALE;
@@ -2583,71 +3553,52 @@ impl Vdbe {
 
                 OP_Insert => {
                     let ci = op.p1 as usize;
-                    let (x, root) = {
-                        let c = csr!(ci);
-                        match c.btx {
-                            Some(x) => (x, c.pgno_root),
-                            None => return Err(internal("OP_Insert on a table that is not ephemeral")),
-                        }
-                    };
                     let n_key = self.a_mem[op.p3 as usize].i;
+                    if op.p5 & OPFLAG_PREFORMAT != 0 {
+                        return Err(internal("OPFLAG_PREFORMAT is not ported"));
+                    }
+                    if op.p5 & OPFLAG_NCHANGE != 0 {
+                        self.n_change += 1;
+                        if op.p5 & OPFLAG_LASTROWID != 0 {
+                            host.set_last_rowid(n_key);
+                        }
+                    }
                     self.a_mem[op.p2 as usize].expand_blob();
-                    self.save_all_cursors(x, root, ci)?;
-                    let Some(e) = self.ephem.get_mut(x).and_then(|e| e.as_mut()) else {
-                        return Err(internal("ephemeral b-tree is closed"));
-                    };
-                    e.bt.insert_table(root, n_key, &self.a_mem[op.p2 as usize].z)?;
-                    e.bt.statement_end();
+                    save_cursors!(ci);
                     let c = csr!(ci);
-                    e.bt.bc_invalidate(&mut c.cur);
+                    let seek_result = if op.p5 & OPFLAG_USESEEKRESULT != 0 { c.seek_result } else { 0 };
+                    let bt = btree_of!(c);
+                    let rc = bt.bc_insert(
+                        &mut c.cur,
+                        n_key,
+                        &self.a_mem[op.p2 as usize].z,
+                        (op.p5 & (OPFLAG_APPEND | OPFLAG_SAVEPOSITION)) as u8,
+                        seek_result,
+                        None,
+                    );
                     c.deferred_moveto = false;
                     c.cache_status = CACHE_STALE;
                     col_cache_ctr = col_cache_ctr.wrapping_add(1);
+                    rc?;
                 }
 
                 OP_Delete => {
                     let ci = op.p1 as usize;
-                    let (x, root, is_table) = {
-                        let c = csr!(ci);
-                        match c.btx {
-                            Some(x) => (x, c.pgno_root, c.is_table),
-                            None => return Err(internal("OP_Delete on a table that is not ephemeral")),
-                        }
-                    };
-                    // sqlite3BtreeDelete(pC->uc.pCursor, pOp->p5): the entry the cursor is on
-                    let Some(e) = self.ephem.get_mut(x).and_then(|e| e.as_mut()) else {
-                        return Err(internal("ephemeral b-tree is closed"));
-                    };
+                    save_cursors!(ci);
                     let c = csr!(ci);
-                    if !c.cur.is_valid() {
-                        return Err(corrupt());
+                    let bt = btree_of!(c);
+                    if c.cur.e_state >= CURSOR_REQUIRESEEK && bt.bc_needs_index_restore(&c.cur) {
+                        // (sqlite3BtreeDelete: btreeRestoreCursorPosition of an index cursor)
+                        restore_cursor_position(bt, c)?;
                     }
-                    let mut key: Vec<u8> = Vec::new();
-                    let mut rowid = 0i64;
-                    if is_table {
-                        rowid = e.bt.bc_integer_key(&mut c.cur)?;
-                    } else {
-                        let n = e.bt.bc_payload_size(&mut c.cur)?;
-                        key.resize(n as usize, 0);
-                        e.bt.bc_payload(&mut c.cur, 0, &mut key)?;
-                    }
-                    let orders = c.orders.clone();
-                    self.save_all_cursors(x, root, ci)?;
-                    let Some(e) = self.ephem.get_mut(x).and_then(|e| e.as_mut()) else {
-                        return Err(internal("ephemeral b-tree is closed"));
-                    };
-                    let c = csr!(ci);
-                    e.bt.bc_invalidate(&mut c.cur);
-                    if is_table {
-                        e.bt.delete_table(root, rowid)?;
-                    } else {
-                        let vals = sqliters_types::decode_record(&key)?;
-                        e.bt.delete_index(root, &vals, &orders)?;
-                    }
-                    e.bt.statement_end();
+                    let rc = bt.bc_delete(&mut c.cur, op.p5 as u8);
                     c.cache_status = CACHE_STALE;
                     col_cache_ctr = col_cache_ctr.wrapping_add(1);
                     c.seek_result = 0;
+                    rc?;
+                    if op.p2 as u16 & OPFLAG_NCHANGE != 0 {
+                        self.n_change += 1;
+                    }
                 }
 
                 OP_SorterCompare => {
@@ -2834,28 +3785,118 @@ impl Vdbe {
                         jump_check!(op.p2);
                     }
                     pc_.null_row = true;
-                    host.check_interrupt()?;
+                    check_int!();
                 }
 
                 OP_IdxInsert => {
                     let ci = op.p1 as usize;
-                    let (x, root) = {
-                        let c = csr!(ci);
-                        match c.btx {
-                            Some(x) => (x, c.pgno_root),
-                            None => return Err(internal("OP_IdxInsert on an index that is not ephemeral")),
-                        }
-                    };
+                    if op.p5 & OPFLAG_PREFORMAT != 0 {
+                        return Err(internal("OPFLAG_PREFORMAT is not ported"));
+                    }
+                    if op.p5 & OPFLAG_NCHANGE != 0 {
+                        self.n_change += 1;
+                    }
                     self.a_mem[op.p2 as usize].expand_blob();
-                    self.save_all_cursors(x, root, ci)?;
-                    let Some(e) = self.ephem.get_mut(x).and_then(|e| e.as_mut()) else {
-                        return Err(internal("ephemeral b-tree is closed"));
-                    };
+                    save_cursors!(ci);
                     let c = csr!(ci);
-                    e.bt.bc_invalidate(&mut c.cur);
-                    e.bt.insert_index(root, &self.a_mem[op.p2 as usize].z, &c.orders)?;
-                    e.bt.statement_end();
+                    let Some(ki) = c.key_info.clone() else {
+                        return Err(internal("index cursor without KeyInfo"));
+                    };
+                    let seek_result = if op.p5 & OPFLAG_USESEEKRESULT != 0 { c.seek_result } else { 0 };
+                    let flags = (op.p5 & (OPFLAG_APPEND | OPFLAG_SAVEPOSITION)) as u8;
+                    let bt = btree_of!(c);
+                    let n_mem = match op.p4 {
+                        P4::Int32(n) => n.max(0) as usize,
+                        _ => 0,
+                    };
+                    let p3 = op.p3 as usize;
+                    let rc = if n_mem > 0 {
+                        // "r.aMem = pX->aMem; r.nField = pX->nMem; r.default_rc = 0"
+                        let mut r = UnpackedRecord::new(&ki, &self.a_mem[p3..p3 + n_mem], n_mem as u16, 0);
+                        r.find_compare();
+                        bt.bc_insert(&mut c.cur, 0, &self.a_mem[op.p2 as usize].z, flags, seek_result, Some(&mut r))
+                    } else {
+                        // btreeMoveto: sqlite3VdbeRecordUnpack of the key
+                        let mems = sqlite3_vdbe_record_unpack(&ki, &self.a_mem[op.p2 as usize].z, usize::from(ki.n_key_field) + 1);
+                        if seek_result == 0 && (mems.is_empty() || mems.len() > usize::from(ki.n_all_field)) {
+                            return Err(corrupt());
+                        }
+                        let mut r = UnpackedRecord::new(&ki, &mems, mems.len() as u16, 0);
+                        r.find_compare();
+                        bt.bc_insert(&mut c.cur, 0, &self.a_mem[op.p2 as usize].z, flags, seek_result, Some(&mut r))
+                    };
                     c.cache_status = CACHE_STALE;
+                    rc?;
+                }
+
+                OP_IdxDelete => {
+                    let ci = op.p1 as usize;
+                    save_cursors!(ci);
+                    let c = csr!(ci);
+                    let Some(ki) = c.key_info.clone() else {
+                        return Err(internal("index cursor without KeyInfo"));
+                    };
+                    let bt = btree_of!(c);
+                    let p2 = op.p2 as usize;
+                    let n_field = op.p5 as usize;
+                    let res = {
+                        let mut r = UnpackedRecord::new(&ki, &self.a_mem[p2..p2 + n_field], n_field as u16, 0);
+                        r.find_compare();
+                        bt.bc_index_moveto(&mut c.cur, &mut r)?
+                    };
+                    if res != 0 {
+                        // sqlite3VdbeFindIndexKey: the search among the neighbours for an index
+                        // on expressions or virtual columns is not ported (mask==0 here: "do
+                        // not search for a match").
+                        if !host.writable_schema() {
+                            // sqlite3ReportError(SQLITE_CORRUPT_INDEX, __LINE__, "index corruption")
+                            return Err(SqliteError::with_extended(779, "database disk image is malformed"));
+                        }
+                        c.cache_status = CACHE_STALE;
+                        c.seek_result = 0;
+                        pc += 1;
+                        continue;
+                    }
+                    if op.p3 != 0 {
+                        // vdbeIndexKeyCompare: the entry equals the new key byte for byte
+                        let m = &self.a_mem[op.p3 as usize];
+                        if m.flags & MEM_BLOB != 0 {
+                            let n_key = bt.bc_payload_size(&mut c.cur)?;
+                            if n_key as usize == m.z.len() {
+                                let mut k = vec![0u8; n_key as usize];
+                                bt.bc_payload(&mut c.cur, 0, &mut k)?;
+                                if k == m.z {
+                                    self.a_mem[op.p3 as usize].set_null();
+                                    pc += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    bt.bc_delete(&mut c.cur, BTREE_AUXDELETE)?;
+                    c.cache_status = CACHE_STALE;
+                    c.seek_result = 0;
+                }
+
+                OP_Clear => {
+                    // sqlite3BtreeClearTable(db->aDb[pOp->p2].pBt, (u32)pOp->p1, &nChange)
+                    self.save_db_cursors(host, op.p2 as i8, op.p1 as Pgno, usize::MAX)?;
+                    let Some(bt) = host.btree(op.p2 as usize) else {
+                        return Err(internal("database has no b-tree"));
+                    };
+                    let n = bt.bc_clear_table(op.p1 as Pgno, op.p3 != 0)? as i64;
+                    if op.p3 != 0 {
+                        self.n_change += n;
+                        if op.p3 > 0 {
+                            self.a_mem[op.p3 as usize].i += n;
+                        }
+                    }
+                }
+
+                OP_ResetCount => {
+                    // sqlite3VdbeSetChanges(db, p->nChange); p->nChange = 0;
+                    host.set_changes(self.n_change);
+                    self.n_change = 0;
                 }
 
                 OP_SorterInsert => {
@@ -2973,7 +4014,7 @@ impl Vdbe {
                             self.a_mem[op.p3 as usize].set_int64(v);
                         }
                     }
-                    host.check_interrupt()?;
+                    check_int!();
                 }
 
                 OP_RowSetTest => {
@@ -2993,10 +4034,11 @@ impl Vdbe {
                 }
 
                 OP_MemMax => {
-                    self.a_mem[op.p1 as usize].integerify();
+                    // pIn1: the register of the root frame
+                    self.root_mem(op.p1 as usize).integerify();
                     self.a_mem[op.p2 as usize].integerify();
                     let v2 = self.a_mem[op.p2 as usize].i;
-                    let m1 = &mut self.a_mem[op.p1 as usize];
+                    let m1 = self.root_mem(op.p1 as usize);
                     if m1.i < v2 {
                         m1.i = v2;
                     }
@@ -3087,6 +4129,12 @@ impl Vdbe {
                             let args: Vec<RuntimeValue> = self.a_mem[p2..p2 + argc].iter().map(Mem::to_runtime_value).collect();
                             if op.p1 != 0 { host.agg_inverse(id, &args)? } else { host.agg_step(id, &args)? }
                         }
+                        Some(AggCtx::Win(w)) => {
+                            // (pCtx->isError: "sqlite3VdbeError(p, "%s", sqlite3_value_text(pCtx->pOut))")
+                            if let Err(msg) = w.step(op.p1 != 0, &mut self.a_mem[p2..p2 + argc]) {
+                                return Err(SqliteError::new(ErrorCode::Error, msg));
+                            }
+                        }
                         _ => return Err(internal("aggregate context lost")),
                     }
                     if skip && pc > 0 {
@@ -3117,6 +4165,7 @@ impl Vdbe {
                     let is_value = op.p3 != 0;
                     let rv: Mem = match self.a_agg[reg].as_mut() {
                         Some(AggCtx::MinMax { best, .. }) => best.clone().unwrap_or_else(Mem::null),
+                        Some(AggCtx::Win(w)) => w.value(!is_value).unwrap_or_else(Mem::null),
                         Some(AggCtx::Host(a)) => {
                             let v = if is_value {
                                 match *a {
@@ -3180,6 +4229,15 @@ impl Vdbe {
                             }
                             out = if null { Mem::null() } else { argv[i_best].clone() };
                         }
+                    } else if func.func_flags & SQLITE_FUNC_BUILTIN != 0 && argc == 1 && func.name.eq_ignore_ascii_case("zeroblob") {
+                        // zeroblobFunc: sqlite3_result_zeroblob64(context, n) — a MEM_Zero blob
+                        let n = self.a_mem[p2].int_value().max(0);
+                        if n > i64::from(limit_length) {
+                            return Err(too_big());
+                        }
+                        let mut m = Mem::null();
+                        m.set_zero_blob(n as i32);
+                        out = m;
                     } else {
                         let args: Vec<RuntimeValue> = self.a_mem[p2..p2 + argc].iter().map(Mem::to_runtime_value).collect();
                         let rv = host.call_function(func, &args)?;
@@ -3245,9 +4303,101 @@ impl Vdbe {
 
                 OP_Trace | OP_Init => {
                     if op.opcode == OP_Init {
-                        self.init_p1 += 1;
+                        if self.frames.is_empty() {
+                            self.init_p1 += 1;
+                        } else {
+                            // (the OP_Init of a sub-program counts in its own aOp[0].p1, which
+                            // only the OP_Once of the main program read)
+                            #[cfg(sqliters_dtrace)]
+                            {
+                                if sqliters_types::dtrace_enabled() {
+                                    eprintln!("TR|vm|sql|{}", self.tr_sql);
+                                }
+                            }
+                        }
                         self.a_counter[SQLITE_STMTSTATUS_RUN] += 1;
                         jump!(op.p2);
+                    }
+                }
+
+                OP_Program => {
+                    let P4::SubProgram(sp0) = &op.p4 else {
+                        return Err(internal("OP_Program without a sub-program"));
+                    };
+                    let sp = if sp0.is_stub() {
+                        match prog.p_program.get(sp0.n_csr as usize) {
+                            Some(s) => Arc::clone(s),
+                            None => return Err(internal("sub-program stub without a sub-program")),
+                        }
+                    } else {
+                        Arc::clone(sp0)
+                    };
+                    // P5: recursive invocation of the trigger is disabled
+                    if op.p5 != 0 && self.frames.iter().any(|f| f.token == sp.token) {
+                        pc += 1;
+                        continue;
+                    }
+                    if self.frames.len() >= host.trigger_depth_limit() {
+                        return Err(SqliteError::new(ErrorCode::Error, "triggers nested too deep"));
+                    }
+                    #[cfg(sqliters_dtrace)]
+                    {
+                        // (C prints OP_Program against the sub-program's aOp: out of range, unless
+                        // the sub-program calls itself)
+                        if !hold_sub.as_ref().is_some_and(|h| Arc::ptr_eq(h, &sp)) {
+                            tr_prev = None;
+                        }
+                    }
+                    self.push_frame(host, sp, pc, op)?;
+                    // "pOp = &aOp[-1]; goto check_for_interrupt;"
+                    pc = 0;
+                    check_int!();
+                    continue 'frames;
+                }
+
+                OP_Param => {
+                    let Some(f) = self.frames.last() else {
+                        return Err(internal("OP_Param outside a frame"));
+                    };
+                    // pFrame->aMem[pOp->p1 + pFrame->aOp[pFrame->pc].p1]
+                    let v = f.a_mem[(op.p1 + f.prog_p1) as usize].clone();
+                    self.a_mem[op.p2 as usize] = v;
+                }
+
+                OP_CursorLock => {
+                    // sqlite3BtreeCursorPin(pC->uc.pCursor)
+                    csr!(op.p1).cur.cur_flags |= sqliters_btree::btcursor::BTCF_PINNED;
+                }
+
+                OP_CursorUnlock => {
+                    csr!(op.p1).cur.cur_flags &= !sqliters_btree::btcursor::BTCF_PINNED;
+                }
+
+                OP_FkCounter => {
+                    if op.p1 != 0 {
+                        host.add_deferred_cons(false, i64::from(op.p2));
+                    } else if host.defer_fks() {
+                        host.add_deferred_cons(true, i64::from(op.p2));
+                    } else {
+                        self.n_fk_constraint += i64::from(op.p2);
+                    }
+                }
+
+                OP_FkIfZero => {
+                    let (n_def, n_def_imm) = host.deferred_cons();
+                    if op.p1 != 0 {
+                        if n_def == 0 && n_def_imm == 0 {
+                            jump!(op.p2);
+                        }
+                    } else if self.n_fk_constraint == 0 && n_def_imm == 0 {
+                        jump!(op.p2);
+                    }
+                }
+
+                OP_FkCheck => {
+                    // sqlite3VdbeCheckFkImmediate
+                    if self.n_fk_constraint != 0 {
+                        return Err(fk_error());
                     }
                 }
 
@@ -3258,6 +4408,7 @@ impl Vdbe {
                 }
             }
             pc += 1;
+        }
         }
     }
 
@@ -3291,6 +4442,9 @@ impl Vdbe {
 
     /// A fresh accumulator for the aggregate function of the instruction at `i_op`.
     fn agg_new<H: VdbeHost>(&mut self, host: &mut H, func: &Arc<FuncDef>, argc: usize, i_op: usize) -> Result<AggCtx> {
+        if let Some(f) = WinFn::of(func) {
+            return Ok(AggCtx::Win(Box::new(WinCtx::new(f))));
+        }
         if func.func_flags & SQLITE_FUNC_NEEDCOLL != 0 {
             // min() / max(): sqlite3GetFuncCollSeq
             let coll = self.func_coll_seq(i_op);
@@ -3304,7 +4458,9 @@ impl Vdbe {
     /// line the instrumented C build prints (`patch_m1.py`: `trVmOp`).
     #[cfg(sqliters_dtrace)]
     fn trace_op(&self, pc: usize) {
-        let op = &self.prog.a_op[pc];
+        let Some(op) = self.cur_ops().get(pc) else {
+            return;
+        };
         // C rewrites these opcodes when they first run
         let opcode = match op.opcode {
             OP_String8 => OP_String,
@@ -3313,9 +4469,15 @@ impl Vdbe {
         };
         let prop = OPCODE_PROPERTY[opcode as usize];
         let mut w = String::new();
-        let n_reg = self.prog.n_mem - self.prog.n_cursor;
+        // p->nMem - p->nCursor (a frame: nChildMem - nChildCsr)
+        let n_reg = match &self.cur_sub {
+            Some(s) => s.n_mem + i32::from(s.n_csr == 0),
+            None => self.prog.n_mem - self.prog.n_cursor,
+        };
         let reg = |i: i32| -> String {
-            if i > 0 && i <= n_reg {
+            if i > 0 && i <= n_reg && self.tr_undef {
+                "U".to_owned()
+            } else if i > 0 && i <= n_reg {
                 let m = &self.a_mem[i as usize];
                 if m.flags & MEM_BLOB != 0 && self.a_rowset.get(i as usize).is_some_and(Option::is_some) {
                     return "U".to_owned();
@@ -3353,12 +4515,13 @@ impl Vdbe {
     }
 
     /// Opcode trace: the statement text (C prints `p->zSql` at `OP_Init`).
-    pub fn trace_sql(&self, sql: &str) {
+    pub fn trace_sql(&mut self, sql: &str) {
         #[cfg(sqliters_dtrace)]
         {
             if sqliters_types::dtrace_enabled() {
                 let z: String = sql.chars().take(300).map(|c| if c == '\n' { ' ' } else { c }).collect();
                 eprintln!("TR|vm|sql|{z}");
+                self.tr_sql = z;
             }
         }
         let _ = sql;

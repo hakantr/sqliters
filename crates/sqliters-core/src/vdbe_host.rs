@@ -20,13 +20,19 @@ use sqliters_syntax::Stmt;
 use sqliters_types::{
     AggregateStepId, DatabaseId, ErrorCode, ExecutionServices, Result, RuntimeValue, SqliteError, TextEncoding, Value,
 };
-use sqliters_vdbe::vdbe::{Vdbe, VdbeHost, unsupported_reason};
+use sqliters_vdbe::functions::VmRuntimeContext;
+use sqliters_vdbe::vdbe::{
+    COLTYPE_ANY, COLTYPE_BLOB, COLTYPE_CUSTOM, COLTYPE_INT, COLTYPE_INTEGER, COLTYPE_REAL, COLTYPE_TEXT, TableColRt, TableRt, Vdbe,
+    VdbeHost, unsupported_reason,
+};
 use sqliters_vdbe::vdbeaux::{COLNAME_NAME, FuncDef, Program};
 use sqliters_vdbe::vdbemem::{CollRt, Mem};
+use sqliters_vdbe::vdbeaux::P4;
 
 use crate::ConnectionInner;
-use crate::engine::{ExecContext, QueryOutput};
-use crate::execution_context::ExecutionContext;
+use crate::engine::ExecContext;
+use crate::db_set::DatabaseSet;
+use crate::execution_context::{CollationRegistry, ExecutionContext, FunctionRegistry, ProgressTracker};
 
 /// True if the environment variable `SQLITERS_VDBE_EXEC` is set: statements the generator and
 /// the machine support completely are executed by the machine.
@@ -125,6 +131,11 @@ pub(crate) fn machine_program(
                 trace(&format!("fallback: {why}"), raw_sql);
                 return None;
             }
+            if p.a_op.iter().any(|op| matches!(&op.p4, P4::FuncCtx(c) if c.p_func.name.eq_ignore_ascii_case("rtreecheck"))) {
+                // (evaluated by the engine's executor, not by the function library)
+                trace("fallback: rtreecheck()", raw_sql);
+                return None;
+            }
             if p.n_var as usize != n_param {
                 trace("fallback: parameter numbering", raw_sql);
                 return None;
@@ -154,155 +165,488 @@ pub(crate) fn column_names(prog: &Program) -> Option<Vec<String>> {
     Some(out)
 }
 
-struct MachineHost<'a, 'b> {
-    ctx: &'a mut ExecContext<'b>,
+/// The connection as the machine sees it for one `sqlite3_step`.
+pub(crate) struct MachineHost<'a> {
+    pub db_set: &'a mut DatabaseSet,
+    pub functions: &'a FunctionRegistry,
+    pub collations: &'a CollationRegistry,
+    pub progress: &'a mut ProgressTracker,
+    pub runtime: &'a VmRuntimeContext,
+    pub interrupt_flag: &'a std::sync::atomic::AtomicBool,
+    pub strict_subtype: bool,
+    pub encoding: TextEncoding,
 }
 
-impl MachineHost<'_, '_> {
+impl<'a> MachineHost<'a> {
+    pub(crate) fn new(inner: &'a mut ConnectionInner) -> MachineHost<'a> {
+        let encoding = inner.effective_encoding();
+        MachineHost {
+            db_set: &mut inner.db_set,
+            functions: &inner.functions,
+            collations: &inner.collations,
+            progress: &mut inner.progress,
+            runtime: &inner.runtime,
+            interrupt_flag: &inner.active_interrupt_flag,
+            strict_subtype: inner.strict_subtype,
+            encoding,
+        }
+    }
+
+    fn dbs(&mut self) -> &mut DatabaseSet {
+        self.db_set
+    }
+
+    fn colls(&self) -> &CollationRegistry {
+        self.collations
+    }
+
+    fn prog(&mut self) -> &mut ProgressTracker {
+        self.progress
+    }
+
+    fn prog_ref(&self) -> &ProgressTracker {
+        self.progress
+    }
+
+    fn intr(&self) -> &std::sync::atomic::AtomicBool {
+        self.interrupt_flag
+    }
+
     fn svc(&mut self) -> ExecutionContext<'_> {
-        let enc = self.ctx.encoding();
         ExecutionContext {
-            interrupt_flag: self.ctx.interrupt_flag,
-            runtime: self.ctx.runtime,
-            encoding: enc,
-            functions: self.ctx.functions,
-            collations: self.ctx.collations,
-            progress: self.ctx.progress,
-            strict_subtype: self.ctx.strict_subtype,
+            interrupt_flag: self.interrupt_flag,
+            runtime: self.runtime,
+            encoding: self.encoding,
+            functions: self.functions,
+            collations: self.collations,
+            progress: self.progress,
+            strict_subtype: self.strict_subtype,
         }
     }
 }
 
-impl VdbeHost for MachineHost<'_, '_> {
+/// The methods of [`VdbeHost`] that are the same for a statement that reads
+/// ([`MachineHost`]) and one that writes ([`WriteHost`]).
+macro_rules! host_common {
+    () => {
+        fn get_meta(&mut self, i_db: usize, i_cookie: i32) -> Result<u32> {
+            let Some(bt) = self.btree(i_db) else {
+                return Ok(0);
+            };
+            let h = bt.pager().header();
+            Ok(match i_cookie {
+                1 => h.schema_cookie,
+                2 => h.schema_format,
+                6 => h.user_version as u32,
+                8 => h.application_id as u32,
+                _ => return Err(SqliteError::new(ErrorCode::Internal, "vdbe: OP_ReadCookie of this cookie is not ported")),
+            })
+        }
+
+        fn find_collation(&mut self, name: &str) -> Option<CollRt> {
+            self.colls().get_custom(name).map(CollRt::from_custom)
+        }
+
+        fn call_function(&mut self, func: &FuncDef, args: &[RuntimeValue]) -> Result<RuntimeValue> {
+            self.svc().call_scalar(&func.name, args)
+        }
+
+        fn agg_open(&mut self, func: &FuncDef, n_arg: usize) -> Result<usize> {
+            Ok(self.svc().agg_open(&func.name, n_arg)?.0)
+        }
+
+        fn agg_step(&mut self, id: usize, args: &[RuntimeValue]) -> Result<()> {
+            self.svc().agg_step(AggregateStepId(id), args)
+        }
+
+        fn agg_inverse(&mut self, id: usize, args: &[RuntimeValue]) -> Result<()> {
+            self.svc().agg_inverse(AggregateStepId(id), args)
+        }
+
+        fn agg_value(&mut self, id: usize) -> Result<RuntimeValue> {
+            self.svc().agg_value(AggregateStepId(id))
+        }
+
+        fn agg_finalize(&mut self, id: usize) -> Result<RuntimeValue> {
+            self.svc().agg_finalize(AggregateStepId(id))
+        }
+
+        fn open_ephemeral(&mut self) -> Result<Btree> {
+            // BTREE_OMIT_JOURNAL | BTREE_SINGLE on a private pager. C keeps such a b-tree in
+            // memory until its cache would spill to a temporary file; here it stays in memory.
+            let opts = PagerOpenOptions {
+                lock_geometry: Some(self.dbs().lock_geometry()),
+                db_kind: Some(DatabaseKind::PrivateTemporary),
+                temp_in_memory: true,
+                ..PagerOpenOptions::default()
+            };
+            let mut bt = Btree::open_private_temporary(Arc::clone(self.dbs().disk_vfs()), opts)?;
+            let _ = bt.pager_mut().set_locking_mode(LockingMode::Exclusive);
+            bt.begin_write()?;
+            Ok(bt)
+        }
+
+        fn limit_length(&self) -> i32 {
+            // SQLITE_MAX_LENGTH (the engine has no sqlite3_limit())
+            1_000_000_000
+        }
+
+        fn check_interrupt(&mut self) -> Result<()> {
+            if self.intr().load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"));
+            }
+            Ok(())
+        }
+
+        fn progress_ops(&self) -> u64 {
+            self.prog_ref().interval()
+        }
+
+        fn progress_invoke(&mut self) -> Result<bool> {
+            self.prog().invoke()
+        }
+
+        fn table_info(&mut self, name: &str) -> Option<Arc<TableRt>> {
+            // (the operand carries the name only: the table is looked up as sqlite3FindTable
+            // does — TEMP before MAIN, then the attached databases; OP_TypeCheck is coded for
+            // STRICT tables only)
+            let n = self.dbs().slot_count();
+            let order = [1usize, 0].into_iter().chain(2..n);
+            for i in order {
+                let Some(slot) = self.dbs().slot(DatabaseId(i)) else {
+                    continue;
+                };
+                if slot.btree.is_none() {
+                    continue;
+                }
+                if let Some(t) = slot.schema.tables.iter().find(|t| t.strict && t.name.eq_ignore_ascii_case(name)) {
+                    let cols = t
+                        .columns
+                        .iter()
+                        .map(|c| TableColRt {
+                            name: c.name.clone(),
+                            affinity: match c.affinity {
+                                sqliters_types::TypeAffinity::Blob => 0x41,
+                                sqliters_types::TypeAffinity::Text => 0x42,
+                                sqliters_types::TypeAffinity::Numeric => 0x43,
+                                sqliters_types::TypeAffinity::Integer => 0x44,
+                                sqliters_types::TypeAffinity::Real => 0x45,
+                            },
+                            // sqlite3StdType[]: the standard type names of a STRICT table
+                            e_ctype: match c.type_name.to_ascii_uppercase().as_str() {
+                                "ANY" => COLTYPE_ANY,
+                                "BLOB" => COLTYPE_BLOB,
+                                "INT" => COLTYPE_INT,
+                                "INTEGER" => COLTYPE_INTEGER,
+                                "REAL" => COLTYPE_REAL,
+                                "TEXT" => COLTYPE_TEXT,
+                                _ => COLTYPE_CUSTOM,
+                            },
+                            generated: c.generated.is_some(),
+                            is_virtual: c.generated.as_ref().is_some_and(|(_, stored)| !*stored),
+                        })
+                        .collect();
+                    return Some(Arc::new(TableRt { name: t.name.clone(), cols }));
+                }
+            }
+            None
+        }
+
+        fn sorter_config(&mut self) -> (i64, i64, bool) {
+            let bt = self.dbs().main_btree();
+            (i64::from(bt.pager().page_size()), i64::from(bt.cache_size()), self.dbs().temp_store().is_memory())
+        }
+    };
+}
+
+impl VdbeHost for MachineHost<'_> {
+    fn btree(&mut self, i_db: usize) -> Option<&mut Btree> {
+        self.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut())
+    }
+
+    fn begin_read_trans(&mut self, i_db: usize) -> Result<(u32, i32)> {
+        let ahead = self.db_set.c_cookie_ahead();
+        let Some(slot) = self.db_set.slot(DatabaseId(i_db)) else {
+            return Err(SqliteError::new(ErrorCode::Error, format!("unknown database index {i_db}")));
+        };
+        // The engine's read step has begun the read transaction of every database the
+        // statement names (`sqlite3BtreeBeginTrans(pBt, 0)` is then a no-op, as in C when
+        // the b-tree is already in a transaction). A database that is not in one was not
+        // seen by the engine: the statement is given back to the engine's executor.
+        if slot.btree.as_ref().is_some_and(|bt| bt.transaction_state() == TransactionState::Open) {
+            return Err(SqliteError::new(ErrorCode::Schema, "database schema has changed"));
+        }
+        Ok((slot.schema.schema_cookie + u32::from(ahead == Some(i_db)), slot.c_generation))
+    }
+
+    host_common!();
+}
+
+/// The connection as the machine sees it for a statement that writes: the engine's write
+/// statement context (`ExecContext`), whose transaction, statement-journal and commit logic
+/// the machine uses as the engine's own executor does.
+pub(crate) struct WriteHost<'a, 'c> {
+    pub ctx: &'a mut ExecContext<'c>,
+    pub encoding: TextEncoding,
+}
+
+impl WriteHost<'_, '_> {
+    fn dbs(&mut self) -> &mut DatabaseSet {
+        self.ctx.db_set
+    }
+
+    fn colls(&self) -> &CollationRegistry {
+        self.ctx.collations
+    }
+
+    fn prog(&mut self) -> &mut ProgressTracker {
+        self.ctx.progress
+    }
+
+    fn prog_ref(&self) -> &ProgressTracker {
+        self.ctx.progress
+    }
+
+    fn intr(&self) -> &std::sync::atomic::AtomicBool {
+        self.ctx.interrupt_flag
+    }
+
+    fn svc(&mut self) -> ExecutionContext<'_> {
+        ExecutionContext {
+            interrupt_flag: self.ctx.interrupt_flag,
+            runtime: &*self.ctx.runtime,
+            encoding: self.encoding,
+            functions: self.ctx.functions,
+            collations: self.ctx.collations,
+            progress: &mut *self.ctx.progress,
+            strict_subtype: self.ctx.strict_subtype,
+        }
+    }
+
+    /// `(iMeta, pSchema->iGeneration)` of database `i_db` once its transaction has begun.
+    fn meta_and_generation(&mut self, i_db: usize) -> Result<(u32, i32)> {
+        let ahead = self.ctx.db_set.c_cookie_ahead();
+        let Some(slot) = self.ctx.db_set.slot(DatabaseId(i_db)) else {
+            return Err(SqliteError::new(ErrorCode::Error, format!("unknown database index {i_db}")));
+        };
+        Ok((slot.schema.schema_cookie + u32::from(ahead == Some(i_db)), slot.c_generation))
+    }
+}
+
+impl VdbeHost for WriteHost<'_, '_> {
     fn btree(&mut self, i_db: usize) -> Option<&mut Btree> {
         self.ctx.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut())
     }
 
     fn begin_read_trans(&mut self, i_db: usize) -> Result<(u32, i32)> {
-        let ahead = self.ctx.db_set.c_cookie_ahead();
-        let Some(slot) = self.ctx.db_set.slot_mut(DatabaseId(i_db)) else {
-            return Err(SqliteError::new(ErrorCode::Error, format!("unknown database index {i_db}")));
-        };
-        if let Some(bt) = slot.btree.as_mut()
-            && bt.transaction_state() == TransactionState::Open
-        {
-            bt.begin_read()?;
-            self.ctx.stmt_tx.started_read_mask |= 1u16.checked_shl(i_db as u32).unwrap_or(0);
+        // sqlite3BtreeBeginTrans(pBt, 0, &iMeta)
+        self.ctx.ensure_read_db(DatabaseId(i_db), false)?;
+        self.meta_and_generation(i_db)
+    }
+
+    fn begin_write_trans(&mut self, i_db: usize, _p2: i32) -> Result<(u32, i32)> {
+        // sqlite3BtreeBeginTrans(pBt, p2, &iMeta); the statement transaction
+        // (sqlite3BtreeBeginStmt) is opened with it when the statement has a statement
+        // journal (`ExecContext::ensure_write_db`: `stmt_tx.stmt_sp_slot`, set by
+        // `run_write` from `Program.uses_stmt_journal`).
+        self.ctx.ensure_write_db(DatabaseId(i_db), false)?;
+        self.meta_and_generation(i_db)
+    }
+
+    fn set_last_rowid(&mut self, rowid: i64) {
+        self.ctx.runtime.last_insert_rowid = rowid;
+    }
+
+    fn set_changes(&mut self, n: i64) {
+        let n = n.max(0) as u64;
+        self.ctx.runtime.last_changes = n;
+        self.ctx.runtime.total_changes += n;
+    }
+
+    fn last_rowid(&self) -> i64 {
+        self.ctx.runtime.last_insert_rowid
+    }
+
+    fn db_changes(&self) -> i64 {
+        self.ctx.runtime.last_changes as i64
+    }
+
+    fn set_db_changes(&mut self, n: i64) {
+        self.ctx.runtime.last_changes = n.max(0) as u64;
+    }
+
+    fn trigger_depth_limit(&self) -> usize {
+        self.ctx.db_set.trigger_depth_limit()
+    }
+
+    fn deferred_cons(&self) -> (i64, i64) {
+        (self.ctx.deferred_fk_suspects.n_deferred_cons, self.ctx.deferred_fk_suspects.n_deferred_imm_cons)
+    }
+
+    fn add_deferred_cons(&mut self, imm: bool, n: i64) {
+        if imm {
+            self.ctx.deferred_fk_suspects.n_deferred_imm_cons += n;
+        } else {
+            self.ctx.deferred_fk_suspects.n_deferred_cons += n;
         }
-        self.ctx.stmt_tx.read_db_mask |= 1u16.checked_shl(i_db as u32).unwrap_or(0);
-        let slot = self.ctx.db_set.slot(DatabaseId(i_db)).ok_or_else(|| SqliteError::misuse("database detached"))?;
-        Ok((slot.schema.schema_cookie + u32::from(ahead == Some(i_db)), slot.c_generation))
     }
 
-    fn get_meta(&mut self, i_db: usize, i_cookie: i32) -> Result<u32> {
-        let Some(bt) = self.btree(i_db) else {
-            return Ok(0);
-        };
-        let h = bt.pager().header();
-        Ok(match i_cookie {
-            1 => h.schema_cookie,
-            2 => h.schema_format,
-            6 => h.user_version as u32,
-            8 => h.application_id as u32,
-            _ => return Err(SqliteError::new(ErrorCode::Internal, "vdbe: OP_ReadCookie of this cookie is not ported")),
-        })
+    fn randomness(&mut self) -> i64 {
+        let mut b = [0u8; 8];
+        self.ctx.db_set.main_btree().pager().vfs().randomness(&mut b);
+        i64::from_le_bytes(b)
     }
 
-    fn find_collation(&mut self, name: &str) -> Option<CollRt> {
-        self.ctx.collations.get_custom(name).map(CollRt::from_custom)
+    fn writable_schema(&self) -> bool {
+        *self.ctx.writable_schema
     }
 
-    fn call_function(&mut self, func: &FuncDef, args: &[RuntimeValue]) -> Result<RuntimeValue> {
-        self.ctx.call_scalar_rt(&func.name, args)
-    }
-
-    fn agg_open(&mut self, func: &FuncDef, n_arg: usize) -> Result<usize> {
-        Ok(self.svc().agg_open(&func.name, n_arg)?.0)
-    }
-
-    fn agg_step(&mut self, id: usize, args: &[RuntimeValue]) -> Result<()> {
-        self.svc().agg_step(AggregateStepId(id), args)
-    }
-
-    fn agg_inverse(&mut self, id: usize, args: &[RuntimeValue]) -> Result<()> {
-        self.svc().agg_inverse(AggregateStepId(id), args)
-    }
-
-    fn agg_value(&mut self, id: usize) -> Result<RuntimeValue> {
-        self.svc().agg_value(AggregateStepId(id))
-    }
-
-    fn agg_finalize(&mut self, id: usize) -> Result<RuntimeValue> {
-        self.svc().agg_finalize(AggregateStepId(id))
-    }
-
-    fn open_ephemeral(&mut self) -> Result<Btree> {
-        // BTREE_OMIT_JOURNAL | BTREE_SINGLE on a private pager. C keeps such a b-tree in
-        // memory until its cache would spill to a temporary file; here it stays in memory.
-        let opts = PagerOpenOptions {
-            lock_geometry: Some(self.ctx.db_set.lock_geometry()),
-            db_kind: Some(DatabaseKind::PrivateTemporary),
-            temp_in_memory: true,
-            ..PagerOpenOptions::default()
-        };
-        let mut bt = Btree::open_private_temporary(Arc::clone(self.ctx.db_set.disk_vfs()), opts)?;
-        let _ = bt.pager_mut().set_locking_mode(LockingMode::Exclusive);
-        bt.begin_write()?;
-        Ok(bt)
-    }
-
-    fn limit_length(&self) -> i32 {
-        // SQLITE_MAX_LENGTH (the engine has no sqlite3_limit())
-        1_000_000_000
-    }
-
-    fn check_interrupt(&mut self) -> Result<()> {
-        self.ctx.step_tick()
-    }
-
-    fn sorter_config(&mut self) -> (i64, i64, bool) {
-        let bt = self.ctx.db_set.main_btree();
-        (i64::from(bt.pager().page_size()), i64::from(bt.cache_size()), self.ctx.db_set.temp_store().is_memory())
-    }
+    host_common!();
 }
 
-/// Runs `prog` to completion (`sqlite3_step` until `SQLITE_DONE`): the rows, and the error
-/// that ended the statement after it had produced rows, if any.
-pub(crate) fn run(
+/// A statement that writes, run by the machine to its end inside the engine's write
+/// statement (`lib.rs`: the implicit transaction, the statement savepoint, the commit or
+/// the abort of the statement are the engine's, as for its own executor). `prog` is the
+/// program C generates for the statement.
+///
+/// What `sqlite3VdbeHalt` does with the counters: a statement that ends normally sets
+/// `changes()` to its `nChange` and adds it to `total_changes()`.
+pub(crate) fn run_write(
     ctx: &mut ExecContext<'_>,
     prog: &Arc<Program>,
     params: &[Value],
     sql: &str,
-) -> Result<(QueryOutput, Option<SqliteError>)> {
+) -> Result<crate::engine::QueryOutput> {
+    // `Vdbe.usesStmtJournal` (C: `isMultiWrite && mayAbort`): without it C opens no
+    // statement transaction (see `engine::apply_stmt_journal_policy`).
+    sqliters_types::dtrace!("TR|stmt|usj|v={}", u8::from(prog.uses_stmt_journal));
+    if ctx.stmt_tx.stmt_sp_slot.is_some() {
+        if prog.uses_stmt_journal {
+            sqliters_types::dtrace!("TR|stmt|journal|open");
+        } else {
+            ctx.stmt_tx.stmt_sp_slot = None;
+            ctx.stmt_tx.no_stmt_journal = true;
+        }
+    }
     let mut vm = Vdbe::new(Arc::clone(prog));
-    vm.trace_sql(sql);
-    RUNS.with(|r| r.set(r.get() + 1));
+    vm.rewind();
     for (i, v) in params.iter().enumerate() {
         vm.bind(i + 1, v);
     }
-    let mut host = MachineHost { ctx };
+    vm.trace_sql(sql);
+    RUNS.with(|r| r.set(r.get() + 1));
+    let encoding = ctx.encoding();
+    ctx.stmt_tx.exec_depth += 1;
     let mut rows: Vec<Vec<Value>> = Vec::new();
-    let mut trailing = None;
-    loop {
-        match vm.exec(&mut host) {
-            Ok(true) => rows.push(vm.result_row().iter().map(Mem::to_value).collect()),
-            Ok(false) => break,
-            Err(e) => {
-                if let Some(path) = std::env::var_os("SQLITERS_VDBE_ERRLOG") {
-                    // Port aid: where a statement run by the machine failed.
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                        let pages: Vec<u32> = host.ctx.db_set.slots().iter().map(|s| s.btree.as_ref().map_or(0, |b| b.pager().page_count())).collect();
-                        let _ = writeln!(f, "pc={} op={} pages={:?} err={} :: {}", vm.pc, vm.failed_op(), pages, e.message, sql);
-                    }
+    let res = {
+        let mut host = WriteHost { ctx, encoding };
+        let r = loop {
+            match vm.exec(&mut host) {
+                Ok(true) => rows.push(vm.result_row().iter().map(Mem::to_value).collect()),
+                Ok(false) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        };
+        let steps = vm.n_vm_step;
+        host.ctx.progress.add_ops(steps);
+        // sqlite3VdbeHalt: "if( p->rc==SQLITE_OK || (p->errorAction==OE_Fail && !isSpecialError) )
+        //   (void)sqlite3VdbeCheckFkImmediate(p);" (rc = SQLITE_CONSTRAINT_FOREIGNKEY, OE_Abort)
+        let r = match r {
+            Ok(()) if vm.n_fk_constraint != 0 => Err(sqliters_vdbe::vdbe::fk_error()),
+            Err(e)
+                if vm.n_fk_constraint != 0
+                    && e.conflict_effect == sqliters_types::ConflictResolutionEffect::Fail
+                    && !matches!(e.code, ErrorCode::NoMem | ErrorCode::IoErr | ErrorCode::Interrupt | ErrorCode::Full) =>
+            {
+                Err(sqliters_vdbe::vdbe::fk_error())
+            }
+            r => r,
+        };
+        if r.is_ok() {
+            // sqlite3VdbeHalt: "if( p->changeCntOn ) sqlite3VdbeSetChanges(db, p->nChange)"
+            let n = vm.n_change;
+            host.set_changes(n);
+        } else {
+            if let Some(path) = std::env::var_os("SQLITERS_VDBE_ERRLOG") {
+                use std::io::Write;
+                if let (Err(e), Ok(mut f)) = (&r, std::fs::OpenOptions::new().create(true).append(true).open(path)) {
+                    let _ = writeln!(f, "pc={} op={} err={} :: {}", vm.pc, vm.failed_op(), e.message, sql);
                 }
-                if rows.is_empty() {
-                    return Err(e);
-                }
-                trailing = Some(e);
-                break;
+            }
+            // sqlite3VdbeHalt: a statement stopped by OE_Fail keeps what it did
+            // ("eStatementOp = SAVEPOINT_RELEASE", `sqlite3VdbeSetChanges(db, p->nChange)`);
+            // one that is rolled back — the statement or the transaction — counts nothing
+            // (the abort of the engine's write statement sets `changes()` to 0).
+            if let Err(e) = &r
+                && e.conflict_effect == sqliters_types::ConflictResolutionEffect::Fail
+                && !matches!(e.code, ErrorCode::NoMem | ErrorCode::IoErr | ErrorCode::Interrupt | ErrorCode::Full)
+            {
+                let n = vm.n_change;
+                host.set_changes(n);
             }
         }
+        r
+    };
+    crate::engine::c_statement_halt(ctx);
+    crate::engine::note_corrupt_in_transaction(ctx, &res);
+    res.map(|()| crate::engine::QueryOutput { column_names: Vec::new(), rows })
+}
+
+/// `sqlite3_step` of a statement the machine runs: the next row, or `None` at the end
+/// (`SQLITE_DONE`; the statement has halted). `start`: the first step of an execution
+/// (`sqlite3VdbeRewind`, the parameters are bound).
+pub(crate) fn step(
+    inner: &mut ConnectionInner,
+    vm: &mut Vdbe,
+    params: &[Value],
+    start: bool,
+    sql: &str,
+) -> Result<Option<Vec<Value>>> {
+    if start {
+        vm.rewind();
+        for (i, v) in params.iter().enumerate() {
+            vm.bind(i + 1, v);
+        }
+        vm.trace_sql(sql);
+        vm.expire_seq = inner.db_set.c_expire_seq();
+        RUNS.with(|r| r.set(r.get() + 1));
+    } else if vm.expire_seq != inner.db_set.c_expire_seq() {
+        // sqlite3ExpirePreparedStatements(db, 0) ran since the execution started
+        vm.expired = true;
     }
-    Ok((QueryOutput { column_names: column_names(prog).unwrap_or_default(), rows }, trailing))
+    // 'now' is the same within one step (`p->iCurrentTime = 0` at every sqlite3VdbeExec)
+    let prev_ts = inner.runtime.stmt_timestamp_ms;
+    if prev_ts.is_none() {
+        inner.runtime.stmt_timestamp_ms = Some(inner.db_set.main_btree().pager().vfs().current_unix_millis());
+    }
+    let res = {
+        let steps_before = vm.n_vm_step;
+        let mut host = MachineHost::new(inner);
+        let r = vm.exec(&mut host);
+        // (the engine's tick counter, `Connection::progress_op_count`)
+        host.progress.add_ops(vm.n_vm_step - steps_before);
+        r
+    };
+    inner.runtime.stmt_timestamp_ms = prev_ts;
+    match res {
+        Ok(true) => Ok(Some(vm.result_row().iter().map(Mem::to_value).collect())),
+        Ok(false) => Ok(None),
+        Err(e) => {
+            if let Some(path) = std::env::var_os("SQLITERS_VDBE_ERRLOG") {
+                // Port aid: where a statement run by the machine failed.
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(f, "pc={} op={} err={} :: {}", vm.pc, vm.failed_op(), e.message, sql);
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+/// `sqlite3VdbeHalt` of a statement that is reset or finalized before its end: its cursors
+/// are closed.
+pub(crate) fn halt(inner: &mut ConnectionInner, vm: &mut Vdbe) {
+    let mut host = MachineHost::new(inner);
+    vm.halt(&mut host);
 }

@@ -93,7 +93,7 @@ pub struct SqlSavepoint {
     pub schemas_at_open: Vec<(SchemaInstanceId, Schema)>,
     pub schema_gen_at_open: u64,
     pub v1_expire_gen_at_open: u64,
-    pub deferred_fk_suspects: Vec<(SchemaInstanceId, String, TableRowKey, usize)>,
+    pub deferred_fk_suspects: FkSuspects,
     pub mutation_len_at_open: usize,
 }
 
@@ -432,7 +432,7 @@ pub struct ExecContext<'a> {
     pub working_dir: &'a Option<std::path::PathBuf>,
     pub busy_policy: &'a mut BusyPolicy,
     pub rollback_count: &'a mut u64,
-    pub deferred_fk_suspects: &'a mut Vec<(SchemaInstanceId, String, TableRowKey, usize)>,
+    pub deferred_fk_suspects: &'a mut FkSuspects,
     pub trace_hook: &'a mut Option<crate::TraceHookCallback>,
     pub publish_mirrors: &'a mut dyn FnMut(&VmRuntimeContext, bool, bool, u64),
 }
@@ -2111,8 +2111,51 @@ impl CteStore {
     }
 }
 
+/// The deferred foreign key state of the connection: the rows the engine's executor
+/// suspects (checked again at commit) and C's counters `db->nDeferredCons` /
+/// `db->nDeferredImmCons`, which the machine's `OP_FkCounter` keeps. Saved and restored
+/// with the suspects (statement rollback, `SAVEPOINT` / `ROLLBACK TO`), reset with them at
+/// the end of the transaction.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct FkSuspects {
+    pub list: Vec<(SchemaInstanceId, String, TableRowKey, usize)>,
+    /// `db->nDeferredCons`
+    pub n_deferred_cons: i64,
+    /// `db->nDeferredImmCons`
+    pub n_deferred_imm_cons: i64,
+}
+
+impl FkSuspects {
+    /// No suspect, counters at zero (`db->nDeferredCons = 0; db->nDeferredImmCons = 0;`).
+    pub fn clear(&mut self) {
+        self.list.clear();
+        self.n_deferred_cons = 0;
+        self.n_deferred_imm_cons = 0;
+    }
+}
+
+impl std::ops::Deref for FkSuspects {
+    type Target = Vec<(SchemaInstanceId, String, TableRowKey, usize)>;
+    fn deref(&self) -> &Self::Target {
+        &self.list
+    }
+}
+
+impl std::ops::DerefMut for FkSuspects {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.list
+    }
+}
+
 /// Checks all outstanding deferred foreign key suspects (`sqlite3VdbeCheckFkDeferred`).
 pub(crate) fn check_deferred_fks(ctx: &mut ExecContext<'_>) -> Result<()> {
+    // "if( (db->nDeferredCons+db->nDeferredImmCons)==0 ) return SQLITE_OK;" (the counters of
+    // the machine; `> 0`: a statement of the engine's executor does not count, so a machine
+    // statement that resolves its violation can take the sum below zero)
+    if ctx.deferred_fk_suspects.n_deferred_cons + ctx.deferred_fk_suspects.n_deferred_imm_cons > 0 {
+        return Err(fk_constraint_err());
+    }
     if *ctx.foreign_keys && !ctx.deferred_fk_suspects.is_empty() {
         let suspects = ctx.deferred_fk_suspects.clone();
         verify_fk_suspects(ctx, &suspects)?;
@@ -2524,6 +2567,7 @@ pub(crate) fn execute_nolock_stmt(
         }
         Stmt::DetachDatabase { schema_name } => {
             exec_detach_database(ctx, schema_name, params)?;
+            ctx.db_set.c_expire_all();
             Ok(QueryOutput::default())
         }
         Stmt::Pragma {
@@ -2542,7 +2586,7 @@ pub(crate) fn execute_nolock_stmt(
 /// SQLITE_CORRUPT_VTAB does not count). From then on `OP_Transaction` refuses every write
 /// statement with SQLITE_CORRUPT, and COMMIT rolls the transaction back (`sqlite3VdbeHalt`).
 #[inline]
-fn note_corrupt_in_transaction<T>(ctx: &mut ExecContext<'_>, res: &Result<T>) {
+pub(crate) fn note_corrupt_in_transaction<T>(ctx: &mut ExecContext<'_>, res: &Result<T>) {
     if let Err(e) = res
         && e.code == ErrorCode::Corrupt
         && e.extended_code == ErrorCode::Corrupt as i32
@@ -2564,24 +2608,9 @@ pub(crate) fn execute_read_body(
     res
 }
 
-/// [`execute_read_body`] on the port of C's virtual machine (diagnostic switch
-/// `SQLITERS_VDBE_EXEC`, see `vdbe_host.rs`): the rows, and the error that ended the statement
-/// after it had produced rows.
-pub(crate) fn execute_read_on_machine(
-    ctx: &mut ExecContext<'_>,
-    prog: &std::sync::Arc<sqliters_vdbe::vdbeaux::Program>,
-    params: &[Value],
-    sql: &str,
-) -> Result<(QueryOutput, Option<SqliteError>)> {
-    ctx.stmt_tx.exec_depth += 1;
-    let res = crate::vdbe_host::run(ctx, prog, params, sql);
-    c_statement_halt(ctx);
-    res
-}
-
 /// `sqlite3VdbeHalt` → `closeAllCursors`: the statement's cursors give their pages back, before
 /// its statement journal is released and before an autocommit transaction ends.
-fn c_statement_halt(ctx: &mut ExecContext<'_>) {
+pub(crate) fn c_statement_halt(ctx: &mut ExecContext<'_>) {
     ctx.stmt_tx.exec_depth = ctx.stmt_tx.exec_depth.saturating_sub(1);
     if ctx.stmt_tx.exec_depth == 0 && ctx.stmt_tx.subprogram_stack.is_empty() {
         ctx.stmt_tx.c_rowid_seek = None;
@@ -3772,6 +3801,8 @@ fn execute_write_body_inner(
         }
         Stmt::Analyze(target) => {
             exec_analyze(ctx, target.as_ref())?;
+            // (the ANALYZE program ends with OP_LoadAnalysis, OP_Expire)
+            ctx.db_set.c_expire_all();
             // OP_LoadAnalysis: sqlite3AnalysisLoad() on C's existing schema objects
             ctx.db_set.c_note_stats(true);
             Ok(QueryOutput::default())
@@ -32706,6 +32737,13 @@ fn exec_drop_index(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
         .and_then(|s| s.btree.as_ref())
         .is_some_and(|bt| bt.has_any_other_open_cursor(None));
     if ctx.activity.other_readers > 0 || has_open_cur {
+        // C's DROP INDEX program has changed the schema cookie (OP_SetCookie) when OP_Destroy
+        // fails with SQLITE_LOCKED: in autocommit mode the failed statement is rolled back as
+        // a transaction that changed the schema (sqlite3RollbackAll: prepared statements are
+        // expired and every schema is reset).
+        if !*ctx.explicit_tx && !*ctx.implicit_savepoint_tx {
+            ctx.db_set.c_reset_all_schemas();
+        }
         return Err(SqliteError::new(
             ErrorCode::Locked,
             "database table is locked",
