@@ -14,7 +14,7 @@ use sqliters::types::{
 };
 
 fn sqlite_ref_bin() -> PathBuf {
-    PathBuf::from("/home/hakanbiris/github/sqliters/target/sqlite-ref/sqlite3")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/sqlite-ref/sqlite3")
 }
 
 fn run_ref_sqlite(db_path: Option<&std::path::Path>, sql: &str) -> Vec<String> {
