@@ -276,6 +276,11 @@ pub struct DatabaseSet {
     c_case_sensitive_like: bool,
     c_prepare_unloaded: bool,
     c_cookie_ahead: Option<usize>,
+    /// Number of times C would have run `sqlite3ExpirePreparedStatements(db, 0)` (`OP_Expire`
+    /// with P1=0: ANALYZE, DETACH, a flag pragma): a statement of the port of C's virtual
+    /// machine that is running then fails with SQLITE_ABORT_ROLLBACK at its next
+    /// `OP_OpenRead`.
+    c_expire_seq: u64,
 }
 
 impl std::fmt::Debug for DatabaseSet {
@@ -364,6 +369,7 @@ impl DatabaseSet {
             c_case_sensitive_like: false,
             c_prepare_unloaded: false,
             c_cookie_ahead: None,
+            c_expire_seq: 0,
             xferopt_delta: std::sync::atomic::AtomicU64::new(0),
             open_blobs: std::collections::HashMap::new(),
             vtab_registry: crate::vtab::VTabRegistry::new(),
@@ -686,8 +692,20 @@ impl DatabaseSet {
         self.c_flags_toggled
     }
 
+    /// `sqlite3ExpirePreparedStatements(db, 0)`.
+    pub fn c_expire_all(&mut self) {
+        self.c_expire_seq += 1;
+    }
+
+    /// See [`Self::c_expire_all`].
+    pub const fn c_expire_seq(&self) -> u64 {
+        self.c_expire_seq
+    }
+
     /// Records that flag `bit` of C's `db->flags` now differs (`true`) or not from its default.
     pub fn set_c_flag_toggled(&mut self, bit: u64, toggled: bool) {
+        // (C's flag pragmas end with OP_Expire)
+        self.c_expire_seq += 1;
         if toggled {
             self.c_flags_toggled |= bit;
         } else {
@@ -771,6 +789,8 @@ impl DatabaseSet {
     /// transaction that changed the schema is rolled back and at the end of VACUUM.
     pub fn c_reset_all_schemas(&mut self) {
         self.c_cookie_ahead = None;
+        // (sqlite3RollbackAll: "sqlite3ExpirePreparedStatements(db, 0)" comes with it)
+        self.c_expire_seq += 1;
         for slot in &mut self.slots {
             if slot.c_loaded {
                 slot.c_generation += 1;

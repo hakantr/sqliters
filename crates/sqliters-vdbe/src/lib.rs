@@ -6,6 +6,8 @@ mod func_c;
 pub mod functions;
 pub mod opcodes;
 pub mod printf;
+#[doc(hidden)]
+pub mod progdump;
 pub mod storage_api;
 pub mod vdbe;
 pub mod vdbeaux;

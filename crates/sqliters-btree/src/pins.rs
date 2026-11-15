@@ -68,6 +68,9 @@ pub(crate) struct VCursor {
 /// see `cscan.rs` of the core). Such a cursor moves over the pages without referencing them.
 pub(crate) const VC_SILENT: u8 = 0x80;
 
+/// Role of the page stack a cursor of the machine lends to a write ([`Btree::vc_lend`]).
+pub(crate) const VC_MACHINE: u8 = 0x7f;
+
 /// Role of the cursor a statement writes a b-tree through (`OP_OpenWrite`).
 pub const VC_WRITE: u8 = 0;
 /// Role of a cursor that only reads (`OP_OpenRead` of a scan or a lookup).
@@ -116,6 +119,49 @@ impl Btree {
             is_index: false,
         });
         self.vcursors.len() - 1
+    }
+
+    /// A cursor of the machine (`BtCursor`) lends its page stack for the duration of a write:
+    /// a new `VCursor` holding `pages` (root first) with the child slots `ai`. No reference
+    /// is taken — the references are the ones the `BtCursor` holds.
+    pub(crate) fn vc_lend(&mut self, root: Pgno, pages: &[Pgno], ai: &[u16], is_index: bool) -> usize {
+        let n = pages.len().min(VC_MAX_DEPTH);
+        let mut c = VCursor {
+            root,
+            role: VC_MACHINE,
+            pages: [0; VC_MAX_DEPTH],
+            ai: [0; VC_MAX_DEPTH],
+            n: n as u8,
+            epoch: self.pager.pcache_epoch(),
+            valid: true,
+            ix: 0,
+            at_last: false,
+            skip: 0,
+            seek_rowid: None,
+            nkey: None,
+            seek_key: None,
+            is_index,
+        };
+        c.pages[..n].copy_from_slice(&pages[..n]);
+        c.ai[..n].copy_from_slice(&ai[..n]);
+        self.vcursors.push(c);
+        self.vcursors.len() - 1
+    }
+
+    /// The end of [`Self::vc_lend`]: the page stack as the write left it (`balance()` gives
+    /// pages back and may add the child of `balance_deeper`), and whether the cursor is
+    /// still valid (`false` once `balance()` ran). The `VCursor` is removed; no reference is
+    /// given back.
+    pub(crate) fn vc_take_back(&mut self, vc: usize) -> ([Pgno; VC_MAX_DEPTH], usize, bool) {
+        self.vc_live(vc);
+        let c = &mut self.vcursors[vc];
+        let out = (c.pages, c.n as usize, c.valid);
+        c.n = 0;
+        c.root = 0;
+        while self.vcursors.last().is_some_and(|c| c.root == 0 && c.role == VC_MACHINE) {
+            self.vcursors.pop();
+        }
+        out
     }
 
     /// The cursor of a read function of this layer on `root`: a scan that is still delivering

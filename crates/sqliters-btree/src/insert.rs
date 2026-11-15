@@ -476,6 +476,49 @@ impl Btree {
         self.balance(cur)
     }
 
+    /// [`Self::replace_cell`] for a cursor of the machine (`sqlite3BtreeInsert`, `loc==0`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bc_replace_cell(
+        &mut self,
+        cur: &mut BalCursor,
+        root_pgno: Pgno,
+        pgno: Pgno,
+        k: &PgKind,
+        idx: usize,
+        rowid: i64,
+        payload: &[u8],
+        overwrite: bool,
+    ) -> Result<()> {
+        self.replace_cell(Some(cur), root_pgno, pgno, k, idx, rowid, payload, overwrite).map(|_| ())
+    }
+
+    /// `fillInCell` + `insertCellFast` + `balance()` for a cursor of the machine
+    /// (`sqlite3BtreeInsert`, `loc!=0`): a new cell at index `idx` of the page `cur` is on.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bc_insert_new(
+        &mut self,
+        cur: &mut BalCursor,
+        root_pgno: Pgno,
+        k: &PgKind,
+        n_cell: usize,
+        idx: usize,
+        rowid: i64,
+        payload: &[u8],
+    ) -> Result<()> {
+        let _ = root_pgno;
+        let cell = self.fill_in_cell(k, [0; 4], rowid, payload)?;
+        if self.dtrace_persistent() {
+            sqliters_types::dtrace!(
+                "TR|ins|cell|root={} pg={} idx={} o=new sz={}",
+                root_pgno,
+                cur.page(),
+                idx,
+                cell.size
+            );
+        }
+        self.insert_new_cell(cur, k, n_cell, idx, &cell)
+    }
+
     /// `btreeOverwriteCell`: the cell at `off` of page `pgno` (parsed as `info`) has a payload
     /// of exactly `payload.len()` bytes; write `payload` over it, local part and overflow pages,
     /// making a page writable only when its bytes change (`btreeOverwriteContent`).

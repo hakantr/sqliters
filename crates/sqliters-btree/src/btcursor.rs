@@ -140,6 +140,34 @@ fn corrupt() -> SqliteError {
     SqliteError::corrupt("database disk image is malformed")
 }
 
+/// The error of a cursor in `CURSOR_FAULT` (`pCur->skipNext` holds the error code): after a
+/// ROLLBACK that changed the schema it is `SQLITE_ABORT_ROLLBACK`.
+#[cold]
+fn fault(code: i32) -> SqliteError {
+    let msg = if code == 516 {
+        "abort due to ROLLBACK"
+    } else {
+        sqliters_types::ErrorCode::from_raw_primary(code).as_str()
+    };
+    SqliteError::with_extended(code, msg)
+}
+
+/// A slot of the cursor list of a b-tree (`BtShared.pCursor`) for a cursor of a suspended
+/// statement.
+#[derive(Debug)]
+pub(crate) struct BcSlot {
+    cur: Box<BtCursor>,
+    in_use: bool,
+    generation: u32,
+}
+
+/// Handle of a cursor parked in the cursor list of its b-tree ([`Btree::bc_park`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BcParked {
+    slot: u32,
+    generation: u32,
+}
+
 /// `getVarint32` at `off`: `(value, bytes)`. `None` when the varint runs off the page.
 #[inline]
 fn varint32(d: &[u8], off: usize) -> Option<(u32, usize)> {
@@ -270,6 +298,87 @@ impl Btree {
             a_overflow: Vec::new(),
             epoch: self.pager.pcache_epoch(),
         }
+    }
+
+    /// A statement is suspended (`sqlite3_step` returned a row): its cursor joins the cursor
+    /// list of the b-tree (`BtShared.pCursor`), where a write through another cursor saves its
+    /// position (`saveAllCursors`) and a rollback trips it (`sqlite3BtreeTripAllCursors`).
+    /// `cur` is left holding a spare cursor; [`Self::bc_unpark`] swaps the real one back.
+    pub fn bc_park(&mut self, cur: &mut Box<BtCursor>) -> BcParked {
+        let slot = match self.bcs.iter().position(|s| !s.in_use) {
+            Some(i) => i,
+            None => {
+                self.bcs.push(BcSlot { cur: Box::new(BtCursor::detached()), in_use: false, generation: 0 });
+                self.bcs.len() - 1
+            }
+        };
+        let s = &mut self.bcs[slot];
+        std::mem::swap(&mut s.cur, cur);
+        s.in_use = true;
+        s.generation = s.generation.wrapping_add(1);
+        BcParked { slot: slot as u32, generation: s.generation }
+    }
+
+    /// The statement runs again: its cursor leaves the list. `false`: the cursor is gone (the
+    /// b-tree was replaced); `cur` is then a cursor in `CURSOR_FAULT` with `SQLITE_ABORT`.
+    pub fn bc_unpark(&mut self, id: BcParked, cur: &mut Box<BtCursor>) -> bool {
+        match self.bcs.get_mut(id.slot as usize) {
+            Some(s) if s.in_use && s.generation == id.generation => {
+                std::mem::swap(&mut s.cur, cur);
+                s.in_use = false;
+                true
+            }
+            _ => {
+                **cur = BtCursor::detached();
+                cur.e_state = CURSOR_FAULT;
+                cur.skip_next = 4;
+                false
+            }
+        }
+    }
+
+    /// `saveAllCursors(pBt, iRoot, 0)` for the cursors of suspended statements: called by the
+    /// write paths of this layer before a b-tree is modified.
+    pub(crate) fn bc_save_parked(&mut self, root: Option<Pgno>) -> Result<()> {
+        for i in 0..self.bcs.len() {
+            if !self.bcs[i].in_use || root.is_some_and(|r| r != self.bcs[i].cur.pgno_root) {
+                continue;
+            }
+            let mut c = std::mem::replace(&mut self.bcs[i].cur, Box::new(BtCursor::detached()));
+            let r = self.bc_save_for_write(&mut c);
+            self.bcs[i].cur = c;
+            r?;
+        }
+        Ok(())
+    }
+
+    /// `sqlite3BtreeTripAllCursors(pBtree, errCode, writeOnly)` for the cursors of suspended
+    /// statements (they are all read cursors): with `write_only` a positioned cursor saves
+    /// its position, otherwise the cursor goes to `CURSOR_FAULT` with `errCode`; either way
+    /// it gives its pages back (`btreeReleaseAllCursorPages`).
+    pub(crate) fn bc_trip_parked(&mut self, err_code: i32, write_only: bool) {
+        for i in 0..self.bcs.len() {
+            if !self.bcs[i].in_use {
+                continue;
+            }
+            let mut c = std::mem::replace(&mut self.bcs[i].cur, Box::new(BtCursor::detached()));
+            let mut faulted = !write_only;
+            if write_only && (c.e_state == CURSOR_VALID || c.e_state == CURSOR_SKIPNEXT) && self.bc_save_cursor_position(&mut c).is_err() {
+                faulted = true;
+            }
+            if faulted {
+                c.clear_cursor();
+                c.e_state = CURSOR_FAULT;
+                c.skip_next = err_code;
+            }
+            self.bc_release_all_cursor_pages(&mut c);
+            self.bcs[i].cur = c;
+        }
+    }
+
+    /// Number of cursors of suspended statements on this b-tree.
+    pub fn bc_parked_count(&self) -> usize {
+        self.bcs.iter().filter(|s| s.in_use).count()
     }
 
     /// The references of the cursor are still the ones the cache knows about.
@@ -674,7 +783,7 @@ impl Btree {
         } else {
             if cur.e_state >= CURSOR_REQUIRESEEK {
                 if cur.e_state == CURSOR_FAULT {
-                    return Err(corrupt());
+                    return Err(fault(cur.skip_next));
                 }
                 cur.clear_cursor();
             }
@@ -1266,7 +1375,7 @@ impl Btree {
             return Ok(());
         }
         if cur.e_state == CURSOR_FAULT {
-            return Err(corrupt());
+            return Err(fault(cur.skip_next));
         }
         if cur.p_key.is_some() {
             // An index cursor: the owner restores it (it holds the KeyInfo); a cursor that
@@ -1298,7 +1407,7 @@ impl Btree {
             return Ok(());
         }
         if cur.e_state == CURSOR_FAULT {
-            return Err(corrupt());
+            return Err(fault(cur.skip_next));
         }
         let Some(k) = cur.p_key.take() else {
             return self.bc_restore_cursor_position(cur);
@@ -1347,5 +1456,342 @@ impl Btree {
     #[inline]
     pub fn bc_needs_index_restore(&self, cur: &BtCursor) -> bool {
         cur.e_state == CURSOR_REQUIRESEEK && cur.p_key.is_some()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Writes through a cursor: `sqlite3BtreeInsert`, `sqlite3BtreeDelete`, `sqlite3BtreeClearTable`.
+//
+// The page work is the b-tree layer's port of C's functions (`insert.rs`: `fillInCell`,
+// `insertCell`, the overwrite / replace path; `balance.rs`; the leaf and interior steps of the
+// delete in `lib.rs`). What is ported here is the part of the two functions that works on the
+// cursor: where the entry goes, what the cursor is afterwards. While the page work runs, the
+// page stack of the cursor is lent to it as a `VCursor` (`pins.rs`), so that `balance()` gives
+// the references back as C does (`releasePage(pPage); pCur->iPage--`).
+// ---------------------------------------------------------------------------------------------
+
+/// `BTREE_SAVEPOSITION`, `BTREE_AUXDELETE`, `BTREE_APPEND`, `BTREE_PREFORMAT`: flags of
+/// `sqlite3BtreeInsert` / `sqlite3BtreeDelete`.
+pub const BTREE_SAVEPOSITION: u8 = 0x02;
+pub const BTREE_AUXDELETE: u8 = 0x04;
+pub const BTREE_APPEND: u8 = 0x08;
+pub const BTREE_PREFORMAT: u8 = 0x80;
+
+impl Btree {
+    /// The `MemPage` fields of `pgno` as they are now (no reference is taken).
+    fn bc_page_meta(&mut self, pgno: Pgno) -> Result<PageMeta> {
+        let usable = self.pager.usable_size();
+        let page_size = self.pager.page_size();
+        let hdr: usize = if pgno == 1 { 100 } else { 0 };
+        let d = self.pager.read_page(pgno)?;
+        if d.len() < hdr + 12 {
+            return Err(corrupt());
+        }
+        let mut m = PageMeta { pgno, hdr: hdr as u16, ..PageMeta::default() };
+        let flag = d[hdr];
+        m.leaf = flag & 0x08 != 0;
+        m.child_ptr_size = if m.leaf { 0 } else { 4 };
+        let idx_max_local = (usable - 12) * 64 / 255 - 23;
+        let min_local = (usable - 12) * 32 / 255 - 23;
+        match flag & !0x08 {
+            0x05 => {
+                m.int_key = true;
+                m.max_local = (usable - 35) as u16;
+                m.min_local = min_local as u16;
+            }
+            0x02 => {
+                m.int_key = false;
+                m.max_local = idx_max_local as u16;
+                m.min_local = min_local as u16;
+            }
+            _ => return Err(corrupt()),
+        }
+        m.max1byte_payload = if idx_max_local > 127 { 127 } else { idx_max_local as u8 };
+        m.cell_offset = (hdr + 8 + usize::from(m.child_ptr_size)) as u16;
+        let n_cell = get2(d, hdr + 3);
+        if n_cell > (page_size as usize - 8) / 6 || usize::from(m.cell_offset) + 2 * n_cell > d.len() {
+            return Err(corrupt());
+        }
+        m.n_cell = n_cell as u16;
+        Ok(m)
+    }
+
+    /// The page stack of `cur` becomes a `VCursor` for the duration of a write (the references
+    /// stay the ones the cursor took).
+    fn bc_lend(&mut self, cur: &BtCursor) -> (usize, crate::balance::BalCursor) {
+        let n = (cur.i_page + 1).max(0) as usize;
+        let mut pages = [0 as Pgno; BTCURSOR_MAX_DEPTH];
+        for (i, p) in pages.iter_mut().enumerate().take(n) {
+            *p = cur.ap[i].pgno;
+        }
+        let vc = self.vc_lend(cur.pgno_root, &pages[..n], &cur.ai_idx[..n], cur.has_key_info);
+        let mut bal = crate::balance::BalCursor::new(cur.pgno_root);
+        bal.pg[..n].copy_from_slice(&pages[..n]);
+        bal.ai[..n].copy_from_slice(&cur.ai_idx[..n]);
+        bal.i_page = n.saturating_sub(1);
+        bal.bulk = cur.hints & BTREE_BULKLOAD != 0;
+        bal.vc = vc;
+        (vc, bal)
+    }
+
+    /// The end of [`Self::bc_lend`]: the cursor takes its page stack back as the write left it
+    /// and reads the fields of those pages again. Returns whether `balance()` ran.
+    fn bc_take_back(&mut self, cur: &mut BtCursor, vc: usize) -> Result<bool> {
+        let (pages, n, valid) = self.vc_take_back(vc);
+        cur.epoch = self.pager.pcache_epoch();
+        cur.i_page = n as i8 - 1;
+        for i in 0..n {
+            cur.ap[i] = self.bc_page_meta(pages[i])?;
+        }
+        Ok(!valid)
+    }
+
+    /// `saveCursorKey`
+    fn bc_save_cursor_key(&mut self, cur: &mut BtCursor) -> Result<()> {
+        if cur.cur_int_key {
+            cur.n_key = self.bc_integer_key(cur)?;
+        } else {
+            let n = self.bc_payload_size(cur)?;
+            cur.n_key = i64::from(n);
+            let mut k = vec![0u8; n as usize];
+            self.bc_access_payload(cur, 0, &mut k)?;
+            cur.p_key = Some(k);
+        }
+        Ok(())
+    }
+
+    /// `sqlite3BtreeInsert(pCur, pX, flags, seekResult)`. For a table b-tree `n_key` is the
+    /// rowid and `payload` the record; for an index b-tree `payload` is the key (`pX->pKey`,
+    /// `pX->nKey`) and `key` compares it with the cells of the tree (`pX->aMem` / the
+    /// unpacked `pX->pKey`), needed when the insert has to search (`seekResult==0` without
+    /// `BTREE_SAVEPOSITION`).
+    ///
+    /// The other cursors of the caller on the same b-tree must have been saved
+    /// (`saveAllCursors`, see [`Self::bc_save_for_write`]); the cursors of suspended
+    /// statements are saved here.
+    pub fn bc_insert(
+        &mut self,
+        cur: &mut BtCursor,
+        n_key: i64,
+        payload: &[u8],
+        flags: u8,
+        seek_result: i32,
+        key: Option<&mut dyn IdxKeyCompare>,
+    ) -> Result<()> {
+        let mut loc = seek_result;
+        let root = cur.pgno_root;
+        self.tr_ins = true;
+        // "if( pCur->curFlags & BTCF_Multiple ){ rc = saveAllCursors(pBt, pCur->pgnoRoot, pCur);
+        //  if( loc && pCur->iPage<0 ) return SQLITE_CORRUPT_PGNO(pCur->pgnoRoot); }"
+        self.vc_keep = usize::MAX;
+        self.save_cursors_for_mutation(Some(root), None)?;
+        self.bc_live(cur);
+        if loc != 0 && cur.i_page < 0 {
+            return Err(corrupt());
+        }
+        // "if( pCur->eState>=CURSOR_REQUIRESSEEK ){ rc = moveToRoot(pCur);
+        //  if( rc && rc!=SQLITE_EMPTY ) return rc; }"
+        if cur.e_state >= CURSOR_REQUIRESEEK {
+            self.bc_move_to_root(cur)?;
+        }
+        let mut overwrite = false;
+        if !cur.has_key_info {
+            if self.dtrace_persistent() {
+                sqliters_types::dtrace!("TR|w|ins|root={} rowid={}", root, n_key);
+            }
+            if cur.cur_flags & BTCF_VALID_NKEY != 0 && n_key == cur.info.n_key {
+                // "The cursor is pointing to the entry that is to be overwritten": with a
+                // payload of the same size, btreeOverwriteCell.
+                overwrite = cur.info.n_size != 0;
+                debug_assert!(loc == 0);
+                loc = 0;
+            } else if loc == 0 {
+                loc = self.bc_table_moveto(cur, n_key, flags & BTREE_APPEND != 0)?;
+            }
+        } else {
+            if self.dtrace_persistent() {
+                sqliters_types::dtrace!("TR|w|ins|root={} len={}", root, payload.len());
+            }
+            if loc == 0 && flags & BTREE_SAVEPOSITION == 0 {
+                let Some(key) = key else {
+                    return Err(corrupt());
+                };
+                loc = self.bc_index_moveto(cur, key)?;
+            }
+            if loc == 0 {
+                // "getCellInfo(pCur); if( pCur->info.nKey==pX->nKey ) return
+                //  btreeOverwriteCell(pCur, &x2);"
+                self.bc_get_cell_info(cur)?;
+                overwrite = true;
+            }
+        }
+        if cur.i_page < 0 {
+            return Err(corrupt());
+        }
+        let usable = self.pager.usable_size();
+        let pg = cur.ap[cur.i_page as usize].pgno;
+        let (k, n_cell) = {
+            let hdr = if pg == 1 { 100 } else { 0 };
+            let d = self.pager.read_page(pg)?;
+            if d.len() < hdr + 12 {
+                return Err(corrupt());
+            }
+            (crate::balance::PgKind::decode(d[hdr], usable)?, get2(d, hdr + 3))
+        };
+        let mut idx = usize::from(cur.ix);
+        cur.info.n_size = 0;
+        let (vc, mut bal) = self.bc_lend(cur);
+        let res = if loc == 0 {
+            if idx >= n_cell {
+                Err(corrupt())
+            } else {
+                // (testcase BTCF_ValidOvfl) invalidateOverflowCache(pCur)
+                cur.cur_flags &= !BTCF_VALID_OVFL;
+                self.bc_replace_cell(&mut bal, root, pg, &k, idx, n_key, payload, overwrite)
+            }
+        } else {
+            if loc < 0 && n_cell > 0 {
+                cur.ix += 1;
+                idx = usize::from(cur.ix);
+                cur.cur_flags &= !(BTCF_VALID_NKEY | BTCF_VALID_OVFL);
+            }
+            self.bc_insert_new(&mut bal, root, &k, n_cell, idx, n_key, payload)
+        };
+        let balanced = self.bc_take_back(cur, vc);
+        res?;
+        if balanced? {
+            // "pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl); rc = balance(pCur);
+            //  pCur->pPage->nOverflow = 0; pCur->eState = CURSOR_INVALID;"
+            cur.cur_flags &= !(BTCF_VALID_NKEY | BTCF_VALID_OVFL);
+            cur.e_state = CURSOR_INVALID;
+            if flags & BTREE_SAVEPOSITION != 0 {
+                self.bc_release_all_cursor_pages(cur);
+                if cur.has_key_info {
+                    cur.p_key = Some(payload.to_vec());
+                    cur.n_key = payload.len() as i64;
+                } else {
+                    cur.n_key = n_key;
+                }
+                cur.e_state = CURSOR_REQUIRESEEK;
+            }
+        }
+        Ok(())
+    }
+
+    /// `sqlite3BtreeDelete(pCur, flags)`: the entry the cursor is on. An index cursor in
+    /// `CURSOR_REQUIRESEEK` must have been restored by the caller.
+    pub fn bc_delete(&mut self, cur: &mut BtCursor, flags: u8) -> Result<()> {
+        self.tr_ins = false;
+        let root = cur.pgno_root;
+        if cur.e_state != CURSOR_VALID {
+            if cur.e_state >= CURSOR_REQUIRESEEK {
+                self.bc_restore_cursor_position(cur)?;
+                if cur.e_state != CURSOR_VALID {
+                    return Ok(());
+                }
+            } else {
+                return Err(corrupt());
+            }
+        }
+        if !self.bc_live(cur) || cur.i_page < 0 {
+            return Err(corrupt());
+        }
+        let usable = self.pager.usable_size() as usize;
+        let i_cell_depth = cur.i_page;
+        let i_cell_idx = usize::from(cur.ix);
+        let pg = cur.ap[cur.i_page as usize].pgno;
+        let hdr = if pg == 1 { 100 } else { 0 };
+        let (kind, n_cell, n_free, sz) = {
+            let d = self.pager.read_page(pg)?;
+            let (kind, n_cell, n_free) = crate::balance::page_state(d, pg, usable)?;
+            if n_cell <= i_cell_idx {
+                return Err(corrupt());
+            }
+            let p = hdr + 8 + kind.child_ptr + 2 * i_cell_idx;
+            let off = get2(d, p);
+            if off < hdr + 8 + kind.child_ptr + 2 * n_cell {
+                return Err(corrupt());
+            }
+            (kind, n_cell, n_free, crate::balance::cell_size(&kind, usable as u32, d, off))
+        };
+        // "If the BTREE_SAVEPOSITION bit is on, then the cursor position must be preserved
+        // following this delete operation. If the current delete will cause a rebalance, then
+        // the cursor will need to be explicitly saved (bPreserve==1); otherwise the cursor is
+        // left pointing at the next entry (CURSOR_SKIPNEXT, bPreserve==2)."
+        let mut preserve = u8::from(flags & BTREE_SAVEPOSITION != 0);
+        if preserve != 0 {
+            if !kind.leaf || (n_free as usize + sz + 2) > usable * 2 / 3 || n_cell == 1 {
+                self.bc_save_cursor_key(cur)?;
+            } else {
+                preserve = 2;
+            }
+        }
+        if self.dtrace_persistent() {
+            if cur.has_key_info {
+                sqliters_types::dtrace!("TR|w|del|root={} len=?", root);
+            } else {
+                let _rowid = self.bc_integer_key(cur)?;
+                sqliters_types::dtrace!("TR|w|del|root={} rowid={}", root, _rowid);
+            }
+        }
+        // (interior page: `sqlite3BtreePrevious` is the descent of the page work below)
+        // "if( pCur->curFlags & BTCF_Multiple ) rc = saveAllCursors(pBt, pCur->pgnoRoot, pCur);"
+        self.vc_keep = usize::MAX;
+        self.save_cursors_for_mutation(Some(root), None)?;
+        let (vc, mut bal) = self.bc_lend(cur);
+        let res = if kind.leaf {
+            match self.delete_leaf_cell_general(pg, i_cell_idx) {
+                Ok(needs_balance) => {
+                    self.dtrace_delete_decision(root, pg);
+                    if needs_balance && bal.i_page != 0 { self.balance(&mut bal) } else { Ok(()) }
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            self.delete_index_interior_cell(&mut bal, i_cell_idx)
+        };
+        let back = self.bc_take_back(cur, vc);
+        res?;
+        back?;
+        cur.info.n_size = 0;
+        cur.cur_flags &= !(BTCF_VALID_NKEY | BTCF_VALID_OVFL | BTCF_AT_LAST);
+        if preserve > 1 && cur.i_page == i_cell_depth && cur.ap[cur.i_page as usize].pgno == pg {
+            let n_now = usize::from(cur.ap[cur.i_page as usize].n_cell);
+            cur.e_state = CURSOR_SKIPNEXT;
+            if i_cell_idx >= n_now {
+                cur.skip_next = -1;
+                cur.ix = n_now.saturating_sub(1) as u16;
+            } else {
+                cur.skip_next = 1;
+            }
+        } else {
+            // "rc = moveToRoot(pCur); if( bPreserve ){ btreeReleaseAllCursorPages(pCur);
+            //  pCur->eState = CURSOR_REQUIRESSEEK; } if( rc==SQLITE_EMPTY ) rc = SQLITE_OK;"
+            let saved_key = cur.p_key.take();
+            let saved_n = cur.n_key;
+            cur.e_state = CURSOR_INVALID;
+            let rc = self.bc_move_to_root(cur);
+            if preserve != 0 {
+                self.bc_release_all_cursor_pages(cur);
+                cur.p_key = saved_key;
+                cur.n_key = saved_n;
+                cur.e_state = CURSOR_REQUIRESEEK;
+            }
+            rc?;
+        }
+        Ok(())
+    }
+
+    /// `sqlite3BtreeClearTable(p, iTable, pnChange)`; the caller has saved or invalidated its
+    /// own cursors on the b-tree.
+    pub fn bc_clear_table(&mut self, root: Pgno, count: bool) -> Result<u64> {
+        self.vc_keep = usize::MAX;
+        self.save_cursors_for_mutation(Some(root), None)?;
+        if count {
+            self.clear_tree_counting(root)
+        } else {
+            self.clear_tree(root)?;
+            Ok(0)
+        }
     }
 }
