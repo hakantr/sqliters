@@ -7,7 +7,11 @@ pub mod functions;
 pub mod opcodes;
 pub mod printf;
 pub mod storage_api;
+pub mod vdbe;
 pub mod vdbeaux;
+pub mod vdbeaux_rt;
+pub mod vdbemem;
+pub mod vdbesort;
 
 use std::cmp::Ordering;
 use std::sync::Arc;

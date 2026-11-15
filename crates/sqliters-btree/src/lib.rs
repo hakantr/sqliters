@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod balance;
+pub mod btcursor;
 pub mod cursor;
 mod insert;
 mod integrity;

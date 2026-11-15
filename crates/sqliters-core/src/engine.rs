@@ -2564,6 +2564,21 @@ pub(crate) fn execute_read_body(
     res
 }
 
+/// [`execute_read_body`] on the port of C's virtual machine (diagnostic switch
+/// `SQLITERS_VDBE_EXEC`, see `vdbe_host.rs`): the rows, and the error that ended the statement
+/// after it had produced rows.
+pub(crate) fn execute_read_on_machine(
+    ctx: &mut ExecContext<'_>,
+    prog: &std::sync::Arc<sqliters_vdbe::vdbeaux::Program>,
+    params: &[Value],
+    sql: &str,
+) -> Result<(QueryOutput, Option<SqliteError>)> {
+    ctx.stmt_tx.exec_depth += 1;
+    let res = crate::vdbe_host::run(ctx, prog, params, sql);
+    c_statement_halt(ctx);
+    res
+}
+
 /// `sqlite3VdbeHalt` → `closeAllCursors`: the statement's cursors give their pages back, before
 /// its statement journal is released and before an autocommit transaction ends.
 fn c_statement_halt(ctx: &mut ExecContext<'_>) {

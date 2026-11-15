@@ -76,6 +76,30 @@ Ayrıntı: `karar_esligi_v1.md` (işlev eşlemesi, karar tabloları, kapsam tabl
 
 **Bilinen eksikler.** `OP_Transaction` nesil işleneni şu durumlarda izlenmiyor: başka bağlantının şema değişikliği, çerez değiştikten sonra başarısız olan diğer DDL, `ATTACH`/`DETACH` hataları. Üretici "desteklenmiyor" diyor: tablo üzerinde GROUP BY / HAVING, pencere işlevleri, özyinelemeli CTE, sanal tablolar, DML, DDL, `PRAGMA`, VIRTUAL üretilmiş sütunlu tablolar, `COLLATE BINARY` açıkça yazılmış tablolar. Bu adımda görülen eski motor farkları: `gorulen_farklar_v2.md`.
 
+## M1 — makine: `SELECT` programlarının C gibi çalıştırılması (dal `performans-A-vdbe-makine`)
+
+**Taşınan** (yaklaşık 7.150 satır; ayrıntı `karar_esligi_m1.md`).
+- `crates/sqliters-vdbe/src/vdbe.rs`: `sqlite3VdbeExec` — her `case OP_x` için bir kol; `vdbemem.rs` (`vdbemem.c`: dönüşümler, yakınlık, karşılaştırma); `vdbeaux_rt.rs` (kayıt çözme ve karşılaştırma, imleç geri yükleme, okuma ifadeleri için Halt); `vdbesort.rs` (`vdbesort.c` sıralama düzeni ve `rowset.c`).
+- `crates/sqliters-btree/src/btcursor.rs`: `btree.c` imlecinin okuma yarısı (`sqlite3BtreeCursor`, `First/Last/Next/Previous`, `TableMoveto`, `IndexMoveto`, `accessPayload`) — tek iniş hem veriyi buluyor hem C'nin sayfa başvurularını tutuyor.
+- İşlem kodu durumu (191): **119 doğrulandı**, 28 taşındı ama derlemlerde hiç çalışmadı, 44 henüz yok (yazma, işlem, tetikleyici, DDL ve sanal tablo kodları).
+- Geçici tanılama anahtarı `SQLITERS_VDBE_EXEC=1`: üretici ifadeyi destekliyor ve programın tüm kodları taşınmışsa okuma ifadesi makinede çalışır. Anahtar kapalıyken (varsayılan) hiçbir şey değişmez.
+
+**Kanıt (anahtar açık).**
+
+| Ölçüm | Sonuç |
+| :--- | :--- |
+| Sonuç farksalı (11 derlem) | makinede çalışan 108.473 ifade; makineye izlenen C farkı yok. Kalan farklar: eski yazma yolu, üretici (2 durum), motorun işlev kitaplığı, saat / `random()` |
+| Bağımsız kontrol (C'nin kurduğu 40 veri dolu şema, 2.400 sorgu: tek tablo, LEFT/RIGHT/FULL birleşimler, alt sorgular, bileşik seçimler, karışık tipli ve taşma sayfalı veri) | satırlar ve satır sırası C ile aynı 2.400 / 2.400; stderr 40 / 40 |
+| İşlem kodu izi (pc, kod, yazılan yazmaç özeti) | 32.954 ifadenin 30.978'inde akış eşit; eşit olmayanlar saat / `random()` ifadeleri, hata anındaki yazmaç gösterimi, motor işlev sonuçları, 6 plan farkı (üretici) |
+| Önbellek karar izi — yazma işlemi içindeki `SELECT`ler | H6b'nin `psx` ailesi (bütünlük kontrolü çıkarılınca) **5/5** (eski yol 0/5); beş yeni aile (birleşim, alt sorgu, sıralayıcı, bileşik, taşma) **25/25** (eski yol 0/25) |
+| C tarafı kapsamı (gcov) | satır %78,3, dal %63,4; alınmayan dal taşıyan 426 satır "doğrulanmadı" |
+| Anahtar kapalı | testler 940 geçti (11 yeni), bilinen 4 başarısız, 337 yok sayıldı; ayrışma bulucu 241 / 245; DML farksalı 377 / 400; speedbench toplamı 0,997x, özetler eşit |
+| Anahtar açık, test paketi | 937 geçti, 7 başarısız: bilinen 4 + 3 bulgu (iki test C'de olmayan davranışı sınıyor, biri hızlı yol sayacını) |
+
+**Makinenin hızı (anahtar açık; geçiş öncesi yapılacak iş).** Aynı programı çalıştırdığı halde makine şimdilik C'den yavaş: `W03` C'nin 2,5 katı, `W04` 2,8 katı, `W09` 5,0 katı, `W14` 2,0 katı; toplam eski yolun 1,50 katı. Henüz profil alınmadı; olası nedenler: her yürütmede yeni `Vdbe`, işlevlerin adla çağrılması ve argüman kopyaları.
+
+**C'den yapı gereği farklı / yapılmayan.** Okuma adımı makineyi sonuna kadar çalıştırıp satırları tutuyor (satır satır adımlama henüz yok); sıralayıcının disk birleştirmesi ve geçici dosyaları yok; geçici B-ağaçları diske taşmıyor; UTF-8 dışı kodlamalar; `OP_AutoCommit` / `OP_Savepoint` ve tüm yazma kodları. Görülen eski motor farkları: `gorulen_farklar_m1.md`.
+
 ## Bu adımda görülen, eski motora ait C farkları (dokunulmadı)
 
 | İfade | C | Motor |

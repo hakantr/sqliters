@@ -15,6 +15,7 @@ pub mod execution_context;
 pub mod fast_read;
 pub mod schema;
 pub mod trigger;
+pub(crate) mod vdbe_host;
 pub mod vtab;
 pub mod window;
 
@@ -4961,6 +4962,12 @@ pub struct Statement {
     /// `EXPLAIN <stmt>` only: the program C's code generator builds for the statement, when
     /// the port of the generator supports it (its listing is what `EXPLAIN` returns).
     c_explain: Option<Arc<sqliters_vdbe::vdbeaux::Program>>,
+    /// Diagnostic switch `SQLITERS_VDBE_EXEC` only (see `vdbe_host.rs`): the program the port
+    /// of C's virtual machine runs for this statement instead of the engine's executor.
+    c_machine: Option<Arc<sqliters_vdbe::vdbeaux::Program>>,
+    /// The error that ended a statement run by the machine after it had produced rows: it is
+    /// reported when the rows have been stepped through.
+    c_machine_error: Option<SqliteError>,
     cached_read_vm: Option<VdbeVm>,
     write_vm_scratch: sqliters_vdbe::VdbeWriteScratch,
     compiled_schema_generation: u64,
@@ -6662,6 +6669,30 @@ fn parse_simple_literal_insert_prefix<'a>(
 }
 
 impl Statement {
+    /// Diagnostic switch `SQLITERS_VDBE_EXEC`: the program the port of C's virtual machine
+    /// runs for the statement. When there is one, the engine's compiled forms of the
+    /// statement are dropped so that its step goes through the general read path, where the
+    /// machine takes the place of the executor.
+    fn c_machine_of(
+        inner: &ConnectionInner,
+        artifacts: &mut CompiledArtifacts,
+        raw_sql: &str,
+        is_explain: bool,
+    ) -> Option<Arc<sqliters_vdbe::vdbeaux::Program>> {
+        if !vdbe_host::exec_switch_on() || is_explain || artifacts.category != Some(StmtCategory::Read) {
+            return None;
+        }
+        let prog = vdbe_host::machine_program(inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param)?;
+        artifacts.compiled_vdbe = None;
+        artifacts.compiled_fast_read = None;
+        if let Some(names) = vdbe_host::column_names(&prog)
+            && names.len() == artifacts.column_names.len()
+        {
+            artifacts.column_names = names;
+        }
+        Some(prog)
+    }
+
     /// `EXPLAIN <stmt>` (not `EXPLAIN QUERY PLAN`): the program C's code generator builds for
     /// the statement, `None` when the port of the generator does not support the statement
     /// yet (the engine's own listing is then used), or C's compile error.
@@ -6898,6 +6929,8 @@ impl Statement {
             }
         }
 
+        let c_machine = Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some());
+
         let hid = inner.register_handle(HandleKind::Statement);
         Ok(Self {
             shared: Arc::clone(shared),
@@ -6910,6 +6943,8 @@ impl Statement {
             compiled_vdbe: artifacts.compiled_vdbe,
             compiled_fast_read: artifacts.compiled_fast_read,
             c_explain,
+            c_machine,
+            c_machine_error: None,
             cached_read_vm: None,
             write_vm_scratch: sqliters_vdbe::VdbeWriteScratch::default(),
             compiled_schema_generation: inner.schema_generation,
@@ -7520,6 +7555,7 @@ impl Statement {
             if let Some(prog) = &c_explain {
                 artifacts.column_names = explain_column_names(prog.explain);
             }
+            let c_machine = Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some());
             let mut transferred = vec![Value::Null; artifacts.max_param];
             let copy_len = self.params.len().min(artifacts.max_param);
             transferred[..copy_len].clone_from_slice(&self.params[..copy_len]);
@@ -7530,6 +7566,8 @@ impl Statement {
             self.compiled_vdbe = artifacts.compiled_vdbe;
             self.compiled_fast_read = artifacts.compiled_fast_read;
             self.c_explain = c_explain;
+            self.c_machine = c_machine;
+            self.c_machine_error = None;
             self.column_names = artifacts.column_names;
             self.params = transferred;
             self.named_params = artifacts.named_params;
@@ -8800,6 +8838,7 @@ impl Statement {
                 }
                 let mut expire_self_only = false;
                 let mut stmt_tx = StmtTxTracker::default();
+                let mut c_machine_error: Option<SqliteError> = None;
                 let exec_res = inner.with_exec_ctx(
                     shared,
                     summary,
@@ -8807,9 +8846,23 @@ impl Statement {
                     &mut expire_self_only,
                     |ctx| {
                         crate::vtab::ensure_stmt_vtabs_connected(ctx, stmt_ref)?;
+                        // Diagnostic switch SQLITERS_VDBE_EXEC: the statement runs on the
+                        // port of C's virtual machine.
+                        if let Some(prog) = &self.c_machine {
+                            match engine::execute_read_on_machine(ctx, prog, &self.params, &self.raw_sql) {
+                                Ok((out, trailing)) => {
+                                    c_machine_error = trailing;
+                                    return Ok(out);
+                                }
+                                // (a program of another schema version: the engine's path)
+                                Err(e) if e.code == ErrorCode::Schema => {}
+                                Err(e) => return Err(e),
+                            }
+                        }
                         execute_read_body(ctx, stmt_ref, &self.params)
                     },
                 );
+                self.c_machine_error = c_machine_error;
                 // `EXPLAIN <stmt>` of a statement C's code generator (the port) supports: the
                 // rows are C's listing.
                 let exec_res = match &self.c_explain {
@@ -9697,6 +9750,22 @@ impl Statement {
 
                 if let Some(vals) = rows.next() {
                     Ok(StepResult::Row(Row::new(vals)))
+                } else if let Some(e) = self.c_machine_error.take() {
+                    // The machine's statement failed after these rows.
+                    let cursors = std::mem::take(lease_cursors);
+                    let r_insts = std::mem::take(read_instances);
+                    let _ = inner.finish_activity(
+                        hid,
+                        ActivityFinish::ReadAborted {
+                            lease_cursors: cursors,
+                            read_instances: r_insts,
+                        },
+                        shared,
+                    );
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(e.clone()),
+                    };
+                    Err(e)
                 } else {
                     let cursors = std::mem::take(lease_cursors);
                     let r_insts = std::mem::take(read_instances);
@@ -13307,6 +13376,8 @@ mod c_align_h6b_tests;
 mod c_align_v1_tests;
 #[cfg(test)]
 mod c_align_v2_tests;
+#[cfg(test)]
+mod c_align_m1_tests;
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
 /// value below is what the reference `sqlite3` produces for the same statements.
 #[cfg(test)]
