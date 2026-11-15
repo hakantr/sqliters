@@ -30,6 +30,7 @@ pub mod tk;
 pub mod treedump;
 pub mod tokenize;
 pub mod util;
+pub mod vtab;
 pub mod walker;
 pub mod where_;
 pub mod wherecode;
@@ -41,6 +42,8 @@ pub mod window;
 mod explain_tests;
 #[cfg(test)]
 mod plan_tests;
+#[cfg(test)]
+mod vtab_tests;
 
 use sqliters_vdbe::vdbeaux::Program;
 

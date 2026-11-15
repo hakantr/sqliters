@@ -1809,7 +1809,7 @@ pub fn sqlite3_expr_code_target(p: &mut Parse, mut e: ExprId, target: i32) -> i3
             let n_farg = if farg.nn() { p.l(farg).n_expr() } else { 0 };
             let z_id = p.e(e).tok().to_owned();
             let def = sqlite3_find_function(p, &z_id, n_farg, 0);
-            let def = match def {
+            let mut def = match def {
                 Some(d)
                     if !d.x_finalize
                         && !((d.func_flags & SQLITE_FUNC_INTERNAL) != 0
@@ -1861,8 +1861,21 @@ pub fn sqlite3_expr_code_target(p: &mut Parse, mut e: ExprId, target: i32) -> i3
             } else {
                 r1 = 0;
             }
-            // (sqlite3VtabOverloadFunction: the first argument is never a virtual-table column
-            // in step V1)
+            // Possibly overload the function if the first argument is a virtual table column.
+            //
+            // For infix functions (LIKE, GLOB, REGEXP, and MATCH) use the second argument, not
+            // the first, as the argument to test to see if it is a column in a virtual table.
+            // This is done because the left operand of infix functions (the operand we want
+            // to control overloading) ends up as the second argument to the function. The
+            // expression "A glob B" is equivalent to "glob(B,A). We want to use the A in "A
+            // glob B" to test for function overloading. But we use the B term in "glob(B,A)".
+            if n_farg >= 2 && p.e(e).has(EP_InfixFunc) {
+                let a1 = p.l(farg).a[1].p_expr;
+                def = crate::vtab::sqlite3_vtab_overload_function(p, def, n_farg, a1);
+            } else if n_farg > 0 {
+                let a0 = p.l(farg).a[0].p_expr;
+                def = crate::vtab::sqlite3_vtab_overload_function(p, def, n_farg, a0);
+            }
             if def.func_flags & SQLITE_FUNC_NEEDCOLL != 0 {
                 let c = match coll {
                     Some(c) => c,

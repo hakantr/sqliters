@@ -990,7 +990,7 @@ pub fn sqlite3_vdbe_display_p4_bytes(op: &VdbeOp) -> Option<Vec<u8>> {
             Value::Null => text("NULL".to_owned()),
             Value::Blob(_) => text("(blob)".to_owned()),
         },
-        P4::Vtab(v) => text(format!("vtab:{:#x}", v.id)),
+        P4::Vtab(v) => text(format!("vtab:{:X}", v.id)), // (C: "vtab:%p")
         P4::IntArray(ai) => {
             let mut x = String::new();
             for (i, v) in ai.iter().enumerate() {

@@ -40,7 +40,10 @@ pub fn where_clause_insert(p: &Parse, w: &mut WhereInfo, wc: WcId, e: ExprId, wt
         p_expr: sqlite3_expr_skip_collate_and_likely(p, e),
         truth_prob,
         wt_flags,
-        i_parent: -1,
+        // pTerm->iParent = -1, then memset(&pTerm->eOperator, 0, ...) clears it again
+        // (iParent follows eOperator in struct WhereTerm): a term that exprAnalyze() never
+        // sees, such as a LIMIT / OFFSET term of a virtual table, keeps iParent 0.
+        i_parent: 0,
         ..WhereTerm::default()
     };
     let c = &mut w.a_wc[wc];
@@ -1236,12 +1239,153 @@ pub fn expr_analyze(p: &mut Parse, w: &mut WhereInfo, wc: WcId, idx_term: usize)
             mark_term_as_child(w, wc, idx_new, idx_term);
         }
     }
-    // (isAuxiliaryVtabOperator(): the WO_AUX terms of virtual tables. A virtual table never
-    // reaches the planner: sqlite3LocateTable() reports it as unsupported.)
+    // Add a WO_AUX auxiliary term to the constraint set if the current expression is of the
+    // form "column OP expr" where OP is an operator that gets passed into virtual tables but
+    // which is not normally optimized for ordinary tables. In other words, OP is one of
+    // MATCH, LIKE, GLOB, REGEXP, !=, IS, IS NOT, or NOT NULL. This information is used by
+    // the xBestIndex methods of virtual tables. The native query optimizer does not attempt
+    // to do anything with MATCH functions.
+    else if w.a_wc[wc].op == TK_AND {
+        let (mut res, e_op2, mut p_left, mut p_right) = is_auxiliary_vtab_operator(p, e);
+        while res > 0 {
+            res -= 1;
+            let prereq_expr = sqlite3_where_expr_usage(p, &mut w.s_mask_set, p_right);
+            let prereq_column = sqlite3_where_expr_usage(p, &mut w.s_mask_set, p_left);
+            if (prereq_expr & prereq_column) == 0 {
+                let d = sqlite3_expr_dup(p, p_right, 0);
+                let new_expr = sqlite3_p_expr(p, TK_MATCH, ExprId::NULL, d);
+                if p.e(e).has(EP_OuterON) && new_expr.nn() {
+                    let j = p.e(e).w;
+                    let ne = p.em(new_expr);
+                    ne.flags |= EP_OuterON;
+                    ne.w = j;
+                }
+                let idx_new = where_clause_insert(p, w, wc, new_expr, TERM_VIRTUAL | TERM_DYNAMIC);
+                let (lt, lc) = (p.e(p_left).i_table, p.e(p_left).i_column as i32);
+                {
+                    let nt = &mut w.a_wc[wc].a[idx_new];
+                    nt.prereq_right = prereq_expr | extra_right;
+                    nt.left_cursor = lt;
+                    nt.left_column = lc;
+                    nt.e_operator = WO_AUX;
+                    nt.e_match_op = e_op2;
+                }
+                mark_term_as_child(w, wc, idx_new, idx_term);
+                w.a_wc[wc].a[idx_term].wt_flags |= TERM_COPIED;
+                let pa = w.a_wc[wc].a[idx_term].prereq_all;
+                w.a_wc[wc].a[idx_new].prereq_all = pa;
+            }
+            std::mem::swap(&mut p_left, &mut p_right);
+        }
+    }
 
     // Prevent ON clause terms of a LEFT JOIN from being used to drive an index for tables to
     // the left of the join.
     w.a_wc[wc].a[idx_term].prereq_right |= extra_right;
+}
+
+/// `ExprIsVtab(X)`: X is a column of a virtual table
+fn expr_is_vtab(p: &Parse, x: ExprId) -> bool {
+    x.nn() && p.e(x).op == TK_COLUMN && p.e(x).y_tab.nn() && p.tab(p.e(x).y_tab).is_virtual()
+}
+
+/// `isAuxiliaryVtabOperator(db, pExpr, peOp2, ppLeft, ppRight)`: check to see if the given
+/// expression is of the form
+///
+/// ```text
+///         column OP expr
+/// ```
+///
+/// where OP is one of MATCH, GLOB, LIKE, REGEXP, !=, IS NOT, or IS NOT NULL and "column" is a
+/// column of a virtual table:
+///
+/// ```text
+///          Expression                   Virtual Table Operator
+///          -----------------------      ---------------------------------
+///      1.  column MATCH expr            SQLITE_INDEX_CONSTRAINT_MATCH
+///      2.  column GLOB expr             SQLITE_INDEX_CONSTRAINT_GLOB
+///      3.  column LIKE expr             SQLITE_INDEX_CONSTRAINT_LIKE
+///      4.  column REGEXP expr           SQLITE_INDEX_CONSTRAINT_REGEXP
+///      5.  column != expr               SQLITE_INDEX_CONSTRAINT_NE
+///      6.  expr != column               SQLITE_INDEX_CONSTRAINT_NE
+///      7.  column IS NOT expr           SQLITE_INDEX_CONSTRAINT_ISNOT
+///      8.  expr IS NOT column           SQLITE_INDEX_CONSTRAINT_ISNOT
+///      9.  column IS NOT NULL           SQLITE_INDEX_CONSTRAINT_ISNOTNULL
+/// ```
+///
+/// In every case, "column" must be a column of a virtual table. If there is a match, return
+/// the "column" expression as the left one, the "expr" expression as the right one (even
+/// though in forms (6) and (8) the column is on the right and the expression is on the left),
+/// and the appropriate virtual table operator. The count is 1 or 2 if there is a match. The
+/// usual count is 1, but if the RHS is also a column of virtual table in forms (5) or (7)
+/// then it is 2. If the expression matches none of the patterns above, the count is 0.
+fn is_auxiliary_vtab_operator(p: &mut Parse, e: ExprId) -> (i32, u8, ExprId, ExprId) {
+    let op = p.e(e).op;
+    if op == TK_FUNCTION {
+        let list = p.e(e).x_list();
+        if list.is_null() || p.l(list).a.len() != 2 {
+            return (0, 0, ExprId::NULL, ExprId::NULL);
+        }
+
+        // Built-in operators MATCH, GLOB, LIKE, and REGEXP attach to a virtual table on their
+        // second argument, which is the same as the left-hand side operand in their in-fix
+        // form.
+        //
+        //       vtab_column MATCH expression
+        //       MATCH(expression,vtab_column)
+        let col = p.l(list).a[1].p_expr;
+        if expr_is_vtab(p, col) {
+            let i = crate::where_::sqlite3_expr_is_like_operator(p, e);
+            if i != 0 {
+                return (1, i as u8, col, p.l(list).a[0].p_expr);
+            }
+        }
+
+        // We can also match against the first column of overloaded functions where
+        // xFindFunction returns a value of at least SQLITE_INDEX_CONSTRAINT_FUNCTION.
+        //
+        //      OVERLOADED(vtab_column,expression)
+        //
+        // Historically, xFindFunction expected to see lower-case function names. But for
+        // this use case, xFindFunction is expected to deal with function names in an
+        // arbitrary case.
+        let col = p.l(list).a[0].p_expr;
+        if expr_is_vtab(p, col) {
+            let vt = crate::vtab::sqlite3_get_vtable(p, p.e(col).y_tab).cloned();
+            if let Some(vt) = vt
+                && vt.has_find_function
+            {
+                let host = p.db.host;
+                let z = p.e(e).tok().to_owned();
+                let i = host.vtab_find_function(vt.id, 2, &z);
+                if i >= crate::vtab::SQLITE_INDEX_CONSTRAINT_FUNCTION {
+                    return (1, i as u8, col, p.l(list).a[1].p_expr);
+                }
+            }
+        }
+    } else if op >= TK_EQ {
+        // Comparison operators are a common case. Save a few comparisons for that common case
+        // by terminating early.
+        return (0, 0, ExprId::NULL, ExprId::NULL);
+    } else if op == TK_NE || op == TK_ISNOT || op == TK_NOTNULL {
+        let mut res = 0;
+        let mut p_left = p.e(e).p_left;
+        let mut p_right = p.e(e).p_right;
+        if expr_is_vtab(p, p_left) {
+            res += 1;
+        }
+        if p_right.nn() && expr_is_vtab(p, p_right) {
+            res += 1;
+            std::mem::swap(&mut p_left, &mut p_right);
+        }
+        let e_op2 = match op {
+            TK_NE => crate::vtab::SQLITE_INDEX_CONSTRAINT_NE,
+            TK_ISNOT => crate::vtab::SQLITE_INDEX_CONSTRAINT_ISNOT,
+            _ => crate::vtab::SQLITE_INDEX_CONSTRAINT_ISNOTNULL,
+        };
+        return (res, e_op2, p_left, p_right);
+    }
+    (0, 0, ExprId::NULL, ExprId::NULL)
 }
 
 /// `sqlite3WhereSplit(pWC, pExpr, op)`: this routine identifies subexpressions in the WHERE
@@ -1336,14 +1480,139 @@ pub fn sqlite3_where_expr_analyze(p: &mut Parse, w: &mut WhereInfo, wc: WcId) {
     }
 }
 
+/// `whereAddLimitExpr(pWC, iReg, pExpr, iCsr, eMatchOp)`: add either a LIMIT (if
+/// eMatchOp==SQLITE_INDEX_CONSTRAINT_LIMIT) or OFFSET (if
+/// eMatchOp==SQLITE_INDEX_CONSTRAINT_OFFSET) term to the where-clause passed as the first
+/// argument. The value for the term is found in register iReg.
+///
+/// In the common case where the value is a simple integer (example: "LIMIT 5 OFFSET 10")
+/// then the expression codes as a TK_INTEGER so that it will be available to
+/// sqlite3_vtab_rhs_value(). If not, then it codes as a TK_REGISTER expression.
+fn where_add_limit_expr(p: &mut Parse, w: &mut WhereInfo, wc: WcId, i_reg: i32, e: ExprId, i_csr: i32, e_match_op: u8) {
+    let new;
+    match sqlite3_expr_is_integer(p, e, true, false) {
+        Some(i_val) if i_val >= 0 => {
+            let val = sqlite3_expr_int32(p, i_val);
+            if val.is_null() {
+                return;
+            }
+            new = sqlite3_p_expr(p, TK_MATCH, ExprId::NULL, val);
+        }
+        _ => {
+            let val = sqlite3_expr_alloc(p, TK_REGISTER, None, 0);
+            if val.is_null() {
+                return;
+            }
+            p.em(val).i_table = i_reg;
+            new = sqlite3_p_expr(p, TK_MATCH, ExprId::NULL, val);
+        }
+    }
+    if new.nn() {
+        let idx = where_clause_insert(p, w, wc, new, TERM_DYNAMIC | TERM_VIRTUAL);
+        let t = &mut w.a_wc[wc].a[idx];
+        t.left_cursor = i_csr;
+        t.e_operator = WO_AUX;
+        t.e_match_op = e_match_op;
+    }
+}
+
+/// `sqlite3WhereAddLimit(pWC, p)`: possibly add terms corresponding to the LIMIT and OFFSET
+/// clauses of the SELECT statement passed as the second argument. These terms are only added
+/// if:
+///
+///   1. The SELECT statement has a LIMIT clause, and
+///   2. The SELECT statement is not an aggregate or DISTINCT query, and
+///   3. The SELECT statement has exactly one object in its FROM clause, and that object is a
+///      virtual table, and
+///   4. There are no terms in the WHERE clause that will not be passed to the virtual table
+///      xBestIndex method.
+///   5. The ORDER BY clause, if any, will be made available to the xBestIndex method.
+///
+/// LIMIT and OFFSET terms are ignored by most of the planner code. They exist only so that
+/// they may be passed to the xBestIndex method of the single virtual table in the FROM clause
+/// of the SELECT.
+pub fn sqlite3_where_add_limit(p: &mut Parse, w: &mut WhereInfo, wc: WcId, sel: SelectId) {
+    let src = p.s(sel).p_src;
+    if p.s(sel).p_group_by.is_null()
+        && (p.s(sel).sel_flags & (SF_Distinct | SF_Aggregate)) == 0 // 2
+        && (p.src(src).a.len() == 1 && p.tab(p.src(src).a[0].p_s_tab).is_virtual())
+    // 3
+    {
+        let order_by = p.s(sel).p_order_by;
+        let i_csr = p.src(src).a[0].i_cursor;
+
+        // Check condition (4). Return early if it is not met.
+        for ii in 0..w.a_wc[wc].a.len() {
+            let t = &w.a_wc[wc].a[ii];
+            if t.wt_flags & TERM_CODED != 0 {
+                // This term is a vector operation that has been decomposed into other,
+                // subsequent terms. It can be ignored. See tag-20220128a
+                continue;
+            }
+            if t.n_child != 0 {
+                // If this term has child terms, then they are also part of the pWC->a[]
+                // array. So this term can be ignored, as a LIMIT clause will only be added if
+                // each of the child terms passes the (leftCursor==iCsr) test below.
+                continue;
+            }
+            if t.left_cursor == i_csr && t.prereq_right == 0 {
+                continue;
+            }
+
+            // If this term has a parent with exactly one child, and the parent will be passed
+            // through to xBestIndex, then this term can be ignored.
+            if t.i_parent >= 0 {
+                let pp = &w.a_wc[wc].a[t.i_parent as usize];
+                if pp.left_cursor == i_csr && pp.prereq_right == 0 && pp.n_child == 1 {
+                    continue;
+                }
+            }
+
+            // This term will not be passed through. Do not add a LIMIT clause.
+            return;
+        }
+
+        // Check condition (5). Return early if it is not met.
+        if order_by.nn() {
+            for ii in 0..p.l(order_by).a.len() {
+                let e = p.l(order_by).a[ii].p_expr;
+                if p.e(e).op != TK_COLUMN {
+                    return;
+                }
+                if p.e(e).i_table != i_csr {
+                    return;
+                }
+                if p.l(order_by).a[ii].sort_flags & sqliters_vdbe::vdbeaux::KEYINFO_ORDER_BIGNULL != 0 {
+                    return;
+                }
+            }
+        }
+
+        // All conditions are met. Add the terms to the where-clause object.
+        let (i_offset, i_limit, sel_flags, lim) = {
+            let s = p.s(sel);
+            (s.i_offset, s.i_limit, s.sel_flags, s.p_limit)
+        };
+        if i_offset != 0 && (sel_flags & SF_Compound) == 0 {
+            let r = p.e(lim).p_right;
+            where_add_limit_expr(p, w, wc, i_offset, r, i_csr, crate::vtab::SQLITE_INDEX_CONSTRAINT_OFFSET);
+        }
+        if i_offset == 0 || (sel_flags & SF_Compound) == 0 {
+            let l = p.e(lim).p_left;
+            where_add_limit_expr(p, w, wc, i_limit, l, i_csr, crate::vtab::SQLITE_INDEX_CONSTRAINT_LIMIT);
+        }
+    }
+}
+
 /// `sqlite3WhereTabFuncArgs(pParse, pItem, pWC)`: for table-valued-functions, transform the
-/// function arguments into new WHERE clause terms. Table-valued functions are virtual
-/// tables, which are reported as unsupported before the planner is reached; what remains is
-/// the error for function arguments on an ordinary table.
-pub fn sqlite3_where_tab_func_args(p: &mut Parse, src: SrcListId, i: usize) {
-    let (is_tab_func, tab, name) = {
+/// function arguments into new WHERE clause terms.
+///
+/// Each function argument translates into an equality constraint against a HIDDEN column in
+/// the table.
+pub fn sqlite3_where_tab_func_args(p: &mut Parse, w: &mut WhereInfo, wc: WcId, src: SrcListId, i: usize) {
+    let (is_tab_func, tab, name, args, i_cursor, jointype) = {
         let it = &p.src(src).a[i];
-        (it.is_tab_func, it.p_s_tab, it.z_name.clone().unwrap_or_default())
+        (it.is_tab_func, it.p_s_tab, it.z_name.clone().unwrap_or_default(), it.p_func_arg, it.i_cursor, it.jointype as i32)
     };
     if !is_tab_func {
         return;
@@ -1352,7 +1621,41 @@ pub fn sqlite3_where_tab_func_args(p: &mut Parse, src: SrcListId, i: usize) {
         p.error_msg(format!("'{name}' is not a function"));
         return;
     }
-    p.not_supported("table-valued function");
+    if args.is_null() {
+        return;
+    }
+    let n_col = p.tab(tab).a_col.len();
+    let mut k = 0usize;
+    for j in 0..p.l(args).a.len() {
+        while k < n_col && (p.tab(tab).a_col[k].col_flags & COLFLAG_HIDDEN as u16) == 0 {
+            k += 1;
+        }
+        if k >= n_col {
+            let tn = p.tab(tab).z_name.clone();
+            p.error_msg(format!("too many arguments on {tn}() - max {j}"));
+            return;
+        }
+        let col_ref = sqlite3_expr_alloc(p, TK_COLUMN, None, 0);
+        if col_ref.is_null() {
+            return;
+        }
+        {
+            let c = p.em(col_ref);
+            c.i_table = i_cursor;
+            c.i_column = k as i16;
+            c.y_tab = tab;
+        }
+        k += 1;
+        let used = crate::resolve::sqlite3_expr_col_used(p, col_ref);
+        p.srcm(src).a[i].col_used |= used;
+        let a = p.l(args).a[j].p_expr;
+        let d = sqlite3_expr_dup(p, a, 0);
+        let rhs = sqlite3_p_expr(p, TK_UPLUS, d, ExprId::NULL);
+        let term = sqlite3_p_expr(p, TK_EQ, col_ref, rhs);
+        let join_type = if jointype & (JT_LEFT | JT_RIGHT) != 0 { EP_OuterON } else { EP_InnerON };
+        crate::select::sqlite3_set_join_expr(p, term, i_cursor, join_type);
+        where_clause_insert(p, w, wc, term, TERM_DYNAMIC);
+    }
 }
 
 /// `sqlite3WhereLoopBloomable(pLoop)`: return true if pLoop is a candidate for a Bloom

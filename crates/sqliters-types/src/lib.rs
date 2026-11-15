@@ -75,8 +75,9 @@ pub use value::{
 };
 pub use varint::{get_varint, get_varint_i64, push_varint, put_varint, put_varint_i64, varint_len};
 pub use vtab_api::{
+    SQLITE_INDEX_SCAN_HEX, SQLITE_INDEX_SCAN_UNIQUE,
     ShadowBlobRead, ShadowHint, VTabConfigOption, VTabConflictMode, VTabConstraint,
-    VTabConstraintOp, VTabConstraintUsage, VTabHostContext, VTabIndexInfo, VTabOrderBy,
+    VTabConstraintOp, VTabConstraintUsage, VTabHostContext, VTabIndexInfo, VTabIndexInfoCalls, VTabOrderBy,
     VTabRiskFlags, VTabUpdateOperation, VirtualCursor, VirtualTable, VirtualTableModule,
 };
 

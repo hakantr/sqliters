@@ -67,6 +67,36 @@ pub enum VTabConstraintOp {
     Function(u8),
 }
 
+impl VTabConstraintOp {
+    /// The `SQLITE_INDEX_CONSTRAINT_*` code of the operator.
+    pub fn c_code(self) -> u8 {
+        match self {
+            Self::Eq => 2,
+            Self::Gt => 4,
+            Self::Le => 8,
+            Self::Lt => 16,
+            Self::Ge => 32,
+            Self::Match => 64,
+            Self::Like => 65,
+            Self::Glob => 66,
+            Self::Regexp => 67,
+            Self::Ne => 68,
+            Self::IsNot => 69,
+            Self::IsNotNull => 70,
+            Self::IsNull => 71,
+            Self::Is => 72,
+            Self::Limit => 73,
+            Self::Offset => 74,
+            Self::Function(x) => x,
+        }
+    }
+}
+
+/// `SQLITE_INDEX_SCAN_UNIQUE`: the scan visits at most one row
+pub const SQLITE_INDEX_SCAN_UNIQUE: u32 = 0x0000_0001;
+/// `SQLITE_INDEX_SCAN_HEX`: display idxNum as hex in EXPLAIN QUERY PLAN
+pub const SQLITE_INDEX_SCAN_HEX: u32 = 0x0000_0002;
+
 /// Single `WHERE` or `LIMIT`/`OFFSET` constraint presented to [`VirtualTable::best_index`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VTabConstraint {
@@ -111,6 +141,9 @@ pub struct VTabIndexInfo {
     pub idx_num: i32,
     /// Optional module-chosen index string passed to [`VirtualCursor::filter`].
     pub idx_str: Option<String>,
+    /// `needToFreeIdxStr`: what the module set (C's modules set it with an allocated
+    /// `idxStr`; R-Tree also without one). Only [`VirtualTable::best_index_calls`] reports it.
+    pub need_to_free_idx_str: bool,
     /// True if the virtual table cursor guarantees rows are already ordered by `order_by`.
     pub order_by_consumed: bool,
     /// Estimated cost of the scan.
@@ -136,6 +169,7 @@ impl VTabIndexInfo {
             constraint_usage,
             idx_num: 0,
             idx_str: None,
+            need_to_free_idx_str: false,
             order_by_consumed: false,
             estimated_cost: 1_000_000.0,
             estimated_rows: 1_000_000,
@@ -621,10 +655,34 @@ pub trait VirtualTableModule: Send + Sync + 'static {
     }
 }
 
+/// The calls a module can make back into the core while its `xBestIndex` runs:
+/// `sqlite3_vtab_in()`, `sqlite3_vtab_rhs_value()`, `sqlite3_vtab_distinct()`,
+/// `sqlite3_vtab_collation()`. Constraint numbers index [`VTabIndexInfo::constraints`].
+pub trait VTabIndexInfoCalls {
+    /// `sqlite3_vtab_in(pIdxInfo, iCons, bHandle)`: true if constraint `i_cons` is really an
+    /// `IN (...)` constraint; `b_handle` 1 asks to receive the whole list (0: one value at a
+    /// time, -1: only ask).
+    fn vtab_in(&mut self, i_cons: usize, b_handle: i32) -> bool;
+    /// `sqlite3_vtab_rhs_value(pIdxInfo, iCons, &pVal)`: the right-hand value of constraint
+    /// `i_cons` if it is known while the statement is prepared.
+    fn rhs_value(&mut self, i_cons: usize) -> Option<Value>;
+    /// `sqlite3_vtab_distinct(pIdxInfo)`
+    fn distinct(&self) -> i32;
+    /// `sqlite3_vtab_collation(pIdxInfo, iCons)`: the collating sequence of constraint `i_cons`
+    fn collation(&mut self, i_cons: usize) -> String;
+}
+
 /// Connected virtual table instance (`sqlite3_vtab`).
 pub trait VirtualTable: Send + Sync {
     /// Evaluates query constraints and populates `info` (`xBestIndex`).
     fn best_index(&self, info: &mut VTabIndexInfo) -> Result<()>;
+
+    /// [`Self::best_index`] as the SQL compiler that is a port of C's code generator calls
+    /// it: with access to the `sqlite3_vtab_*()` calls of `xBestIndex`. A module that makes
+    /// such calls overrides this method.
+    fn best_index_calls(&self, info: &mut VTabIndexInfo, _calls: &mut dyn VTabIndexInfoCalls) -> Result<()> {
+        self.best_index(info)
+    }
 
     /// Opens a new cursor over this virtual table (`xOpen`).
     fn open(&self) -> Result<Box<dyn VirtualCursor>>;

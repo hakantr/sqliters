@@ -174,6 +174,150 @@ impl VirtualTableModule for GenerateSeriesModule {
 struct GenerateSeriesTable;
 
 impl VirtualTable for GenerateSeriesTable {
+    /// `seriesBestIndex()` of series.c as the reference shell (3.54.1) builds it
+    /// (`SQLITE_SERIES_CONSTRAINT_VERIFY` 0, `SQLITE_INDEX_SCAN_HEX` defined). Used by the port
+    /// of C's code generator; the engine's executor plans with [`Self::best_index`].
+    ///
+    /// The query plan selected is passed in the idxNum parameter. idxNum is a bitmask:
+    /// 0x0001 start=, 0x0002 stop=, 0x0004 step=, 0x0008 descending order, 0x0010 ascending
+    /// order, 0x0020 LIMIT, 0x0040 OFFSET, 0x0080 value=, 0x0100 value>=, 0x0200 value>,
+    /// 0x1000 value<=, 0x2000 value<.
+    fn best_index_calls(&self, info: &mut VTabIndexInfo, _calls: &mut dyn sqliters_types::VTabIndexInfoCalls) -> Result<()> {
+        let mut idx_num = 0i32; // The query plan bitmask
+        let mut b_start_seen = false; // EQ constraint seen on the START column
+        let mut unusable_mask = 0i32; // Mask of unusable constraints
+        let mut n_arg = 0usize; // Number of arguments that seriesFilter() expects
+        // Constraints on start, stop, step, LIMIT, OFFSET, and value. aIdx[5] covers value=,
+        // value>=, and value>, aIdx[6] covers value<= and value<
+        let mut a_idx = [-1i64; 7];
+        for (i, c) in info.constraints.iter().enumerate() {
+            let op = c.op.c_code();
+            if (73..=74).contains(&op) {
+                // SQLITE_INDEX_CONSTRAINT_LIMIT ..= SQLITE_INDEX_CONSTRAINT_OFFSET
+                if !c.usable {
+                    // do nothing
+                } else if op == 73 {
+                    a_idx[3] = i as i64;
+                    idx_num |= 0x20;
+                } else {
+                    a_idx[4] = i as i64;
+                    idx_num |= 0x40;
+                }
+                continue;
+            }
+            if c.i_column < 1 {
+                // < SERIES_COLUMN_START
+                if (c.i_column == 0 || c.i_column == -1) && c.usable {
+                    match op {
+                        2 | 72 => {
+                            // SQLITE_INDEX_CONSTRAINT_EQ, SQLITE_INDEX_CONSTRAINT_IS
+                            idx_num |= 0x0080;
+                            idx_num &= !0x3300;
+                            a_idx[5] = i as i64;
+                            a_idx[6] = -1;
+                            b_start_seen = true;
+                        }
+                        32 => {
+                            // SQLITE_INDEX_CONSTRAINT_GE
+                            if idx_num & 0x0080 == 0 {
+                                idx_num |= 0x0100;
+                                idx_num &= !0x0200;
+                                a_idx[5] = i as i64;
+                                b_start_seen = true;
+                            }
+                        }
+                        4 => {
+                            // SQLITE_INDEX_CONSTRAINT_GT
+                            if idx_num & 0x0080 == 0 {
+                                idx_num |= 0x0200;
+                                idx_num &= !0x0100;
+                                a_idx[5] = i as i64;
+                                b_start_seen = true;
+                            }
+                        }
+                        8 => {
+                            // SQLITE_INDEX_CONSTRAINT_LE
+                            if idx_num & 0x0080 == 0 {
+                                idx_num |= 0x1000;
+                                idx_num &= !0x2000;
+                                a_idx[6] = i as i64;
+                            }
+                        }
+                        16 => {
+                            // SQLITE_INDEX_CONSTRAINT_LT
+                            if idx_num & 0x0080 == 0 {
+                                idx_num |= 0x2000;
+                                idx_num &= !0x1000;
+                                a_idx[6] = i as i64;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            let i_col = (c.i_column - 1) as usize; // 0 for start, 1 for stop, 2 for step
+            let i_mask = 1i32 << i_col;
+            if i_col == 0 && op == 2 {
+                b_start_seen = true;
+            }
+            if !c.usable {
+                unusable_mask |= i_mask;
+                continue;
+            } else if op == 2 {
+                idx_num |= i_mask;
+                a_idx[i_col] = i as i64;
+            }
+        }
+        if a_idx[3] == 0 {
+            // Ignore OFFSET if LIMIT is omitted
+            idx_num &= !0x60;
+            a_idx[4] = 0;
+        }
+        for (i, &j) in a_idx.iter().enumerate() {
+            if j >= 0 {
+                n_arg += 1;
+                info.constraint_usage[j as usize].argv_index = n_arg;
+                // !SQLITE_SERIES_CONSTRAINT_VERIFY || i>=3
+                info.constraint_usage[j as usize].omit = true;
+                let _ = i;
+            }
+        }
+        // The current generate_column() implementation requires at least one argument (the
+        // START value).
+        if !b_start_seen {
+            return Err(SqliteError::new(ErrorCode::Error, "first argument to \"generate_series()\" missing or unusable"));
+        }
+        if (unusable_mask & !idx_num) != 0 {
+            // The start, stop, and step columns are inputs. Therefore if there are unusable
+            // constraints on any of start, stop, or step then this plan is unusable
+            return Err(SqliteError::new(ErrorCode::Constraint, "unusable generate_series constraint"));
+        }
+        if (idx_num & 0x03) == 0x03 {
+            // Both start= and stop= boundaries are available. This is the the preferred case
+            info.estimated_cost = (2 - i32::from((idx_num & 4) != 0)) as f64;
+            info.estimated_rows = 1000;
+            if !info.order_by.is_empty() && info.order_by[0].i_column == 0 {
+                if info.order_by[0].desc {
+                    idx_num |= 0x08;
+                } else {
+                    idx_num |= 0x10;
+                }
+                info.order_by_consumed = true;
+            }
+        } else if (idx_num & 0x21) == 0x21 {
+            // We have start= and LIMIT
+            info.estimated_rows = 2500;
+        } else {
+            // If either boundary is missing, we have to generate a huge span of numbers. Make
+            // this case very expensive so that the query planner will work hard to avoid it.
+            info.estimated_rows = 2_147_483_647;
+        }
+        info.idx_num = idx_num;
+        info.idx_flags = sqliters_types::SQLITE_INDEX_SCAN_HEX;
+        Ok(())
+    }
+
     fn best_index(&self, info: &mut VTabIndexInfo) -> Result<()> {
         let mut idx_num = 0i32;
         let mut unusable_mask = 0i32;

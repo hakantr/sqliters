@@ -294,9 +294,40 @@ pub fn sqlite3_select_check_on_clauses(p: &mut Parse, sel: SelectId) {
     p.sm(sel).sel_flags &= !SF_OnToWhere;
 
     // Check for any table-function args that are attached to virtual tables on the RHS of an
-    // outer join. They are subject to similar constraints as ON clauses. (Table-valued
-    // functions are virtual tables: sqlite3LocateTableItem() has already reported them as
-    // unsupported.)
+    // outer join. They are subject to similar constraints as ON clauses. Specifically:
+    //
+    // * If the table-valued function is to the left of any RIGHT JOIN, or if it is the RHS of
+    //   a RIGHT JOIN, then the table-valued function arguments may not refer to any tables to
+    //   the right of this one.
+    //
+    // * If the table-valued function is to the left of a LEFT JOIN, then it may not refer to
+    //   any table that occurs to the right of the LEFT JOIN.
+    let top = w.v_ctx.len() - 1;
+    w.v_ctx[top].2 = true; // sCtx.bFuncArg = 1
+    let n_src = p.src(src).a.len();
+    for ii in 0..n_src {
+        let (is_tab_func, jointype, i_cursor, func_arg) = {
+            let it = &p.src(src).a[ii];
+            (it.is_tab_func, it.jointype as i32, it.i_cursor, it.p_func_arg)
+        };
+        if is_tab_func {
+            let mut i_join = -1;
+            if (jointype & (JT_LTORJ | JT_RIGHT)) != 0 {
+                i_join = i_cursor;
+            } else {
+                for jj in ii + 1..n_src {
+                    if (p.src(src).a[jj].jointype as i32 & JT_OUTER) != 0 {
+                        i_join = p.src(src).a[jj - 1].i_cursor;
+                        break;
+                    }
+                }
+            }
+            w.v_ctx[top].1 = i_join;
+            if i_join >= 0 {
+                sqlite3_walk_expr_list(p, &mut w, func_arg);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

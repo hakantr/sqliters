@@ -7150,6 +7150,15 @@ impl Statement {
             inner.db_set.c_note_stats(false);
         }
 
+        // The port of C's code generator reaches the virtual tables through the engine's
+        // connected instances (C connects them while it prepares the statement): connect the
+        // ones an EXPLAIN names now. An error is the engine's to report (try_compile below).
+        if let Some(ref st @ Stmt::Explain { .. }) = stmt_opt {
+            let _ = inner.with_default_exec_ctx(shared, ActivitySummary::default(), |ctx| {
+                crate::vtab::ensure_stmt_vtabs_connected(ctx, st)
+            });
+        }
+
         // `EXPLAIN <stmt>`: C's listing (or C's compile error) when the port of C's code
         // generator supports the statement; the engine's own output otherwise.
         let c_explain = match c_explain_of_rejected {

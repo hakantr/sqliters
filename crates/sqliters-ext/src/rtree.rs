@@ -2490,6 +2490,15 @@ fn rtree_query_stat1(
 }
 
 impl VirtualTable for RTreeTable {
+    /// `rtreeBestIndex` as the port of C's code generator calls it: also reports
+    /// `needToFreeIdxStr`, which C sets on the R-Tree scan plan (idxNum 2) even without an
+    /// idxStr.
+    fn best_index_calls(&self, info: &mut VTabIndexInfo, _calls: &mut dyn sqliters_types::VTabIndexInfoCalls) -> Result<()> {
+        self.best_index(info)?;
+        info.need_to_free_idx_str = info.idx_num == 2;
+        Ok(())
+    }
+
     /// `rtreeBestIndex`
     fn best_index(&self, info: &mut VTabIndexInfo) -> Result<()> {
         // Check if there exists a MATCH constraint - even an unusable one. If there is, do

@@ -509,7 +509,9 @@ fn planner_dump_of_a_join() {
 #[test]
 fn unsupported_in_v3() {
     let host = TestHost;
-    for sql in ["select * from pragma_table_info('t')"] {
+    // (V4b: table-valued functions are ported - see vtab_tests.rs; the statement kinds of DML
+    // are not)
+    for sql in ["insert into t(b) values(1)"] {
         assert!(matches!(crate::prepare(db(&host), sql), PrepareResult::Unsupported(_)), "{sql}");
     }
 }

@@ -90,6 +90,56 @@ struct JsonWalkTable {
 }
 
 impl VirtualTable for JsonWalkTable {
+    /// `jsonEachBestIndex()` of json.c (3.54.1), used by the port of C's code generator; the
+    /// engine's executor plans with [`Self::best_index`].
+    fn best_index_calls(&self, info: &mut VTabIndexInfo, _calls: &mut dyn sqliters_types::VTabIndexInfoCalls) -> Result<()> {
+        let mut a_idx = [-1i64; 2]; // Index of constraints for JSON and ROOT
+        let mut unusable_mask = 0i32; // Mask of unusable JSON and ROOT constraints
+        let mut idx_mask = 0i32; // Mask of usable == constraints JSON and ROOT
+        // This implementation assumes that JSON and ROOT are the last two columns in the table
+        for (i, c) in info.constraints.iter().enumerate() {
+            if c.i_column < JEACH_JSON {
+                continue;
+            }
+            let i_col = (c.i_column - JEACH_JSON) as usize;
+            let i_mask = 1i32 << i_col;
+            if !c.usable {
+                unusable_mask |= i_mask;
+            } else if c.op == VTabConstraintOp::Eq {
+                a_idx[i_col] = i as i64;
+                idx_mask |= i_mask;
+            }
+        }
+        if !info.order_by.is_empty() && info.order_by[0].i_column < 0 && !info.order_by[0].desc {
+            info.order_by_consumed = true;
+        }
+
+        if (unusable_mask & !idx_mask) != 0 {
+            // If there are any unusable constraints on JSON or ROOT, then reject this entire
+            // plan
+            return Err(SqliteError::new(ErrorCode::Constraint, "unusable json_each/json_tree constraint"));
+        }
+        if a_idx[0] < 0 {
+            // No JSON input. Leave estimatedCost at the huge value that it was initialized to
+            // to discourage the query planner from selecting this plan.
+            info.idx_num = 0;
+        } else {
+            info.estimated_cost = 1.0;
+            let i = a_idx[0] as usize;
+            info.constraint_usage[i].argv_index = 1;
+            info.constraint_usage[i].omit = true;
+            if a_idx[1] < 0 {
+                info.idx_num = 1; // Only JSON supplied. Plan 1
+            } else {
+                let i = a_idx[1] as usize;
+                info.constraint_usage[i].argv_index = 2;
+                info.constraint_usage[i].omit = true;
+                info.idx_num = 3; // Both JSON and ROOT are supplied. Plan 3
+            }
+        }
+        Ok(())
+    }
+
     fn best_index(&self, info: &mut VTabIndexInfo) -> Result<()> {
         let mut json_idx: Option<usize> = None;
         let mut root_idx: Option<usize> = None;

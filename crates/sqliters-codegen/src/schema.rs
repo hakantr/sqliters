@@ -330,9 +330,18 @@ pub fn sqlite3_locate_table(p: &mut Parse, flags: u32, z_name: &str, z_dbase: Op
         // If zName is the not the name of a table in the schema created using CREATE, then
         // check to see if it is the name of an virtual table that can be an eponymous
         // virtual table.
-        if (p.prep_flags as i32 & SQLITE_PREPARE_NO_VTAB) == 0 && !p.db.init_busy && is_eponymous_module(z_name) {
-            p.not_supported("eponymous virtual table / table-valued function");
-            return TableId::NULL;
+        if (p.prep_flags as i32 & SQLITE_PREPARE_NO_VTAB) == 0 && !p.db.init_busy {
+            // sqlite3HashFind(&db->aModule, zName), sqlite3PragmaVtabRegister(db, zName) for
+            // "pragma_*", sqlite3JsonVtabRegister(db, zName) for "json*"
+            let host = p.db.host;
+            if let Some(m) = host.vtab_module(z_name, true)
+                && let Some(epo) = crate::vtab::sqlite3_vtab_eponymous_table_init(p, &m)
+            {
+                return epo;
+            }
+            if p.unsupported.is_some() {
+                return TableId::NULL;
+            }
         }
         if !p.db.init_busy {
             let key = z_name.to_ascii_lowercase();
@@ -345,10 +354,8 @@ pub fn sqlite3_locate_table(p: &mut Parse, flags: u32, z_name: &str, z_dbase: Op
             return TableId::NULL;
         }
         p.check_schema = true;
-    } else if p.tab(t).is_virtual() {
-        p.not_supported("virtual table");
+    } else if p.tab(t).is_virtual() && (p.prep_flags as i32 & SQLITE_PREPARE_NO_VTAB) != 0 {
         t = TableId::NULL;
-        return t;
     }
     if t.nn() && !p.db.init_busy {
         // An object the generator could not load, or state of C's connection that the engine
@@ -371,19 +378,6 @@ pub fn sqlite3_locate_table(p: &mut Parse, flags: u32, z_name: &str, z_dbase: Op
         }
     }
     t
-}
-
-/// True if `z_name` can be an eponymous virtual table of the reference build: a registered
-/// module with `xCreate==0` or `xCreate==xConnect`, `pragma_*` and the JSON table functions.
-fn is_eponymous_module(z_name: &str) -> bool {
-    let l = z_name.to_ascii_lowercase();
-    l.starts_with("pragma_")
-        || matches!(
-            l.as_str(),
-            "json_each" | "json_tree" | "jsonb_each" | "jsonb_tree" | "generate_series" | "dbstat" | "sqlite_dbpage"
-                | "bytecode" | "tables_used" | "sqlite_stmt" | "completion" | "fts5vocab" | "rtree_i32" | "carray"
-                | "sqlite_dbdata" | "sqlite_dbptr" | "fsdir" | "zipfile"
-        )
 }
 
 /// `sqlite3LocateTableItem(pParse, flags, p)`: locate the table identified by a SrcItem.

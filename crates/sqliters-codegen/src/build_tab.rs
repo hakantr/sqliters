@@ -115,12 +115,19 @@ fn sqlite3_check_object_name(p: &mut Parse, z_name: &str, z_type: &str, z_tbl_na
         // sqlite3WritableSchema(db)
         return false;
     }
-    if p.db.init_busy
-        && (!z_type.eq_ignore_ascii_case(&p.init_az[0])
+    if p.db.init_busy {
+        if !z_type.eq_ignore_ascii_case(&p.init_az[0])
             || !z_name.eq_ignore_ascii_case(&p.init_az[1])
-            || !z_tbl_name.eq_ignore_ascii_case(&p.init_az[2]))
-    {
-        p.error_msg(""); // corruptSchema() will supply the error
+            || !z_tbl_name.eq_ignore_ascii_case(&p.init_az[2])
+        {
+            p.error_msg(""); // corruptSchema() will supply the error
+            return true;
+        }
+    } else if p.nested == 0 && z_name.len() >= 7 && z_name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_") {
+        // (only reached by sqlite3_declare_vtab(): other statements that create objects are
+        // not ported. sqlite3ReadOnlyShadowTables(): SQLITE_Defensive is never set for the
+        // generator.)
+        p.error_msg(format!("object name reserved for internal use: {z_name}"));
         return true;
     }
     false
@@ -162,7 +169,7 @@ pub fn sqlite3_find_index(p: &Parse, z_name: &str, z_db: Option<&str>) -> IndexI
 /// information to this record. At the end of the CREATE TABLE statement, the
 /// sqlite3EndTable() routine is called to complete the construction of the new table record.
 pub fn sqlite3_start_table(p: &mut Parse, name1: &Token, name2: &Token, is_temp: bool, is_view: bool, _is_virtual: bool, _no_err: bool) {
-    if !p.db.init_busy {
+    if !p.db.init_busy && !p.in_declare_vtab() {
         // (code generation for CREATE TABLE / CREATE VIEW is a later step)
         p.not_supported("statement kind (grammar rule not ported)");
         return;
@@ -170,7 +177,7 @@ pub fn sqlite3_start_table(p: &mut Parse, name1: &Token, name2: &Token, is_temp:
     let i_db: i32;
     let z_name: String;
     let mut name = Token::EMPTY;
-    if p.init_new_tnum == 1 {
+    if p.db.init_busy && p.init_new_tnum == 1 {
         // Special case: Parsing the sqlite_schema or sqlite_temp_schema schema
         i_db = p.init_i_db as i32;
         z_name = (if i_db == 1 { "sqlite_temp_master" } else { "sqlite_master" }).to_owned();
@@ -194,6 +201,9 @@ pub fn sqlite3_start_table(p: &mut Parse, name1: &Token, name2: &Token, is_temp:
         z_name = sqlite3_dequote(p.tok_str(&name));
     }
     p.s_name_token = name;
+    if p.init_i_db == 1 && p.db.init_busy {
+        // if( db->init.iDb==1 ) isTemp = 1;  (only read by the authorizer)
+    }
     if sqlite3_check_object_name(p, &z_name, if is_view { "view" } else { "table" }, &z_name) {
         p.check_schema = true;
         return;
@@ -495,7 +505,7 @@ pub fn sqlite3_add_primary_key(p: &mut Parse, list: ExprListId, on_error: i32, a
 pub fn sqlite3_add_check_constraint(p: &mut Parse, check: ExprId, z_start: usize, z_end: usize) {
     let tab = p.p_new_table;
     let read_only = p.db.a_db.get(p.init_i_db).is_some_and(|d| d.read_only);
-    if tab.nn() && !read_only {
+    if tab.nn() && !p.in_declare_vtab() && !read_only {
         let l0 = p.tab(tab).p_check;
         let l = sqlite3_expr_list_append(p, l0, check);
         p.tabm(tab).p_check = l;
@@ -558,6 +568,10 @@ pub fn sqlite3_add_generated(p: &mut Parse, mut e: ExprId, ty: Option<&Token>) {
         return;
     }
     let i_col = p.tab(tab).a_col.len() - 1;
+    if p.in_declare_vtab() {
+        p.error_msg("virtual tables cannot use computed columns");
+        return;
+    }
     let mut e_type = COLFLAG_VIRTUAL as u16;
     let mut bad = p.tab(tab).a_col[i_col].i_dflt > 0;
     if !bad && let Some(t) = ty {
@@ -615,7 +629,7 @@ pub fn sqlite3_add_generated(p: &mut Parse, mut e: ExprId, ty: Option<&Token>) {
 /// sqlite3DeferForeignKey() might change this to DEFERRED.
 pub fn sqlite3_create_foreign_key(p: &mut Parse, from_col: ExprListId, to: &Token, to_col: ExprListId, flags: i32) {
     let tab = p.p_new_table;
-    if tab.is_null() {
+    if tab.is_null() || p.in_declare_vtab() {
         return;
     }
     let n_col;
@@ -908,7 +922,9 @@ pub fn sqlite3_end_table(p: &mut Parse, has_end: bool, tab_opts: u32, select: Se
     if tab.is_null() {
         return;
     }
-    // (sqlite3ShadowTableName(): TF_Shadow is not kept; the generator does not read it)
+    if select.is_null() && crate::vtab::sqlite3_shadow_table_name(p, &p.tab(tab).z_name.clone()) {
+        p.tabm(tab).tab_flags |= TF_Shadow;
+    }
 
     // If the db->init.busy is 1 it means we are reading the SQL off the "sqlite_schema" or
     // "sqlite_temp_schema" table on the disk. So do not write to the disk again. Extract the
@@ -1095,8 +1111,12 @@ pub fn sqlite3_create_index(
     if p.n_err != 0 {
         return;
     }
+    if p.in_declare_vtab() && idx_type != SQLITE_IDXTYPE_PRIMARYKEY as u8 {
+        return;
+    }
     if !p.db.init_busy {
-        // (code generation for CREATE INDEX is a later step)
+        // (code generation for CREATE INDEX is a later step; the PRIMARY KEY of a WITHOUT
+        // ROWID table declared by a virtual table is not ported either)
         p.not_supported("statement kind (grammar rule not ported)");
         return;
     }
@@ -1572,6 +1592,86 @@ fn init_parse(p: &mut Parse, text: &str) -> bool {
     !failed
 }
 
+/// The parse of `sqlite3_declare_vtab()`: `sqlite3RunParser()` over `text` with
+/// `eParseMode = PARSE_MODE_DECLARE_VTAB` and `db->init.busy` cleared, on a parse object of
+/// its own (here: the state of `p` that the parse touches is saved and restored). Returns the
+/// table the statement built (`sParse.pNewTable`), or None if the parse failed.
+pub fn declare_vtab_parse(p: &mut Parse, text: &str) -> Option<TableId> {
+    let saved_sql = std::mem::replace(&mut p.z_sql, text.to_owned());
+    let saved_tail = p.z_tail;
+    let saved_last = p.s_last_token;
+    let saved_rc = p.rc;
+    let saved_n_select = p.n_select;
+    let saved_explain = p.explain;
+    let saved_exists = p.b_has_exists;
+    let saved_with = p.b_has_with;
+    let saved_compound = p.has_compound;
+    let saved_n_var = p.n_var;
+    let saved_vlist = std::mem::take(&mut p.p_v_list);
+    let saved_p_with = p.p_with;
+    let saved_dump = p.tree_dump.take();
+    let saved_init = p.db.init_busy;
+    let saved_err = p.z_err_msg.take();
+    let saved_n_err = p.n_err;
+    let saved_ofs = p.err_byte_offset;
+    let saved_unsupported = p.unsupported.take();
+    let saved_check = p.check_schema;
+    let saved_nc = p.a_nc.len();
+    let saved_mode = p.e_parse_mode;
+    let saved_new = p.p_new_table;
+    let saved_cname = p.cr_constraint_name;
+    let saved_pk_order = p.i_pk_sort_order;
+    let saved_name_tok = p.s_name_token;
+    let saved_nested = p.nested;
+    let saved_n_query_loop = p.n_query_loop;
+    let saved_s_arg = p.s_arg;
+    p.n_err = 0;
+    p.rc = SQLITE_OK;
+    p.n_select = 0;
+    p.n_var = 0;
+    p.explain = 0;
+    p.nested = 0;
+    p.p_with = WithId::NULL;
+    p.e_parse_mode = PARSE_MODE_DECLARE_VTAB as u8;
+    p.db.init_busy = false;
+    p.n_query_loop = 1;
+    p.p_new_table = TableId::NULL;
+    p.cr_constraint_name = Token::EMPTY;
+    p.i_pk_sort_order = 0;
+    crate::tokenize::sqlite3_run_parser(p);
+    let failed = p.z_err_msg.is_some() || p.n_err != 0 || p.unsupported.is_some();
+    let new = if failed { None } else { Some(p.p_new_table).filter(|t| t.nn()) };
+    p.p_new_table = saved_new;
+    p.a_nc.truncate(saved_nc);
+    p.z_sql = saved_sql;
+    p.z_tail = saved_tail;
+    p.s_last_token = saved_last;
+    p.rc = saved_rc;
+    p.n_select = saved_n_select;
+    p.explain = saved_explain;
+    p.b_has_exists = saved_exists;
+    p.b_has_with = saved_with;
+    p.has_compound = saved_compound;
+    p.n_var = saved_n_var;
+    p.p_v_list = saved_vlist;
+    p.p_with = saved_p_with;
+    p.tree_dump = saved_dump;
+    p.db.init_busy = saved_init;
+    p.z_err_msg = saved_err;
+    p.n_err = saved_n_err;
+    p.err_byte_offset = saved_ofs;
+    p.unsupported = saved_unsupported;
+    p.check_schema = saved_check;
+    p.e_parse_mode = saved_mode;
+    p.cr_constraint_name = saved_cname;
+    p.i_pk_sort_order = saved_pk_order;
+    p.s_name_token = saved_name_tok;
+    p.nested = saved_nested;
+    p.n_query_loop = saved_n_query_loop;
+    p.s_arg = saved_s_arg;
+    new
+}
+
 /// `sqlite3InitCallback(pInit, argc, argv, NotUsed)`: this is the callback routine for the
 /// code that initializes the database. See sqlite3Init() below for additional information.
 /// This routine is also called from the OP_ParseSchema opcode of the VDBE.
@@ -1591,23 +1691,9 @@ fn sqlite3_init_callback(p: &mut Parse, i_db: usize, row: &SchemaRow) {
     if is_create {
         let sql = row.sql.clone().unwrap_or_default();
         // The parts of C's parser that are not ported yet: a trigger is only noted on its
-        // table; a virtual table becomes a Table of type TABTYP_VTAB (statements that use it
-        // are reported as unsupported).
+        // table.
         if row.ty.eq_ignore_ascii_case("trigger") {
             p.a_schema[i_db].triggers.push(row.tbl_name.to_ascii_lowercase());
-            return;
-        }
-        if is_create_virtual_table(&sql) {
-            let tab = p.new_tab(Table {
-                z_name: row.name.clone(),
-                i_p_key: -1,
-                i_db: i_db as i32,
-                n_tab_ref: 1,
-                n_row_log_est: 200,
-                e_tab_type: TABTYP_VTAB as u8,
-                ..Table::default()
-            });
-            p.a_schema[i_db].tbl_hash.insert(row.name.to_ascii_lowercase(), tab);
             return;
         }
         // Call the parser to process a CREATE TABLE, INDEX or VIEW. But because
@@ -1641,24 +1727,6 @@ fn sqlite3_init_callback(p: &mut Parse, i_db: usize, row: &SchemaRow) {
             p.idxm(ix).tnum = row.rootpage;
         }
     }
-}
-
-/// True if the statement text is `CREATE VIRTUAL TABLE ...`.
-fn is_create_virtual_table(sql: &str) -> bool {
-    let b = sql.as_bytes();
-    let mut pos = 0;
-    let mut toks = Vec::new();
-    while pos < b.len() && toks.len() < 2 {
-        let (n, t) = crate::tokenize::sqlite3_get_token(&b[pos..]);
-        if n == 0 {
-            break;
-        }
-        if t != TK_SPACE && t != TK_COMMENT {
-            toks.push((t, &sql[pos..pos + n]));
-        }
-        pos += n;
-    }
-    toks.len() == 2 && toks[0].0 == TK_CREATE && toks[1].1.eq_ignore_ascii_case("virtual")
 }
 
 /// `sqlite3InitOne(db, iDb, pzErrMsg, mFlags)`: attempt to read the database schema and

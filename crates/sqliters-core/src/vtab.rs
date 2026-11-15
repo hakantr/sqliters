@@ -43,6 +43,9 @@ pub struct VTabDeclaredSchema {
     pub find_function: bool,
     /// `VTabConfigOption::NochangeUnread`.
     pub nochange_unread: bool,
+    /// The text the constructor passed to `sqlite3_declare_vtab()` (read by the port of C's
+    /// code generator, which builds its own Table object from it).
+    pub declare_sql: String,
 }
 
 impl VTabDeclaredSchema {
@@ -289,11 +292,17 @@ impl VTabRegistry {
         }
         if let Some(pragma_mod) = PragmaVTabModule::try_for_module_name(name) {
             let arc: Arc<dyn VirtualTableModule> = Arc::new(pragma_mod);
-            self.modules
-                .insert(key, (name.to_ascii_lowercase(), Arc::clone(&arc)));
+            // sqlite3PragmaVtabRegister(db, zName): the module keeps the spelling of its first
+            // use (PRAGMA module_list, the eponymous table's name)
+            self.modules.insert(key, (name.to_owned(), Arc::clone(&arc)));
             return Some(arc);
         }
         None
+    }
+
+    /// The name module `name` was registered with (`Module.zName`), if it is registered.
+    pub fn registered_module_name(&self, name: &str) -> Option<&str> {
+        self.modules.get(&name.to_ascii_lowercase()).map(|(n, _)| n.as_str())
     }
 
     /// Looks up an already-registered module without lazy `pragma_*` registration.
@@ -366,6 +375,13 @@ impl VTabRegistry {
         self.get_bucket(table_name)?
             .iter()
             .find(|e| name_eq_ignore_case(&e.db_name, db_name))
+    }
+
+    /// The connected eponymous table `table_name` of any database (the engine connects an
+    /// eponymous table under the schema a statement names, `temp.pragma_table_info(...)`; C
+    /// keeps one eponymous table per module, in main).
+    pub fn get_connected_eponymous(&self, table_name: &str) -> Option<&ConnectedVTabEntry> {
+        self.get_bucket(table_name)?.iter().find(|e| e.is_eponymous)
     }
 
     /// Returns `true` if a connected virtual table belongs to an eponymous-only read-only module.
@@ -792,6 +808,7 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
             constraint_support: self.constraint_support,
             find_function: self.find_function,
             nochange_unread: self.nochange_unread,
+            declare_sql: create_table_sql.to_owned(),
         });
         Ok(())
     }
@@ -2733,6 +2750,63 @@ struct DbStatTable {
 }
 
 impl VirtualTable for DbStatTable {
+    /// `statBestIndex()` of dbstat.c (3.54.1), used by the port of C's code generator; the
+    /// engine's executor plans with [`Self::best_index`].
+    fn best_index_calls(&self, info: &mut VTabIndexInfo, _calls: &mut dyn sqliters_types::VTabIndexInfoCalls) -> Result<()> {
+        let mut i_schema = None;
+        let mut i_name = None;
+        let mut i_agg = None;
+
+        // Look for a valid schema=? constraint. If found, change the idxNum to 1 and request
+        // the value of that constraint be sent to xFilter. And lower the cost estimate to
+        // encourage the constrained version to be used.
+        for (i, c) in info.constraints.iter().enumerate() {
+            if c.op != VTabConstraintOp::Eq {
+                continue;
+            }
+            if !c.usable {
+                // Force DBSTAT table should always be the right-most table in a join
+                return Err(SqliteError::new(ErrorCode::Constraint, "unusable dbstat constraint"));
+            }
+            match c.i_column {
+                0 => i_name = Some(i),    // name
+                10 => i_schema = Some(i), // schema
+                11 => i_agg = Some(i),    // aggregate
+                _ => {}
+            }
+        }
+        let mut i = 0usize;
+        if let Some(k) = i_schema {
+            i += 1;
+            info.constraint_usage[k].argv_index = i;
+            info.constraint_usage[k].omit = true;
+            info.idx_num |= 0x01;
+        }
+        if let Some(k) = i_name {
+            i += 1;
+            info.constraint_usage[k].argv_index = i;
+            info.idx_num |= 0x02;
+        }
+        if let Some(k) = i_agg {
+            i += 1;
+            info.constraint_usage[k].argv_index = i;
+            info.idx_num |= 0x04;
+        }
+        info.estimated_cost = 1.0;
+
+        // Records are always returned in ascending order of (name, path). If this will satisfy
+        // the client, set the orderByConsumed flag so that SQLite does not do an external sort.
+        let ob = &info.order_by;
+        if (ob.len() == 1 && ob[0].i_column == 0 && !ob[0].desc)
+            || (ob.len() == 2 && ob[0].i_column == 0 && !ob[0].desc && ob[1].i_column == 1 && !ob[1].desc)
+        {
+            info.order_by_consumed = true;
+            info.idx_num |= 0x08;
+        }
+        info.idx_flags |= sqliters_types::SQLITE_INDEX_SCAN_HEX;
+        Ok(())
+    }
+
     fn best_index(&self, info: &mut VTabIndexInfo) -> Result<()> {
         let mut idx_num = 0i32;
         let mut schema_ci = None;
@@ -3405,8 +3479,10 @@ impl VirtualTableModule for PragmaVTabModule {
         &self.module_name
     }
 
+    /// `pragmaVtabConnect()` does not call `sqlite3_vtab_config()`: the tables are
+    /// SQLITE_VTABRISK_Normal (refused inside views and triggers without trusted_schema).
     fn risk_flags(&self) -> VTabRiskFlags {
-        VTabRiskFlags::Innocuous
+        VTabRiskFlags::Normal
     }
 
     fn is_eponymous(&self) -> bool {
@@ -3434,7 +3510,6 @@ impl VirtualTableModule for PragmaVTabModule {
         _args: &[String],
     ) -> Result<Box<dyn VirtualTable>> {
         ctx.declare_vtab(self.declare_sql)?;
-        let _ = ctx.set_vtab_config(VTabConfigOption::Innocuous);
         Ok(Box::new(PragmaVTabTable { spec: self.clone() }))
     }
 }
@@ -3445,6 +3520,49 @@ struct PragmaVTabTable {
 }
 
 impl VirtualTable for PragmaVTabTable {
+    /// `pragmaVtabBestIndex()` of pragma.c (3.54.1), used by the port of C's code generator;
+    /// the engine's executor plans with [`Self::best_index`].
+    fn best_index_calls(&self, info: &mut VTabIndexInfo, _calls: &mut dyn sqliters_types::VTabIndexInfoCalls) -> Result<()> {
+        // PragmaVtab.iHidden: index of the first hidden column; nHidden: number of hidden
+        // columns (the argument, then the schema)
+        let i_hidden = self.spec.visible_cols as i32;
+        let n_hidden = usize::from(self.spec.has_arg) + usize::from(self.spec.has_schema);
+        info.estimated_cost = 1.0;
+        if n_hidden == 0 {
+            return Ok(());
+        }
+        let mut seen = [0usize; 2];
+        for (i, c) in info.constraints.iter().enumerate() {
+            if c.i_column < i_hidden {
+                continue;
+            }
+            if c.op != VTabConstraintOp::Eq {
+                continue;
+            }
+            if !c.usable {
+                return Err(SqliteError::new(ErrorCode::Constraint, "unusable pragma constraint"));
+            }
+            let j = (c.i_column - i_hidden) as usize;
+            seen[j] = i + 1;
+        }
+        if seen[0] == 0 {
+            info.estimated_cost = 2_147_483_647.0;
+            info.estimated_rows = 2_147_483_647;
+            return Ok(());
+        }
+        let j = seen[0] - 1;
+        info.constraint_usage[j].argv_index = 1;
+        info.constraint_usage[j].omit = true;
+        info.estimated_cost = 20.0;
+        info.estimated_rows = 20;
+        if seen[1] != 0 {
+            let j = seen[1] - 1;
+            info.constraint_usage[j].argv_index = 2;
+            info.constraint_usage[j].omit = true;
+        }
+        Ok(())
+    }
+
     fn best_index(&self, info: &mut VTabIndexInfo) -> Result<()> {
         let arg_col = self.spec.visible_cols as i32;
         let schema_col = (self.spec.visible_cols + 1) as i32;
@@ -3872,6 +3990,7 @@ mod tests {
                 constraint_support: false,
                 find_function: false,
                 nochange_unread: false,
+                declare_sql: String::new(),
             }),
             state: VTabInstanceState::Available(Box::new(NullTable)),
             in_tx: false,

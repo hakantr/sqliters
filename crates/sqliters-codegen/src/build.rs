@@ -25,6 +25,12 @@ pub fn sqlite3_finish_coding(p: &mut Parse) {
     if p.n_err != 0 {
         return;
     }
+    if p.in_declare_vtab() {
+        // The parse of sqlite3_declare_vtab() runs on a Parse object of its own whose program
+        // is finalized unused: no code goes into the statement's program.
+        p.rc = SQLITE_DONE;
+        return;
+    }
     // Begin by generating some termination code at the end of the vdbe program
     if !p.has_vdbe {
         if p.db.init_busy {

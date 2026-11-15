@@ -11,8 +11,13 @@ use std::sync::Arc;
 use sqliters_codegen::builtin_funcs::CONNECTION_FUNCS;
 use sqliters_codegen::build_tab::SchemaRow;
 use sqliters_codegen::consts::{SQLITE_DqsDML, SQLITE_TrustedSchema};
+use sqliters_codegen::sqliteint::{VTable, VtabConnect, VtabModule};
+use sqliters_codegen::vtab::{IndexInfo, IndexInfoHidden};
 use sqliters_codegen::{Db, DbInfo, Host, PrepareResult};
-use sqliters_types::{FunctionFlags, TextEncoding};
+use sqliters_types::{
+    ErrorCode, FunctionFlags, TextEncoding, VTabConstraint, VTabConstraintOp, VTabIndexInfo, VTabIndexInfoCalls, VTabOrderBy,
+    VTabRiskFlags, Value,
+};
 use sqliters_vdbe::vdbeaux::{FuncDef, Program};
 
 use crate::ConnectionInner;
@@ -27,6 +32,51 @@ struct EngineHost<'a> {
     db_set: &'a crate::db_set::DatabaseSet,
     /// set by [`Host::note_schema_loaded`]
     schema_loaded: std::cell::Cell<bool>,
+    /// The virtual-table instances handed to the generator: id -> (database, table)
+    vtabs: std::cell::RefCell<Vec<(u64, String, String)>>,
+}
+
+/// `SQLITE_INDEX_CONSTRAINT_*` -> the engine's operator.
+fn vtab_op_from_c(op: u8) -> VTabConstraintOp {
+    match op {
+        2 => VTabConstraintOp::Eq,
+        4 => VTabConstraintOp::Gt,
+        8 => VTabConstraintOp::Le,
+        16 => VTabConstraintOp::Lt,
+        32 => VTabConstraintOp::Ge,
+        64 => VTabConstraintOp::Match,
+        65 => VTabConstraintOp::Like,
+        66 => VTabConstraintOp::Glob,
+        67 => VTabConstraintOp::Regexp,
+        68 => VTabConstraintOp::Ne,
+        69 => VTabConstraintOp::IsNot,
+        70 => VTabConstraintOp::IsNotNull,
+        71 => VTabConstraintOp::IsNull,
+        72 => VTabConstraintOp::Is,
+        73 => VTabConstraintOp::Limit,
+        74 => VTabConstraintOp::Offset,
+        x => VTabConstraintOp::Function(x),
+    }
+}
+
+/// The calls of an engine module into the generator's `HiddenIndexInfo` during xBestIndex.
+struct CallsAdapter<'x> {
+    h: &'x mut dyn IndexInfoHidden,
+}
+
+impl VTabIndexInfoCalls for CallsAdapter<'_> {
+    fn vtab_in(&mut self, i_cons: usize, b_handle: i32) -> bool {
+        self.h.vtab_in(i_cons as i32, b_handle)
+    }
+    fn rhs_value(&mut self, i_cons: usize) -> Option<Value> {
+        self.h.rhs_value(i_cons as i32).1
+    }
+    fn distinct(&self) -> i32 {
+        self.h.distinct()
+    }
+    fn collation(&mut self, i_cons: usize) -> String {
+        self.h.collation(i_cons as i32).unwrap_or_else(|| "BINARY".to_owned())
+    }
 }
 
 /// `sqlite3CreateFunc()`: the `funcFlags` of an application-defined function.
@@ -130,6 +180,125 @@ impl Host for EngineHost<'_> {
         self.db_set.slots().get(i_db).is_some_and(|s| s.c_incremental.contains(name))
     }
 
+    fn vtab_module(&self, name: &str, lazy: bool) -> Option<VtabModule> {
+        let reg = self.db_set.vtab_registry();
+        let (module, reg_name) = match reg.get_module(name) {
+            Some(m) => (m, reg.registered_module_name(name).unwrap_or(name).to_owned()),
+            // sqlite3PragmaVtabRegister(db, zName): registered under the name of this use
+            None if lazy => {
+                let m = crate::vtab::PragmaVTabModule::try_for_module_name(name)?;
+                let arc: Arc<dyn sqliters_types::VirtualTableModule> = Arc::new(m);
+                (arc, name.to_owned())
+            }
+            None => return None,
+        };
+        Some(VtabModule {
+            name: reg_name,
+            eponymous: module.is_eponymous(),
+            shadow_names: module.shadow_table_suffixes().iter().map(|s| (*s).to_owned()).collect(),
+        })
+    }
+
+    fn vtab_connect(&self, i_db: usize, table: &str, _module: &str, _args: &[String], eponymous: bool) -> VtabConnect {
+        let Some(slot) = self.db_set.slots().get(i_db) else { return VtabConnect::Unsupported };
+        let reg = self.db_set.vtab_registry();
+        // (the engine connects the virtual tables a statement names before the generator runs,
+        // see `prepare_in_session()`; a table it could not connect stays unsupported. An
+        // eponymous table may be connected under the schema the statement named.)
+        let entry = reg.get_connected(&slot.name, table).or_else(|| if eponymous { reg.get_connected_eponymous(table) } else { None });
+        let Some(entry) = entry else { return VtabConnect::Unsupported };
+        let crate::vtab::VTabInstanceState::Available(vt) = &entry.state else { return VtabConnect::Unsupported };
+        let _ = vt;
+        // An address names the instance (C lists `vtab:%p`): the one of the registry entry (a
+        // module's table object can have size zero)
+        let id = (entry as *const crate::vtab::ConnectedVTabEntry) as usize as u64;
+        let mut ids = self.vtabs.borrow_mut();
+        if !ids.iter().any(|(i, _, _)| *i == id) {
+            ids.push((id, entry.db_name.clone(), entry.table_name.clone()));
+        }
+        let d = &entry.declared;
+        VtabConnect::Ok {
+            vtab: VTable {
+                id,
+                module_name: entry.module_name.clone(),
+                b_constraint: d.constraint_support,
+                b_all_schemas: false,
+                e_vtab_risk: match d.config_risk_flags {
+                    Some(VTabRiskFlags::Innocuous) => sqliters_codegen::sqliteint::SQLITE_VTABRISK_Low,
+                    Some(VTabRiskFlags::DirectOnly) => sqliters_codegen::sqliteint::SQLITE_VTABRISK_High,
+                    _ => sqliters_codegen::sqliteint::SQLITE_VTABRISK_Normal,
+                },
+                has_find_function: d.find_function,
+                has_update: !entry.is_read_only && !entry.is_eponymous_only,
+            },
+            declare: Some(d.declare_sql.clone()).filter(|s| !s.is_empty()),
+        }
+    }
+
+    fn vtab_best_index(&self, vtab_id: u64, info: &mut IndexInfo, hidden: &mut dyn IndexInfoHidden) -> (i32, Option<String>) {
+        let found = self.vtabs.borrow().iter().find(|(i, _, _)| *i == vtab_id).map(|(_, d, t)| (d.clone(), t.clone()));
+        let Some((db, tab)) = found else { return (1, None) };
+        let reg = self.db_set.vtab_registry();
+        let Some(entry) = reg.get_connected(&db, &tab) else { return (1, None) };
+        let crate::vtab::VTabInstanceState::Available(vt) = &entry.state else { return (1, None) };
+        let mut v = VTabIndexInfo::new(
+            info.a_constraint
+                .iter()
+                .enumerate()
+                .map(|(i, c)| VTabConstraint {
+                    i_column: c.i_column,
+                    op: vtab_op_from_c(c.op),
+                    usable: c.usable,
+                    in_values: hidden.vtab_in(i as i32, -1),
+                })
+                .collect(),
+            info.a_order_by.iter().map(|o| VTabOrderBy { i_column: o.i_column, desc: o.desc }).collect(),
+        );
+        // the inputs C's whereLoopAddVirtualOne() initialized
+        v.idx_num = info.idx_num;
+        v.idx_str = info.idx_str.clone();
+        v.order_by_consumed = info.order_by_consumed;
+        v.estimated_cost = info.estimated_cost;
+        v.estimated_rows = info.estimated_rows;
+        v.idx_flags = info.idx_flags as u32;
+        v.col_used = info.col_used;
+        let r = {
+            let mut calls = CallsAdapter { h: hidden };
+            vt.best_index_calls(&mut v, &mut calls)
+        };
+        for (u, cu) in info.a_constraint_usage.iter_mut().zip(v.constraint_usage.iter()) {
+            u.argv_index = cu.argv_index as i32;
+            u.omit = cu.omit;
+        }
+        info.idx_num = v.idx_num;
+        info.need_to_free_idx_str = v.need_to_free_idx_str;
+        info.idx_str = v.idx_str;
+        info.order_by_consumed = v.order_by_consumed;
+        info.estimated_cost = v.estimated_cost;
+        info.estimated_rows = v.estimated_rows;
+        info.idx_flags = v.idx_flags as i32;
+        match r {
+            Ok(()) => (0, None),
+            Err(e) if e.code == ErrorCode::Constraint => (19, None),
+            Err(e) => (e.code as i32, Some(e.message)),
+        }
+    }
+
+    fn vtab_find_function(&self, vtab_id: u64, _n_arg: i32, name: &str) -> i32 {
+        let found = self.vtabs.borrow().iter().find(|(i, _, _)| *i == vtab_id).map(|(_, d, t)| (d.clone(), t.clone()));
+        let Some((db, tab)) = found else { return 0 };
+        let reg = self.db_set.vtab_registry();
+        let Some(entry) = reg.get_connected(&db, &tab) else { return 0 };
+        // fts5FindFunctionMethod(): the auxiliary functions of FTS5 (fts5FindAuxiliary())
+        if entry.declared.find_function
+            && ["snippet", "highlight", "bm25", "fts5_get_locale"].iter().any(|f| f.eq_ignore_ascii_case(name))
+        {
+            1
+        } else {
+            0
+        }
+    }
+
     fn table_unsupported(&self, i_db: usize, name: &str) -> Option<&'static str> {
         // C's in-memory statistics are not known to be the engine's (see DbSlot)
         let slot = self.db_set.slots().get(i_db)?;
@@ -151,6 +320,7 @@ pub(crate) fn c_prepare(inner: &ConnectionInner, sql: &str) -> (PrepareResult, u
         collations: &inner.collations,
         db_set: &inner.db_set,
         schema_loaded: std::cell::Cell::new(false),
+        vtabs: std::cell::RefCell::new(Vec::new()),
     };
     if schema_dump_on() && sql.contains("/*#schemadump*/") {
         // Verification aid: the schema objects as the generator loads them, on stderr.

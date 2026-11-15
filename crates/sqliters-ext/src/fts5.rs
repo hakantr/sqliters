@@ -2638,6 +2638,14 @@ impl VirtualTable for Fts5Table {
     /// one item per xFilter argument: `M<col>` (MATCH; col == number of columns for the table
     /// itself), `r` (rank), `L<col>` / `G<col>` (LIKE / GLOB served by a trigram tokenizer),
     /// `=`, `<`, `>` (rowid constraints).
+    fn best_index_calls(&self, info: &mut VTabIndexInfo, _calls: &mut dyn sqliters_types::VTabIndexInfoCalls) -> Result<()> {
+        // (C allocates idxStr before it looks at the constraints: needToFreeIdxStr is set)
+        self.best_index(info)?;
+        info.need_to_free_idx_str = true;
+        Ok(())
+    }
+
+    /// `fts5BestIndexMethod` (see [`Self::best_index_calls`]).
     fn best_index(&self, info: &mut VTabIndexInfo) -> Result<()> {
         let n_col = self.hidden_tbl_col();
         let rank_col = self.hidden_rank_col();
@@ -2659,6 +2667,8 @@ impl VirtualTable for Fts5Table {
                 // A MATCH operator or equivalent
                 if !usable || i_col < 0 {
                     // As there exists an unusable MATCH constraint this is an unusable plan.
+                    // (C has already handed its idxStr to the core: `idxStr[iIdxStr] = 0`)
+                    info.idx_str = Some(idx_str);
                     return Err(SqliteError::new(
                         ErrorCode::Constraint,
                         "unusable fts5 match constraint",
@@ -3289,6 +3299,60 @@ impl VirtualTable for Fts5VocabTable {
     /// on the `term` column (the last one of each kind wins); cost 100 with an equality,
     /// otherwise 1000000 halved per range end; `ORDER BY term [ASC]` alone is consumed. No
     /// constraint is omitted, so the core tests every term again.
+    ///
+    /// As the port of C's code generator calls it: a constraint on the term column counts only
+    /// if it uses the BINARY collation (`fts5VocabIsBinary()`, `sqlite3_vtab_collation()`).
+    fn best_index_calls(&self, info: &mut VTabIndexInfo, calls: &mut dyn sqliters_types::VTabIndexInfoCalls) -> Result<()> {
+        let mut i_term_eq = None;
+        let mut i_term_ge = None;
+        let mut i_term_le = None;
+        let mut idx_num = info.col_used as i32;
+        for (i, c) in info.constraints.iter().enumerate() {
+            if !c.usable {
+                continue;
+            }
+            if c.i_column == 0 && calls.collation(i).eq_ignore_ascii_case("binary") {
+                // term column
+                match c.op {
+                    VTabConstraintOp::Eq => i_term_eq = Some(i),
+                    VTabConstraintOp::Le | VTabConstraintOp::Lt => i_term_le = Some(i),
+                    VTabConstraintOp::Ge | VTabConstraintOp::Gt => i_term_ge = Some(i),
+                    _ => {}
+                }
+            }
+        }
+        let mut n_arg = 0usize;
+        if let Some(i) = i_term_eq {
+            idx_num |= 0x0100; // FTS5_VOCAB_TERM_EQ
+            n_arg += 1;
+            info.constraint_usage[i].argv_index = n_arg;
+            info.estimated_cost = 100.0;
+        } else {
+            info.estimated_cost = 1_000_000.0;
+            if let Some(i) = i_term_ge {
+                idx_num |= 0x0200; // FTS5_VOCAB_TERM_GE
+                n_arg += 1;
+                info.constraint_usage[i].argv_index = n_arg;
+                info.estimated_cost /= 2.0;
+            }
+            if let Some(i) = i_term_le {
+                idx_num |= 0x0400; // FTS5_VOCAB_TERM_LE
+                n_arg += 1;
+                info.constraint_usage[i].argv_index = n_arg;
+                info.estimated_cost /= 2.0;
+            }
+        }
+        // This virtual table always delivers results in ascending order of the "term" column
+        // (column 0). So if the user has requested this specifically - "ORDER BY term" or
+        // "ORDER BY term ASC" - set the sqlite3_index_info.orderByConsumed flag to tell the
+        // core the results are already in sorted order.
+        if info.order_by.len() == 1 && info.order_by[0].i_column == 0 && !info.order_by[0].desc {
+            info.order_by_consumed = true;
+        }
+        info.idx_num = idx_num;
+        Ok(())
+    }
+
     fn best_index(&self, info: &mut VTabIndexInfo) -> Result<()> {
         let mut i_term_eq = None;
         let mut i_term_ge = None;

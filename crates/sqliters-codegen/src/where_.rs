@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use sqliters_vdbe::opcodes::*;
-use sqliters_vdbe::vdbeaux::{KeyInfo, P4};
+use sqliters_vdbe::vdbeaux::{KeyInfo, P4, KEYINFO_ORDER_BIGNULL, KEYINFO_ORDER_DESC};
 
 use crate::build::*;
 use crate::consts::*;
@@ -27,6 +27,8 @@ use crate::walker::*;
 use crate::wherecode::*;
 use crate::whereexpr::*;
 use crate::whereint::*;
+use crate::vtab::{IndexConstraint, IndexConstraintUsage, IndexInfo, IndexInfoHidden, IndexOrderBy};
+use sqliters_types::Value;
 
 /// `sqlite3WhereOrderByLimitOptLabel(pWInfo)`: in the ORDER BY LIMIT optimization, if the
 /// inner-most loop is known to emit rows in increasing order, then we can optimize the sort
@@ -1154,8 +1156,35 @@ fn dump_loop(p: &mut Parse, w: &WhereInfo, what: &str, l: &WhereLoop) {
     if p.where_dump.is_none() {
         return;
     }
-    let name = if l.p_index.nn() && !p.idx(l.p_index).z_name.is_empty() { p.idx(l.p_index).z_name.clone() } else { "-".to_owned() };
     let _ = w;
+    if l.ws_flags & WHERE_VIRTUALTABLE as u32 != 0 {
+        // (V4b: the u.vtab fields of a virtual-table loop)
+        let line = format!(
+            "LOOP {} tab={} idx=- ws={:x} vtab idxNum={} idxStr={} isOrdered={} omit={:x} hex={} hIn={:x} omOff={} nSkip={} nLTerm={} iSortIdx={} rSetup={} rRun={} nOut={} prereq={:x}",
+            what,
+            l.i_tab,
+            l.ws_flags,
+            l.vt_idx_num,
+            l.vt_idx_str.as_deref().unwrap_or("(null)"),
+            l.vt_is_ordered,
+            l.vt_omit_mask,
+            u8::from(l.vt_b_idx_num_hex),
+            l.vt_m_handle_in,
+            u8::from(l.vt_b_omit_offset),
+            l.n_skip,
+            l.n_l_term(),
+            l.i_sort_idx,
+            l.r_setup,
+            l.r_run,
+            l.n_out,
+            l.prereq
+        );
+        if let Some(d) = p.where_dump.as_mut() {
+            d.push(line);
+        }
+        return;
+    }
+    let name = if l.p_index.nn() && !p.idx(l.p_index).z_name.is_empty() { p.idx(l.p_index).z_name.clone() } else { "-".to_owned() };
     let line = format!(
         "LOOP {} tab={} idx={} ws={:x} nEq={} nBtm={} nTop={} nSkip={} nLTerm={} iSortIdx={} rSetup={} rRun={} nOut={} prereq={:x}",
         what,
@@ -1260,12 +1289,16 @@ fn where_loop_insert(p: &mut Parse, w: &mut WhereInfo, b: &mut WhereLoopBuilder)
     }
     // whereLoopXfer(db, p, pTemplate)
     w.loops[pos] = b.p_new.clone();
-    if (b.p_new.ws_flags & WHERE_AUTO_INDEX as u32) != 0 {
+    if (b.p_new.ws_flags & WHERE_VIRTUALTABLE as u32) != 0 {
+        b.p_new.vt_need_free = false;
+    } else if (b.p_new.ws_flags & WHERE_AUTO_INDEX as u32) != 0 {
         b.p_new.p_index = IndexId::NULL;
     }
-    let idx = w.loops[pos].p_index;
-    if idx.nn() && p.idx(idx).idx_type == SQLITE_IDXTYPE_IPK as u8 {
-        w.loops[pos].p_index = IndexId::NULL;
+    if (w.loops[pos].ws_flags & WHERE_VIRTUALTABLE as u32) == 0 {
+        let idx = w.loops[pos].p_index;
+        if idx.nn() && p.idx(idx).idx_type == SQLITE_IDXTYPE_IPK as u8 {
+            w.loops[pos].p_index = IndexId::NULL;
+        }
     }
     SQLITE_OK
 }
@@ -1314,7 +1347,7 @@ fn est_like_pattern_length(p: &mut Parse, e: ExprId, e_code: u16) -> i32 {
 /// `sqlite3ExprIsLikeOperator(pExpr)`: if pExpr is one of "like", "glob", "match", or
 /// "regexp", then return the corresponding SQLITE_INDEX_CONSTRAINT_xxxx value. If it is not
 /// a LIKE-like operator, return 0.
-fn sqlite3_expr_is_like_operator(p: &Parse, e: ExprId) -> i32 {
+pub fn sqlite3_expr_is_like_operator(p: &Parse, e: ExprId) -> i32 {
     let z = p.e(e).tok();
     if z.eq_ignore_ascii_case("match") {
         64 // SQLITE_INDEX_CONSTRAINT_MATCH
@@ -2368,9 +2401,9 @@ fn where_loop_add_or(p: &mut Parse, w: &mut WhereInfo, b: &mut WhereLoopBuilder,
     let mut rc = SQLITE_OK;
     let wc = b.p_wc;
     let n_term = w.a_wc[wc].a.len();
-    let (jointype, i_cur) = {
+    let (jointype, i_cur, item_tab) = {
         let it = &p.src(w.p_tab_list).a[b.p_new.i_tab as usize];
-        (it.jointype as i32, it.i_cursor)
+        (it.jointype as i32, it.i_cursor, it.p_s_tab)
     };
 
     // The multi-index OR optimization does not work for RIGHT and FULL JOIN
@@ -2421,7 +2454,11 @@ fn where_loop_add_or(p: &mut Parse, w: &mut WhereInfo, b: &mut WhereLoopBuilder,
                     continue;
                 }
                 sub.p_or_set = Some(WhereOrSet::default()); // sCur.n = 0
-                rc = where_loop_add_btree(p, w, &mut sub, m_prereq);
+                if p.tab(item_tab).is_virtual() {
+                    rc = where_loop_add_virtual(p, w, &mut sub, m_prereq, m_unusable);
+                } else {
+                    rc = where_loop_add_btree(p, w, &mut sub, m_prereq);
+                }
                 if rc == SQLITE_OK {
                     rc = where_loop_add_or(p, w, &mut sub, m_prereq, m_unusable);
                 }
@@ -2491,6 +2528,721 @@ fn where_loop_add_or(p: &mut Parse, w: &mut WhereInfo, b: &mut WhereLoopBuilder,
     rc
 }
 
+// ---------------------------------------------------------------------------------------------
+// Virtual tables (where.c: allocateIndexInfo ... whereLoopAddVirtual)
+// ---------------------------------------------------------------------------------------------
+
+/// `ALLBITS`
+const ALLBITS: Bitmask = !0;
+
+/// `SMASKBIT32(n)`
+#[inline]
+fn smaskbit32(n: i32) -> u32 {
+    if (0..=31).contains(&n) { 1u32 << n } else { 0 }
+}
+
+/// `struct HiddenIndexInfo`: extra information appended to the end of sqlite3_index_info but
+/// not visible to the xBestIndex function, at least not directly. The sqlite3_vtab_collation()
+/// interface knows how to reach it, however.
+#[derive(Debug, Clone, Default)]
+pub struct HiddenIndexInfo {
+    /// `pWC`: the Where clause being analyzed
+    pub wc: WcId,
+    /// `eDistinct`: Value to return from sqlite3_vtab_distinct()
+    pub e_distinct: i32,
+    /// `mIn`: Mask of terms that are <col> IN (...)
+    pub m_in: u32,
+    /// `mHandleIn`: Terms that vtab will handle as <col> IN (...)
+    pub m_handle_in: u32,
+    /// `aRhs[]`: RHS values of the constraints, computed on the first request (outer None:
+    /// not computed yet)
+    pub a_rhs: Vec<Option<Option<Value>>>,
+}
+
+/// `termFromWhereClause(pWC, iTerm)`: return term iTerm of the WhereClause passed as the first
+/// argument. Terms are numbered from 0 upwards, starting with the terms in pWC->a[], then
+/// those in pWC->pOuter->a[] (if any), and so on.
+fn term_from_where_clause(w: &WhereInfo, wc: WcId, mut i_term: i32) -> Option<TermRef> {
+    let mut c = Some(wc);
+    while let Some(x) = c {
+        let n = w.a_wc[x].a.len() as i32;
+        if i_term < n {
+            return Some(TermRef::new(x, i_term as usize));
+        }
+        i_term -= n;
+        c = w.a_wc[x].p_outer;
+    }
+    None
+}
+
+/// The calls of the module into `HiddenIndexInfo` during its xBestIndex (where.c:
+/// `sqlite3_vtab_in()`, `sqlite3_vtab_rhs_value()`, `sqlite3_vtab_distinct()`,
+/// `sqlite3_vtab_collation()`).
+struct HiddenCalls<'x, 'a> {
+    p: &'x mut Parse<'a>,
+    w: &'x WhereInfo,
+    h: &'x mut HiddenIndexInfo,
+    /// `aConstraint[].iTermOffset` of the constraints passed to the module
+    term_offsets: Vec<i32>,
+}
+
+impl IndexInfoHidden for HiddenCalls<'_, '_> {
+    fn vtab_in(&mut self, i_cons: i32, b_handle: i32) -> bool {
+        let m = smaskbit32(i_cons);
+        if m & self.h.m_in != 0 {
+            if b_handle == 0 {
+                self.h.m_handle_in &= !m;
+            } else if b_handle > 0 {
+                self.h.m_handle_in |= m;
+            }
+            return true;
+        }
+        false
+    }
+
+    fn rhs_value(&mut self, i_cons: i32) -> (i32, Option<Value>) {
+        if i_cons < 0 || i_cons as usize >= self.term_offsets.len() {
+            return (crate::vtab::SQLITE_MISUSE, None); // EV: R-30545-25046
+        }
+        let ic = i_cons as usize;
+        if self.h.a_rhs[ic].is_none() {
+            let t = term_from_where_clause(self.w, self.h.wc, self.term_offsets[ic]).expect("term");
+            let right = self.p.e(self.w.term(t).p_expr).p_right;
+            let v = crate::build_tab::sqlite3_value_from_expr(self.p, right, SQLITE_AFF_BLOB);
+            self.h.a_rhs[ic] = Some(v);
+        }
+        let v = self.h.a_rhs[ic].clone().flatten();
+        if v.is_none() {
+            // IMP: R-19933-32160
+            return (crate::vtab::SQLITE_NOTFOUND, None); // IMP: R-36424-56542
+        }
+        (SQLITE_OK, v)
+    }
+
+    fn distinct(&self) -> i32 {
+        self.h.e_distinct
+    }
+
+    fn collation(&mut self, i_cons: i32) -> Option<String> {
+        if i_cons < 0 || i_cons as usize >= self.term_offsets.len() {
+            return None;
+        }
+        let t = term_from_where_clause(self.w, self.h.wc, self.term_offsets[i_cons as usize]).expect("term");
+        let x = self.w.term(t).p_expr;
+        let mut c = None;
+        if self.p.e(x).p_left.nn() {
+            c = crate::expr::sqlite3_expr_compare_coll_seq(self.p, x);
+        }
+        Some(c.map_or_else(|| "BINARY".to_owned(), |c| c.name.clone()))
+    }
+}
+
+/// `allocateIndexInfo(pWInfo, pWC, mUnusable, pSrc, pmNoOmit)`: allocate and populate an
+/// sqlite3_index_info structure. Returns it with its HiddenIndexInfo and the mask of terms
+/// not to omit.
+fn allocate_index_info(p: &mut Parse, w: &mut WhereInfo, wc: WcId, m_unusable: Bitmask, i_src: usize) -> (IndexInfo, HiddenIndexInfo, u16) {
+    let tab_list = w.p_tab_list;
+    let src_item = p.src(tab_list).a[i_src].clone();
+    let tab = src_item.p_s_tab;
+    let mut m_no_omit: u16 = 0;
+    let mut e_distinct = 0;
+    let order_by = w.p_order_by;
+
+    // Find all WHERE clause constraints referring to this virtual table. Mark each term with
+    // the TERM_OK flag. Set nTerm to the number of terms found.
+    let mut n_term = 0;
+    let mut c = Some(wc);
+    while let Some(x) = c {
+        for i in 0..w.a_wc[x].a.len() {
+            w.a_wc[x].a[i].wt_flags &= !TERM_OK;
+            let t = &w.a_wc[x].a[i];
+            if t.left_cursor != src_item.i_cursor {
+                continue;
+            }
+            if t.prereq_right & m_unusable != 0 {
+                continue;
+            }
+            if (t.e_operator & !WO_EQUIV) == 0 {
+                continue;
+            }
+            if t.wt_flags & TERM_VNULL != 0 {
+                continue;
+            }
+            if (src_item.jointype as i32 & (JT_LEFT | JT_LTORJ | JT_RIGHT)) != 0
+                && !constraint_compatible_with_outer_join(p, t, &src_item)
+            {
+                continue;
+            }
+            n_term += 1;
+            w.a_wc[x].a[i].wt_flags |= TERM_OK;
+        }
+        c = w.a_wc[x].p_outer;
+    }
+
+    // If the ORDER BY clause contains only columns in the current virtual table then allocate
+    // space for the aOrderBy part of the sqlite3_index_info structure.
+    let mut n_order_by = 0;
+    if order_by.nn() {
+        let n = p.l(order_by).a.len();
+        let mut i = 0;
+        while i < n {
+            let e = p.l(order_by).a[i].p_expr;
+
+            // Skip over constant terms in the ORDER BY clause
+            if crate::expr::sqlite3_expr_is_constant_no_parse(p, e) != 0 {
+                i += 1;
+                continue;
+            }
+
+            // Virtual tables are unable to deal with NULLS FIRST
+            if p.l(order_by).a[i].sort_flags & KEYINFO_ORDER_BIGNULL != 0 {
+                break;
+            }
+
+            // First case - a direct column references without a COLLATE operator
+            if p.e(e).op == TK_COLUMN && p.e(e).i_table == src_item.i_cursor {
+                i += 1;
+                continue;
+            }
+
+            // 2nd case - a column reference with a COLLATE operator. Only match of the
+            // COLLATE operator matches the collation of the column.
+            if p.e(e).op == TK_COLLATE {
+                let e2 = p.e(e).p_left;
+                if p.e(e2).op == TK_COLUMN && p.e(e2).i_table == src_item.i_cursor {
+                    let c2 = p.e(e2).i_column;
+                    p.em(e).i_column = c2;
+                    if c2 < 0 {
+                        i += 1;
+                        continue; // Collseq does not matter for rowid
+                    }
+                    let z_coll = crate::schema::sqlite3_column_coll(&p.tab(tab).a_col[c2 as usize]).unwrap_or("BINARY").to_owned();
+                    if p.e(e).tok().eq_ignore_ascii_case(&z_coll) {
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // No matches cause a break out of the loop
+            break;
+        }
+        if i == n {
+            let b_sort_by_group = i32::from((w.wctrl_flags as i32 & WHERE_SORTBYGROUP) != 0);
+            n_order_by = n;
+            if (w.wctrl_flags as i32 & WHERE_DISTINCTBY) != 0 && !src_item.rowid_used {
+                e_distinct = 2 + b_sort_by_group;
+            } else if w.wctrl_flags as i32 & WHERE_GROUPBY != 0 {
+                e_distinct = 1 - b_sort_by_group;
+            } else if w.wctrl_flags as i32 & WHERE_WANT_DISTINCT != 0 {
+                e_distinct = 3;
+            }
+        }
+    }
+
+    // Allocate the sqlite3_index_info structure
+    let mut info = IndexInfo { col_used: src_item.col_used, ..IndexInfo::default() };
+    if !p.tab(tab).has_rowid() {
+        // Ensure that all bits associated with PK columns are set. This is to ensure they are
+        // available for cases like RIGHT joins or OR loops.
+        let pk = crate::schema::sqlite3_primary_key_index(p, tab);
+        for i in 0..p.idx(pk).n_key_col as usize {
+            let mut i_col = p.idx(pk).ai_column[i] as i32;
+            if i_col >= BMS - 1 {
+                i_col = BMS - 1;
+            }
+            info.col_used |= 1u64 << i_col;
+        }
+    }
+    let mut hidden = HiddenIndexInfo { wc, e_distinct, m_in: 0, m_handle_in: 0, a_rhs: vec![None; n_term] };
+    let mut j = 0;
+    let mut i = 0i32;
+    let mut c = Some(wc);
+    while let Some(x) = c {
+        for k in 0..w.a_wc[x].a.len() {
+            let t = &w.a_wc[x].a[k];
+            let i_term = i + k as i32;
+            if (t.wt_flags & TERM_OK) == 0 {
+                continue;
+            }
+            let mut cons = IndexConstraint { i_column: t.left_column, i_term_offset: i_term, ..IndexConstraint::default() };
+            let mut op = t.e_operator & WO_ALL;
+            if op == WO_IN {
+                if (t.wt_flags & TERM_SLICE) == 0 {
+                    hidden.m_in |= smaskbit32(j as i32);
+                }
+                op = WO_EQ;
+            }
+            if op == WO_AUX {
+                cons.op = t.e_match_op;
+            } else if op & (WO_ISNULL | WO_IS) != 0 {
+                if op == WO_ISNULL {
+                    cons.op = crate::vtab::SQLITE_INDEX_CONSTRAINT_ISNULL;
+                } else {
+                    cons.op = crate::vtab::SQLITE_INDEX_CONSTRAINT_IS;
+                }
+            } else {
+                // The direct assignment is possible only because the WO_ and
+                // SQLITE_INDEX_CONSTRAINT_ codes are identical.
+                cons.op = op as u8;
+                if op & (WO_LT | WO_LE | WO_GT | WO_GE) != 0 && crate::expr::sqlite3_expr_is_vector(p, p.e(t.p_expr).p_right) {
+                    if j < 16 {
+                        m_no_omit |= 1 << j;
+                    }
+                    if op == WO_LT {
+                        cons.op = WO_LE as u8;
+                    }
+                    if op == WO_GT {
+                        cons.op = WO_GE as u8;
+                    }
+                }
+            }
+            info.a_constraint.push(cons);
+            j += 1;
+        }
+        i += w.a_wc[x].a.len() as i32;
+        c = w.a_wc[x].p_outer;
+    }
+    info.a_constraint_usage = vec![IndexConstraintUsage::default(); info.a_constraint.len()];
+    for i in 0..n_order_by {
+        let e = p.l(order_by).a[i].p_expr;
+        if crate::expr::sqlite3_expr_is_constant_no_parse(p, e) != 0 {
+            continue;
+        }
+        info.a_order_by.push(IndexOrderBy {
+            i_column: p.e(e).i_column as i32,
+            desc: p.l(order_by).a[i].sort_flags & KEYINFO_ORDER_DESC != 0,
+        });
+    }
+    (info, hidden, m_no_omit)
+}
+
+/// `sqlite3LogEstFromDouble(x)`: convert a double into a LogEst. In other words, compute an
+/// approximation for 10*log2(x).
+pub fn sqlite3_log_est_from_double(x: f64) -> LogEst {
+    if x <= 1.0 {
+        return 0;
+    }
+    if x <= 2_000_000_000.0 {
+        return crate::select::sqlite3_log_est(x as u64);
+    }
+    let a = x.to_bits();
+    let e = (a >> 52) as i64 - 1022;
+    (e * 10) as LogEst
+}
+
+/// `vtabBestIndex(pParse, pTab, p)`: invoke the xBestIndex() method of the virtual table with
+/// the sqlite3_index_info object. If an error occurs, pParse is populated with an error
+/// message and an appropriate error code is returned. A return of SQLITE_CONSTRAINT from
+/// xBestIndex is not considered an error. SQLITE_CONSTRAINT indicates that the current
+/// configuration of "unusable" flags in sqlite3_index_info can not result in a valid plan.
+fn vtab_best_index(p: &mut Parse, w: &WhereInfo, tab: TableId, info: &mut IndexInfo, hidden: &mut HiddenIndexInfo) -> i32 {
+    let vt = crate::vtab::sqlite3_get_vtable(p, tab).cloned().expect("VTable");
+    dump_index_info_inputs(p, tab, info, hidden);
+    let host = p.db.host;
+    let term_offsets = info.a_constraint.iter().map(|c| c.i_term_offset).collect();
+    let (rc, z_err) = {
+        let mut calls = HiddenCalls { p, w, h: hidden, term_offsets };
+        host.vtab_best_index(vt.id, info, &mut calls)
+    };
+    dump_index_info_outputs(p, rc, info, hidden);
+
+    if rc != SQLITE_OK && rc != crate::vtab::SQLITE_CONSTRAINT {
+        if rc == SQLITE_NOMEM {
+            p.error_msg("out of memory");
+        } else {
+            match z_err {
+                None => p.error_msg(crate::vtab::sqlite3_err_str(rc)),
+                Some(m) => p.error_msg(m),
+            }
+        }
+    }
+    if vt.b_all_schemas {
+        // sqlite3VtabUsesAllSchemas(pParse)
+        let n_db = p.db.a_db.len();
+        for i in 0..n_db {
+            crate::build::sqlite3_code_verify_schema(p, i as i32);
+        }
+        if p.write_mask != 0 {
+            for i in 0..n_db {
+                crate::build::sqlite3_begin_write_operation(p, false, i as i32);
+            }
+        }
+    }
+    rc
+}
+
+/// (V4b verification aid) the inputs of an xBestIndex call: `BI` line of the where dump.
+fn dump_index_info_inputs(p: &mut Parse, tab: TableId, info: &IndexInfo, h: &HiddenIndexInfo) {
+    if p.where_dump.is_none() {
+        return;
+    }
+    let cons: Vec<String> =
+        info.a_constraint.iter().map(|c| format!("{}:{}:{}:{}", c.i_column, c.op, u8::from(c.usable), c.i_term_offset)).collect();
+    let ob: Vec<String> = info.a_order_by.iter().map(|o| format!("{}:{}", o.i_column, u8::from(o.desc))).collect();
+    let line = format!(
+        "BI tab={} nCons={} cons=[{}] ob=[{}] colUsed={:x} distinct={} mIn={:x}",
+        p.tab(tab).z_name,
+        info.a_constraint.len(),
+        cons.join(","),
+        ob.join(","),
+        info.col_used,
+        h.e_distinct,
+        h.m_in
+    );
+    if let Some(d) = p.where_dump.as_mut() {
+        d.push(line);
+    }
+}
+
+/// (V4b verification aid) the outputs of an xBestIndex call: `BO` line of the where dump.
+fn dump_index_info_outputs(p: &mut Parse, rc: i32, info: &IndexInfo, h: &HiddenIndexInfo) {
+    if p.where_dump.is_none() {
+        return;
+    }
+    let usage: Vec<String> = info.a_constraint_usage.iter().map(|u| format!("{}:{}", u.argv_index, u8::from(u.omit))).collect();
+    let line = format!(
+        "BO rc={} idxNum={} idxStr={} cost={:016x} rows={} obc={} flags={:x} hIn={:x} usage=[{}]",
+        rc,
+        info.idx_num,
+        info.idx_str.as_deref().unwrap_or("(null)"),
+        info.estimated_cost.to_bits(),
+        info.estimated_rows,
+        u8::from(info.order_by_consumed),
+        info.idx_flags,
+        h.m_handle_in,
+        usage.join(",")
+    );
+    if let Some(d) = p.where_dump.as_mut() {
+        d.push(line);
+    }
+}
+
+/// C keeps `u.vtab` and `u.btree` of a WhereLoop in one union: what a virtual-table loop
+/// leaves in `pBuilder->pNew` is what the next table's `whereLoopAddBtree()` finds in the
+/// `u.btree` fields it does not reset (`nBtm` / `nTop` of an automatic-index loop). This
+/// mirrors the bytes: `nEq`/`nBtm` = `idxNum`, `nTop` = the bit-field byte (needFree,
+/// bOmitOffset, bIdxNumHex) and `isOrdered`, `nDistinctCol` = `omitMask` (x86-64 layout).
+fn alias_vtab_into_btree(l: &mut WhereLoop) {
+    let n = l.vt_idx_num as u32;
+    l.n_eq = (n & 0xffff) as u16;
+    l.n_btm = (n >> 16) as u16;
+    let bits = u16::from(l.vt_need_free) | (u16::from(l.vt_b_omit_offset) << 1) | (u16::from(l.vt_b_idx_num_hex) << 2);
+    l.n_top = bits | (u16::from(l.vt_is_ordered as u8) << 8);
+    l.n_distinct_col = l.vt_omit_mask;
+}
+
+/// `isLimitTerm(pTerm)`: return true if pTerm is a virtual table LIMIT or OFFSET term.
+fn is_limit_term(t: &WhereTerm) -> bool {
+    t.e_match_op >= crate::vtab::SQLITE_INDEX_CONSTRAINT_LIMIT && t.e_match_op <= crate::vtab::SQLITE_INDEX_CONSTRAINT_OFFSET
+}
+
+/// `allConstraintsUsed(aUsage, nCons)`: return true if the first nCons constraints in the
+/// pUsage array are marked as in-use (have argvIndex>0). False otherwise.
+fn all_constraints_used(a_usage: &[IndexConstraintUsage], n_cons: usize) -> bool {
+    a_usage[..n_cons].iter().all(|u| u.argv_index > 0)
+}
+
+/// `whereLoopAddVirtualOne(pBuilder, mPrereq, mUsable, mExclude, pIdxInfo, mNoOmit, pbIn,
+/// pbRetryLimit)`: argument pIdxInfo is already populated with all constraints that may be
+/// used by the virtual table identified by pBuilder->pNew->iTab. This function marks a subset
+/// of those constraints usable, invokes the xBestIndex method and adds the returned plan to
+/// pBuilder.
+///
+/// A constraint is marked usable if:
+///
+///   * Argument mUsable indicates that its prerequisites are available, and
+///
+///   * It is not one of the operators specified in the mExclude mask passed as the fourth
+///     argument (which in practice is either WO_IN or 0).
+///
+/// Argument mPrereq is a mask of tables that must be scanned before the virtual table in
+/// question. These are added to the plans prerequisites before it is added to pBuilder.
+///
+/// Output parameter *pbIn is set to true if the plan added to pBuilder uses one or more WO_IN
+/// terms, or false otherwise.
+#[allow(clippy::too_many_arguments)]
+fn where_loop_add_virtual_one(
+    p: &mut Parse,
+    w: &mut WhereInfo,
+    b: &mut WhereLoopBuilder,
+    m_prereq: Bitmask,
+    m_usable: Bitmask,
+    m_exclude: u16,
+    info: &mut IndexInfo,
+    hidden: &mut HiddenIndexInfo,
+    m_no_omit: u16,
+    pb_in: &mut bool,
+    pb_retry_limit: Option<&mut bool>,
+) -> i32 {
+    let wc = b.p_wc;
+    let i_tab = b.p_new.i_tab as usize;
+    let tab = p.src(w.p_tab_list).a[i_tab].p_s_tab;
+    let n_constraint = info.a_constraint.len();
+    *pb_in = false;
+    b.p_new.prereq = m_prereq;
+
+    // Set the usable flag on the subset of constraints identified by arguments mUsable and
+    // mExclude.
+    let has_retry = pb_retry_limit.is_some();
+    for i in 0..n_constraint {
+        let t = term_from_where_clause(w, wc, info.a_constraint[i].i_term_offset).expect("term");
+        let term = w.term(t);
+        info.a_constraint[i].usable = false;
+        if (term.prereq_right & m_usable) == term.prereq_right && (term.e_operator & m_exclude) == 0 && (has_retry || !is_limit_term(term)) {
+            info.a_constraint[i].usable = true;
+        }
+    }
+
+    // Initialize the output fields of the sqlite3_index_info structure
+    for u in info.a_constraint_usage.iter_mut() {
+        *u = IndexConstraintUsage::default();
+    }
+    info.idx_str = None;
+    info.need_to_free_idx_str = false;
+    info.idx_num = 0;
+    info.order_by_consumed = false;
+    info.estimated_cost = crate::vtab::SQLITE_BIG_DBL / 2.0;
+    info.estimated_rows = 25;
+    info.idx_flags = 0;
+    hidden.m_handle_in = 0;
+
+    // Invoke the virtual table xBestIndex() method
+    let rc = vtab_best_index(p, w, tab, info, hidden);
+    if rc != 0 {
+        if rc == crate::vtab::SQLITE_CONSTRAINT {
+            // If the xBestIndex method returns SQLITE_CONSTRAINT, that means that the
+            // particular combination of parameters provided is unusable. Make no entries in
+            // the loop table.
+            return SQLITE_OK;
+        }
+        return rc;
+    }
+
+    let mut mx_term: i32 = -1;
+    let mut a_l_term: Vec<Option<TermRef>> = vec![None; n_constraint];
+    // memset(&pNew->u.vtab, 0, sizeof(pNew->u.vtab)): the union also clears u.btree
+    {
+        let l = &mut b.p_new;
+        l.vt_idx_num = 0;
+        l.vt_need_free = false;
+        l.vt_b_omit_offset = false;
+        l.vt_b_idx_num_hex = false;
+        l.vt_is_ordered = 0;
+        l.vt_omit_mask = 0;
+        l.vt_idx_str = None;
+        l.vt_m_handle_in = 0;
+        l.n_eq = 0;
+        l.n_btm = 0;
+        l.n_top = 0;
+        l.n_distinct_col = 0;
+        l.p_index = IndexId::NULL;
+        l.p_order_by = ExprListId::NULL;
+    }
+    let mut pb_retry_limit = pb_retry_limit;
+    for i in 0..n_constraint {
+        let i_term = info.a_constraint_usage[i].argv_index - 1;
+        if i_term >= 0 {
+            let j = info.a_constraint[i].i_term_offset;
+            let t = if j >= 0 { term_from_where_clause(w, wc, j) } else { None };
+            if i_term as usize >= n_constraint || t.is_none() || a_l_term[i_term as usize].is_some() || !info.a_constraint[i].usable {
+                let name = p.tab(tab).z_name.clone();
+                p.error_msg(format!("{name}.xBestIndex malfunction"));
+                alias_vtab_into_btree(&mut b.p_new);
+                return SQLITE_ERROR;
+            }
+            let t = t.expect("term");
+            b.p_new.prereq |= w.term(t).prereq_right;
+            a_l_term[i_term as usize] = Some(t);
+            if i_term > mx_term {
+                mx_term = i_term;
+            }
+            if info.a_constraint_usage[i].omit {
+                if i < 16 && ((1 << i) & m_no_omit) == 0 {
+                    b.p_new.vt_omit_mask |= 1 << i_term;
+                }
+                if w.term(t).e_match_op == crate::vtab::SQLITE_INDEX_CONSTRAINT_OFFSET {
+                    b.p_new.vt_b_omit_offset = true;
+                }
+            }
+            if smaskbit32(i as i32) & hidden.m_handle_in != 0 {
+                b.p_new.vt_m_handle_in |= 1u32.checked_shl(i_term as u32).unwrap_or(0);
+            } else if (w.term(t).e_operator & WO_IN) != 0 {
+                // A virtual table that is constrained by an IN clause may not consume the
+                // ORDER BY clause because (1) the order of IN terms is not necessarily
+                // related to the order of output terms and (2) Multiple outputs from a single
+                // IN value will not merge together.
+                info.order_by_consumed = false;
+                info.idx_flags &= !crate::vtab::SQLITE_INDEX_SCAN_UNIQUE;
+                *pb_in = true;
+            }
+
+            if is_limit_term(w.term(t)) && (*pb_in || !all_constraints_used(&info.a_constraint_usage, i)) {
+                // If there is an IN(...) term handled as an == (separate call to xFilter for
+                // each value on the RHS of the IN) and a LIMIT or OFFSET term handled as well,
+                // the plan is unusable. Similarly, if there is a LIMIT/OFFSET and there are
+                // other unused terms, the plan cannot be used. In these cases set variable
+                // *pbRetryLimit to true to tell the caller to retry with LIMIT and OFFSET
+                // disabled.
+                if let Some(r) = pb_retry_limit.as_deref_mut() {
+                    *r = true;
+                }
+                alias_vtab_into_btree(&mut b.p_new);
+                return SQLITE_OK;
+            }
+        }
+    }
+
+    for i in 0..=mx_term {
+        if a_l_term[i as usize].is_none() {
+            // The non-zero argvIdx values must be contiguous. Raise an error if they are not
+            let name = p.tab(tab).z_name.clone();
+            p.error_msg(format!("{name}.xBestIndex malfunction"));
+            alias_vtab_into_btree(&mut b.p_new);
+            return SQLITE_ERROR;
+        }
+    }
+    a_l_term.truncate((mx_term + 1) as usize);
+    let l = &mut b.p_new;
+    l.a_l_term = a_l_term;
+    l.vt_idx_num = info.idx_num;
+    l.vt_need_free = info.need_to_free_idx_str;
+    info.need_to_free_idx_str = false;
+    l.vt_idx_str = info.idx_str.clone();
+    l.vt_is_ordered = if info.order_by_consumed { info.a_order_by.len() as i8 } else { 0 };
+    l.vt_b_idx_num_hex = (info.idx_flags & crate::vtab::SQLITE_INDEX_SCAN_HEX) != 0;
+    l.r_setup = 0;
+    l.r_run = sqlite3_log_est_from_double(info.estimated_cost);
+    l.n_out = crate::select::sqlite3_log_est(info.estimated_rows as u64);
+
+    // Set the WHERE_ONEROW flag if the xBestIndex() method indicated that the scan will visit
+    // at most one row. Clear it otherwise.
+    if info.idx_flags & crate::vtab::SQLITE_INDEX_SCAN_UNIQUE != 0 {
+        l.ws_flags |= WHERE_ONEROW as u32;
+    } else {
+        l.ws_flags &= !(WHERE_ONEROW as u32);
+    }
+    alias_vtab_into_btree(&mut b.p_new);
+    let rc = where_loop_insert(p, w, b);
+    if b.p_new.vt_need_free {
+        b.p_new.vt_need_free = false;
+    }
+    alias_vtab_into_btree(&mut b.p_new);
+    rc
+}
+
+/// `whereLoopAddVirtual(pBuilder, mPrereq, mUnusable)`: add all WhereLoop objects for a table
+/// of the join identified by pBuilder->pNew->iTab. That table is guaranteed to be a virtual
+/// table.
+///
+/// If there are no LEFT or CROSS JOIN joins in the query, both mPrereq and mUnusable are set
+/// to 0. Otherwise, mPrereq is a mask of all FROM clause entries that occur before the virtual
+/// table in the FROM clause and are separated from it by at least one LEFT or CROSS JOIN.
+/// Similarly, the mUnusable mask contains all FROM clause entries that occur after the
+/// virtual table and are separated from it by at least one LEFT or CROSS JOIN.
+///
+/// For example, if the query were:
+///
+///   ... FROM t1, t2 LEFT JOIN t3, t4, vt CROSS JOIN t5, t6;
+///
+/// then mPrereq corresponds to (t1, t2) and mUnusable to (t5, t6).
+///
+/// All the tables in mPrereq must be scanned before the current virtual table. So any terms
+/// for which all prerequisites are satisfied by mPrereq may be specified as "usable" in all
+/// calls to xBestIndex. Conversely, all tables in mUnusable must be scanned after the current
+/// virtual table, so any terms for which the prerequisites overlap with mUnusable should
+/// always be configured as "not-usable" for xBestIndex.
+fn where_loop_add_virtual(p: &mut Parse, w: &mut WhereInfo, b: &mut WhereLoopBuilder, m_prereq: Bitmask, m_unusable: Bitmask) -> i32 {
+    let wc = b.p_wc;
+    let i_tab = b.p_new.i_tab as usize;
+    let (mut info, mut hidden, m_no_omit) = allocate_index_info(p, w, wc, m_unusable, i_tab);
+    b.p_new.r_setup = 0;
+    b.p_new.ws_flags = WHERE_VIRTUALTABLE as u32;
+    b.p_new.a_l_term.clear();
+    b.p_new.vt_need_free = false;
+    b.p_new.n_top &= !1; // (the needFree bit, see alias_vtab_into_btree())
+    let n_constraint = info.a_constraint.len();
+    let mut b_in = false;
+    let mut b_retry = false;
+
+    // First call xBestIndex() with all constraints usable.
+    let mut rc = where_loop_add_virtual_one(p, w, b, m_prereq, ALLBITS, 0, &mut info, &mut hidden, m_no_omit, &mut b_in, Some(&mut b_retry));
+    if b_retry {
+        rc = where_loop_add_virtual_one(p, w, b, m_prereq, ALLBITS, 0, &mut info, &mut hidden, m_no_omit, &mut b_in, None);
+    }
+
+    // If the call to xBestIndex() with all terms enabled produced a plan that does not
+    // require any source tables (IOW: a plan with mBest==0) and does not use an IN(...)
+    // operator, then there is no point in making any further calls to xBestIndex() since they
+    // will all return the same result (if the xBestIndex() implementation is sane).
+    let m_best = b.p_new.prereq & !m_prereq;
+    if rc == SQLITE_OK && (m_best != 0 || b_in) {
+        let mut seen_zero = false; // True if a plan with no prereqs seen
+        let mut seen_zero_no_in = false; // Plan with no prereqs and no IN(...) seen
+        let mut m_prev: Bitmask = 0;
+        let mut m_best_no_in: Bitmask = 0;
+
+        // If the plan produced by the earlier call uses an IN(...) term, call xBestIndex
+        // again, this time with IN(...) terms disabled.
+        if b_in {
+            rc = where_loop_add_virtual_one(p, w, b, m_prereq, ALLBITS, WO_IN, &mut info, &mut hidden, m_no_omit, &mut b_in, None);
+            m_best_no_in = b.p_new.prereq & !m_prereq;
+            if m_best_no_in == 0 {
+                seen_zero = true;
+                seen_zero_no_in = true;
+            }
+        }
+
+        // Call xBestIndex once for each distinct value of (prereqRight & ~mPrereq) in the set
+        // of terms that apply to the current virtual table.
+        while rc == SQLITE_OK {
+            let mut m_next: Bitmask = ALLBITS;
+            for i in 0..n_constraint {
+                let i_term = info.a_constraint[i].i_term_offset;
+                let t = term_from_where_clause(w, wc, i_term).expect("term");
+                let m_this = w.term(t).prereq_right & !m_prereq;
+                if m_this > m_prev && m_this < m_next {
+                    m_next = m_this;
+                }
+            }
+            m_prev = m_next;
+            if m_next == ALLBITS {
+                break;
+            }
+            if m_next == m_best || m_next == m_best_no_in {
+                continue;
+            }
+            rc = where_loop_add_virtual_one(p, w, b, m_prereq, m_next | m_prereq, 0, &mut info, &mut hidden, m_no_omit, &mut b_in, None);
+            if b.p_new.prereq == m_prereq {
+                seen_zero = true;
+                if !b_in {
+                    seen_zero_no_in = true;
+                }
+            }
+        }
+
+        // If the calls to xBestIndex() in the above loop did not find a plan that requires no
+        // source tables at all (i.e. one guaranteed to be usable), make a call here with all
+        // source tables disabled
+        if rc == SQLITE_OK && !seen_zero {
+            rc = where_loop_add_virtual_one(p, w, b, m_prereq, m_prereq, 0, &mut info, &mut hidden, m_no_omit, &mut b_in, None);
+            if !b_in {
+                seen_zero_no_in = true;
+            }
+        }
+
+        // If the calls to xBestIndex() have so far failed to find a plan that requires no
+        // source tables at all and does not use an IN(...) operator, make a final call to
+        // obtain one here.
+        if rc == SQLITE_OK && !seen_zero_no_in {
+            rc = where_loop_add_virtual_one(p, w, b, m_prereq, m_prereq, WO_IN, &mut info, &mut hidden, m_no_omit, &mut b_in, None);
+        }
+    }
+
+    // freeIndexInfo(pParse->db, p)
+    rc
+}
+
 /// `whereLoopAddAll(pBuilder)`: add all WhereLoop objects for all tables
 fn where_loop_add_all(p: &mut Parse, w: &mut WhereInfo, b: &mut WhereLoopBuilder) -> i32 {
     let mut m_prereq: Bitmask = 0;
@@ -2503,7 +3255,7 @@ fn where_loop_add_all(p: &mut Parse, w: &mut WhereInfo, b: &mut WhereLoopBuilder
     // Loop over the tables in the join, from left to right
     b.i_plan_limit = SQLITE_QUERY_PLANNER_LIMIT;
     for i_tab in 0..w.n_level as usize {
-        let m_unusable: Bitmask = 0;
+        let mut m_unusable: Bitmask = 0;
         let (jointype, i_cursor, from_exists, tab) = {
             let it = &p.src(tab_list).a[i_tab];
             (it.jointype as i32, it.i_cursor, it.from_exists, it.p_s_tab)
@@ -2538,10 +3290,19 @@ fn where_loop_add_all(p: &mut Parse, w: &mut WhereInfo, b: &mut WhereLoopBuilder
             m_prereq = 0;
         }
         if p.tab(tab).is_virtual() {
-            p.not_supported("virtual table in the FROM clause (whereLoopAddVirtual)");
-            return SQLITE_ERROR;
+            for k in i_tab + 1..w.n_level as usize {
+                let (jt, cur) = {
+                    let it = &p.src(tab_list).a[k];
+                    (it.jointype as i32, it.i_cursor)
+                };
+                if (jt & (JT_OUTER | JT_CROSS)) != 0 {
+                    m_unusable |= sqlite3_where_get_mask(&w.s_mask_set, cur);
+                }
+            }
+            rc = where_loop_add_virtual(p, w, b, m_prereq, m_unusable);
+        } else {
+            rc = where_loop_add_btree(p, w, b, m_prereq);
         }
-        rc = where_loop_add_btree(p, w, b, m_prereq);
         if rc == SQLITE_OK && w.a_wc[b.p_wc].has_or {
             rc = where_loop_add_or(p, w, b, m_prereq, m_unusable);
         }
@@ -2709,6 +3470,16 @@ fn where_path_satisfies_order_by(
             }
         } else {
             cur_loop = last;
+        }
+        if w.loops[cur_loop].ws_flags & WHERE_VIRTUALTABLE as u32 != 0 {
+            if w.loops[cur_loop].vt_is_ordered != 0 && w.p_order_by == order_by {
+                ob_sat = ob_done;
+            } else {
+                // No further ORDER BY terms may be matched. So this call should return >=0,
+                // not -1. Clear isOrderDistinct to ensure it does so.
+                is_order_distinct = false;
+            }
+            break;
         }
         let i_cur = p.src(w.p_tab_list).a[w.loops[cur_loop].i_tab as usize].i_cursor;
 
@@ -3521,10 +4292,14 @@ fn where_path_solver(p: &mut Parse, w: &mut WhereInfo, n_row_est: LogEst) -> i32
 fn where_interstage_heuristic(w: &mut WhereInfo) {
     for i in 0..w.n_level as usize {
         let k = w.a[i].p_w_loop;
-        if k == usize::MAX {
+        if k == usize::MAX || k >= w.loops.len() {
             break;
         }
         let (ws_flags, i_tab) = (w.loops[k].ws_flags, w.loops[k].i_tab);
+        if (ws_flags & WHERE_VIRTUALTABLE as u32) != 0 {
+            // Treat a vtab scan as similar to a full-table scan
+            break;
+        }
         if (ws_flags & (WHERE_COLUMN_EQ | WHERE_COLUMN_NULL | WHERE_COLUMN_IN) as u32) != 0 {
             for l in w.loops.iter_mut() {
                 if l.i_tab != i_tab {
@@ -3883,6 +4658,9 @@ fn dump_where_clause(p: &mut Parse, w: &WhereInfo, wc: WcId, depth: usize) {
                 t.n_child,
                 if t.p_or_info.is_some() || t.p_and_info.is_some() { 0 } else { t.i_field },
             ));
+            if t.e_operator == WO_AUX {
+                lines.push(format!("TERMAUX {}{} mop={}", "  ".repeat(depth), i, t.e_match_op));
+            }
             if let Some(oi) = t.p_or_info {
                 lines.push(format!("ORINFO {}indexable={:x}", "  ".repeat(depth + 1), oi.indexable));
                 rec(p, w, oi.wc, depth + 1, lines);
@@ -3992,7 +4770,8 @@ pub fn sqlite3_where_begin(
         i_limit: i_aux_arg as LogEst,
         saved_n_query_loop: p.n_query_loop as i32,
         p_select: select,
-        a: vec![WhereLevel::default(); n_tab_list],
+        // (pWLoop is NULL until wherePathSolver() succeeds)
+        a: vec![WhereLevel { p_w_loop: usize::MAX, ..WhereLevel::default() }; n_tab_list],
         a_wc: vec![WhereClause::default()],
         ..WhereInfo::default()
     };
@@ -4032,13 +4811,16 @@ pub fn sqlite3_where_begin(
         for ii in 0..p.src(tab_list).a.len() {
             let c = p.src(tab_list).a[ii].i_cursor;
             create_mask(&mut w.s_mask_set, c);
-            sqlite3_where_tab_func_args(p, tab_list, ii);
+            sqlite3_where_tab_func_args(p, &mut w, 0, tab_list, ii);
         }
     }
 
     // Analyze all of the subexpressions.
     sqlite3_where_expr_analyze(p, &mut w, 0);
-    // (sqlite3WhereAddLimit(): only for a single virtual table in the FROM clause)
+    if w.p_select.nn() && p.s(w.p_select).p_limit.nn() {
+        let sel = w.p_select;
+        crate::whereexpr::sqlite3_where_add_limit(p, &mut w, 0, sel);
+    }
     if p.n_err != 0 {
         p.n_query_loop = w.saved_n_query_loop as LogEst;
         return None;
@@ -4211,6 +4993,11 @@ pub fn sqlite3_where_begin(
         let l_ws_flags = w.loops[k].ws_flags;
         if (p.tab(tab).tab_flags & TF_Ephemeral) != 0 || p.tab(tab).is_view() {
             // Do nothing
+        } else if (l_ws_flags & WHERE_VIRTUALTABLE as u32) != 0 {
+            let vt = crate::vtab::sqlite3_get_vtable(p, tab).cloned().unwrap_or_default();
+            p.v.add_op4(OP_VOpen, i_cursor, 0, 0, P4::Vtab(Arc::new(sqliters_vdbe::vdbeaux::P4Vtab { id: vt.id, name: p.tab(tab).z_name.clone() })));
+        } else if p.tab(tab).is_virtual() {
+            // noop
         } else if ((l_ws_flags & WHERE_IDX_ONLY as u32) == 0 && (wctrl_flags as i32 & WHERE_OR_SUBCLAUSE) == 0)
             || (jointype & (JT_LTORJ | JT_RIGHT)) != 0
         {

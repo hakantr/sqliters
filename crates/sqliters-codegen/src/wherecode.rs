@@ -210,6 +210,14 @@ pub fn sqlite3_where_add_explain_text(p: &mut Parse, w: &WhereInfo, addr: i32, t
             c_range_op = '<';
         }
         s.push_str(&format!("{c_range_op}?)"));
+    } else if (flags & WHERE_VIRTUALTABLE as u32) != 0 {
+        s.push_str(" VIRTUAL TABLE INDEX ");
+        let z = l.vt_idx_str.as_deref().unwrap_or("");
+        if l.vt_b_idx_num_hex {
+            s.push_str(&format!("0x{:x}:{z}", l.vt_idx_num as u32));
+        } else {
+            s.push_str(&format!("{}:{z}", l.vt_idx_num));
+        }
     }
     if jointype & JT_LEFT != 0 {
         s.push_str(" LEFT-JOIN");
@@ -976,6 +984,104 @@ pub fn sqlite3_where_code_one_loop_start(p: &mut Parse, w: &mut WhereInfo, i_lev
         p.v.add_op3(OP_InitCoroutine, reg_yield, 0, addr_fill_sub);
         w.a[i_level].p2 = p.v.add_op2(OP_Yield, reg_yield, addr_brk);
         w.a[i_level].op = OP_Goto;
+    } else if (l_ws_flags & WHERE_VIRTUALTABLE as u32) != 0 {
+        // Case 1: The table is a virtual-table. Use the VFilter and VNext to access the data.
+        let n_constraint = w.loops[i_loop].n_l_term();
+        let i_reg = sqlite3_get_temp_range(p, n_constraint as i32 + 2); // P3 Value for OP_VFilter
+        let mut addr_not_found = w.a[i_level].addr_brk;
+        for j in 0..n_constraint {
+            let i_target = i_reg + j as i32 + 2;
+            let Some(t) = w.loops[i_loop].a_l_term[j] else { continue };
+            if w.term(t).e_operator & WO_IN != 0 {
+                if (1u32.checked_shl(j as u32).unwrap_or(0) & w.loops[i_loop].vt_m_handle_in) != 0 {
+                    let i_tab = p.n_tab;
+                    p.n_tab += 1;
+                    p.n_mem += 1;
+                    let i_cache = p.n_mem;
+                    let x = w.term(t).p_expr;
+                    sqlite3_code_rhs_of_in(p, x, i_tab, false);
+                    p.v.add_op3(OP_VInitIn, i_tab, i_target, i_cache);
+                } else {
+                    code_equality_term(p, w, t, i_level, j, b_rev, i_target);
+                    addr_not_found = w.a[i_level].addr_nxt;
+                }
+            } else {
+                let right = p.e(w.term(t).p_expr).p_right;
+                code_expr_or_vector(p, right, i_target, 1);
+                if w.term(t).e_match_op == crate::vtab::SQLITE_INDEX_CONSTRAINT_OFFSET && w.loops[i_loop].vt_b_omit_offset {
+                    let i_offset = p.s(w.p_select).i_offset;
+                    p.v.add_op2(OP_Integer, 0, i_offset);
+                }
+            }
+        }
+        let idx_num = w.loops[i_loop].vt_idx_num;
+        p.v.add_op2(OP_Integer, idx_num, i_reg);
+        p.v.add_op2(OP_Integer, n_constraint as i32, i_reg + 1);
+        // The instruction immediately prior to OP_VFilter must be an OP_Integer that sets the
+        // "argc" value for xVFilter. This is necessary for resolveP2() to work correctly.
+        // See tag-20250207a.
+        match w.loops[i_loop].vt_idx_str.clone() {
+            Some(z) => {
+                p.v.add_op4(OP_VFilter, i_cur, addr_not_found, i_reg, P4::dynamic(&z));
+            }
+            None => {
+                p.v.add_op3(OP_VFilter, i_cur, addr_not_found, i_reg);
+            }
+        }
+        w.loops[i_loop].vt_need_free = false;
+        w.a[i_level].p1 = i_cur;
+        w.a[i_level].op = if w.e_one_pass != 0 { OP_Noop } else { OP_VNext };
+        w.a[i_level].p2 = p.v.current_addr();
+
+        for j in 0..n_constraint {
+            let t = w.loops[i_loop].a_l_term[j].expect("term");
+            if j < 16 && (w.loops[i_loop].vt_omit_mask >> j) & 1 != 0 {
+                disable_term(p, w, i_level, t);
+                continue;
+            }
+            if (w.term(t).e_operator & WO_IN) != 0 && (1u32.checked_shl(j as u32).unwrap_or(0) & w.loops[i_loop].vt_m_handle_in) == 0 {
+                // Reload the constraint value into reg[iReg+j+2]. The same value was loaded
+                // into the same register prior to the OP_VFilter, but the xFilter
+                // implementation might have changed the datatype or encoding of the value in
+                // the register, so it *must* be reloaded.
+                let target = i_reg + j as i32 + 2;
+                for i_in in 0..w.a[i_level].a_in_loop.len() {
+                    let a = w.a[i_level].a_in_loop[i_in].addr_in_top;
+                    let (opc, p1, p2, p3) = {
+                        let op = p.v.get_op(a);
+                        (op.opcode, op.p1, op.p2, op.p3)
+                    };
+                    if (opc == OP_Column && p3 == target) || (opc == OP_Rowid && p2 == target) {
+                        p.v.add_op3(opc, p1, p2, p3);
+                        break;
+                    }
+                }
+
+                // Generate code that will continue to the next row if the IN constraint is
+                // not satisfied
+                let compare = sqlite3_p_expr(p, TK_EQ, ExprId::NULL, ExprId::NULL);
+                let i_fld = w.term(t).i_field;
+                let x = w.term(t).p_expr;
+                let left = p.e(x).p_left;
+                let cl = if i_fld > 0 { p.l(p.e(left).x_list()).a[(i_fld - 1) as usize].p_expr } else { left };
+                p.em(compare).p_left = cl;
+                let right = sqlite3_expr_alloc(p, TK_REGISTER, None, 0);
+                p.em(compare).p_right = right;
+                if right.nn() {
+                    p.em(right).i_table = target;
+                    let addr_cont = w.a[i_level].addr_cont;
+                    sqlite3_expr_if_false(p, compare, addr_cont, SQLITE_JUMPIFNULL);
+                }
+                p.em(compare).p_left = ExprId::NULL;
+            }
+        }
+
+        // These registers need to be preserved in case there is an IN operator loop. So we
+        // could deallocate the registers here (and potentially reuse them later) if
+        // (pLoop->wsFlags & WHERE_IN_ABLE)==0. But it seems simpler and safer to simply not
+        // reuse the registers.
+        //
+        //    sqlite3ReleaseTempRange(pParse, iReg, nConstraint+2);
     } else if (l_ws_flags & WHERE_IPK as u32) != 0 && (l_ws_flags & (WHERE_COLUMN_IN | WHERE_COLUMN_EQ) as u32) != 0 {
         // Case 2: We can directly reference a single row using an equality comparison
         // against the ROWID field. Or we reference multiple rows using a "rowid IN (...)"

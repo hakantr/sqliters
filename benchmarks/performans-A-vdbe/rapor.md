@@ -15,6 +15,7 @@
 | V2 — tablolar: şema bağdaştırıcısı, sıralayıcı, `where.c` ailesi, birleşimler | `c4efe5e` | `whereexpr.c`, `where.c`, `wherecode.c`, `select.c` (GROUP BY hariç), alt sorgu düzleştirme, görünümler, `EXPLAIN QUERY PLAN` | 35.525 / 35.526 kabul edilen (3.474 desteklenmiyor) | 13.659 / 39.300 (%34,8) | 929 geçti, bilinen 4 başarısız, 337 yok sayıldı |
 | V3 — şemanın C gibi yüklenmesi, GROUP BY / HAVING / FILTER, özyinelemeli CTE | `a0dfd44` | `build.c` tablo/indeks/görünüm kurucuları, `sqlite3Init`, `sqlite3AnalysisLoad`, GROUP BY sıralayıcı dalı, FILTER, `generateWithRecursiveQuery`, C bağlantı durumu (DBFLAG_EncodingFixed) | 87.000 / 87.000 kabul edilen (8 derlem; 0 farklı) | 14.133 / 39.300 (%36,0) | 979 geçti, bilinen 4 başarısız, 337 yok sayıldı |
 | V4a — pencere işlevleri | `f7df02e` | `window.c`'nin üretici tarafı (yeniden yazım, adlandırılmış / zincirlenmiş pencereler, `sqlite3WindowCodeInit` / `CodeStep` ve yardımcıları, ROWS / RANGE / GROUPS, EXCLUDE), ayrıştırıcı kuralları 93, 318–345 | 24.012 / 24.012 (pencere derlemleri) + V3'ün 87.000'i | 14.532 / 39.300 (%37,0) | 1002 geçti, bilinen 4 başarısız, 337 yok sayıldı |
+| V4b — FROM içinde sanal tablolar ve tablo değerli işlevler | (bu commit) | `vtab.c` okuma tarafı, CREATE VIRTUAL TABLE şema yüklemesi, `whereLoopAddVirtual` / `xBestIndex`, sanal tablo döngü kodu ve EQP | 23.640 / 23.642 (vtab derlemleri; 2 = D34) + önceki 111.012 | 14.773 / 39.300 (%37,6) | 1011 geçti, bilinen 4 başarısız, 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -126,6 +127,26 @@ Ayrıntı: `karar_esligi_v1.md` (işlev eşlemesi, karar tabloları, kapsam tabl
 **Değişen test beklentileri (2).** `explain_tests.rs` ve `plan_tests.rs` içindeki "desteklenmiyor" listelerinden birer pencere ifadesi çıkarıldı (C bunları derliyor); C'nin çıktısı 3 yeni testle (`window_function_without_from`, `window_aggregate_listing`, `window_objects_dump`) sınanıyor.
 
 **Kalanlar.** Eski motor farkları `gorulen_farklar_v4a.md`'de (D30–D32). **D30 veri farkıdır** ve D23 ile birlikte motor kuyruğunda öne alınmalı.
+
+## V4b — FROM içinde sanal tablolar ve tablo değerli işlevler
+
+**Taşınan** (ayrıntı `karar_esligi_v4b.md`).
+- Yeni `vtab.rs`: CREATE VIRTUAL TABLE'ın şema yüklemesinde C gibi ayrıştırılması (`sqlite3VtabBeginParse` … `FinishParse`), `vtabCallConstructor` (HIDDEN sütun kuralları), `sqlite3VtabCallConnect`, `sqlite3_declare_vtab` (iç içe ayrıştırma), `sqlite3VtabEponymousTableInit`, `sqlite3GetVTable`, `sqlite3VtabOverloadFunction`, `sqlite3VtabMakeWritable`, `sqlite3_index_info`.
+- Ayrıştırıcı kuralları 302–308; tablo değerli işlev argümanları (`sqlite3WhereTabFuncArgs`), `isAuxiliaryVtabOperator`, `sqlite3WhereAddLimit`; `allocateIndexInfo`, `vtabBestIndex`, `whereLoopAddVirtualOne` / `Virtual`, `sqlite3_vtab_in` / `rhs_value` / `distinct` / `collation`; VFilter / VNext / VInitIn döngüsü ve "VIRTUAL TABLE INDEX" EQP metni.
+- Host arayüzüne 4 yöntem: `vtab_module`, `vtab_connect`, `vtab_best_index`, `vtab_find_function`. Motor tarafında generate_series, json_each / json_tree, dbstat, `pragma_*`, fts5vocab, fts5, rtree için C'den taşınmış `xBestIndex` yöntemleri (yürütücünün kendi `best_index`'i değişmedi). D33 düzeltildi: `pragma_*` sanal tabloları C'deki gibi "innocuous" değil.
+- Yeni katmanların bulduğu taşıma hataları düzeltildi (`whereClauseInsert` iParent, çözümsüz sorguda panik, `u.vtab` / `u.btree` birleşim örtüşmesi).
+
+**Kanıt** (ikili `r3`; sonuçlar `target/perf-work/v4b/res/*_r3.*`).
+- Sanal tablo derlemleri (`gen_vtab.py`): vt_a 12.000, vt_b 6.000, vt_t 2.400, vt_x 3.000, vt_e 55 — `EXPLAIN` ve EQP tamamı aynı; vt_d 185 / 187 (2 = D34, motorda olmayan `pragma_*` tabloları). Terim / döngü / yol / agg / şema katmanları ve yeni **`xBestIndex` çağrı dizisi katmanı** (her çağrının kısıtları, sıralama, `colUsed` ve çıktıları) 0 fark. Hiçbir yerleşik modülün ulaşmadığı yollar (`OP_VInitIn`, `rhs_value`, `distinct`, `collation`, "xBestIndex malfunction") geçici C modülleriyle (`vtx` / `vtbad`) karşılaştırıldı.
+- Önceki derlemler (V3'ün 87.000'i, V4a'nın 24.012'si): %100 aynı.
+- Tüm ifade türleri: kabul **%37,0 → %37,6** (14.773); `EXPLAIN` aynı 14.406, farklı 367 (V4a'nın 355'i + 6 yalnız kabukta olan `fsdir` + 6 D27 yansıması); EQP aynı 14.495, farklı 278; sanal tablo nedeniyle desteklenmeyen 0 (V4a: 241).
+- C tarafı kapsamı: satır %87,8, dal %76,0; iki yönü de alınmayan 113 dal satırı tek tek sınıflandırıldı.
+- Testler: anahtar kapalı 1011 / bilinen 4 / 337; açık 1005 / 10 (aynı 10). DML farksalı 378 / 400; ayrışma bulucu h7b ile aynı. Hız (1.100 tabanı, 7 deneme): toplam 1,005x, geomean 1,006x.
+- Makinede sanal tablo işlem kodları yok: anahtar açıkken bu programlar eski motora düşüyor (sonraki makine adımı).
+
+**Değişen test beklentisi (1).** `plan_tests.rs::unsupported_in_v3`: `select * from pragma_table_info('t')` artık destekleniyor (C'nin listesi bayt bayt aynı); listede hâlâ desteklenmeyen bir DML ifadesiyle değiştirildi. 9 yeni test (`vtab_tests.rs`) C'nin listelerini ve `xBestIndex` satırlarını sınıyor.
+
+**Kalanlar** (`gorulen_farklar_v4b.md`). **D37 veri farkı:** yürütücü, tablo değerli işlevin gizli sütunları üzerindeki kısıtları yeniden sınamıyor — `SELECT value FROM generate_series(0,3,1) WHERE stop=1` C'de satır döndürmüyor, motorda `0`, `1` döndürüyor (üreticinin programı C'ninki). D34 eksik `pragma_*` tabloları, D35 motorun `best_index` / filtre sözleşmesi (makine `OP_VFilter`'ı çalıştırmadan önce hizalanmalı), D36 json modüllerinin kayıt zamanı, D38–D41 hata metinleri ve satır sırası. Öne alınacak veri farkları: D23, D30, D37.
 
 ## M1 — makine: `SELECT` programlarının C gibi çalıştırılması (dal `performans-A-vdbe-makine`)
 

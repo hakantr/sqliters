@@ -1501,6 +1501,23 @@ impl YyParser {
                 }
             }
             241 => m!(1).i = OE_None, // uniqueflag ::=
+            302 => crate::vtab::sqlite3_vtab_finish_parse(p, None), // cmd ::= create_vtab
+            303 => {
+                // cmd ::= create_vtab LP vtabarglist RP
+                let x = m!(0).tok;
+                crate::vtab::sqlite3_vtab_finish_parse(p, Some(&x));
+            }
+            304 => {
+                // create_vtab ::= createkw VIRTUAL TABLE ifnotexists nm dbnm USING nm
+                let (x, y, z, e) = (m!(-3).tok, m!(-2).tok, m!(0).tok, m!(-4).i);
+                crate::vtab::sqlite3_vtab_begin_parse(p, &x, &y, &z, e != 0);
+            }
+            305 => crate::vtab::sqlite3_vtab_arg_init(p), // vtabarg ::=
+            306..=308 => {
+                // vtabargtoken ::= ANY / vtabargtoken ::= lp anylist RP / lp ::= LP
+                let x = m!(0).tok;
+                crate::vtab::sqlite3_vtab_arg_extend(p, &x);
+            }
             n if (n as i32) < YYNRULE_WITH_ACTION => {
                 // A rule with an action in parse.y that step V1 does not port: CREATE / DROP /
                 // ALTER, INSERT / UPDATE / DELETE, triggers, PRAGMA, VACUUM, ATTACH, ANALYZE,

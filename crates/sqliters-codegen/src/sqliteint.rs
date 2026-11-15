@@ -705,6 +705,62 @@ pub struct Table {
     /// C's `nCol<0` marker of a view: its column names are being computed, or its SELECT is
     /// being expanded (detects circular view definitions)
     pub view_busy: bool,
+    /// `u.vtab.azArg[]` of a virtual table (`u.vtab.nArg` is the length): the module name, the
+    /// database name (set by the constructor), the table name and the module arguments
+    pub vtab_args: Vec<Option<String>>,
+    /// `u.vtab.p`: the connection's `VTable` of a virtual table, once connected
+    pub vtab: Option<VTable>,
+}
+
+/// `struct VTable`, the part the code generator reads: the instance of a virtual table that
+/// the connection uses (`sqlite3GetVTable()`). The module object itself stays on the engine
+/// side; `id` names it.
+#[derive(Debug, Clone, Default)]
+pub struct VTable {
+    /// The identity of the `sqlite3_vtab` instance (`P4_VTAB` lists it as `vtab:%p`)
+    pub id: u64,
+    /// `pMod->zName`
+    pub module_name: String,
+    /// `bConstraint`: true if constraints are supported
+    pub b_constraint: bool,
+    /// `bAllSchemas`: true if might use any attached schema
+    pub b_all_schemas: bool,
+    /// `eVtabRisk`: riskiness of allowing hacker access (`SQLITE_VTABRISK_*`)
+    pub e_vtab_risk: u8,
+    /// `pMod->pModule->xFindFunction!=0`
+    pub has_find_function: bool,
+    /// `pMod->pModule->xUpdate!=0`
+    pub has_update: bool,
+}
+
+/// `SQLITE_VTABRISK_*`: allowed values for VTable.eVtabRisk
+pub const SQLITE_VTABRISK_Low: u8 = 0;
+pub const SQLITE_VTABRISK_Normal: u8 = 1;
+pub const SQLITE_VTABRISK_High: u8 = 2;
+
+/// A virtual-table module of the connection (`Module` / `sqlite3_module`), as far as the code
+/// generator needs it.
+#[derive(Debug, Clone, Default)]
+pub struct VtabModule {
+    /// `zName`: the name the module was registered with
+    pub name: String,
+    /// `xCreate==0 || xCreate==xConnect`: the module can have an eponymous table
+    pub eponymous: bool,
+    /// The table-name suffixes for which `xShadowName` returns true (empty if the module has
+    /// no `xShadowName` or `iVersion<3`)
+    pub shadow_names: Vec<String>,
+}
+
+/// The outcome of [`Host::vtab_connect`] (`xConnect` through `vtabCallConstructor()`).
+#[derive(Debug, Clone)]
+pub enum VtabConnect {
+    /// The constructor succeeded: the instance and the text it passed to
+    /// `sqlite3_declare_vtab()` (`None`: it declared no schema)
+    Ok { vtab: VTable, declare: Option<String> },
+    /// The constructor failed with this message (C's `*pzErr`)
+    Err(String),
+    /// The engine cannot connect the table for the generator
+    Unsupported,
 }
 
 impl Table {
@@ -963,6 +1019,36 @@ pub trait Host {
     /// when `convertToWithoutRowidTable()` removed redundant PRIMARY KEY columns afterwards.
     fn created_since_load(&self, _i_db: usize, _name: &str) -> bool {
         false
+    }
+    /// `sqlite3HashFind(&db->aModule, zName)`: the virtual-table module registered under
+    /// `name` (ASCII case is ignored). With `lazy`, also the modules `sqlite3LocateTable()`
+    /// registers on first use (`sqlite3PragmaVtabRegister()`, `sqlite3JsonVtabRegister()`).
+    fn vtab_module(&self, _name: &str, _lazy: bool) -> Option<VtabModule> {
+        None
+    }
+    /// `vtabCallConstructor(db, pTab, pMod, pMod->pModule->xConnect, &zErr)`: connect the
+    /// virtual table `table` of database `i_db` (an eponymous table when `eponymous`) built
+    /// with module `module` and the arguments `args` (`azArg[]`, the database name already
+    /// in `args[1]`).
+    fn vtab_connect(&self, _i_db: usize, _table: &str, _module: &str, _args: &[String], _eponymous: bool) -> VtabConnect {
+        VtabConnect::Unsupported
+    }
+    /// `pVtab->pModule->xBestIndex(pVtab, p)` of the instance `vtab_id`: the return code
+    /// (`SQLITE_OK`, `SQLITE_CONSTRAINT`, ...) and `pVtab->zErrMsg`. `hidden` answers the
+    /// `sqlite3_vtab_in()` / `_rhs_value()` / `_distinct()` / `_collation()` calls the module
+    /// makes during the call.
+    fn vtab_best_index(
+        &self,
+        _vtab_id: u64,
+        _info: &mut crate::vtab::IndexInfo,
+        _hidden: &mut dyn crate::vtab::IndexInfoHidden,
+    ) -> (i32, Option<String>) {
+        (1, Some("virtual table not supported".to_owned()))
+    }
+    /// `pMod->xFindFunction(pVtab, nArg, zName, &xSFunc, &pArg)` of the instance `vtab_id`: 0
+    /// if the module does not overload the function, else its return value.
+    fn vtab_find_function(&self, _vtab_id: u64, _n_arg: i32, _name: &str) -> i32 {
+        0
     }
 }
 
@@ -1228,6 +1314,16 @@ pub struct Parse<'a> {
     /// Set when the statement needs a part of C that is not ported yet: the statement is then
     /// handled by the engine's old code. The text names the first missing piece.
     pub unsupported: Option<&'static str>,
+
+    /// `sArg`: complete text of a module argument (CREATE VIRTUAL TABLE)
+    pub s_arg: Token,
+    /// `apVtabLock[]` / `nVtabLock`: pointer to virtual tables needing locking
+    pub ap_vtab_lock: Vec<TableId>,
+    /// `pMod->pEpoTab` of the modules of the connection: the eponymous virtual table of each
+    /// module (by lower-case module name) created so far
+    pub epo_tab: std::collections::HashMap<String, TableId>,
+    /// `db->pVtabCtx` chain: the tables whose constructor is running
+    pub vtab_ctx: Vec<TableId>,
 }
 
 impl<'a> Parse<'a> {
@@ -1310,6 +1406,10 @@ impl<'a> Parse<'a> {
             tree_dump: None,
             suppress_err: false,
             unsupported: None,
+            s_arg: Token::EMPTY,
+            ap_vtab_lock: Vec::new(),
+            epo_tab: std::collections::HashMap::new(),
+            vtab_ctx: Vec::new(),
         }
     }
 
@@ -1511,6 +1611,12 @@ impl<'a> Parse<'a> {
         if self.rc == SQLITE_OK || self.rc == SQLITE_DONE {
             self.rc = SQLITE_ERROR;
         }
+    }
+
+    /// `IN_DECLARE_VTAB`
+    #[inline]
+    pub fn in_declare_vtab(&self) -> bool {
+        self.e_parse_mode == PARSE_MODE_DECLARE_VTAB as u8
     }
 
     /// `IN_RENAME_OBJECT`

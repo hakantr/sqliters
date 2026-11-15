@@ -227,6 +227,23 @@ pub struct WhereLoop {
     pub n_skip: u16,
     /// WhereTerms used (`nLTerm` is the length)
     pub a_l_term: Vec<Option<TermRef>>,
+    // ---- `u.vtab` (C keeps it in a union with `u.btree`) ----
+    /// `u.vtab.idxNum`: index number
+    pub vt_idx_num: i32,
+    /// `u.vtab.needFree`: true if sqlite3_free(idxStr) is needed
+    pub vt_need_free: bool,
+    /// `u.vtab.bOmitOffset`: True to let virtual table handle offset
+    pub vt_b_omit_offset: bool,
+    /// `u.vtab.bIdxNumHex`: Show idxNum as hex in EXPLAIN QUERY PLAN
+    pub vt_b_idx_num_hex: bool,
+    /// `u.vtab.isOrdered`: True if satisfies ORDER BY
+    pub vt_is_ordered: i8,
+    /// `u.vtab.omitMask`: Terms that may be omitted
+    pub vt_omit_mask: u16,
+    /// `u.vtab.idxStr`: index identifier string
+    pub vt_idx_str: Option<String>,
+    /// `u.vtab.mHandleIn`: Terms to handle as IN(...) instead of ==
+    pub vt_m_handle_in: u32,
 }
 
 impl WhereLoop {

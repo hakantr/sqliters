@@ -1123,6 +1123,14 @@ fn select_expander(p: &mut Parse, w: &mut Walker, sel: SelectId) -> i32 {
                         }
                         let vs = p.tab(tab).p_select;
                         crate::build::sqlite3_src_item_attach_subquery(p, tab_list, i, vs, true);
+                    } else if p.tab(tab).is_virtual()
+                        && (p.src(tab_list).a[i].from_ddl || (p.prep_flags as i32 & SQLITE_PREPARE_FROM_DDL) != 0)
+                        && p.tab(tab).vtab.as_ref().is_some_and(|v| {
+                            v.e_vtab_risk > u8::from((p.db.flags & SQLITE_TrustedSchema) != 0)
+                        })
+                    {
+                        let name = p.tab(tab).z_name.clone();
+                        p.error_msg(format!("unsafe use of virtual table \"{name}\""));
                     }
                     // nCol = pTab->nCol; pTab->nCol = -1;
                     p.tabm(tab).view_busy = true;
@@ -1682,8 +1690,8 @@ pub fn sqlite3_view_get_column_names(p: &mut Parse, tab: TableId) -> i32 {
     }
     let mut n_err = 0;
     if p.tab(tab).is_virtual() {
-        p.not_supported("virtual table");
-        return 1;
+        // db->nSchemaLock++; rc = sqlite3VtabCallConnect(pParse, pTable); db->nSchemaLock--;
+        return crate::vtab::sqlite3_vtab_call_connect(p, tab);
     }
 
     // A negative nCol is a special marker meaning that we are currently trying to compute
