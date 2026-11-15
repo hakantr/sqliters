@@ -224,6 +224,42 @@ Ayrıntı: `karar_esligi_v1.md` (işlev eşlemesi, karar tabloları, kapsam tabl
 
 **C'den yapı gereği farklı / yapılmayan.** `BEGIN` / `COMMIT` / `SAVEPOINT` / DDL programları (`OP_AutoCommit`, `OP_Savepoint`, `OP_SetCookie`, `OP_Expire`, `OP_CreateBtree` …) motorda kalıyor; sanal tablo yazmaları, `xfer` (`OPFLAG_PREFORMAT`), güncelleme kancaları; sıralayıcının disk birleştirmesi, geçici B-ağacının diske taşması, UTF-16. Görülen eski motor farkları: `gorulen_farklar_m2.md`.
 
+## M3a — makine: DML'nin C'nin derleme sonucuyla makineye yönlendirilmesi, E16 / E17, sanal tablo yazmaları, xfer (dal `performans-A-vdbe-makine`, commit `2b0e6a8`)
+
+**Taşınan / düzeltilen** (ayrıntı `karar_esligi_m3.md`).
+- **DML yolu (E19):** `SQLITERS_VDBE_EXEC=1` iken INSERT / UPDATE / DELETE, C'nin derleme sonucundan geçiyor: üretici program veriyorsa makine çalıştırıyor; C hata veriyorsa prepare C'nin iletisi ve konumuyla başarısız oluyor; motorun prepare'inin reddi ya da kabulü artık karar vermiyor (bu yolda D43 / D44 kapandı). Motora yalnız üreticinin desteklemediği ifade türleri, yalnız motor kitaplığında olan işlevler (testfixture) ve mutation trace açıkken düşülüyor.
+- **E16:** `sqlite3VdbeFindIndexKey`, `vdbeIsMatchingIndexKey`, `vdbeSkipField` taşındı; ifade indeksinde `OP_IdxDelete` C gibi komşu girdiyi buluyor.
+- **E17 = D30:** kök neden makine değil motorun şema kurucusu. C eşdeğer UNIQUE / PRIMARY KEY kısıtlarını birleştirirken ilk indeksi ve onun sıralamasını tutuyor (build.c 4396–4458); motor PK'nın DESC sırasını yazıyordu. `schema.rs` düzeltildi; iki yolda da dosya baytları C ile aynı.
+- **Sanal tablo yazmaları (E18):** `OP_VBegin`, `OP_VUpdate`, `OP_VOpen`, `OP_VFilter`, `OP_VColumn` (NOCHNG kuralı), `OP_VNext`, sanal tablo imlecinde `OP_Rowid`, ifade günlüğünde `sqlite3VtabSavepoint`. Yazma programlarında çalışıyor; tarama yalnız fts5 / rtree için.
+- **xfer:** `OP_RowCell`, `OPFLAG_PREFORMAT` ile `OP_Insert` (B-ağacı aktarım kipi), `sqlite3_xferopt_count` C'nin saydığı yerde. Güncelleme kancası `OP_Insert` / `OP_Delete` içinde C'nin koşullarıyla. `max_page_count` her eklemeden sonra denetleniyor (E23: C'de sayfa alınırken).
+- Anahtar açık testlerin bulduğu motor düzeltmeleri: üreticiye `Defensive` / `EnableTrigger` / `EnableView` bayrakları ve sütun / ifade derinliği / tetikleyici sınırları geçiyor; yeniden adlandırılan fts5 tablosunun `declare_sql`'i.
+
+**Kanıt** (ikili `r6`; sonuçlar `target/perf-work/m3/res/`; betik sayısı, stdout ve dosya baytı C ile aynı).
+
+| Derlem | API eski yol | API V5 makinesi | API yeni yol | CLI anahtar kapalı | CLI anahtar açık |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| ops_dml_a | 112 / 300 | 130 | **283** | 69 | **288** |
+| ops_dml_t | 89 / 200 | 104 | **188** | 46 | **190** |
+| ops_dml_f | 90 / 200 | 100 | **193** | 62 | **194** |
+| ops_dml_tf | 57 / 150 | 66 | **142** | 29 | **142** |
+| ops_dml_v | 51 / 150 | 57 | **138** | 30 | **137** |
+| M2 dml_a | 188 / 200 | 200 | 200 | 188 | 200 |
+| M2 dml_b | 374 / 400 | 398 | **400** | 373 | 398 |
+| sc6 / sc7 / sc8 | 140 / 65 / 15 | 144 / 75 / 20 | 144 / 75 / 20 | 140 / 65 / 15 | 144 / 75 / 20 |
+
+- Zengin derlemler (API): r_a / r_f / r_t / r_v 195 / 193 / 147 / 78 (eski yol 94 / 74 / 59 / 33). CLI'de anahtar kapalıyken 7 çökme (D48), açıkken 0.
+- Kalan farklar: `random()` kullanmayan 14 betik; hepsi E20 (geçersiz UTF-8'in motor işlev kitaplığında U+FFFD'ye dönmesi) ya da bilinen sc6 fts5 dosya baytları. Geri düşme yalnız sc6 / sc7'deki 10 + 10 sanal tablo okuyan SELECT.
+- C kapsamı (gcov) ve karar tabloları: örn. `sqlite3VdbeFindIndexKey` 27 / 30 satır, `OP_VUpdate` 27 / 29, `OP_VFilter` 19 / 19; alınmayan dallar sınıflandırıldı (G/Ç ve bozuk kayıt, sanal tablo imlecinde `nullRow`, `bIntegrity`). Ek C kanıtları: C'nin yazdığı dosyada FindIndexKey senaryosu, güncelleme kancası olay dizisi (`hook.c`), taşma sayfalı xfer (9 / 9 dosya baytı aynı).
+- Çökme takımları (anahtar açık, yazmalar makinede): sürücü 120 + 648, CLI `crash_h1` 288 + 2.654, `crash_stmt` 84 + 432; 0 hata.
+- Kendi denetimim: E16 (ifade indeksinde DELETE … RETURNING), E17 / D30, D48 (C'nin `generated column loop on "e"` iletisi), görünüme yazma, bilinmeyen ON CONFLICT hedefi ve işlev, FK CASCADE + tetikleyici + UPSERT + AUTOINCREMENT + xfer içeren betikler anahtar açıkken stdout ve dosya baytında C ile aynı (anahtar kapalı eski yolda E16 dosyası ve D48 farklı).
+- Testler: anahtar kapalı 1023 geçti / 0 başarısız / 337 yok sayıldı (5 yeni); açık 1013 / 10 — bilinen 6 + C dışı davranış sınayan 4 yeni (F7): `group64` (`RETURNING main.rt.*` C'de `near "*": syntax error`), `phase3_end_to_end_differential_…` (C: `cannot modify v_items because it is a view`), `fts5bigtok2-1.1` (C'de bağlama SQLITE_TOOBIG ile başarısız, INSERT NULL ile başarılı; D50), `point_update_delete_plans_match_vdbe_programs` (motorun kendi programını inceliyor). Beklentiler değiştirilmedi: anahtar kapalıyken eski yol bu davranışı veriyor. DML farksalı: kapalı 378 / 400, **açık 398 / 400** (kalan 2 = D51). Ayrışma bulucu h7b ile aynı. Hız (anahtar kapalı, 1.100 tabanı): toplam 1,000x, geomean 0,993x.
+
+**Hız (anahtar açık, C'ye göre; M3b konusu).** W03 1,95x, W04 2,60x, W09 4,58x, W10 3,77x, W14 8,30x (DML artık makinede olduğu için W14 belirgin yavaşladı).
+
+**Yapılmayanlar.** İşlem ve DDL kodları (`OP_AutoCommit`, `OP_Savepoint`, `OP_SetCookie`, `OP_Expire`, `OP_CreateBtree`, `OP_Destroy`, `OP_ParseSchema`, `OP_Drop*`) taşınmadı; BEGIN / COMMIT / SAVEPOINT ve DDL motorda (E22). Sanal tablo okuyan SELECT'ler motora düşüyor (okuma host'unda yürütme bağlamı yok; E21), bu yüzden D37'nin kapandığı doğrulanmadı; `OP_VInitIn`, `OP_VCheck`, `OP_VRename` yok. `OPFLAG_PREFORMAT` ile `OP_IdxInsert` (yalnız VACUUM). Ön güncelleme kancası başvuru derlemesinde yok. E11'e dokunulmadı (hiçbir derlemde ve çökme takımında görünür etkisi yok).
+
+**Kalanlar** (`gorulen_farklar_m3.md`). D49 metinden sayıya önek dönüşümü (`'4.24.2'+'4.24.2'` eski yolda 8, C'de 8,48; anahtar açık makine yolu C ile aynı); D50 bağlama SQLITE_MAX_LENGTH sınırını uygulamıyor; D51 bir DDL hatası prepare yerine step'te; E20–E23 yukarıda.
+
 ## Bu adımda görülen, eski motora ait C farkları (dokunulmadı)
 
 | İfade | C | Motor |
