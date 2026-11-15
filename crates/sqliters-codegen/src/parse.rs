@@ -6,7 +6,7 @@
 //! generator exactly where `parse.y` does.
 //!
 //! Step V1 ports the actions of the expression, SELECT / VALUES, WITH and transaction rules.
-//! The actions of the other rules (FROM clause terms, DML, DDL, triggers, window definitions,
+//! The actions of the other rules (FROM clause terms, DML, DDL, triggers,
 //! PRAGMA, …) set [`Parse::unsupported`]; the statement is then handled by the engine's old
 //! code. Rules without an action in `parse.y` need none here either.
 
@@ -465,8 +465,21 @@ impl YyParser {
             }
             93 => {
                 // oneselect ::= SELECT distinct selcollist from where_opt groupby_opt having_opt window_clause orderby_opt limit_opt
-                p.not_supported("WINDOW clause");
-                m!(-9).id = 0;
+                let s = sqlite3_select_new(
+                    p,
+                    el!(-7),
+                    SrcListId(m!(-6).id),
+                    ex!(-5),
+                    el!(-4),
+                    ex!(-3),
+                    el!(-1),
+                    m!(-8).i as u32,
+                    ex!(0),
+                );
+                if s.nn() {
+                    p.sm(s).p_win_defn = WindowId(m!(-2).id);
+                }
+                m!(-9).id = s.0;
             }
             94 => {
                 // values ::= VALUES LP nexprlist RP
@@ -1147,25 +1160,116 @@ impl YyParser {
             }
             343 => {
                 // filter_over ::= filter_clause
-                p.a_win.push(Window { e_frm_type: TK_FILTER as u8, p_filter: ex!(0), ..Window::default() });
-                m!(0).id = (p.a_win.len() - 1) as u32;
+                let w = p.new_win(Window { e_frm_type: TK_FILTER, p_filter: ex!(0), ..Window::default() });
+                m!(0).id = w.0;
             }
             346 => {
                 // filter_clause ::= FILTER LP WHERE expr RP
                 m!(-4).id = m!(-1).id;
             }
-            318..=342 | 344 | 345 => {
-                // window definitions, frame specifications and OVER clauses
-                p.not_supported("window function");
-                let k = match yyruleno {
-                    341 => -1,
-                    344 => -3,
-                    345 => -1,
-                    _ => 1,
-                };
-                if k <= 0 {
-                    m!(k).id = 0;
+            318 => {
+                // windowdefn_list ::= windowdefn_list COMMA windowdefn
+                let (y, z) = (WindowId(m!(-2).id), WindowId(m!(0).id));
+                crate::window::sqlite3_window_chain(p, z, y);
+                p.wm(z).p_next_win = y;
+                m!(-2).id = z.0;
+            }
+            319 => {
+                // windowdefn ::= nm AS LP window RP
+                let (x, y) = (m!(-4).tok, WindowId(m!(-1).id));
+                if y.nn() {
+                    let name = p.tok_str(&x).to_owned();
+                    p.wm(y).z_name = Some(name);
                 }
+                m!(-4).id = y.0;
+            }
+            320 => {
+                // window ::= PARTITION BY nexprlist orderby_opt frame_opt
+                let w = crate::window::sqlite3_window_assemble(p, WindowId(m!(0).id), el!(-2), el!(-1), None);
+                m!(-4).id = w.0;
+            }
+            321 => {
+                // window ::= nm PARTITION BY nexprlist orderby_opt frame_opt
+                let t = m!(-5).tok;
+                let w = crate::window::sqlite3_window_assemble(p, WindowId(m!(0).id), el!(-2), el!(-1), Some(&t));
+                m!(-5).id = w.0;
+            }
+            322 => {
+                // window ::= ORDER BY sortlist frame_opt
+                let w = crate::window::sqlite3_window_assemble(p, WindowId(m!(0).id), ExprListId::NULL, el!(-1), None);
+                m!(-3).id = w.0;
+            }
+            323 => {
+                // window ::= nm ORDER BY sortlist frame_opt
+                let t = m!(-4).tok;
+                let w = crate::window::sqlite3_window_assemble(p, WindowId(m!(0).id), ExprListId::NULL, el!(-1), Some(&t));
+                m!(-4).id = w.0;
+            }
+            324 => {
+                // window ::= nm frame_opt
+                let t = m!(-1).tok;
+                let w = crate::window::sqlite3_window_assemble(p, WindowId(m!(0).id), ExprListId::NULL, ExprListId::NULL, Some(&t));
+                m!(-1).id = w.0;
+            }
+            325 => {
+                // frame_opt ::=
+                let w = crate::window::sqlite3_window_alloc(p, 0, TK_UNBOUNDED, ExprId::NULL, TK_CURRENT, ExprId::NULL, 0);
+                m!(1).id = w.0;
+            }
+            326 => {
+                // frame_opt ::= range_or_rows frame_bound_s frame_exclude_opt
+                let (x, ye, yp, z) = (m!(-2).i as u8, m!(-1).i as u8, ex!(-1), m!(0).i as u8);
+                let w = crate::window::sqlite3_window_alloc(p, x, ye, yp, TK_CURRENT, ExprId::NULL, z);
+                m!(-2).id = w.0;
+            }
+            327 => {
+                // frame_opt ::= range_or_rows BETWEEN frame_bound_s AND frame_bound_e frame_exclude_opt
+                let (x, ye, yp, ze, zp, wx) = (m!(-5).i as u8, m!(-3).i as u8, ex!(-3), m!(-1).i as u8, ex!(-1), m!(0).i as u8);
+                let w = crate::window::sqlite3_window_alloc(p, x, ye, yp, ze, zp, wx);
+                m!(-5).id = w.0;
+            }
+            328 => m!(0).i = major!(0) as i32, // range_or_rows ::= RANGE|ROWS|GROUPS
+            329 | 331 | 342 => {}              // frame_bound_s ::= frame_bound ; frame_bound_e ::= frame_bound ; filter_over ::= over_clause
+            330 | 332 | 334 => {
+                // frame_bound_s ::= UNBOUNDED PRECEDING ; frame_bound_e ::= UNBOUNDED FOLLOWING ;
+                // frame_bound ::= CURRENT ROW
+                let x = major!(-1) as i32;
+                m!(-1).i = x;
+                m!(-1).id = 0;
+            }
+            333 => {
+                // frame_bound ::= expr PRECEDING|FOLLOWING
+                m!(-1).i = major!(0) as i32;
+            }
+            335 => m!(1).i = 0, // frame_exclude_opt ::=
+            336 => {
+                // frame_exclude_opt ::= EXCLUDE frame_exclude
+                m!(-1).i = m!(0).i;
+            }
+            337 | 338 => m!(-1).i = major!(-1) as i32, // frame_exclude ::= NO OTHERS ; frame_exclude ::= CURRENT ROW
+            339 => m!(0).i = major!(0) as i32,        // frame_exclude ::= GROUP|TIES
+            340 => {
+                // window_clause ::= WINDOW windowdefn_list
+                m!(-1).id = m!(0).id;
+            }
+            341 => {
+                // filter_over ::= filter_clause over_clause
+                let (f, o) = (ex!(-1), WindowId(m!(0).id));
+                if o.nn() {
+                    p.wm(o).p_filter = f;
+                }
+                m!(-1).id = o.0;
+            }
+            344 => {
+                // over_clause ::= OVER LP window RP
+                m!(-3).id = m!(-1).id;
+            }
+            345 => {
+                // over_clause ::= OVER nm
+                let z = m!(0).tok;
+                let name = p.tok_str(&z).to_owned();
+                let w = p.new_win(Window { z_name: Some(name), ..Window::default() });
+                m!(-1).id = w.0;
             }
             347 => {
                 // term ::= QNUMBER

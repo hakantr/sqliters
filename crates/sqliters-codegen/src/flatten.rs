@@ -1081,8 +1081,7 @@ pub fn push_down_where_terms(p: &mut Parse, mut subq: SelectId, mut wh: ExprId, 
                 s = p.s(s).p_prior;
             }
         }
-    } else if p.s(subq).p_win.nn() {
-        // (pSubq->pWin && pSubq->pWin->pPartition==0: window functions are unsupported)
+    } else if p.s(subq).p_win.nn() && p.w(p.s(subq).p_win).p_partition.is_null() {
         return 0;
     }
 
@@ -1117,6 +1116,11 @@ pub fn push_down_where_terms(p: &mut Parse, mut subq: SelectId, mut wh: ExprId, 
                 let s2 = p.e(wh).x_select();
                 p.sm(s2).sel_flags |= SF_ClonedRhsIn;
             }
+            if p.s(subq).p_win.nn() && !push_down_window_check(p, subq, new) {
+                // Restriction 6c has prevented push-down in this case
+                n_chng -= 1;
+                break;
+            }
             if p.s(subq).sel_flags & SF_Aggregate != 0 {
                 let h = p.s(subq).p_having;
                 let n = sqlite3_expr_and(p, h, new);
@@ -1130,6 +1134,14 @@ pub fn push_down_where_terms(p: &mut Parse, mut subq: SelectId, mut wh: ExprId, 
         }
     }
     n_chng
+}
+
+/// `pushDownWindowCheck(pParse, pSubq, pExpr)`: return true if expression pExpr (a WHERE term
+/// about to be pushed into sub-query pSubq, which uses window functions) may be pushed down:
+/// it must be constant or a function of the PARTITION BY expressions only (restriction 6c).
+fn push_down_window_check(p: &mut Parse, subq: SelectId, e: ExprId) -> bool {
+    let part = p.w(p.s(subq).p_win).p_partition;
+    sqlite3_expr_is_constant_or_group_by(p, e, part) != 0
 }
 
 /// `disableUnusedSubqueryResultColumns(pItem)`: check to see if a subquery contains result-set

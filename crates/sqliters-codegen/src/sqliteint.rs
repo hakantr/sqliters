@@ -474,23 +474,76 @@ pub struct With {
     pub a: Vec<Cte>,
 }
 
-/// `struct Window` (the fields built by the parser; the rest belongs to `window.c`).
+/// `Window.ppThis`: where the pointer to this object in a `Select.pWin` list lives (C keeps a
+/// `Window**`; here the owner of that pointer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WinPpThis {
+    /// `ppThis==0`: not linked into a `Select.pWin` list
+    #[default]
+    None,
+    /// `&pSel->pWin`
+    Select(SelectId),
+    /// `&pPrev->pNextWin`
+    Win(WindowId),
+}
+
+/// `struct Window`
 #[derive(Debug, Clone, Default)]
 pub struct Window {
+    /// Name of window (may be NULL)
     pub z_name: Option<String>,
+    /// Name of base window for chaining (may be NULL)
     pub z_base: Option<String>,
+    /// PARTITION BY clause
     pub p_partition: ExprListId,
+    /// ORDER BY clause
     pub p_order_by: ExprListId,
+    /// TK_RANGE, TK_GROUPS, TK_ROWS, or 0
     pub e_frm_type: u8,
+    /// UNBOUNDED, CURRENT, PRECEDING or FOLLOWING
     pub e_start: u8,
+    /// UNBOUNDED, CURRENT, PRECEDING or FOLLOWING
     pub e_end: u8,
+    /// True if frame was implicitly specified
     pub b_implicit_frame: u8,
+    /// TK_NO, TK_CURRENT, TK_TIES, TK_GROUP, or 0
     pub e_exclude: u8,
+    /// Expression for "<expr> PRECEDING"
     pub p_start: ExprId,
+    /// Expression for "<expr> FOLLOWING"
     pub p_end: ExprId,
+    /// Pointer to this object in Select.pWin list
+    pub pp_this: WinPpThis,
+    /// Next window function belonging to this SELECT
     pub p_next_win: WindowId,
+    /// The FILTER expression
     pub p_filter: ExprId,
+    /// The function
+    pub p_w_func: Option<Arc<FuncDef>>,
+    /// Partition buffer or Peer buffer
+    pub i_eph_csr: i32,
+    /// Accumulator
+    pub reg_accum: i32,
+    /// Interim result
+    pub reg_result: i32,
+    /// Function cursor (used by min/max)
+    pub csr_app: i32,
+    /// Function register (also used by min/max)
+    pub reg_app: i32,
+    /// Array of registers for PARTITION BY values
+    pub reg_part: i32,
+    /// Expression object this window is attached to
     pub p_owner: ExprId,
+    /// Number of columns in buffer table
+    pub n_buffer_col: i32,
+    /// Offset of first argument for this function
+    pub i_arg_col: i32,
+    /// Register containing constant value 1
+    pub reg_one: i32,
+    pub reg_start_rowid: i32,
+    pub reg_end_rowid: i32,
+    /// Defer evaluation of window function arguments due to the SQLITE_SUBTYPE flag
+    pub b_expr_args: u8,
 }
 
 /// `struct AggInfo_col`
@@ -812,6 +865,13 @@ pub struct Walker {
     /// An integer array of a callback-specific structure (`u.aiCol`: the cursor map of
     /// renumberCursors())
     pub v_int: Vec<i32>,
+    /// `u.pRewrite->pWin` (window.c `WindowRewrite`)
+    pub p_win: WindowId,
+    /// `u.pRewrite->pSub` (window.c `WindowRewrite`)
+    pub p_sub: ExprListId,
+    /// `xSelectCallback2` is `sqlite3WalkWinDefnDummyCallback` or `sqlite3SelectPopWith`:
+    /// sqlite3WalkSelectExpr() also walks `Select.pWinDefn`
+    pub walk_win_defn: bool,
 }
 
 impl Default for Walker {
@@ -839,6 +899,9 @@ impl Default for Walker {
             v_ctx: Vec::new(),
             m: 0,
             v_int: Vec::new(),
+            p_win: WindowId::NULL,
+            p_sub: ExprListId::NULL,
+            walk_win_defn: false,
         }
     }
 }
@@ -1268,6 +1331,19 @@ impl<'a> Parse<'a> {
     pub fn lm(&mut self, id: ExprListId) -> &mut ExprList {
         debug_assert!(id.nn());
         &mut self.a_list[id.ix()]
+    }
+    #[inline]
+    pub fn w(&self, id: WindowId) -> &Window {
+        &self.a_win[id.ix()]
+    }
+    #[inline]
+    pub fn wm(&mut self, id: WindowId) -> &mut Window {
+        debug_assert!(id.nn());
+        &mut self.a_win[id.ix()]
+    }
+    pub fn new_win(&mut self, w: Window) -> WindowId {
+        self.a_win.push(w);
+        WindowId(self.a_win.len() as u32 - 1)
     }
     #[inline]
     pub fn s(&self, id: SelectId) -> &Select {

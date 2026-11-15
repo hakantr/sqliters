@@ -797,6 +797,12 @@ fn resolve_expr_step(p: &mut Parse, w: &mut Walker, e: ExprId) -> i32 {
             let mut wrong_num_args = false; // True if wrong number of arguments
             let mut is_agg = false; // True if is an aggregate function
             let saved_allow_flags = p.nc(nc).nc_flags & (NC_AllowAgg | NC_AllowWin);
+            // pWin = IsWindowFunc(pExpr) ? pExpr->y.pWin : 0
+            let p_win = if p.e(e).has(EP_WinFunc) && p.w(p.e(e).y_win).e_frm_type != TK_FILTER {
+                p.e(e).y_win
+            } else {
+                WindowId::NULL
+            };
             let z_id = p.e(e).tok().to_owned();
             let mut def = sqlite3_find_function(p, &z_id, n, 0);
             match def.clone() {
@@ -891,11 +897,16 @@ fn resolve_expr_step(p: &mut Parse, w: &mut Walker, e: ExprId) -> i32 {
             }
 
             if !p.in_rename_object() {
-                // (pWin: window functions are not ported in step V1; the parser reports a
-                // statement with OVER / FILTER as unsupported, so pWin==0 here)
                 let d_is_window = def.as_ref().is_some_and(|d| (d.func_flags & SQLITE_FUNC_WINDOW) != 0);
-                if (is_agg && (p.nc(nc).nc_flags & NC_AllowAgg) == 0) || (is_agg && d_is_window) {
-                    let z_type = if d_is_window { "window" } else { "aggregate" };
+                if def.as_ref().is_some_and(|d| !d.x_value) && p_win.nn() {
+                    let msg = format!("{}() may not be used as a window function", p.e(e).tok());
+                    p.error_msg_expr(msg, e);
+                    p.ncm(nc).n_nc_err += 1;
+                } else if (is_agg && (p.nc(nc).nc_flags & NC_AllowAgg) == 0)
+                    || (is_agg && d_is_window && p_win.is_null())
+                    || (is_agg && p_win.nn() && (p.nc(nc).nc_flags & NC_AllowWin) == 0)
+                {
+                    let z_type = if d_is_window || p_win.nn() { "window" } else { "aggregate" };
                     let msg = format!("misuse of {} function {}()", z_type, p.e(e).tok());
                     p.error_msg_expr(msg, e);
                     p.ncm(nc).n_nc_err += 1;
@@ -920,7 +931,7 @@ fn resolve_expr_step(p: &mut Parse, w: &mut Walker, e: ExprId) -> i32 {
                     // Window functions may not be arguments of aggregate functions. Or
                     // arguments of other window functions. But aggregate functions may be
                     // arguments for window functions.
-                    p.ncm(nc).nc_flags &= !(NC_AllowWin | NC_AllowAgg);
+                    p.ncm(nc).nc_flags &= !(NC_AllowWin | if p_win.is_null() { NC_AllowAgg } else { 0 });
                 }
             } else if p.e(e).has(EP_WinFunc) || p.e(e).p_left.nn() {
                 is_agg = true;
@@ -932,7 +943,20 @@ fn resolve_expr_step(p: &mut Parse, w: &mut Walker, e: ExprId) -> i32 {
                     let l = p.e(left).x_list();
                     sqlite3_walk_expr_list(p, w, l);
                 }
-                {
+                if p_win.nn() && p.n_err == 0 {
+                    let sel = p.nc(nc).p_win_select;
+                    if !p.in_rename_object() {
+                        let list = if sel.nn() { p.s(sel).p_win_defn } else { WindowId::NULL };
+                        let d = def.clone().expect("window function definition");
+                        crate::window::sqlite3_window_update(p, list, p_win, &d);
+                    }
+                    let (part, ob, filter) = (p.w(p_win).p_partition, p.w(p_win).p_order_by, p.w(p_win).p_filter);
+                    sqlite3_walk_expr_list(p, w, part);
+                    sqlite3_walk_expr_list(p, w, ob);
+                    sqlite3_walk_expr(p, w, filter);
+                    crate::window::sqlite3_window_link(p, sel, p_win);
+                    p.ncm(nc).nc_flags |= NC_HasWin;
+                } else {
                     // For looping up thru outer contexts
                     p.em(e).op = TK_AGG_FUNCTION;
                     p.em(e).op2 = 0;
@@ -1280,7 +1304,8 @@ fn resolve_order_group_by(p: &mut Parse, nc: NcId, select: SelectId, order_by: E
             if sqlite3_expr_compare(p, false, pe, p.l(e_list).a[j].p_expr, -1) == 0 {
                 // Since this expression is being changed into a reference to an identical
                 // expression in the result set, remove all Window objects belonging to the
-                // expression from the Select.pWin list. (window functions: not ported)
+                // expression from the Select.pWin list.
+                window_remove_expr_from_select(p, select, pe);
                 p.lm(order_by).a[i].i_order_by_col = j as u16 + 1;
             }
         }
@@ -1642,4 +1667,22 @@ pub fn sqlite3_resolve_self_reference(p: &mut Parse, tab: TableId, mut ty: i32, 
     }
     p.a_nc.truncate(mark);
     rc
+}
+
+/// `resolveRemoveWindowsCb(pWalker, pExpr)`: walker callback for windowRemoveExprFromSelect().
+fn resolve_remove_windows_cb(p: &mut Parse, _w: &mut Walker, e: ExprId) -> i32 {
+    if p.e(e).has(EP_WinFunc) {
+        let win = p.e(e).y_win;
+        crate::window::sqlite3_window_unlink_from_select(p, win);
+    }
+    WRC_Continue
+}
+
+/// `windowRemoveExprFromSelect(pSelect, pExpr)`: remove any Window objects owned by the
+/// expression pExpr from the Select.pWin list of Select object pSelect.
+fn window_remove_expr_from_select(p: &mut Parse, select: SelectId, e: ExprId) {
+    if p.s(select).p_win.nn() {
+        let mut w = Walker { x_expr_callback: Some(resolve_remove_windows_cb), p_select: select, ..Walker::default() };
+        sqlite3_walk_expr(p, &mut w, e);
+    }
 }

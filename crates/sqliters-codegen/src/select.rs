@@ -1873,6 +1873,7 @@ fn sqlite3_select_expand(p: &mut Parse, sel: SelectId) {
     }
     w.x_select_callback = Some(select_expander);
     w.x_select_callback2 = Some(sqlite3_select_pop_with);
+    w.walk_win_defn = true;
     w.e_code = 0;
     sqlite3_walk_select(p, &mut w, sel);
 }
@@ -2673,6 +2674,9 @@ fn multi_select_values(p: &mut Parse, sel: SelectId, dest: &mut SelectDest) -> i
     let b_show_all = p.s(sel).p_limit.is_null();
     let mut s = sel;
     loop {
+        if p.s(s).p_win.nn() {
+            return -1;
+        }
         if p.s(s).p_prior.is_null() {
             break;
         }
@@ -2764,7 +2768,10 @@ fn generate_with_recursive_query(p: &mut Parse, sel: SelectId, dest: &mut Select
     let mut i_current = 0; // The Current table
     let mut i_distinct = 0; // To ensure unique results if UNION
 
-    // (p->pWin: window functions are reported as unsupported by the parser)
+    if p.s(sel).p_win.nn() {
+        p.error_msg("cannot use window functions in recursive queries");
+        return;
+    }
 
     // (sqlite3AuthCheck(pParse, SQLITE_RECURSIVE, ...): authorization is done by the engine)
 
@@ -2922,7 +2929,11 @@ fn multi_select(p: &mut Parse, sel: SelectId, p_dest: &mut SelectDest) -> i32 {
     let mut done = false;
     if p.s(sel).sel_flags & SF_MultiValue != 0 {
         rc = multi_select_values(p, sel, &mut dest);
-        done = true;
+        if rc >= 0 {
+            done = true;
+        } else {
+            rc = SQLITE_OK;
+        }
     }
     if !done {
         // Make sure all SELECTs in the statement have the same number of elements in their
@@ -3756,9 +3767,7 @@ fn sqlite3_select_body(p: &mut Parse, sel: SelectId, dest: &mut SelectDest, b_po
         sqlite3_generate_column_names(p, sel);
     }
 
-    if p.s(sel).p_win.nn() {
-        // sqlite3WindowRewrite(pParse, p)
-        p.not_supported("window function");
+    if crate::window::sqlite3_window_rewrite(p, sel) != 0 {
         return rc;
     }
     let mut tab_list = p.s(sel).p_src;
@@ -4245,6 +4254,10 @@ fn sqlite3_select_body(p: &mut Parse, sel: SelectId, dest: &mut SelectDest, b_po
         // No aggregate functions and no GROUP BY clause. tag-select-0700
         let wctrl_flags: u16 =
             (if s_distinct.is_tnct != 0 { WHERE_WANT_DISTINCT as u16 } else { 0 }) | (p.s(sel).sel_flags & SF_FixedLimit) as u16;
+        let p_win = p.s(sel).p_win; // Main window object (or NULL)
+        if p_win.nn() {
+            crate::window::sqlite3_window_code_init(p, sel);
+        }
 
         // Begin the database scan.
         let el = p.s(sel).p_e_list;
@@ -4278,12 +4291,30 @@ fn sqlite3_select_body(p: &mut Parse, sel: SelectId, dest: &mut SelectDest, b_po
             p.v.change_to_noop(s_sort.addr_sort_index);
         }
 
-        // Use the standard inner loop.
-        let (i_cont, i_brk) = (winfo.continue_label(), winfo.break_label());
-        select_inner_loop(p, sel, -1, Some(&mut s_sort), Some(&s_distinct), dest, i_cont, i_brk);
+        if p_win.nn() {
+            let addr_gosub = p.v.make_label();
+            let i_cont = p.v.make_label();
+            let i_break = p.v.make_label();
+            p.n_mem += 1;
+            let reg_gosub = p.n_mem;
 
-        // End the database scan loop.
-        sqlite3_where_end(p, winfo);
+            crate::window::sqlite3_window_code_step(p, sel, winfo, reg_gosub, addr_gosub);
+
+            p.v.add_op2(OP_Goto, 0, i_break);
+            p.v.resolve_label(addr_gosub);
+            s_sort.label_ob_lopt = 0;
+            select_inner_loop(p, sel, -1, Some(&mut s_sort), Some(&s_distinct), dest, i_cont, i_break);
+            p.v.resolve_label(i_cont);
+            p.v.add_op1(OP_Return, reg_gosub);
+            p.v.resolve_label(i_break);
+        } else {
+            // Use the standard inner loop.
+            let (i_cont, i_brk) = (winfo.continue_label(), winfo.break_label());
+            select_inner_loop(p, sel, -1, Some(&mut s_sort), Some(&s_distinct), dest, i_cont, i_brk);
+
+            // End the database scan loop.
+            sqlite3_where_end(p, winfo);
+        }
     } else {
         // This case is for when there exist aggregate functions or a GROUP BY clause or both.
         // tag-select-0800

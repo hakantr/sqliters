@@ -1797,7 +1797,9 @@ pub fn sqlite3_expr_code_target(p: &mut Parse, mut e: ExprId, target: i32) -> i3
         }
         TK_FUNCTION => {
             let mut const_mask: u32 = 0;
-            // (EP_WinFunc: window functions are not ported in step V1)
+            if p.e(e).has(EP_WinFunc) {
+                return p.w(p.e(e).y_win).reg_result;
+            }
             if p.ok_const_factor && sqlite3_expr_is_constant_not_join(p, e) != 0 {
                 // SQL functions can be expensive. So try to avoid running them multiple times
                 // if we know they always give the same result.

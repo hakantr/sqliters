@@ -628,8 +628,11 @@ pub fn sqlite3_expr_add_function_order_by(p: &mut Parse, e: ExprId, order_by: Ex
         // Ignore ORDER BY on zero-argument aggregates
         return;
     }
-    // IsWindowFunc(pExpr): window functions are not ported in step V1 (the parser reports the
-    // statement as unsupported before a window can be attached).
+    if p.e(e).has(EP_WinFunc) && p.w(p.e(e).y_win).e_frm_type != TK_FILTER {
+        // IsWindowFunc(pExpr)
+        sqlite3_expr_order_by_aggregate_error(p, e);
+        return;
+    }
     if p.l(order_by).n_expr() > p.db.a_limit[SQLITE_LIMIT_COLUMN as usize] {
         p.error_msg("too many terms in ORDER BY clause");
         return;
@@ -912,6 +915,11 @@ pub fn sqlite3_select_dup(p: &mut Parse, dup: SelectId, flags: i32) -> SelectId 
             sel_id: old.sel_id,
         };
         let id = p.new_select(n);
+        let defn = crate::window::sqlite3_window_list_dup(p, old.p_win_defn);
+        p.sm(id).p_win_defn = defn;
+        if old.p_win.nn() {
+            gather_select_windows(p, id);
+        }
         if prev_new.nn() {
             p.sm(prev_new).p_prior = id;
         } else {
@@ -922,6 +930,33 @@ pub fn sqlite3_select_dup(p: &mut Parse, dup: SelectId, flags: i32) -> SelectId 
         s = old.p_prior;
     }
     p_ret
+}
+
+/// `gatherSelectWindowsCallback(pWalker, pExpr)`
+fn gather_select_windows_callback(p: &mut Parse, w: &mut Walker, e: ExprId) -> i32 {
+    if p.e(e).op == TK_FUNCTION && p.e(e).has(EP_WinFunc) {
+        let win = p.e(e).y_win;
+        debug_assert!(p.w(win).pp_this == WinPpThis::None);
+        crate::window::sqlite3_window_link(p, w.p_select, win);
+    }
+    WRC_Continue
+}
+/// `gatherSelectWindowsSelectCallback(pWalker, p)`
+fn gather_select_windows_select_callback(_p: &mut Parse, w: &mut Walker, s: SelectId) -> i32 {
+    if s == w.p_select { WRC_Continue } else { WRC_Prune }
+}
+/// `gatherSelectWindows(p)`: scan all the expressions of a newly duplicated SELECT statement
+/// and gather all of the Window objects found there, assembling them onto the linked list at
+/// Select->pWin.
+fn gather_select_windows(p: &mut Parse, sel: SelectId) {
+    let mut w = Walker {
+        x_expr_callback: Some(gather_select_windows_callback),
+        x_select_callback: Some(gather_select_windows_select_callback),
+        has_parse: false,
+        p_select: sel,
+        ..Walker::default()
+    };
+    sqlite3_walk_select(p, &mut w, sel);
 }
 
 /// `sqlite3WithDup(db, p)`
@@ -2052,8 +2087,19 @@ pub fn sqlite3_references_src_list(p: &mut Parse, e: ExprId, src_list: SrcListId
                 continue;
             } else if ex.use_x_select() {
                 walk_select(p, x, src, e_code, ex.x_select());
-            } else if ex.x_list().nn() {
-                walk_list(p, x, src, e_code, ex.x_list());
+            } else {
+                if ex.x_list().nn() {
+                    walk_list(p, x, src, e_code, ex.x_list());
+                }
+                if ex.has(EP_WinFunc) {
+                    // walkWindowList(pWalker, pExpr->y.pWin, 1)
+                    let w = p.w(ex.y_win);
+                    walk_list(p, x, src, e_code, w.p_order_by);
+                    walk_list(p, x, src, e_code, w.p_partition);
+                    walk_expr(p, x, src, e_code, w.p_filter);
+                    walk_expr(p, x, src, e_code, w.p_start);
+                    walk_expr(p, x, src, e_code, w.p_end);
+                }
             }
             break;
         }
@@ -2103,6 +2149,10 @@ pub fn sqlite3_references_src_list(p: &mut Parse, e: ExprId, src_list: SrcListId
     if left.nn() {
         let l = p.e(left).x_list();
         walk_list(p, &mut x, src_list, &mut e_code, l);
+    }
+    if p.e(e).has(EP_WinFunc) {
+        let f = p.w(p.e(e).y_win).p_filter;
+        walk_expr(p, &mut x, src_list, &mut e_code, f);
     }
     if e_code & 0x01 != 0 {
         1

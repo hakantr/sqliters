@@ -102,7 +102,7 @@ fn program_sizing() {
 
 #[test]
 fn unsupported_statements_are_reported_not_approximated() {
-    for sql in ["create table t(x)", "insert into t values(1)", "select row_number() over ()", "pragma page_size"] {
+    for sql in ["create table t(x)", "insert into t values(1)", "pragma page_size"] {
         assert!(matches!(prepare(Db::new(&NoHost), sql), PrepareResult::Unsupported(_)), "{sql}");
     }
     // A table in FROM is compiled since step V2: with no schema it is C's error.
@@ -110,4 +110,62 @@ fn unsupported_statements_are_reported_not_approximated() {
         panic!("select a from t")
     };
     assert_eq!((message.as_str(), offset), ("no such table: t", -1));
+}
+
+/// A window function without a FROM clause (step V4a): the listing of the C library.
+#[test]
+fn window_function_without_from() {
+    let PrepareResult::Program(p) = prepare(Db::new(&NoHost), "EXPLAIN SELECT row_number() OVER ()") else {
+        panic!("not compiled")
+    };
+    assert_eq!(
+        crate::explain_text(&p),
+        [
+            "0|Init|0|44|0||0|",
+            "1|Null|0|1|0||0|",
+            "2|InitCoroutine|3|6|3||0|",
+            "3|Integer|0|4|0||0|",
+            "4|Yield|3|0|0||0|",
+            "5|EndCoroutine|3|0|0||0|",
+            "6|OpenEphemeral|0|1|0||0|",
+            "7|OpenDup|1|0|0||0|",
+            "8|OpenDup|2|0|0||0|",
+            "9|OpenDup|3|0|0||0|",
+            "10|Integer|1|5|0||0|",
+            "11|InitCoroutine|3|0|3||0|",
+            "12|Yield|3|29|0||0|",
+            "13|Copy|4|7|0||2|",
+            "14|MakeRecord|7|1|8||0|",
+            "15|NewRowid|1|9|0||0|",
+            "16|Insert|1|8|9||0|",
+            "17|Ne|5|22|9||0|",
+            "18|Null|0|1|0||0|",
+            "19|Rewind|0|0|0||0|",
+            "20|Rewind|3|0|0||0|",
+            "21|Goto|0|28|0||0|",
+            "22|AggStep|0|10|1|row_number(0)|0|",
+            "23|Next|3|24|0||0|",
+            "24|AggValue|1|0|2|row_number(0)|0|",
+            "25|Gosub|6|40|0||0|",
+            "26|Delete|0|0|0||2|",
+            "27|Next|0|28|0||0|",
+            "28|Goto|0|12|0||0|",
+            "29|Rewind|1|38|0||0|",
+            "30|AggStep|0|10|1|row_number(0)|0|",
+            "31|Next|3|32|0||0|",
+            "32|AggValue|1|0|2|row_number(0)|0|",
+            "33|Gosub|6|40|0||0|",
+            "34|Delete|0|0|0||2|",
+            "35|Next|0|37|0||0|",
+            "36|Goto|0|38|0||0|",
+            "37|Goto|0|32|0||0|",
+            "38|ResetSorter|0|0|0||0|",
+            "39|Goto|0|43|0||0|",
+            "40|Copy|2|10|0||0|",
+            "41|ResultRow|10|1|0||0|",
+            "42|Return|6|0|0||0|",
+            "43|Halt|0|0|0||0|",
+            "44|Goto|0|1|0||0|",
+        ]
+    );
 }

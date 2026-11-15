@@ -14,6 +14,7 @@
 | V1 — temel, ifadeler, `FROM`'suz `SELECT` | `bdffdc1` | program gösterimi ve kurucu, `EXPLAIN` listesi, C'nin ayrıştırma ağacı, `resolve.c`, `expr.c`, `VALUES`, işlem ifadeleri | 54.469 / 54.469 kabul edilen (144 desteklenmiyor) | 3.954 / 39.300 (%10,1) | 907 geçti, bilinen 4 başarısız, 337 yok sayıldı |
 | V2 — tablolar: şema bağdaştırıcısı, sıralayıcı, `where.c` ailesi, birleşimler | `c4efe5e` | `whereexpr.c`, `where.c`, `wherecode.c`, `select.c` (GROUP BY hariç), alt sorgu düzleştirme, görünümler, `EXPLAIN QUERY PLAN` | 35.525 / 35.526 kabul edilen (3.474 desteklenmiyor) | 13.659 / 39.300 (%34,8) | 929 geçti, bilinen 4 başarısız, 337 yok sayıldı |
 | V3 — şemanın C gibi yüklenmesi, GROUP BY / HAVING / FILTER, özyinelemeli CTE | `a0dfd44` | `build.c` tablo/indeks/görünüm kurucuları, `sqlite3Init`, `sqlite3AnalysisLoad`, GROUP BY sıralayıcı dalı, FILTER, `generateWithRecursiveQuery`, C bağlantı durumu (DBFLAG_EncodingFixed) | 87.000 / 87.000 kabul edilen (8 derlem; 0 farklı) | 14.133 / 39.300 (%36,0) | 979 geçti, bilinen 4 başarısız, 337 yok sayıldı |
+| V4a — pencere işlevleri | (bu commit) | `window.c`'nin üretici tarafı (yeniden yazım, adlandırılmış / zincirlenmiş pencereler, `sqlite3WindowCodeInit` / `CodeStep` ve yardımcıları, ROWS / RANGE / GROUPS, EXCLUDE), ayrıştırıcı kuralları 93, 318–345 | 24.012 / 24.012 (pencere derlemleri) + V3'ün 87.000'i | 14.532 / 39.300 (%37,0) | 1002 geçti, bilinen 4 başarısız, 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -104,6 +105,27 @@ Ayrıntı: `karar_esligi_v1.md` (işlev eşlemesi, karar tabloları, kapsam tabl
 **Değişen test beklentileri.** `plan_tests.rs`: `unsupported_over_tables` yerine `unsupported_in_v3`; tablo üzerinde GROUP BY artık destekleniyor (C'nin listesi `group_by_in_index_order` ile sınanıyor). Başka beklenti değişmedi.
 
 **Bilinen eksikler ve sonraki adım.** Pencere işlevleri ve FROM içinde sanal tablolar / tablo değerli işlevler taşınmadı; öneri: V4a (`window.c`) ve V4b (`vtab.c`, `whereLoopAddVirtual`). Bu adımda görülen eski motor farkları `gorulen_farklar_v3.md`'de (D1–D29). **D23 veri farkı:** `SELECT 0.5 IS TRUE` motorda 0, C'de 1 — motor kuyruğunda öne alınmalı.
+
+## V4a — pencere işlevleri (Rust 1.100 ile)
+
+**Önce: araç zinciri.** Ayrı commit (`9f67480`): `rust-toolchain.toml` `channel = "1.100"`, `rust-version = "1.100"`. Aynı kaynakta 1.99.1 → 1.100: speedbench toplam 0,994x, geomean 1,003x; testler, DML farksalı ve ayrışma bulucu aynı. Bu adımdan itibaren hız tabanı 1.100 ile derleniyor (`target/perf-work/v4_bin/base_1100/`).
+
+**Taşınan** (`crates/sqliters-codegen/src/`; ayrıntı `karar_esligi_v4a.md`).
+- `window.rs`: `window.c`'nin kod üretici tarafının tamamı — `sqlite3WindowRewrite` ve yürüteçleri, adlandırılmış / zincirlenmiş pencereler, `Alloc` / `Assemble` / `Attach` / `Link` / `Unlink` / `Compare` / `Dup`, `sqlite3WindowCodeInit`, `sqlite3WindowCodeStep` ve tüm yardımcıları (`windowCodeOp`, `windowReturnOneRow`, `windowAggStep` / `Final`, `windowFullScan`, `windowIfNewPeer`, `windowCodeRangeTest`, `windowCheckValue`, `windowCacheFrame`, `windowInitAccum`, `windowExprGtZero`).
+- Yerleşik işlev kimliği: C'nin `zName==xxxName` / `xSFunc==noopStepFunc` karşılaştırması yerine `SQLITE_FUNC_BUILTIN|SQLITE_FUNC_WINDOW` bayraklı FuncDef + ad (uygulama işlevi bu bayrağı taşıyamaz). Host arayüzü değişmedi.
+- `parse.rs` kuralları 93, 318–345; `resolve.rs` pencere dalları ve `windowRemoveExprFromSelect`; `expr.rs` (`SelectDup` WINDOW listesini kopyalıyor, pencere işlevinde ORDER BY hatası); `select.rs` (özyinelemeli CTE pencere hatası, `multiSelectValues`); `flatten.rs` aşağı itme kısıtları 6a–6c.
+
+**Kanıt** (ikili `r2`; sonuçlar `target/perf-work/v4a/res/*_r2.*`).
+- Pencere derlemleri (`gen_win.py`; win_a 12.000, win_b 6.000, win_c 6.000, elle yazılmış win_d 12): `EXPLAIN` ve EQP 24.012 / 24.012 kabul edilen ve aynı; terim / döngü / yol / agg / şema katmanları aynı; yeni **Window nesnesi döküm katmanı** (C `patch_v4a.py` ile) 16.833 / 16.833 aynı.
+- V3 derlemleri (87.000 ifade): hâlâ %100 aynı, tüm katmanlar.
+- Tüm ifade türleri: kabul **%36,0 → %37,0** (14.532); `EXPLAIN` aynı 14.177, farklı 355 (V3'ün aynı, önceden atfedilmiş 355'i); EQP aynı 14.260, farklı 272 (V3 ile aynı küme). "Pencere işlevi" diye desteklenmeyen 409 ifadenin 399'u artık kabul edilip aynı; 10'u tetikleyici gövdesi / DML içinde (ifade türü olarak bekliyor).
+- `SQLITERS_VDBE_EXEC=1` ile sonuç satırları: makinede 4.617 ifadenin 4.615'i C ile aynı; 2 fark D30 (motorun WITHOUT ROWID `UNIQUE PRIMARY KEY DESC` yazım sırası; C'nin `integrity_check`'i dosyayı reddediyor — V4a öncesinde de var). Hata yolunda 51 + 2 fark motor mesajlarından (D31, D32, D21).
+- C tarafı kapsamı (gcov): `window.c` satır %99,4 (970 / 976), dal %95,8 (548 / 572); hiç alınmayan 42 dal satırı tek tek sınıflandırıldı (bellek yetmezliği, ALWAYS / NEVER, taşınmamış RENAME, test denetimi).
+- Testler: anahtar kapalı 1002 geçti / bilinen 4 / 337 yok sayıldı; açık 996 / 10 (M2'nin 9'u + F6). DML farksalı 378 / 400; ayrışma bulucu h7b ile aynı. Hız (1.100 tabanına göre, boş makinede 7 deneme): toplam 1,001x, geomean 0,998x.
+
+**Değişen test beklentileri (2).** `explain_tests.rs` ve `plan_tests.rs` içindeki "desteklenmiyor" listelerinden birer pencere ifadesi çıkarıldı (C bunları derliyor); C'nin çıktısı 3 yeni testle (`window_function_without_from`, `window_aggregate_listing`, `window_objects_dump`) sınanıyor.
+
+**Kalanlar.** Eski motor farkları `gorulen_farklar_v4a.md`'de (D30–D32). **D30 veri farkıdır** ve D23 ile birlikte motor kuyruğunda öne alınmalı.
 
 ## M1 — makine: `SELECT` programlarının C gibi çalıştırılması (dal `performans-A-vdbe-makine`)
 

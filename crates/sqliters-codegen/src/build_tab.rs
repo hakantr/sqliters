@@ -1490,7 +1490,15 @@ fn fix_select_cb(p: &mut Parse, w: &mut Walker, sel: SelectId) -> i32 {
 /// `sqlite3FixSelect(pFix, pSelect)` after `sqlite3FixInit(pFix, pParse, iDb, "view", pName)`.
 /// Returns true on error.
 fn fix_select(p: &mut Parse, sel: SelectId, i_db: i32) -> bool {
-    let mut w = Walker { x_expr_callback: Some(fix_expr_cb), x_select_callback: Some(fix_select_cb), n: i_db, b1: i_db == 1, ..Walker::default() };
+    // (xSelectCallback2 = sqlite3WalkWinDefnDummyCallback: the window definitions are walked)
+    let mut w = Walker {
+        x_expr_callback: Some(fix_expr_cb),
+        x_select_callback: Some(fix_select_cb),
+        n: i_db,
+        b1: i_db == 1,
+        walk_win_defn: true,
+        ..Walker::default()
+    };
     crate::walker::sqlite3_walk_select(p, &mut w, sel) != 0
 }
 

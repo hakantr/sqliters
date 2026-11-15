@@ -121,7 +121,12 @@ pub fn sqlite3_walk_select_expr(p: &mut Parse, w: &mut Walker, sel: SelectId) ->
     if sqlite3_walk_expr(p, w, e) != 0 {
         return WRC_Abort;
     }
-    // (p->pWinDefn: window definitions are not ported in step V1)
+    let defn = p.s(sel).p_win_defn;
+    if defn.nn() && (w.walk_win_defn || (w.has_parse && p.in_rename_object())) {
+        // The following may return WRC_Abort if there are unresolvable symbols (e.g. a table
+        // that does not exist) in a window definition.
+        return walk_window_list(p, w, defn, false);
+    }
     WRC_Continue
 }
 

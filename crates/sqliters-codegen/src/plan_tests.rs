@@ -509,7 +509,7 @@ fn planner_dump_of_a_join() {
 #[test]
 fn unsupported_in_v3() {
     let host = TestHost;
-    for sql in ["select sum(a) over () from t", "select * from pragma_table_info('t')"] {
+    for sql in ["select * from pragma_table_info('t')"] {
         assert!(matches!(crate::prepare(db(&host), sql), PrepareResult::Unsupported(_)), "{sql}");
     }
 }
@@ -707,5 +707,97 @@ fn recursive_cte_query_plan() {
             "42|0|186|SCAN c",
             "47|0|0|USING ROWID SEARCH ON TABLE t FOR IN-OPERATOR",
         ],
+    );
+}
+
+// ---- step V4a: window functions ----
+
+/// An aggregate as a window function over a table: the listing of the C library.
+#[test]
+fn window_aggregate_listing() {
+    check(
+        "EXPLAIN SELECT sum(a) OVER () FROM t",
+        &[
+            "0|Init|0|57|0||0|",
+            "1|Null|0|1|0||0|",
+            "2|InitCoroutine|3|9|3||0|",
+            "3|OpenRead|6|3|0|k(2,,)|0|",
+            "4|Rewind|6|8|4|0|0|",
+            "5|IdxRowid|6|4|0||0|",
+            "6|Yield|3|0|0||0|",
+            "7|Next|6|5|0||1|",
+            "8|EndCoroutine|3|0|0||0|",
+            "9|OpenEphemeral|1|1|0||0|",
+            "10|OpenDup|2|1|0||0|",
+            "11|OpenDup|3|1|0||0|",
+            "12|OpenDup|4|1|0||0|",
+            "13|Integer|1|5|0||0|",
+            "14|InitCoroutine|3|0|3||0|",
+            "15|Yield|3|38|0||0|",
+            "16|Copy|4|7|0||2|",
+            "17|MakeRecord|7|1|8||0|",
+            "18|NewRowid|2|9|0||0|",
+            "19|Insert|2|8|9||0|",
+            "20|Ne|5|25|9||0|",
+            "21|Null|0|1|0||0|",
+            "22|Rewind|1|0|0||0|",
+            "23|Rewind|4|0|0||0|",
+            "24|Goto|0|37|0||0|",
+            "25|Goto|0|37|0||0|",
+            "26|Column|4|0|10||0|",
+            "27|AggStep|0|10|1|sum(1)|1|",
+            "28|Next|4|30|0||0|",
+            "29|Goto|0|31|0||0|",
+            "30|Goto|0|26|0||0|",
+            "31|AggValue|1|1|2|sum(1)|0|",
+            "32|Gosub|6|53|0||0|",
+            "33|Delete|1|0|0||2|",
+            "34|Next|1|36|0||0|",
+            "35|Goto|0|37|0||0|",
+            "36|Goto|0|32|0||0|",
+            "37|Goto|0|15|0||0|",
+            "38|Rewind|2|51|0||0|",
+            "39|Column|4|0|10||0|",
+            "40|AggStep|0|10|1|sum(1)|1|",
+            "41|Next|4|43|0||0|",
+            "42|Goto|0|44|0||0|",
+            "43|Goto|0|39|0||0|",
+            "44|AggValue|1|1|2|sum(1)|0|",
+            "45|Gosub|6|53|0||0|",
+            "46|Delete|1|0|0||2|",
+            "47|Next|1|49|0||0|",
+            "48|Goto|0|51|0||0|",
+            "49|Goto|0|45|0||0|",
+            "50|Goto|0|44|0||0|",
+            "51|ResetSorter|1|0|0||0|",
+            "52|Goto|0|56|0||0|",
+            "53|Copy|2|11|0||0|",
+            "54|ResultRow|11|1|0||0|",
+            "55|Return|6|0|0||0|",
+            "56|Halt|0|0|0||0|",
+            "57|Transaction|0|0|5|0|1|",
+            "58|Goto|0|1|0||0|",
+        ],
+    );
+}
+
+/// The Window objects at sqlite3WindowCodeStep() (one SELECT per window list after the
+/// rewrite: four nested sub-queries) are exactly those of the instrumented C library.
+#[test]
+fn window_objects_dump() {
+    let host = TestHost;
+    let sql = "EXPLAIN SELECT b, rank() OVER (PARTITION BY c ORDER BY b ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING EXCLUDE TIES), max(a) OVER (PARTITION BY c ORDER BY b ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING EXCLUDE TIES), lag(d, 2) OVER win, nth_value(d, 2) OVER win FROM t WINDOW win AS (ORDER BY a RANGE BETWEEN 2 PRECEDING AND 1 FOLLOWING)";
+    let (r, _, dump) = crate::prepare_with_where_dump(db(&host), sql);
+    assert!(matches!(r, PrepareResult::Program(_)), "{sql}");
+    let win: Vec<&str> = dump.iter().map(|s| s.as_str()).filter(|s| s.starts_with("WIN ")).collect();
+    assert_eq!(
+        win,
+        [
+            "WIN 0 sel=4 func=nth_value/2 flags=810001 frm=90 start=89 end=87 excl=0 implicit=0 pStart=1 pEnd=1 part=-1 ob=1 filter=0 eph=16 accum=10 result=11 csrApp=22 regApp=21 regPart=0 nBuf=4 argCol=5 regOne=20 rs=0 re=0 exprArgs=0 eDelete=2 regArg=39",
+            "WIN 0 sel=3 func=lag/2 flags=810001 frm=77 start=91 end=86 excl=0 implicit=0 pStart=0 pEnd=0 part=-1 ob=1 filter=0 eph=11 accum=7 result=8 csrApp=24 regApp=0 regPart=0 nBuf=4 argCol=5 regOne=55 rs=0 re=0 exprArgs=0 eDelete=0 regArg=66",
+            "WIN 0 sel=2 func=max/1 flags=8801021 frm=77 start=89 end=87 excl=95 implicit=0 pStart=1 pEnd=1 part=1 ob=1 filter=0 eph=6 accum=4 result=5 csrApp=26 regApp=0 regPart=81 nBuf=4 argCol=6 regOne=82 rs=83 re=84 exprArgs=0 eDelete=2 regArg=98",
+            "WIN 0 sel=1 func=rank/0 flags=810001 frm=90 start=91 end=86 excl=0 implicit=0 pStart=0 pEnd=0 part=1 ob=1 filter=0 eph=1 accum=1 result=2 csrApp=0 regApp=0 regPart=109 nBuf=4 argCol=6 regOne=110 rs=0 re=0 exprArgs=0 eDelete=1 regArg=125",
+        ],
+        "{sql}"
     );
 }
