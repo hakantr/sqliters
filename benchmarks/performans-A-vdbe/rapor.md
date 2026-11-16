@@ -27,7 +27,8 @@
 | V6b.7 — bağlantı/cache PRAGMA hazırlama etkileri | `8fdf60f` | cache_spill, busy_timeout, wal_autocheckpoint; TEMP, EXPLAIN ve ilk kodlama yüklemesi | 7.701 EXPLAIN/EQP, 6.757 tam program, 330+16 API aynı | Yeniden ölçülmedi | kapalı 1063/0; açık 1048/15 bilinen; 337 yok sayıldı |
 | V6b.8 — locking_mode ve hazırlama hataları; D103 açık | `d9f13d7` | Global/yerel kip; tempFile, sayaç, sentaks ve hata konumu | 10093 EXPLAIN/EQP; 8249 tam program; API 487/488 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1071/0; açık 1056/15 bilinen; 337 yok sayıldı |
 | V6b.9 — temp_store hazırlama ve şema temizleme | `94c2949` | İlk karakter, TEMP işlem koruması, sabit sonuç ve cache_size koruma | 11832 EXPLAIN/EQP; 9216 tam program; API 1047/1048 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1076/0; açık 1061/15 bilinen; 337 yok sayıldı |
-| V6b.10 — encoding hazırlama ve advisory expire; D111 açık | bu commit | Aliaslar, şema/kodlama geri yükleme, dosya kilidi, bekleyen/çalışan ifadeler | 13493 EXPLAIN/EQP; 10012 tam program; API 1721/1722 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1083/0; açık 1068/15 bilinen; 337 yok sayıldı |
+| V6b.10 — encoding hazırlama ve advisory expire; D111 açık | `f3762ab` | Aliaslar, şema/kodlama geri yükleme, dosya kilidi, bekleyen/çalışan ifadeler | 13493 EXPLAIN/EQP; 10012 tam program; API 1721/1722 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1083/0; açık 1068/15 bilinen; 337 yok sayıldı |
+| V6b.11 — doğrulama hazırlama durumu; D112/D113 açık | bu commit | D111, ilk sanal tablo ve şema çerezi önizlemesi | 11172 tam program aynı; yeni bozuk şema farkları açık | Yeniden ölçülmedi | kapalı 1087/0; açık 1072/15 bilinen; 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -400,3 +401,7 @@ temp_store hazırlama etkileri, TEMP işlem koruması, şema temizleme, cache_si
 ## V6b.10 — kodlama hazırlaması
 
 encoding üretimi ve hazırlama etkileri, aynı atamada advisory expire, sorgunun şema okuması, boş pagerlerin kodlaması ve kilitsiz setter C ile karşılaştırıldı. Üç mevcut dosya kodlaması değişmeden açıldı. Kanıt ve açık sınırlar [karar_esligi_v6b_10.md](karar_esligi_v6b_10.md) içinde. Önce D111 ve sanal tablo bağlama doğrulaması, ardından kalan PRAGMA doğruluk dilimleriyle devam edilecek.
+
+## V6b.11 — üretici doğrulama durumu
+
+D111 ve ilk sanal tablo bağlama sınırı kapandı; 11.172 tam program aynı ilk-kullanım girdisinde C ile eşleşti. Bağımsız bozuk şema yoklaması D112/D113 farklarını gösterdi; bunlar sonraki adıma önceliklendirildi. Kanıt ve dört kapı [karar_esligi_v6b_11.md](karar_esligi_v6b_11.md) içinde.

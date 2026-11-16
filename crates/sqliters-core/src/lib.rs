@@ -3508,22 +3508,38 @@ impl Connection {
     /// Test oracle of the port of C's code generator: the program the generator builds for
     /// the statement `sql` in the connection's current state (what `sqlite3_prepare_v2`
     /// would build in C). `Err` carries C's compile error (`"error: ..."`) or the part of the
-    /// generator that is not ported (`"unsupported: ..."`). Nothing else changes.
+    /// generator that is not ported (`"unsupported: ..."`). Schema metadata and virtual-table
+    /// connections may initialize; the returned program is not executed and top-level
+    /// PRAGMA prepare effects are discarded.
     #[doc(hidden)]
     pub fn c_generated_program(&self, sql: &str) -> std::result::Result<sqliters_vdbe::vdbeaux::Program, String> {
         let mut session = self.shared.enter().map_err(|e| e.message)?;
-        // (as for EXPLAIN: the virtual tables C connects while it prepares an ALTER TABLE ADD
-        // COLUMN - pragma_quick_check of the nested constraint check)
-        if let Ok((Some(st @ Stmt::AlterTable { .. }), _)) = parse_one(sql) {
-            let shared = &self.shared;
-            let _ = session.inner_mut().with_default_exec_ctx(
-                shared,
-                ActivitySummary::default(),
-                |ctx| crate::vtab::ensure_stmt_vtabs_connected(ctx, &st),
-            );
+        // Seed the same already-known encoding flag as real prepare, including
+        // after a literal INSERT that bypassed prepare (prepare.c:104).
+        session.inner_mut().db_set.c_note_encoding_fixed();
+        if let Ok((Some(st), _)) = parse_one(sql) {
+            if stmt_loads_schema_on_prepare(&st) || crate::engine::c_pragma_reads_schema(&st) {
+                let inner = session.inner_mut();
+                let unloaded = inner.db_set.c_any_schema_unloaded();
+                inner.db_set.set_c_prepare_unloaded(unloaded);
+                inner.refresh_open_tx_schemas().map_err(|e| format!("error: {}", e.message))?;
+                inner.ensure_schemas_loaded_for_prepare(false).map_err(|e| format!("error: {}", e.message))?;
+                inner.db_set.c_mark_schemas_loaded();
+                inner.db_set.c_note_encoding_fixed();
+                if unloaded { inner.db_set.c_note_stats(false); }
+            }
+            // C calls xConnect while compiling SELECT and ALTER's nested checks.
+            if matches!(st, Stmt::Select(_) | Stmt::AlterTable { .. }) {
+                let shared = &self.shared;
+                let _ = session.inner_mut().with_default_exec_ctx(
+                    shared,
+                    ActivitySummary::default(),
+                    |ctx| crate::vtab::ensure_stmt_vtabs_connected(ctx, &st),
+                );
+            }
         }
         let (r, _, _) = cgen::c_prepare(session.inner(), sql);
-        // The verification oracle is read-only; its prepare effects must not leak
+        // The preview's top-level PRAGMA effects must not leak
         // into a later prepare/reprepare, including one on another connection.
         let _ = cgen::take_c_pragma_effects();
         match r {
