@@ -2620,6 +2620,43 @@ impl Pager {
         self.page_count
     }
 
+    /// sqlite3BtreeOpen's unlocked file-header read (btree.c:2716–2767).
+    /// Signature and page contents are validated later by lockBtree.
+    pub fn read_btree_header_at_open(&mut self) -> Result<()> {
+        let mut bytes = [0u8; DB_HEADER_SIZE];
+        if let Some(file) = self.file.as_deref() {
+            file.read_at(&mut bytes, 0)?;
+        }
+        let size = (u32::from(bytes[16]) << 8) | (u32::from(bytes[17]) << 16);
+        if DatabaseHeader::is_valid_page_size(size) {
+            if size != self.header.page_size {
+                self.bump_data_version();
+                self.header.page_size = size;
+                self.pcache_reset();
+            }
+            self.header.reserved_bytes = bytes[20];
+            self.page_size_fixed = true;
+            self.header.largest_root_btree_page = u32::from_be_bytes(bytes[52..56].try_into().unwrap());
+            self.header.incremental_vacuum_mode = u32::from_be_bytes(bytes[64..68].try_into().unwrap());
+            self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
+        }
+        Ok(())
+    }
+
+    /// PRAGMA page_size's prepare-time sqlite3BtreeSetPageSize call, without a schema read.
+    /// A fixed Btree ignores requests; nextPagesize belongs to the connection instead.
+    pub fn set_pragma_page_size(&mut self, size: i32) {
+        let Ok(mut size) = u32::try_from(size) else { return; };
+        if self.page_size_fixed || !DatabaseHeader::is_valid_page_size(size) { return; }
+        if size == 512 && self.header.reserved_bytes > 32 { size = 1024; }
+        if size != self.header.page_size {
+            self.notify_backup_restart();
+            self.bump_data_version();
+            self.header.page_size = size;
+            self.pcache_reset();
+        }
+    }
+
     /// Sets the page size before the database is initialized (`PRAGMA page_size = N`), or records
     /// `next_page_size` for a subsequent `VACUUM` when the database already has fixed pages or WAL.
     pub fn set_page_size(&mut self, new_size: u32) -> Result<()> {

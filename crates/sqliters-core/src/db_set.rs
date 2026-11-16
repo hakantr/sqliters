@@ -163,8 +163,6 @@ pub struct DbSlot {
     /// 99 in C (`sqlite3CreateIndex()` -> `sqlite3DefaultRowEst()` on the live table) since C
     /// last read the statistics or loaded this schema.
     pub c_rowest_tables: std::collections::HashSet<String>,
-    /// Deferred page size requested via `PRAGMA [schema.]page_size = N` for next `VACUUM`.
-    pub next_page_size: Option<u32>,
     /// Deferred auto-vacuum mode requested via `PRAGMA [schema.]auto_vacuum = M` for next `VACUUM`.
     pub next_auto_vacuum: Option<AutoVacuumMode>,
     /// Per-database `PRAGMA [schema.]max_page_count` limit.
@@ -314,6 +312,8 @@ pub struct DatabaseSet {
     /// machine that is running then fails with SQLITE_ABORT_ROLLBACK at its next
     /// `OP_OpenRead`.
     c_expire_seq: u64,
+    /// sqlite3.nextPagesize, shared by every schema; invalid requests replace older ones.
+    pub(crate) next_page_size: i32,
 }
 
 impl std::fmt::Debug for DatabaseSet {
@@ -355,7 +355,6 @@ impl DatabaseSet {
                 c_tbl_hash: None,
                 c_rowest_clamped: false,
                 c_rowest_tables: Default::default(),
-                next_page_size: None,
                 next_auto_vacuum: None,
                 max_page_count: SQLITE_MAX_PAGE_COUNT,
                 enable_8_3_names: main_enable_8_3_names,
@@ -377,7 +376,6 @@ impl DatabaseSet {
                 c_tbl_hash: None,
                 c_rowest_clamped: false,
                 c_rowest_tables: Default::default(),
-                next_page_size: None,
                 next_auto_vacuum: None,
                 max_page_count: SQLITE_MAX_PAGE_COUNT,
                 enable_8_3_names: false,
@@ -416,6 +414,7 @@ impl DatabaseSet {
             c_analyzed: Vec::new(),
             c_encoding_fixed: false,
             c_expire_seq: 0,
+            next_page_size: 0,
             xferopt_delta: std::sync::atomic::AtomicU64::new(0),
             open_blobs: std::collections::HashMap::new(),
             vtab_registry: crate::vtab::VTabRegistry::new(),
@@ -1380,7 +1379,10 @@ impl DatabaseSet {
     ) -> Result<&mut DbSlot> {
         if self.slots[1].btree.is_none() {
             let opts = PagerOpenOptions {
-                default_page_size: self.default_page_size,
+                // build.c:5430: temp uses db->nextPagesize, not the main Btree's size.
+                default_page_size: u32::try_from(self.next_page_size).ok()
+                    .filter(|n| sqliters_pager::DatabaseHeader::is_valid_page_size(*n))
+                    .unwrap_or(self.attach_page_size),
                 lock_geometry: Some(self.lock_geometry),
                 db_kind: Some(DatabaseKind::PrivateTemporary),
                 temp_in_memory: self.temp_store.is_memory(),
@@ -1942,7 +1944,6 @@ impl DatabaseSet {
             c_tbl_hash: None,
             c_rowest_clamped: false,
             c_rowest_tables: Default::default(),
-            next_page_size: None,
             next_auto_vacuum: None,
             max_page_count: SQLITE_MAX_PAGE_COUNT,
             enable_8_3_names,

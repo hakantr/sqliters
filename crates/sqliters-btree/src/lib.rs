@@ -526,16 +526,21 @@ impl Btree {
         Ok(())
     }
 
+    fn from_open_pager(mut pager: Pager) -> Result<Self> {
+        pager.read_btree_header_at_open()?;
+        Ok(Self::new(pager))
+    }
+
     pub fn open_file(path: impl AsRef<Path>, flags: OpenFlags) -> Result<Self> {
-        Ok(Self::new(Pager::open_file(path, flags)?))
+        Self::from_open_pager(Pager::open_file(path, flags)?)
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Ok(Self::new(Pager::open_in_memory()?))
+        Self::from_open_pager(Pager::open_in_memory()?)
     }
 
     pub fn open_with_vfs(vfs: Arc<dyn Vfs>, path: Option<&Path>, flags: OpenFlags) -> Result<Self> {
-        Ok(Self::new(Pager::open_with_vfs(vfs, path, flags)?))
+        Self::from_open_pager(Pager::open_with_vfs(vfs, path, flags)?)
     }
 
     pub fn open_with_options(
@@ -544,13 +549,13 @@ impl Btree {
         flags: OpenFlags,
         options: PagerOpenOptions,
     ) -> Result<Self> {
-        Ok(Self::new(Pager::open_with_options(
+        Self::from_open_pager(Pager::open_with_options(
             vfs, path, flags, options,
-        )?))
+        )?)
     }
 
     pub fn open_private_temporary(vfs: Arc<dyn Vfs>, options: PagerOpenOptions) -> Result<Self> {
-        Ok(Self::new(Pager::open_private_temporary(vfs, options)?))
+        Self::from_open_pager(Pager::open_private_temporary(vfs, options)?)
     }
 
     #[inline]

@@ -43,6 +43,7 @@ pub enum PrepareEffect {
         mode: u8,
     },
     Synchronous { i_db: usize, level: u8 },
+    PageSize { i_db: usize, size: i32 },
 }
 
 /// Names of the pragmas enabled in the C reference build, in pragma.h order.
@@ -67,6 +68,7 @@ pub fn prepare_constant(name: &str) -> bool {
             "journal_size_limit",
             "secure_delete",
             "synchronous",
+            "page_size",
         ]
         .iter()
         .any(|n| name.eq_ignore_ascii_case(n))
@@ -427,7 +429,7 @@ pub fn sqlite3_pragma(
                     return_int(p, n);
                 }
             } else {
-                p.not_supported("PRAGMA page_size prepare effect (V6b)");
+                p.db.host.note_pragma_effect(PrepareEffect::PageSize { i_db: i_db as usize, size: sqlite3_get_int32(right.unwrap()).unwrap_or(0) });
             }
         }
         32 => {

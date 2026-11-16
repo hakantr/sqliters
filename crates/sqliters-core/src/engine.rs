@@ -41846,7 +41846,7 @@ pub(crate) fn exec_vacuum_checked(
                     bt.pager().page_size(),
                     bt.pager().is_pager_memdb(),
                     bt.pager().db_kind(),
-                    slot.next_page_size,
+                    u32::try_from(ctx.db_set.next_page_size).ok(),
                     slot.next_auto_vacuum
                         .unwrap_or_else(|| bt.auto_vacuum_mode()),
                     bt.pager().synchronous(),
@@ -42000,7 +42000,6 @@ pub(crate) fn exec_vacuum_checked(
         })();
 
         if let Some(slot) = ctx.db_set.slot_mut(db_id) {
-            slot.next_page_size = None;
             if opened_read && let Some(ref mut bt) = slot.btree {
                 let _ = bt.end_read_if_unused();
             }
@@ -42012,9 +42011,6 @@ pub(crate) fn exec_vacuum_checked(
 
     // In-place `VACUUM [schema]` (`into.is_none()`):
     if db_id == DatabaseId::TEMP {
-        if let Some(slot) = ctx.db_set.slot_mut(DatabaseId::TEMP) {
-            slot.next_page_size = None;
-        }
         return Ok(QueryOutput::default());
     }
 
@@ -42032,7 +42028,6 @@ pub(crate) fn exec_vacuum_checked(
             .retry_btree(bt, |b| b.begin_write())
             .map_err(VacuumFail::Clean)?;
         if let Err(e) = slot.schema.ensure_fresh_in_tx_for_schema(bt, &slot_name) {
-            slot.next_page_size = None;
             if let Err(rb_err) = bt.rollback() {
                 return Err(VacuumFail::Poison(rb_err));
             }
@@ -42040,7 +42035,7 @@ pub(crate) fn exec_vacuum_checked(
         }
         let is_wal_db = bt.journal_mode() == JournalMode::Wal || bt.pager().is_wal_mode();
         if is_wal_db {
-            slot.next_page_size = None;
+            ctx.db_set.next_page_size = 0;
         }
     }
 
@@ -42060,7 +42055,7 @@ pub(crate) fn exec_vacuum_checked(
                 bt.journal_mode() == JournalMode::Wal || bt.pager().is_wal_mode(),
                 bt.pager().lock_geometry(),
                 bt.pager().header().clone(),
-                slot.next_page_size,
+                u32::try_from(ctx.db_set.next_page_size).ok(),
                 slot.next_auto_vacuum
                     .unwrap_or_else(|| bt.auto_vacuum_mode()),
             )
@@ -42114,9 +42109,6 @@ pub(crate) fn exec_vacuum_checked(
         Ok(rebuilt_schema)
     })();
 
-    if let Some(slot) = ctx.db_set.slot_mut(db_id) {
-        slot.next_page_size = None;
-    }
     let new_schema = match res {
         Ok(s) => s,
         Err(e) => {
@@ -44463,50 +44455,10 @@ fn exec_pragma(
     match upper.as_str() {
         "PAGE_SIZE" => {
             if let Some(pv) = value {
-                {
-                    let bt = ctx
-                        .db_set
-                        .slot_mut(db_id)
-                        .and_then(|s| s.btree.as_mut())
-                        .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-                    if bt.transaction_state() == TransactionState::Open
-                        && !bt.pager().is_header_loaded()
-                        && bt.pager().db_kind() == DatabaseKind::NamedDisk
-                    {
-                        let _ = ctx
-                            .busy_policy
-                            .retry_btree(bt, |b| b.pager_mut().ensure_header_loaded().map(|_| ()));
-                    }
-                }
-                let raw = pragma_to_i64(pv);
-                if let Ok(mut sz) = u32::try_from(raw)
-                    && sqliters_pager::DatabaseHeader::is_valid_page_size(sz)
-                {
-                    let autocommit = is_in_autocommit(ctx);
-                    let slot = ctx.db_set.slot_mut(db_id).unwrap();
-                    let reserve = slot
-                        .btree
-                        .as_ref()
-                        .map_or(0, |bt| bt.pager().header().reserved_bytes);
-                    if sz == 512 && reserve > 32 {
-                        sz = 1024;
-                    }
-                    if sz.saturating_sub(u32::from(reserve)) >= 480 {
-                        slot.next_page_size = Some(sz);
-                        let applied = if let Some(ref mut bt) = slot.btree
-                            && !bt.pager().is_page_size_fixed()
-                            && bt.pager().page_count() == 0
-                            && autocommit
-                        {
-                            let _ = bt.pager_mut().set_page_size(sz);
-                            true
-                        } else {
-                            false
-                        };
-                        if applied && db_id == DatabaseId::MAIN {
-                            ctx.db_set.set_default_page_size(sz);
-                        }
-                    }
+                let size = pragma_get_int32(&pragma_to_string(pv)).unwrap_or(0);
+                ctx.db_set.next_page_size = size;
+                if let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
+                    bt.pager_mut().set_pragma_page_size(size);
                 }
                 Ok(QueryOutput::default())
             } else {

@@ -3704,7 +3704,6 @@ impl Connection {
             let main_slot = inner.db_set.main_slot_mut();
             main_slot.schema = Schema::default();
             main_slot.next_auto_vacuum = None;
-            main_slot.next_page_size = None;
         }
         inner.schema_generation += 1;
         inner.v1_expire_generation += 1;
@@ -5744,6 +5743,12 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) {
                     if i_db.is_none_or(|target| target == i) {
                         if let Some(bt) = slot.btree.as_mut() { bt.secure_delete(Some(mode)); }
                     }
+                }
+            }
+            PrepareEffect::PageSize { i_db, size } => {
+                inner.db_set.next_page_size = size;
+                if let Some(bt) = inner.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut()) {
+                    bt.pager_mut().set_pragma_page_size(size);
                 }
             }
             PrepareEffect::Synchronous { i_db, level } => {
