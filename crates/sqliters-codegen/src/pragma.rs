@@ -34,6 +34,14 @@ pub enum PrepareEffect {
         i_db: usize,
         size: i32,
     },
+    JournalSizeLimit {
+        i_db: usize,
+        limit: i64,
+    },
+    SecureDelete {
+        i_db: Option<usize>,
+        mode: u8,
+    },
 }
 
 /// Names of the pragmas enabled in the C reference build, in pragma.h order.
@@ -47,6 +55,19 @@ pub fn flag_mask(name: &str) -> Option<u64> {
 
 pub fn flag_masks() -> impl Iterator<Item = u64> {
     table::PRAGMAS.iter().filter(|p| p.typ == 4).map(|p| p.arg)
+}
+
+/// PRAGMAs whose complete program is a frozen integer row or an empty result.
+pub fn prepare_constant(name: &str) -> bool {
+    flag_mask(name).is_some()
+        || [
+            "analysis_limit",
+            "cache_size",
+            "journal_size_limit",
+            "secure_delete",
+        ]
+        .iter()
+        .any(|n| name.eq_ignore_ascii_case(n))
 }
 
 fn locate(name: &str) -> Option<&'static PragmaName> {
@@ -269,6 +290,22 @@ pub fn sqlite3_pragma(
                 p.v.add_op0(OP_Expire);
             }
         }
+        6 => {
+            // pragma.c:882–889: Schema.cache_size, changed during prepare.
+            if let Some(z) = right {
+                p.db.host.note_pragma_effect(PrepareEffect::CacheSize {
+                    i_db: i_db as usize,
+                    size: sqlite3_get_int32(z).unwrap_or(0),
+                });
+            } else if let Some(n) = host_int(p, i_db, "cache_size") {
+                // Reading the schema may initialize the pager's cache size.
+                p.db.host.note_pragma_effect(PrepareEffect::CacheSize {
+                    i_db: i_db as usize,
+                    size: n as i32,
+                });
+                return_int(p, n);
+            }
+        }
         8 if right.is_none() => {} // case_sensitive_like query is empty
         13 => {
             // PragTyp_DEFAULT_CACHE_SIZE, pragma.c:553
@@ -341,6 +378,23 @@ pub fn sqlite3_pragma(
             }
             p.v.add_op2(OP_ResultRow, 1, 1);
         }
+        24 => {
+            // pragma.c:780–788: the conversion's value is used even on error.
+            let limit = if let Some(z) = right {
+                let n = sqlite3_dec_or_hex_to_i64(z).0.max(-1);
+                p.db.host
+                    .note_pragma_effect(PrepareEffect::JournalSizeLimit {
+                        i_db: i_db as usize,
+                        limit: n,
+                    });
+                Some(n)
+            } else {
+                host_int(p, i_db, "journal_size_limit")
+            };
+            if let Some(n) = limit {
+                return_int(p, n);
+            }
+        }
         27 => {
             // page_count / max_page_count, pragma.c:673
             sqlite3_code_verify_schema(p, i_db);
@@ -370,6 +424,26 @@ pub fn sqlite3_pragma(
         32 => {
             for name in pragma_names() {
                 row(p, vec![name.into()]);
+            }
+        }
+        33 => {
+            // pragma.c:624–640: an unqualified assignment applies to all Btrees.
+            let mode = if let Some(z) = right {
+                let mode = if z.eq_ignore_ascii_case("fast") {
+                    2
+                } else {
+                    u8::from(get_boolean(z, false))
+                };
+                p.db.host.note_pragma_effect(PrepareEffect::SecureDelete {
+                    i_db: z_db.as_ref().map(|_| i_db as usize),
+                    mode,
+                });
+                Some(i64::from(mode))
+            } else {
+                host_int(p, i_db, "secure_delete")
+            };
+            if let Some(n) = mode {
+                return_int(p, n);
             }
         }
         37 => table_info(p, pragma.arg != 0, right, z_db.as_deref()),

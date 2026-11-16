@@ -128,6 +128,105 @@ fn pragma_results_and_assignments_keep_their_prepare_time_meaning() {
 }
 
 #[test]
+fn pager_pragma_results_freeze_and_explain_applies_settings() {
+    let conn = Connection::open_in_memory().unwrap();
+    for name in ["cache_size", "journal_size_limit", "secure_delete"] {
+        let error = conn.prepare(&format!("PRAGMA {name}=-'17'")).unwrap_err();
+        assert_eq!(error.message, "near \"'17'\": syntax error");
+    }
+    for (name, before, after) in [
+        ("cache_size", 17, 23),
+        ("journal_size_limit", 31, 47),
+        ("secure_delete", 1, 2),
+    ] {
+        conn.execute(&format!("PRAGMA {name}={before}")).unwrap();
+        let mut query = conn.prepare(&format!("PRAGMA {name}")).unwrap();
+        let setting = if name == "secure_delete" {
+            "FAST".to_owned()
+        } else {
+            after.to_string()
+        };
+        conn.prepare(&format!("EXPLAIN PRAGMA {name}={setting}"))
+            .unwrap();
+        let StepResult::Row(row) = query.step().unwrap() else {
+            panic!("expected row")
+        };
+        assert_eq!(row.values(), &[Value::Integer(before)]);
+        assert_eq!(integer(&conn, &format!("PRAGMA {name}")), after);
+    }
+    let mut setter = conn.prepare("PRAGMA journal_size_limit=53").unwrap();
+    conn.prepare("PRAGMA journal_size_limit=59").unwrap();
+    let StepResult::Row(row) = setter.step().unwrap() else {
+        panic!("expected row")
+    };
+    assert_eq!(row.values(), &[Value::Integer(53)]);
+    assert_eq!(integer(&conn, "PRAGMA journal_size_limit"), 59);
+    for (literal, expected) in [
+        ("9223372036854775807", i64::MAX),
+        ("4294967296", 4294967296),
+        ("0x10000000000000001", 1),
+    ] {
+        assert_eq!(
+            integer(&conn, &format!("PRAGMA journal_size_limit={literal}")),
+            expected
+        );
+        assert_eq!(integer(&conn, "PRAGMA journal_size_limit"), expected);
+    }
+}
+
+#[test]
+fn secure_delete_prepare_changes_only_the_c_selected_btrees() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("ATTACH ':memory:' AS aux; PRAGMA temp.unknown_pragma;")
+        .unwrap();
+    conn.prepare("EXPLAIN PRAGMA secure_delete=FAST").unwrap();
+    for schema in ["main", "temp", "aux"] {
+        assert_eq!(integer(&conn, &format!("PRAGMA {schema}.secure_delete")), 2);
+    }
+    conn.prepare("PRAGMA aux.secure_delete=OFF").unwrap();
+    assert_eq!(integer(&conn, "PRAGMA aux.secure_delete"), 0);
+    assert_eq!(integer(&conn, "PRAGMA main.secure_delete"), 2);
+    conn.prepare("PRAGMA temp.journal_size_limit=29").unwrap();
+    assert_eq!(integer(&conn, "PRAGMA temp.journal_size_limit"), 29);
+    conn.prepare("EXPLAIN PRAGMA cache_size=2147483648")
+        .unwrap();
+    assert_eq!(integer(&conn, "PRAGMA cache_size"), 0);
+    conn.execute("CREATE TABLE cache_zero(a)").unwrap();
+    assert_eq!(integer(&conn, "PRAGMA cache_size"), 0);
+    conn.prepare("PRAGMA writable_schema=RESET").unwrap();
+    assert_eq!(integer(&conn, "PRAGMA cache_size"), -2000);
+}
+
+#[test]
+fn cache_size_prepare_loads_the_default_cookie_from_a_c_file() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "sqliters_v6b_cache_{}_{nonce}.db",
+        std::process::id()
+    ));
+    let created = Command::new("sqlite3")
+        .arg(&path)
+        .arg("PRAGMA default_cache_size=83; CREATE TABLE t(a);")
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{:?}", created.stderr);
+    let conn = Connection::open(&path).unwrap();
+    let mut query = conn.prepare("PRAGMA cache_size").unwrap();
+    conn.prepare("PRAGMA cache_size=89").unwrap();
+    let StepResult::Row(row) = query.step().unwrap() else {
+        panic!("expected row")
+    };
+    assert_eq!(row.values(), &[Value::Integer(83)]);
+    assert_eq!(integer(&conn, "PRAGMA cache_size"), 89);
+    drop(query);
+    drop(conn);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn pragma_programs_match_c_for_schema_headers_and_flags() {
     let reference = Command::new("sqlite3")
         .args([":memory:", "SELECT sqlite_version()"])
@@ -148,6 +247,9 @@ fn pragma_programs_match_c_for_schema_headers_and_flags() {
         "data_version",
         "freelist_count",
         "default_cache_size",
+        "cache_size",
+        "journal_size_limit",
+        "secure_delete",
         "incremental_vacuum",
         "index_info",
         "index_xinfo",
@@ -170,6 +272,7 @@ fn pragma_programs_match_c_for_schema_headers_and_flags() {
             "=0",
             "=-1",
             "=0x10",
+            "=0x10000000000000001",
             "='t'",
             "('ix')",
             "('full')",

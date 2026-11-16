@@ -2109,8 +2109,17 @@ impl<'a> Parser<'a> {
         match tok.kind {
             TokenKind::Integer => {
                 self.advance();
-                let v = parse_int_literal(tok.text)?.unwrap_or(0) * neg;
-                Ok(PragmaValue::Integer(v))
+                // parse.y nmnum is a token here, not an integer expression.
+                // PRAGMA accepts a hex token even when its value exceeds i64.
+                match parse_int_literal(tok.text) {
+                    Ok(value) if value.unwrap_or(0).checked_mul(neg).is_some() =>
+                        Ok(PragmaValue::Integer(value.unwrap_or(0) * neg)),
+                    _ => Ok(PragmaValue::String(if neg < 0 {
+                        format!("-{}", tok.text)
+                    } else {
+                        tok.text.to_owned()
+                    })),
+                }
             }
             TokenKind::Float => {
                 self.advance();

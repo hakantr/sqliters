@@ -97,9 +97,13 @@ impl Host for EngineHost<'_> {
         C_PRAGMA_EFFECTS.with(|effects| effects.borrow_mut().push(effect));
     }
     fn pragma_int(&self, i_db: usize, name: &str) -> Option<i64> {
-        let bt = self.db_set.slots().get(i_db)?.btree.as_ref()?;
+        let slot = self.db_set.slots().get(i_db)?;
+        let bt = slot.btree.as_ref()?;
         match name {
             "page_size" => Some(i64::from(bt.pager().page_size())),
+            "cache_size" => Some(i64::from(bt.schema_cache_size())),
+            "journal_size_limit" => Some(bt.pager().journal_size_limit()),
+            "secure_delete" => Some(i64::from(bt.secure_delete_setting())),
             _ => None,
         }
     }

@@ -1547,7 +1547,7 @@ pub(crate) fn stmt_loads_schema_on_prepare(stmt: &Stmt) -> bool {
         Stmt::Pragma { name, .. }
             if matches!(
                 name.to_ascii_uppercase().as_str(),
-                "AUTO_VACUUM" | "INCREMENTAL_VACUUM" | "DEFAULT_CACHE_SIZE"
+                "AUTO_VACUUM" | "INCREMENTAL_VACUUM" | "DEFAULT_CACHE_SIZE" | "CACHE_SIZE"
             )
     )
 }

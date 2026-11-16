@@ -5732,6 +5732,18 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) {
                     bt.set_cache_size(size);
                 }
             }
+            PrepareEffect::JournalSizeLimit { i_db, limit } => {
+                if let Some(bt) = inner.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut()) {
+                    bt.pager_mut().set_journal_size_limit(limit);
+                }
+            }
+            PrepareEffect::SecureDelete { i_db, mode } => {
+                for (i, slot) in inner.db_set.slots_mut().iter_mut().enumerate() {
+                    if i_db.is_none_or(|target| target == i) {
+                        if let Some(bt) = slot.btree.as_mut() { bt.secure_delete(Some(mode)); }
+                    }
+                }
+            }
             PrepareEffect::Flags { flags, reset_deferred, reset_schema } => {
                 let defaults = sqliters_codegen::Db::new(&sqliters_codegen::NoHost).flags;
                 let mask = sqliters_codegen::pragma::flag_masks().fold(0, |a, b| a | b);
@@ -5756,7 +5768,10 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) {
                 if reset_deferred { inner.deferred_fk_suspects.clear(); }
                 if reset_schema {
                     inner.db_set.c_reset_all_schemas();
-                    for slot in inner.db_set.slots_mut() { slot.schema = Schema::default(); }
+                    for slot in inner.db_set.slots_mut() {
+                        if let Some(bt) = slot.btree.as_mut() { bt.reset_schema_cache_initialization(); }
+                        slot.schema = Schema::default();
+                    }
                     inner.schema_generation += 1;
                     inner.v1_expire_generation += 1;
                 }
@@ -5766,23 +5781,30 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) {
 }
 
 #[allow(non_upper_case_globals)]
-fn prepare_constant_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str) -> Option<Box<QueryOutput>> {
+fn prepare_constant_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str) -> Result<Option<Box<QueryOutput>>> {
     use sqliters_vdbe::opcodes::{OP_Int64, OP_Integer};
-    let Some(Stmt::Pragma { name, .. }) = stmt else { return None; };
-    if sqliters_codegen::pragma::flag_mask(name).is_none() && !name.eq_ignore_ascii_case("analysis_limit") {
-        return None;
+    let Some(Stmt::Pragma { name, .. }) = stmt else { return Ok(None); };
+    if !sqliters_codegen::pragma::prepare_constant(name) {
+        return Ok(None);
     }
     let (result, _, _) = cgen::c_prepare_quiet(inner, sql);
     apply_codegen_pragma_effects(inner);
-    let sqliters_codegen::PrepareResult::Program(program) = result else { return None; };
+    let program = match result {
+        sqliters_codegen::PrepareResult::Program(program) => program,
+        sqliters_codegen::PrepareResult::Unsupported(_) => return Ok(None),
+        sqliters_codegen::PrepareResult::Error { message, offset } => {
+            return Err(SqliteError::new(ErrorCode::Error, message)
+                .with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }));
+        }
+    };
     let columns = program.a_col_name.iter().take(program.n_res_column as usize).map(|s| s.clone().unwrap_or_default()).collect();
     let mut rows = Vec::new();
     if program.n_res_column != 0 {
-        let op = program.a_op.iter().find(|op| matches!(op.opcode, OP_Integer | OP_Int64) && op.p2 == 1)?;
+        let Some(op) = program.a_op.iter().find(|op| matches!(op.opcode, OP_Integer | OP_Int64) && op.p2 == 1) else { return Ok(None); };
         let value = if op.opcode == OP_Integer { i64::from(op.p1) } else { sqliters_vdbe::vdbeaux::int32_to_64(op.p1, op.p3) };
         rows.push(vec![Value::Integer(value)]);
     }
-    Some(Box::new(QueryOutput { column_names: columns, rows }))
+    Ok(Some(Box::new(QueryOutput { column_names: columns, rows })))
 }
 
 fn apply_prepare_auto_vacuum_pragma(
@@ -7429,7 +7451,7 @@ impl Statement {
                 result?
             }
         };
-        let c_prepared_pragma = prepare_constant_pragma(inner, stmt_opt.as_ref(), &raw_sql);
+        let c_prepared_pragma = prepare_constant_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
         // C's ALTER TABLE (RENAME TO, RENAME COLUMN, DROP COLUMN of a non-TEMP table) reads
         // `temp.sqlite_schema` in a nested statement, which opens the temp database while the
         // statement is prepared (`sqlite3OpenTempDatabase()`, also under EXPLAIN: the nested
@@ -8228,7 +8250,7 @@ impl Statement {
                 }
             };
             apply_codegen_pragma_effects(inner);
-            let c_prepared_pragma = prepare_constant_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql);
+            let c_prepared_pragma = prepare_constant_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
             let shared = Arc::clone(&self.shared);
             let try_compile = |inner: &mut ConnectionInner,
                                parsed_stmt: &Option<Stmt>|

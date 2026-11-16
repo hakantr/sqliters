@@ -470,6 +470,11 @@ impl Btree {
         self.secure_delete
     }
 
+    /// Current BTS_FAST_SECURE setting, without changing the Btree.
+    pub const fn secure_delete_setting(&self) -> u8 {
+        self.secure_delete
+    }
+
     /// `BTS_FAST_SECURE` test: `true` when cells freed inside a page must be zeroed.
     #[inline]
     fn zero_freed_cells(&self) -> bool {
@@ -831,12 +836,33 @@ impl Btree {
         self.pager.cache_size()
     }
 
+    /// Schema.cache_size after sqlite3InitOne initializes a previously unread schema.
+    pub fn schema_cache_size(&self) -> i32 {
+        if self.schema_cache_size_set {
+            return self.cache_size();
+        }
+        let meta = self.pager.header().default_cache_size;
+        if meta == 0 {
+            -2000
+        } else {
+            meta.checked_abs().unwrap_or(i32::MAX)
+        }
+    }
+
     /// Updates the configured page cache size (`PRAGMA cache_size = N`:
     /// `pDb->pSchema->cache_size = size; sqlite3BtreeSetCacheSize(pDb->pBt, size)`).
     #[inline]
     pub fn set_cache_size(&mut self, size: i32) {
         self.schema_cache_size_set = true;
         self.pager.set_cache_size(size);
+    }
+
+    /// C's Schema survives ordinary DDL, but a real schema reset makes a zero
+    /// cache_size eligible for initialization again (prepare.c:343).
+    pub fn reset_schema_cache_initialization(&mut self) {
+        if self.cache_size() == 0 {
+            self.schema_cache_size_set = false;
+        }
     }
 
     /// `sqlite3InitOne`: "if( pDb->pSchema->cache_size==0 ){ size =
@@ -848,13 +874,8 @@ impl Btree {
         if self.schema_cache_size_set {
             return;
         }
+        let size = self.schema_cache_size();
         self.schema_cache_size_set = true;
-        let meta = self.pager.header().default_cache_size;
-        let size = if meta == 0 {
-            -2000
-        } else {
-            meta.checked_abs().unwrap_or(i32::MAX)
-        };
         self.pager.set_cache_size(size);
     }
 
