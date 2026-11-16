@@ -13,3 +13,4 @@ sqltest/
 /benchmarks/*/**
 !/benchmarks/*/**/
 !/benchmarks/*/**/*.md
+ileriPlanlama/
