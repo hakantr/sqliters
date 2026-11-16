@@ -282,7 +282,7 @@ Ayrıntı: `karar_esligi_v1.md` (işlev eşlemesi, karar tabloları, kapsam tabl
 
 **Yapılmayanlar.** E28: COMMIT'in yazımı G/Ç hatasıyla düşerse C işlemi geri alıyor, Rust açık bırakıyor (Rust sayfalayıcısında PAGER_ERROR durumu yok). D55 `PRAGMA query_only` motorda yok. DDL kodları (`OP_SetCookie`, `OP_CreateBtree`, `OP_ParseSchema`, `OP_VRename` …) taşınmadı. E11 görünür etkisi olmadığı için taşınmadı (M2'nin önbellek izi yeniden koşulmadı).
 
-**Kalanlar** (`gorulen_farklar_m3c.md`). D56 etkisiz `CREATE INDEX IF NOT EXISTS` / `DROP TABLE IF EXISTS` yazma kilidi alıyor; D57 motorun pragma işlev çıktıları; E24 WAL değişiklik sayacı; E25 cache_size=2 ile fts5 + auto_vacuum boş alan baytları; E26 fts5 DROP'un `total_changes` sayımı; E27 önbellek taşma zamanlaması (E24–E27 anahtar kapalıyken de var); E28.
+**Kalanlar** (`gorulen_farklar_m3c.md`). **D58 (doğrularken buldum):** motorun ayrıştırıcısının reddettiği SELECT, C'nin derleme sonucuna hiç ulaşmıyor: `SELECT main."a.b".* FROM (SELECT 1)` anahtar açıkken de motorun `no such table: main.a.b` iletisini veriyor, C ise `near "*": syntax error`. Üretici C'nin hatasını veriyor (`EXPLAIN` önekiyle aynı); F8'deki iki test bu yüzden C'den farklı. D56 etkisiz `CREATE INDEX IF NOT EXISTS` / `DROP TABLE IF EXISTS` yazma kilidi alıyor; D57 motorun pragma işlev çıktıları; E24 WAL değişiklik sayacı; E25 cache_size=2 ile fts5 + auto_vacuum boş alan baytları; E26 fts5 DROP'un `total_changes` sayımı; E27 önbellek taşma zamanlaması (E24–E27 anahtar kapalıyken de var); E28.
 
 **Hız (anahtar açık, C'ye göre; M3b konusu).** W03 2,03x, W04 2,56x, W09 4,66x, W10 3,80x, W14 8,36x.
 
