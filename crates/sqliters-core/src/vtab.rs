@@ -2906,6 +2906,80 @@ struct DbStatCursor {
 }
 
 impl VirtualCursor for DbStatCursor {
+    /// `statFilter()` of dbstat.c with the plan of `statBestIndex()` (idxNum 0x01 schema=,
+    /// 0x02 name=, 0x04 aggregate=, 0x08 ORDER BY name; the arguments in that order).
+    fn filter_c(
+        &mut self,
+        ctx: &mut dyn VTabHostContext,
+        idx_num: i32,
+        _idx_str: Option<&str>,
+        args: &[Value],
+        _in_lists: &[Option<Vec<Value>>],
+    ) -> Result<()> {
+        let mut i_arg = 0usize;
+        let mut eng_idx = 0i32;
+        let mut eng_args: Vec<Value> = Vec::new();
+        if idx_num & 0x01 != 0 {
+            // "pCsr->iDb = sqlite3FindDbName(pTab->db, zDbase); if( pCsr->iDb<0 ){ isEof }"
+            let v = args.get(i_arg).cloned().unwrap_or(Value::Null);
+            i_arg += 1;
+            if v.is_null() {
+                self.rows.clear();
+                self.pos = 0;
+                return Ok(());
+            }
+            eng_idx |= 0x01;
+            eng_args.push(v);
+        }
+        let mut z_name: Option<String> = None;
+        if idx_num & 0x02 != 0 {
+            // "zName = (const char*)sqlite3_value_text(argv[iArg++]);" (NULL: no WHERE)
+            let v = args.get(i_arg).cloned().unwrap_or(Value::Null);
+            i_arg += 1;
+            if !v.is_null() {
+                z_name = Some(v.to_text_lossy());
+            }
+        }
+        if idx_num & 0x04 != 0 {
+            // "pCsr->isAgg = sqlite3_value_double(argv[iArg++])!=0.0;"
+            let v = args.get(i_arg).cloned().unwrap_or(Value::Null);
+            eng_idx |= 0x02;
+            eng_args.push(Value::Integer(i64::from(v.to_real_lossy() != 0.0)));
+        }
+        match self.filter(ctx, eng_idx, None, &eng_args) {
+            Ok(()) => {}
+            Err(e) if e.message.starts_with("unknown database") => {
+                self.rows.clear();
+                self.pos = 0;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+        // The b-trees in the order of C's query: "SELECT 'sqlite_schema' AS name, ... UNION
+        // ALL SELECT name, rootpage, type FROM "%w".sqlite_schema WHERE rootpage!=0" (the
+        // engine's aggregate rows come sorted by name); the pages of one b-tree keep their order.
+        let schema = match eng_args.first() {
+            Some(v) if eng_idx & 0x01 != 0 => v.to_text_lossy(),
+            _ => self.default_schema.clone().unwrap_or_else(|| ctx.db_name().to_owned()),
+        };
+        let order_sql = format!("SELECT name FROM {}.sqlite_schema WHERE rootpage!=0", quote_ident(&schema));
+        if let Ok(order) = ctx.query_sql(&order_sql, &[]) {
+            let mut names: Vec<String> = vec!["sqlite_schema".to_owned()];
+            names.extend(order.into_iter().filter_map(|r| r.first().map(Value::to_text_lossy)));
+            let pos = |n: &str| names.iter().position(|x| x == n).unwrap_or(usize::MAX);
+            self.rows.sort_by_key(|r| pos(&r.name));
+        }
+        if let Some(n) = z_name {
+            // "WHERE name=%Q" (BINARY)
+            self.rows.retain(|r| r.name == n);
+        }
+        if idx_num & 0x08 != 0 {
+            // " ORDER BY name" (the pages of one b-tree stay in path order)
+            self.rows.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+        }
+        Ok(())
+    }
+
     fn filter(
         &mut self,
         ctx: &mut dyn VTabHostContext,
@@ -3664,6 +3738,42 @@ fn quote_string_literal(s: &str) -> String {
 }
 
 impl VirtualCursor for PragmaVTabCursor {
+    /// `pragmaVtabFilter()` of pragma.c with the plan of `pragmaVtabBestIndex()`: idxNum 0,
+    /// argv[0] the first hidden column (the argument, or the schema of a pragma without
+    /// one), argv[1] the schema.
+    fn filter_c(
+        &mut self,
+        ctx: &mut dyn VTabHostContext,
+        _idx_num: i32,
+        _idx_str: Option<&str>,
+        args: &[Value],
+        _in_lists: &[Option<Vec<Value>>],
+    ) -> Result<()> {
+        let mut eng_idx = 0i32;
+        let mut eng_args: Vec<Value> = Vec::new();
+        // "j = (pTab->pName->mPragFlg & PragFlg_Result1)!=0 ? 0 : 1;" — azArg[0] the argument,
+        // azArg[1] the schema; a NULL value leaves its slot empty
+        let mut j = if self.spec.has_arg { 0 } else { 1 };
+        for v in args {
+            if !v.is_null() {
+                if j == 0 {
+                    eng_idx |= 0x01;
+                } else {
+                    eng_idx |= 0x02;
+                }
+            }
+            j += 1;
+        }
+        let mut j = if self.spec.has_arg { 0 } else { 1 };
+        for v in args {
+            if !v.is_null() && (j == 0 || (j == 1 && eng_idx & 0x02 != 0)) {
+                eng_args.push(v.clone());
+            }
+            j += 1;
+        }
+        self.filter(ctx, eng_idx, None, &eng_args)
+    }
+
     fn filter(
         &mut self,
         ctx: &mut dyn VTabHostContext,

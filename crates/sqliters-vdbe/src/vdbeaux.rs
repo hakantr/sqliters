@@ -831,6 +831,11 @@ pub const EXPLAIN_COLUMN_NAMES: [&str; 12] = [
 ];
 
 impl Program {
+    /// The program opens a virtual-table cursor (`OP_VOpen`).
+    pub fn uses_vtab(&self) -> bool {
+        self.a_op.iter().any(|op| op.opcode == crate::opcodes::OP_VOpen)
+    }
+
     /// `sqlite3VdbeList(p)` run to completion: one row per instruction. With `explain==1` the
     /// rows are `addr, opcode, p1, p2, p3, p4, p5, comment` — first the main program, then each
     /// trigger sub-program in the order its `OP_Program` is first met; with `explain==2` the

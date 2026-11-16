@@ -233,7 +233,117 @@ pub trait VdbeHost {
     fn vtab_column_skips_nochange(&self, _vt: &P4Vtab, _i_col: usize) -> bool {
         false
     }
+    /// `pModule->xFilter` with the `sqlite3_value`s of `OP_VInitIn` (`sqlite3_vtab_in_first` /
+    /// `_next` read them): `in_lists[i]` is the list of the IN operator whose `ValueList` is
+    /// argument `i`, `None` for an ordinary argument.
+    fn vtab_filter_in(
+        &mut self,
+        vt: &P4Vtab,
+        cur: &mut dyn sqliters_types::VirtualCursor,
+        idx_num: i32,
+        idx_str: Option<&str>,
+        args: &[Value],
+        _in_lists: &[Option<Vec<Value>>],
+    ) -> Result<()> {
+        self.vtab_filter(vt, cur, idx_num, idx_str, args)
+    }
+    /// `pModule->xRowid`
+    fn vtab_rowid(&mut self, _vt: &P4Vtab, cur: &mut dyn sqliters_types::VirtualCursor) -> Result<i64> {
+        cur.rowid()
+    }
+    /// `OP_VCheck`: `pModule->xIntegrity(pVtab, zSchema, zTabName, isQuick, &zErr)`; `Some`
+    /// is the message the module reports.
+    fn vtab_integrity(&mut self, _vt: &P4Vtab, _schema: &str, _is_quick: bool) -> Result<Option<String>> {
+        Ok(None)
+    }
+    /// `db->flags & SQLITE_QueryOnly`, `db->flags & SQLITE_CorruptRdOnly` (`OP_Transaction`)
+    fn query_only(&self) -> bool {
+        false
+    }
+    fn corrupt_rdonly(&self) -> bool {
+        false
+    }
+    // --- `OP_AutoCommit`, `OP_Savepoint`: the transaction state of the connection ---
+    /// `db->autoCommit`
+    fn auto_commit(&self) -> bool {
+        true
+    }
+    /// `db->autoCommit = v`
+    fn set_auto_commit(&mut self, _v: bool) {}
+    /// `db->nVdbeWrite` of the other statements (this one is read-only)
+    fn n_vdbe_write(&self) -> i32 {
+        0
+    }
+    /// `sqlite3VdbeCheckFkDeferred(p)` without its error: are deferred violations pending?
+    /// (`db->nDeferredCons+db->nDeferredImmCons`, and the rows the engine's own executor
+    /// suspects)
+    fn fk_deferred_pending(&mut self) -> Result<bool> {
+        let (a, b) = self.deferred_cons();
+        Ok(a + b != 0)
+    }
+    /// `sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK)`
+    fn rollback_all(&mut self) -> Result<()> {
+        Err(internal("transactions are not reachable from this statement"))
+    }
+    /// The transaction part of `sqlite3VdbeHalt(p)` for a statement that ran without error
+    /// (`p->rc==SQLITE_OK`) and changes nothing itself: `Ok(None)` done, `Ok(Some(e))` the
+    /// commit failed and the transaction was rolled back (`p->rc = rc`), `Err(e)` `SQLITE_BUSY`
+    /// of a read-only statement (the transaction stays open, the halt is to be repeated).
+    fn halt_transaction(&mut self, _read_only: bool) -> Result<Option<SqliteError>> {
+        Err(internal("transactions are not reachable from this statement"))
+    }
+    /// `sqlite3CloseSavepoints(db)`
+    fn close_savepoints(&mut self) {}
+    /// The index of the newest savepoint named `name` in `db->pSavepoint` (0 = newest).
+    fn savepoint_find(&self, _name: &str) -> Option<usize> {
+        None
+    }
+    /// `pSavepoint->pNext==0 && db->isTransactionSavepoint` of savepoint `k`
+    fn savepoint_is_transaction(&self, _k: usize) -> bool {
+        false
+    }
+    /// `db->isTransactionSavepoint = v`
+    fn set_transaction_savepoint(&mut self, _v: bool) {}
+    /// `sqlite3VtabSavepoint(db, op, iSavepoint)`: `op` is `SAVEPOINT_BEGIN` (`k` = the new
+    /// savepoint's place) or the operation on savepoint `k`.
+    fn vtab_savepoint(&mut self, _op: i32, _k: usize) -> Result<()> {
+        Ok(())
+    }
+    /// Creates savepoint `name` (`pNew`, linked first; `nDeferredCons` saved);
+    /// `transaction`: it is the transaction savepoint (`db->autoCommit` was set).
+    fn savepoint_open(&mut self, _name: &str, _transaction: bool) -> Result<()> {
+        Err(internal("transactions are not reachable from this statement"))
+    }
+    /// `(db->mDbFlags & DBFLAG_SchemaChange)!=0` for a rollback to savepoint `k`
+    fn savepoint_schema_change(&self, _k: usize) -> bool {
+        false
+    }
+    /// The number of databases (`db->nDb`)
+    fn n_db(&self) -> usize {
+        0
+    }
+    /// `sqlite3BtreeTripAllCursors(db->aDb[i].pBt, SQLITE_ABORT_ROLLBACK, writeOnly)`
+    fn trip_all_cursors(&mut self, _i_db: usize, _write_only: bool) -> Result<()> {
+        Ok(())
+    }
+    /// `sqlite3BtreeSavepoint(db->aDb[i].pBt, op, iSavepoint)` for savepoint `k`
+    fn btree_savepoint(&mut self, _i_db: usize, _op: i32, _k: usize) -> Result<()> {
+        Ok(())
+    }
+    /// `sqlite3ExpirePreparedStatements(db, 0); sqlite3ResetAllSchemasOfConnection(db);
+    /// db->mDbFlags |= DBFLAG_SchemaChange;` after a rollback to savepoint `k`
+    fn savepoint_schema_reset(&mut self, _k: usize) -> Result<()> {
+        Ok(())
+    }
+    /// Destroys the savepoints nested inside savepoint `k`; then `release`: savepoint `k`
+    /// too, else `db->nDeferredCons` / `nDeferredImmCons` come back from it.
+    fn savepoint_close(&mut self, _k: usize, _release: bool) {}
 }
+
+/// `SAVEPOINT_BEGIN`, `SAVEPOINT_RELEASE`, `SAVEPOINT_ROLLBACK`
+pub const SAVEPOINT_BEGIN: i32 = 0;
+pub const SAVEPOINT_RELEASE: i32 = 1;
+pub const SAVEPOINT_ROLLBACK: i32 = 2;
 
 /// `COLTYPE_*`: `Column.eCType`.
 pub const COLTYPE_CUSTOM: u8 = 0;
@@ -765,6 +875,23 @@ pub struct Vdbe {
     /// when it holds a heap buffer — `szMalloc`, which the machine does not model; the
     /// comparison tools mask the registers of that line instead)
     tr_undef: bool,
+    /// The last error left the statement running (`goto vdbe_return` without
+    /// `sqlite3VdbeHalt`): `SQLITE_BUSY` of `OP_Transaction` / `OP_AutoCommit` /
+    /// `OP_Savepoint` (`p->pc` is the instruction to repeat) or a deferred foreign key
+    /// violation found by `OP_AutoCommit` / `OP_Savepoint`.
+    pub not_halted: bool,
+    /// `p->rc` of a statement the machine halted itself after its transaction failed to
+    /// commit (`OP_AutoCommit`, `OP_Savepoint` RELEASE).
+    pub halt_rc: Option<SqliteError>,
+    /// Registers that hold a `ValueList` of `OP_VInitIn`, and the cursor of its values
+    value_lists: Vec<(usize, usize)>,
+}
+
+/// The first field of index record `key` (`sqlite3_vtab_in_first`: `sqlite3VdbeMemFromBtree`
+/// and `sqlite3VdbeSerialGet` of the first column).
+fn sqliters_vdbe_record_first(ki: &KeyInfoRt, key: &[u8]) -> Value {
+    let mems = crate::vdbeaux_rt::sqlite3_vdbe_record_unpack(ki, key, 1);
+    mems.first().map_or(Value::Null, Mem::to_value)
 }
 
 #[cold]
@@ -974,6 +1101,12 @@ fn unsupported(prog: &Program, write: bool) -> Option<String> {
                 | OP_ReleaseReg
                 | OP_Abortable
                 | OP_TypeCheck
+                | OP_VOpen
+                | OP_VFilter
+                | OP_VColumn
+                | OP_VNext
+                | OP_VInitIn
+                | OP_VCheck
         ) || (write
             && matches!(
                 op.opcode,
@@ -995,6 +1128,8 @@ fn unsupported(prog: &Program, write: bool) -> Option<String> {
                     | OP_VFilter
                     | OP_VColumn
                     | OP_VNext
+                    | OP_AutoCommit
+                    | OP_Savepoint
             ));
         if !ok {
             return Some(format!("opcode {}", sqlite3_opcode_name(op.opcode)));
@@ -1037,20 +1172,6 @@ fn unsupported(prog: &Program, write: bool) -> Option<String> {
         }
     }
     None
-}
-
-/// `getPageNormal`: "if( pgno>pPager->mxPgno ){ rc = SQLITE_FULL; ... }" — a b-tree that grew
-/// past `PRAGMA max_page_count` while the last insert allocated pages.
-fn check_max_page_count<H: VdbeHost>(host: &mut H, i_db: usize) -> Result<()> {
-    let Some(mx) = host.max_page_count(i_db) else {
-        return Ok(());
-    };
-    if let Some(bt) = host.btree(i_db)
-        && bt.pager().page_count() > mx
-    {
-        return Err(SqliteError::new(ErrorCode::Full, "database or disk is full"));
-    }
-    Ok(())
 }
 
 /// `BTREE_FDK_RANGE`
@@ -1347,6 +1468,9 @@ impl Vdbe {
             n_fk_constraint: 0,
             tr_sql: String::new(),
             tr_undef: false,
+            not_halted: false,
+            halt_rc: None,
+            value_lists: Vec::new(),
         }
     }
 
@@ -1364,6 +1488,18 @@ impl Vdbe {
             Some(op) => format!("{}:{}", self.err_pc, sqlite3_opcode_name(op.opcode)),
             None => "?".to_owned(),
         }
+    }
+
+    /// The virtual tables the statement has an open cursor on that is not at its end (an r-tree
+    /// refuses writes while such a cursor exists: `rtreeUpdate`, SQLITE_LOCKED_VTAB).
+    pub fn positioned_vtabs(&self) -> Vec<Arc<P4Vtab>> {
+        self.ap_csr
+            .iter()
+            .flatten()
+            .filter_map(|c| c.vcur.as_ref())
+            .filter(|v| !v.cur.eof())
+            .map(|v| Arc::clone(&v.vt))
+            .collect()
     }
 
     /// The row `OP_ResultRow` produced (`sqlite3_column_*`).
@@ -1743,6 +1879,8 @@ impl Vdbe {
         self.n_fk_constraint = 0;
         self.tr_pc = usize::MAX;
         self.err_pc = usize::MAX;
+        self.not_halted = false;
+        self.halt_rc = None;
     }
 
     /// `sqlite3_stmt_status(pStmt, op, resetFlag)` for the counters the machine keeps
@@ -1812,6 +1950,7 @@ impl Vdbe {
         if self.halted {
             return Ok(false);
         }
+        self.not_halted = false;
         self.unpark_cursors(host);
         // "if( db->xProgress ){ iPrior = p->aCounter[SQLITE_STMTSTATUS_VM_STEP];
         //   nProgressLimit = db->nProgressOps - (iPrior % db->nProgressOps); }"
@@ -1836,6 +1975,7 @@ impl Vdbe {
                 Ok(true)
             }
             Ok(false) => Ok(false),
+            Err(e) if self.not_halted => Err(e),
             Err(e) => {
                 // abort_due_to_error: sqlite3VdbeHalt(p)
                 #[cfg(sqliters_dtrace)]
@@ -3248,10 +3388,24 @@ impl Vdbe {
                 }
 
                 OP_Transaction => {
-                    let (i_meta, i_gen) = if op.p2 != 0 {
-                        host.begin_write_trans(op.p1 as usize, op.p2)?
-                    } else {
-                        host.begin_read_trans(op.p1 as usize)?
+                    // "if( pOp->p2 && (db->flags & (SQLITE_QueryOnly|SQLITE_CorruptRdOnly))!=0 )"
+                    if op.p2 != 0 && (host.query_only() || host.corrupt_rdonly()) {
+                        if host.query_only() {
+                            return Err(SqliteError::new(ErrorCode::ReadOnly, "attempt to write a readonly database"));
+                        }
+                        return Err(SqliteError::new(ErrorCode::Corrupt, "database disk image is malformed"));
+                    }
+                    let r = if op.p2 != 0 { host.begin_write_trans(op.p1 as usize, op.p2) } else { host.begin_read_trans(op.p1 as usize) };
+                    let (i_meta, i_gen) = match r {
+                        Ok(x) => x,
+                        Err(e) if e.code == ErrorCode::Busy => {
+                            // "if( (rc&0xff)==SQLITE_BUSY ){ p->pc = (int)(pOp - aOp); p->rc = rc;
+                            //   goto vdbe_return; }"
+                            self.pc = pc as i32;
+                            self.not_halted = true;
+                            return Err(e);
+                        }
+                        Err(e) => return Err(e),
                     };
                     let p4 = match op.p4 {
                         P4::Int32(i) => i,
@@ -3260,6 +3414,158 @@ impl Vdbe {
                     if op.p5 != 0 && (i_meta as i32 != op.p3 || i_gen != p4) {
                         return Err(SqliteError::new(ErrorCode::Schema, "database schema has changed"));
                     }
+                }
+
+                OP_Savepoint => {
+                    let p1 = op.p1;
+                    let z_name = p4_text(&op.p4).map(|z| String::from_utf8_lossy(z).into_owned()).unwrap_or_default();
+                    if p1 == SAVEPOINT_BEGIN {
+                        if host.n_vdbe_write() > 0 {
+                            // A new savepoint cannot be created if there are active write
+                            // statements (i.e. open read/write incremental blob handles).
+                            return Err(SqliteError::new(ErrorCode::Busy, "cannot open savepoint - SQL statements in progress"));
+                        }
+                        // "rc = sqlite3VtabSavepoint(db, SAVEPOINT_BEGIN, db->nStatement+db->nSavepoint);
+                        //  if( rc!=SQLITE_OK ) goto abort_due_to_error;"
+                        host.vtab_savepoint(SAVEPOINT_BEGIN, 0)?;
+                        // "if( db->autoCommit ){ db->autoCommit = 0; db->isTransactionSavepoint = 1; }
+                        //  else{ db->nSavepoint++; }" (+ pNew->nDeferredCons, nDeferredImmCons)
+                        let transaction = host.auto_commit();
+                        host.savepoint_open(&z_name, transaction)?;
+                    } else {
+                        // Find the named savepoint. If there is no such savepoint, then an
+                        // an error is returned to the user.
+                        let Some(k) = host.savepoint_find(&z_name) else {
+                            return Err(SqliteError::new(ErrorCode::Error, format!("no such savepoint: {z_name}")));
+                        };
+                        if host.n_vdbe_write() > 0 && p1 == SAVEPOINT_RELEASE {
+                            return Err(SqliteError::new(
+                                ErrorCode::Busy,
+                                "cannot release savepoint - SQL statements in progress",
+                            ));
+                        }
+                        // Determine whether or not this is a transaction savepoint. If so,
+                        // and this is a RELEASE command, then the current transaction is
+                        // committed.
+                        let is_transaction = host.savepoint_is_transaction(k);
+                        if is_transaction && p1 == SAVEPOINT_RELEASE {
+                            if host.fk_deferred_pending()? {
+                                // "if( (rc = sqlite3VdbeCheckFkDeferred(p))!=SQLITE_OK ) goto vdbe_return;"
+                                self.not_halted = true;
+                                return Err(fk_error());
+                            }
+                            host.set_auto_commit(true);
+                            match host.halt_transaction(true) {
+                                Err(e) => {
+                                    // "if( sqlite3VdbeHalt(p)==SQLITE_BUSY ){ p->pc = (int)(pOp - aOp);
+                                    //   db->autoCommit = 0; p->rc = rc = SQLITE_BUSY; goto vdbe_return; }"
+                                    host.set_auto_commit(false);
+                                    self.pc = pc as i32;
+                                    self.not_halted = true;
+                                    return Err(e);
+                                }
+                                Ok(Some(e)) => {
+                                    // "rc = p->rc; if( rc ){ db->autoCommit = 0; }" ... "if( rc ) goto
+                                    // abort_due_to_error;" (the statement has halted)
+                                    host.set_auto_commit(false);
+                                    self.halt(host);
+                                    self.halt_rc = Some(e.clone());
+                                    return Err(e);
+                                }
+                                Ok(None) => {
+                                    // "db->isTransactionSavepoint = 0;" (the VM halted:
+                                    // p->eVdbeState==VDBE_HALT_STATE)
+                                    host.set_transaction_savepoint(false);
+                                    self.halt(host);
+                                }
+                            }
+                        } else {
+                            let is_schema_change;
+                            if p1 == SAVEPOINT_ROLLBACK {
+                                is_schema_change = host.savepoint_schema_change(k);
+                                for ii in 0..host.n_db() {
+                                    host.trip_all_cursors(ii, !is_schema_change)?;
+                                }
+                            } else {
+                                is_schema_change = false;
+                            }
+                            for ii in 0..host.n_db() {
+                                host.btree_savepoint(ii, p1, k)?;
+                            }
+                            if is_schema_change {
+                                host.savepoint_schema_reset(k)?;
+                            }
+                        }
+                        // Regardless of whether this is a RELEASE or ROLLBACK, destroy all
+                        // savepoints nested inside of the savepoint being operated on; a
+                        // RELEASE destroys the savepoint too, a ROLLBACK TO restores the
+                        // deferred constraint counters it saved.
+                        host.savepoint_close(k, p1 == SAVEPOINT_RELEASE);
+                        if !is_transaction || p1 == SAVEPOINT_ROLLBACK {
+                            host.vtab_savepoint(p1, k)?;
+                        }
+                    }
+                    if self.halted {
+                        // "if( p->eVdbeState==VDBE_HALT_STATE ){ rc = SQLITE_DONE; goto vdbe_return; }"
+                        return Ok(false);
+                    }
+                }
+
+                OP_AutoCommit => {
+                    let desired_auto_commit = op.p1 != 0;
+                    let i_rollback = op.p2 != 0;
+                    if desired_auto_commit != host.auto_commit() {
+                        if i_rollback {
+                            host.rollback_all()?;
+                            host.set_auto_commit(true);
+                        } else if desired_auto_commit && host.n_vdbe_write() > 0 {
+                            // If this instruction implements a COMMIT and other VMs are writing
+                            // return an error indicating that the other VMs must complete first.
+                            return Err(SqliteError::new(
+                                ErrorCode::Busy,
+                                "cannot commit transaction - SQL statements in progress",
+                            ));
+                        } else if host.fk_deferred_pending()? {
+                            // "else if( (rc = sqlite3VdbeCheckFkDeferred(p))!=SQLITE_OK ){ goto vdbe_return; }"
+                            self.not_halted = true;
+                            return Err(fk_error());
+                        } else {
+                            host.set_auto_commit(desired_auto_commit);
+                        }
+                        let read_only = self.prog.read_only;
+                        match host.halt_transaction(read_only) {
+                            Err(e) => {
+                                // "if( sqlite3VdbeHalt(p)==SQLITE_BUSY ){ p->pc = (int)(pOp - aOp);
+                                //   db->autoCommit = (u8)(1-desiredAutoCommit); p->rc = rc = SQLITE_BUSY;
+                                //   goto vdbe_return; }"
+                                host.set_auto_commit(!desired_auto_commit);
+                                self.pc = pc as i32;
+                                self.not_halted = true;
+                                return Err(e);
+                            }
+                            Ok(rc) => {
+                                self.halt(host);
+                                // sqlite3CloseSavepoints(db)
+                                host.close_savepoints();
+                                // "if( p->rc==SQLITE_OK ){ rc = SQLITE_DONE; }else{ rc = SQLITE_ERROR; }"
+                                if let Some(e) = rc {
+                                    self.halt_rc = Some(e.clone());
+                                    return Err(e);
+                                }
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    return Err(SqliteError::new(
+                        ErrorCode::Error,
+                        if !desired_auto_commit {
+                            "cannot start a transaction within a transaction"
+                        } else if i_rollback {
+                            "cannot rollback - no transaction is active"
+                        } else {
+                            "cannot commit - no transaction is active"
+                        },
+                    ));
                 }
 
                 OP_ReadCookie => {
@@ -3818,9 +4124,6 @@ impl Vdbe {
                     c.cache_status = CACHE_STALE;
                     col_cache_ctr = col_cache_ctr.wrapping_add(1);
                     rc?;
-                    if c.btx.is_none() {
-                        check_max_page_count(host, c.i_db as usize)?;
-                    }
                     // Invoke the update-hook if required.
                     if let Some(t) = hook_tab {
                         let i_db = c.i_db as usize;
@@ -3862,17 +4165,82 @@ impl Vdbe {
                     }
                 }
 
+                OP_VInitIn => {
+                    // "pRhs->pCsr = pC->uc.pCursor; pRhs->pOut = &aMem[pOp->p3]; pOut->flags =
+                    //  MEM_Null; sqlite3VdbeMemSetPointer(pOut, pRhs, "ValueList", ...)"
+                    let out = &mut self.a_mem[op.p2 as usize];
+                    out.set_null();
+                    out.flags = MEM_NULL | MEM_SUBTYPE;
+                    out.e_subtype = b'p';
+                    let reg = op.p2 as usize;
+                    self.value_lists.retain(|(r, _)| *r != reg);
+                    self.value_lists.push((reg, op.p1 as usize));
+                }
+
+                OP_VCheck => {
+                    // "pOut = &aMem[pOp->p2]; sqlite3VdbeMemSetNull(pOut);" then
+                    // "rc = pModule->xIntegrity(pVtab, db->aDb[pOp->p1].zDbSName, pTab->zName,
+                    //  pOp->p3, &zErr)"
+                    self.a_mem[op.p2 as usize].set_null();
+                    let name = match &op.p4 {
+                        P4::Table(t) => t.name.clone(),
+                        P4::Vtab(v) => v.name.clone(),
+                        _ => return Err(internal("OP_VCheck without P4_TABLEREF")),
+                    };
+                    let vt = P4Vtab { name, ..P4Vtab::default() };
+                    if let Some(z_err) = host.vtab_integrity(&vt, &op.p1.to_string(), op.p3 != 0)? {
+                        self.a_mem[op.p2 as usize].set_str(z_err.as_bytes());
+                    }
+                }
+
                 OP_VFilter => {
                     let p3 = op.p3 as usize;
                     let i_query = self.a_mem[p3].i as i32;
                     let n_arg = self.a_mem[p3 + 1].i.max(0) as usize;
                     let args: Vec<Value> = self.a_mem[p3 + 2..p3 + 2 + n_arg].iter().map(Mem::to_value).collect();
+                    // the arguments that are ValueList pointers of OP_VInitIn: the values of
+                    // their cursors (what sqlite3_vtab_in_first / _next return)
+                    let mut in_lists: Vec<Option<Vec<Value>>> = vec![None; n_arg];
+                    for (ai, slot) in in_lists.iter_mut().enumerate() {
+                        let reg = p3 + 2 + ai;
+                        let m = &self.a_mem[reg];
+                        if m.flags & MEM_SUBTYPE != 0
+                            && m.e_subtype == b'p'
+                            && let Some(&(_, ci)) = self.value_lists.iter().find(|(r, _)| *r == reg)
+                        {
+                            let c = csr!(ci);
+                            let ki = c.key_info.clone();
+                            let bt = btree_of!(c);
+                            let mut vals = Vec::new();
+                            let mut eof = bt.bc_first(&mut c.cur)?;
+                            while !eof {
+                                let n = bt.bc_payload_size(&mut c.cur)? as usize;
+                                let mut key = vec![0u8; n];
+                                bt.bc_payload(&mut c.cur, 0, &mut key)?;
+                                if let Some(ki) = &ki {
+                                    let mems = sqliters_vdbe_record_first(ki, &key);
+                                    vals.push(mems);
+                                }
+                                eof = !bt.bc_next(&mut c.cur)?;
+                            }
+                            c.cache_status = CACHE_STALE;
+                            *slot = Some(vals);
+                        }
+                    }
                     let idx_str = p4_text(&op.p4).map(|z| String::from_utf8_lossy(z).into_owned());
+                    // sqlite3_value_subtype(apArg[i]) (json_each / json_tree of a JSON argument)
+                    let subtypes: Vec<u8> = self.a_mem[p3 + 2..p3 + 2 + n_arg]
+                        .iter()
+                        .map(|m| if m.flags & MEM_SUBTYPE != 0 { m.e_subtype } else { 0 })
+                        .collect();
                     let c = csr!(op.p1);
                     let Some(vc) = c.vcur.as_mut() else {
                         return Err(internal("OP_VFilter on a cursor that is not a virtual-table cursor"));
                     };
-                    host.vtab_filter(&vc.vt, vc.cur.as_mut(), i_query, idx_str.as_deref(), &args)?;
+                    if subtypes.iter().any(|&t| t != 0) {
+                        vc.cur.set_arg_subtypes(&subtypes);
+                    }
+                    host.vtab_filter_in(&vc.vt, vc.cur.as_mut(), i_query, idx_str.as_deref(), &args, &in_lists)?;
                     let res = vc.cur.eof();
                     c.null_row = false;
                     if res {
@@ -3898,7 +4266,14 @@ impl Vdbe {
                             m.n_zero = 0;
                         } else {
                             let v = host.vtab_column(&vc.vt, vc.cur.as_mut(), op.p2 as usize)?;
-                            self.a_mem[p3].set_from_value(&v);
+                            // (sqlite3_result_subtype of xColumn: json_each / json_tree 'J')
+                            let st = vc.cur.column_subtype(op.p2 as usize);
+                            let m = &mut self.a_mem[p3];
+                            m.set_from_value(&v);
+                            if st != 0 {
+                                m.flags |= MEM_SUBTYPE;
+                                m.e_subtype = st;
+                            }
                         }
                     }
                 }
@@ -4049,7 +4424,7 @@ impl Vdbe {
                         self.a_mem[p2].set_null();
                     } else if let Some(vc) = pc_.vcur.as_mut() {
                         // "else if( pC->eCurType==CURTYPE_VTAB ){ rc = pModule->xRowid(pC->uc.pVCur, &v); }"
-                        let v = vc.cur.rowid()?;
+                        let v = host.vtab_rowid(&vc.vt, vc.cur.as_mut())?;
                         let out = &mut self.a_mem[p2];
                         out.flags = MEM_INT;
                         out.i = v;
@@ -4233,9 +4608,6 @@ impl Vdbe {
                     };
                     c.cache_status = CACHE_STALE;
                     rc?;
-                    if c.btx.is_none() {
-                        check_max_page_count(host, c.i_db as usize)?;
-                    }
                 }
 
                 OP_IdxDelete => {

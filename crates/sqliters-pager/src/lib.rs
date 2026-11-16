@@ -395,6 +395,10 @@ pub struct Pager {
     sp_page_buf_pool: Vec<Vec<u8>>,
     backup_trackers: Vec<Arc<Mutex<BackupTracker>>>,
     backup_raw_staging: Option<BTreeMap<Pgno, Vec<u8>>>,
+    /// `mxPgno`: a page beyond it is not fetched (`getPageNormal`: SQLITE_FULL). Set by the
+    /// port of C's VDBE for the statements it runs (`PRAGMA max_page_count`); the engine's
+    /// executor checks the page count after its writes instead.
+    mx_pgno: Pgno,
 }
 
 impl Pager {
@@ -568,6 +572,7 @@ impl Pager {
             lock_geometry,
             db_kind,
             is_memdb_backing,
+            mx_pgno: Pgno::MAX,
             db_path,
             journal_path,
             wal_path,
@@ -3704,6 +3709,12 @@ impl Pager {
         set
     }
 
+    /// `sqlite3PagerMaxPageCount`-like setter of `mxPgno` for the duration of a statement of
+    /// the port of C's VDBE (`Pgno::MAX`: no limit).
+    pub fn set_mx_pgno(&mut self, mx: Pgno) {
+        self.mx_pgno = mx;
+    }
+
     /// Appends a brand-new zeroed page at the end of the database file, skipping the runtime
     /// `lock_byte_page` (`PENDING_BYTE_PAGE`), and returning its `Pgno`.
     pub fn allocate_raw_page(&mut self) -> Result<Pgno> {
@@ -3738,6 +3749,11 @@ impl Pager {
             next_pgno
         };
 
+        if allocated_pgno > self.mx_pgno {
+            // getPageNormal: "if( pgno>pPager->mxPgno ){ rc = SQLITE_FULL; ... }" (page 1 is
+            // already writable, as in allocateBtreePage)
+            return Err(SqliteError::new(ErrorCode::Full, "database or disk is full"));
+        }
         self.page_count = allocated_pgno;
         self.header.database_size_pages = allocated_pgno;
         // The first page after page 1 is the root of the first table (in every state C can

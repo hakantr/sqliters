@@ -1236,6 +1236,9 @@ pub fn shell_exec(p: &mut ShellState, z_sql: &str) -> Result<(), ShellSqlError> 
                         break;
                     }
                     match db.prepare(rest) {
+                        // (a statement after the one that failed was never prepared by the
+                        // batch: only a prepare error that is the batch's error counts)
+                        Err(pe) if pe.message != err.message || pe.code != err.code => break,
                         Err(pe) => {
                             return Err(ShellSqlError {
                                 err: pe,

@@ -948,6 +948,10 @@ pub(crate) enum RunningExec {
     ReturningWrite {
         rows: std::vec::IntoIter<Vec<Value>>,
         abort_snapshot: WriteAbortSnapshot,
+        /// `p->nChange` of a statement the machine ran, stored by `sqlite3VdbeSetChanges` when
+        /// the statement halts (after its last row or at its reset), not when it returns its
+        /// first row.
+        pending_changes: Option<i64>,
     },
     IncrementalVacuum {
         db_instance: SchemaInstanceId,
@@ -956,6 +960,13 @@ pub(crate) enum RunningExec {
     },
     PendingCommit {
         release_savepoint: Option<String>,
+        last_busy: SqliteError,
+    },
+    /// Diagnostic switch `SQLITERS_VDBE_EXEC`: a transaction-control statement the machine
+    /// runs stopped without halting (`SQLITE_BUSY` of `OP_Transaction` / `OP_AutoCommit` /
+    /// `OP_Savepoint`): the next `sqlite3_step` repeats the instruction.
+    MachineControl {
+        vm: Box<sqliters_vdbe::vdbe::Vdbe>,
         last_busy: SqliteError,
     },
 }
@@ -2032,6 +2043,14 @@ impl ConnectionInner {
         Ok(final_res)
     }
 
+    /// `sqlite3VdbeSetChanges(db, p->nChange)` of a statement that halts after it returned
+    /// rows (see `RunningExec::ReturningWrite::pending_changes`).
+    fn set_halt_changes(&mut self, n: i64) {
+        let n = n.max(0) as u64;
+        self.runtime.last_changes = n;
+        self.runtime.total_changes += n;
+    }
+
     fn finish_activity(
         &mut self,
         hid: HandleId,
@@ -2630,7 +2649,16 @@ impl ConnectionInner {
                             self.schema_changed_in_tx = false;
                         }
                         self.publish(shared);
-                        return cm_err;
+                        if cm_err.code == ErrorCode::Constraint {
+                            // sqlite3VdbeCheckFkDeferred: sqlite3VdbeError(p, "FOREIGN KEY
+                            // constraint failed") replaces the message
+                            return cm_err;
+                        }
+                        // sqlite3VdbeHalt: "p->rc = rc;" after vdbeCommit failed — the code is
+                        // the commit's, the message (p->zErrMsg) stays the OR FAIL error's
+                        let mut e = cm_err;
+                        e.message = err.message.clone();
+                        return e;
                     }
                     self.schema_changed_in_tx = false;
                     self.deferred_fk_suspects.clear();
@@ -2815,13 +2843,24 @@ impl ConnectionInner {
             RunningExec::MaterializedNoLock { .. } => {
                 self.finish_activity(hid, ActivityFinish::NoLock, shared)
             }
-            RunningExec::ReturningWrite { abort_snapshot, .. }
-            | RunningExec::IncrementalVacuum { abort_snapshot, .. } => self.finish_activity(
+            RunningExec::ReturningWrite { abort_snapshot, pending_changes, .. } => {
+                if let Some(n) = pending_changes {
+                    self.set_halt_changes(n);
+                }
+                self.finish_activity(hid, ActivityFinish::WriteCompleted { abort_snapshot }, shared)
+            }
+            RunningExec::IncrementalVacuum { abort_snapshot, .. } => self.finish_activity(
                 hid,
                 ActivityFinish::WriteCompleted { abort_snapshot },
                 shared,
             ),
             RunningExec::PendingCommit { last_busy, .. } => {
+                let _ = self.finish_activity(hid, ActivityFinish::PendingCommitAborted, shared);
+                Err(last_busy)
+            }
+            RunningExec::MachineControl { mut vm, last_busy } => {
+                let summary = self.activity.summary_excluding(hid, &self.db_set);
+                self.with_default_exec_ctx(shared, summary, |ctx| vdbe_host::halt_control(ctx, &mut vm));
                 let _ = self.finish_activity(hid, ActivityFinish::PendingCommitAborted, shared);
                 Err(last_busy)
             }
@@ -6907,8 +6946,12 @@ impl Statement {
             None => Box::new(sqliters_vdbe::vdbe::Vdbe::new(prog)),
         };
 
-        match vdbe_host::step(inner, &mut vm, &self.params, true, &self.raw_sql) {
+        match vdbe_host::step(inner, shared, hid, &mut vm, &self.params, true, &self.raw_sql) {
             Ok(Some(row)) => {
+                if vm.prog.uses_vtab() {
+                    let keys = vdbe_host::positioned_vtab_keys(inner, &vm);
+                    inner.activity.set_vtab_cursors(hid, keys);
+                }
                 self.lifecycle = StatementLifecycle::Running(RunningExec::Machine {
                     vm,
                     lease_cursors,
@@ -6950,7 +6993,7 @@ impl Statement {
                     return MachineStart::Stepped(Err(e));
                 }
                 if !retried
-                    && let Some(prog) = vdbe_host::machine_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len())
+                    && let Ok(Some(prog)) = vdbe_host::machine_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len())
                 {
                     self.c_machine = Some(prog);
                     return self.machine_start_inner(hid, shared, inner, lease_cursors, read_instances, true);
@@ -6985,8 +7028,12 @@ impl Statement {
         let StatementLifecycle::Running(RunningExec::Machine { vm, .. }) = &mut self.lifecycle else {
             unreachable!("machine_advance requires a statement suspended on the machine");
         };
-        let res = vdbe_host::step(inner, vm, &self.params, false, &self.raw_sql);
+        let res = vdbe_host::step(inner, shared, hid, vm, &self.params, false, &self.raw_sql);
         if let Ok(Some(row)) = res {
+            if vm.prog.uses_vtab() {
+                let keys = vdbe_host::positioned_vtab_keys(inner, vm);
+                inner.activity.set_vtab_cursors(hid, keys);
+            }
             return Ok(StepResult::Row(Row::new(row)));
         }
         let prev = std::mem::replace(&mut self.lifecycle, StatementLifecycle::Halted { last_error: None });
@@ -7041,11 +7088,13 @@ impl Statement {
         artifacts: &mut CompiledArtifacts,
         raw_sql: &str,
         is_explain: bool,
-    ) -> Option<Arc<sqliters_vdbe::vdbeaux::Program>> {
+    ) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
         if !vdbe_host::exec_switch_on() || is_explain || artifacts.category != Some(StmtCategory::Read) {
-            return None;
+            return Ok(None);
         }
-        let prog = vdbe_host::machine_program(inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param)?;
+        let Some(prog) = vdbe_host::machine_program(inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param)? else {
+            return Ok(None);
+        };
         artifacts.compiled_vdbe = None;
         artifacts.compiled_fast_read = None;
         if let Some(names) = vdbe_host::column_names(&prog)
@@ -7053,7 +7102,7 @@ impl Statement {
         {
             artifacts.column_names = names;
         }
-        Some(prog)
+        Ok(Some(prog))
     }
 
     /// Diagnostic switch `SQLITERS_VDBE_EXEC`: an INSERT / UPDATE / DELETE is compiled by the
@@ -7067,7 +7116,21 @@ impl Statement {
         stmt: Option<&Stmt>,
         raw_sql: &str,
     ) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
-        if !vdbe_host::exec_switch_on() || !matches!(stmt, Some(Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_))) {
+        if !vdbe_host::exec_switch_on()
+            || !matches!(
+                stmt,
+                Some(
+                    Stmt::Insert(_)
+                        | Stmt::Update(_)
+                        | Stmt::Delete(_)
+                        | Stmt::Begin { .. }
+                        | Stmt::Commit
+                        | Stmt::Rollback { .. }
+                        | Stmt::Savepoint(_)
+                        | Stmt::Release(_)
+                )
+            )
+        {
             return Ok(None);
         }
         // (C connects the virtual tables a statement names while it prepares it; the port of
@@ -7385,8 +7448,10 @@ impl Statement {
             }
         }
 
-        let c_machine = Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some());
-        if let Some(prog) = &c_write {
+        let c_machine = Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some())?;
+        if let Some(prog) = &c_write
+            && artifacts.category != Some(StmtCategory::Control)
+        {
             Self::apply_c_write(&mut artifacts, prog);
         }
 
@@ -8041,8 +8106,10 @@ impl Statement {
             if let Some(prog) = &c_explain {
                 artifacts.column_names = explain_column_names(prog.explain);
             }
-            let c_machine = Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some());
-            if let Some(prog) = &c_write {
+            let c_machine = Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some())?;
+            if let Some(prog) = &c_write
+                && artifacts.category != Some(StmtCategory::Control)
+            {
                 Self::apply_c_write(&mut artifacts, prog);
             }
             let mut transferred = vec![Value::Null; artifacts.max_param];
@@ -8642,6 +8709,48 @@ impl Statement {
         Some(self.advance_running_in_session(hid, shared, inner))
     }
 
+    /// One `sqlite3_step` of a transaction-control statement the machine runs (see
+    /// [`vdbe_host::run_control`]).
+    fn step_machine_control(
+        &mut self,
+        hid: HandleId,
+        shared: &Arc<ConnectionShared>,
+        inner: &mut ConnectionInner,
+        vm: &mut Box<sqliters_vdbe::vdbe::Vdbe>,
+        start: bool,
+    ) -> Result<StepResult> {
+        let summary = inner.activity.summary_excluding(hid, &inner.db_set);
+        let mut expire_self_only = false;
+        let mut stmt_tx = StmtTxTracker::default();
+        let sql = self.raw_sql.clone();
+        let res = inner.with_exec_ctx(shared, summary, &mut stmt_tx, &mut expire_self_only, |ctx| {
+            vdbe_host::run_control(ctx, vm, start, &sql)
+        });
+        match res {
+            Ok(()) => {
+                inner.activity.remove(hid);
+                inner.maybe_run_wal_autocheckpoint();
+                self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                Ok(StepResult::Done)
+            }
+            Err(e) if vm.not_halted && e.code == ErrorCode::Busy => {
+                let vm = std::mem::replace(vm, Box::new(sqliters_vdbe::vdbe::Vdbe::new(Arc::clone(&vm.prog))));
+                self.lifecycle = StatementLifecycle::Running(RunningExec::MachineControl { vm, last_busy: e.clone() });
+                Err(e)
+            }
+            Err(e) => {
+                if vm.not_halted {
+                    // (a deferred foreign key violation: sqlite3_reset halts the statement,
+                    // which then has nothing to commit or roll back)
+                    inner.with_default_exec_ctx(shared, summary, |ctx| vdbe_host::halt_control(ctx, vm));
+                }
+                inner.activity.remove(hid);
+                self.lifecycle = StatementLifecycle::Halted { last_error: Some(e.clone()) };
+                Err(e)
+            }
+        }
+    }
+
     fn start_execution_in_session(
         &mut self,
         hid: HandleId,
@@ -8695,6 +8804,17 @@ impl Statement {
         };
 
         match category {
+            StmtCategory::Control if self.c_machine_write.is_some() => {
+                // Diagnostic switch SQLITERS_VDBE_EXEC: C's program on the machine
+                let prog = Arc::clone(self.c_machine_write.as_ref().expect("checked"));
+                let mut vm = Box::new(sqliters_vdbe::vdbe::Vdbe::new(prog));
+                // sqlite3Step: "if( db->nVdbeActive==0 ){ AtomicStore(&db->u1.isInterrupted, 0); }"
+                if inner.activity.summary_excluding(hid, &inner.db_set).other_active == 0 {
+                    inner.active_interrupt_flag.store(false, Ordering::SeqCst);
+                }
+                inner.activity.start(hid, false, false);
+                self.step_machine_control(hid, shared, inner, &mut vm, true)
+            }
             StmtCategory::Control => {
                 let stmt_clone = self.stmt.clone().expect("non-empty statement");
                 inner.activity.start(hid, false, false);
@@ -10056,6 +10176,7 @@ impl Statement {
                                 StatementLifecycle::Running(RunningExec::ReturningWrite {
                                     rows: iter,
                                     abort_snapshot,
+                                    pending_changes: stmt_tx.pending_changes.take(),
                                 });
                             Ok(StepResult::Row(Row::new(first_row)))
                         } else {
@@ -10446,6 +10567,7 @@ impl Statement {
             RunningExec::ReturningWrite {
                 rows,
                 abort_snapshot,
+                pending_changes,
             } => {
                 if let Err(e) = inner.check_any_interrupted() {
                     let snap = abort_snapshot.clone();
@@ -10459,6 +10581,9 @@ impl Statement {
                 if let Some(vals) = rows.next() {
                     Ok(StepResult::Row(Row::new(vals)))
                 } else {
+                    if let Some(n) = pending_changes.take() {
+                        inner.set_halt_changes(n);
+                    }
                     let snap = abort_snapshot.clone();
                     match inner.finish_activity(
                         hid,
@@ -10560,6 +10685,14 @@ impl Statement {
                 }
             }
 
+            RunningExec::MachineControl { .. } => {
+                let Some(StatementLifecycle::Running(RunningExec::MachineControl { mut vm, .. })) =
+                    Some(std::mem::replace(&mut self.lifecycle, StatementLifecycle::Ready))
+                else {
+                    unreachable!("matched above")
+                };
+                self.step_machine_control(hid, shared, inner, &mut vm, false)
+            }
             RunningExec::PendingCommit {
                 release_savepoint,
                 last_busy,
@@ -13922,6 +14055,8 @@ mod c_align_m1_tests;
 mod c_align_m2_tests;
 #[cfg(test)]
 mod c_align_m3_tests;
+#[cfg(test)]
+mod c_align_m3c_tests;
 /// Regression tests for behaviour that has to match C SQLite 3.54.1 (step 5e): every expected
 /// value below is what the reference `sqlite3` produces for the same statements.
 #[cfg(test)]

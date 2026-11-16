@@ -140,6 +140,9 @@ pub struct StmtTxTracker {
     /// Set while a one-pass DELETE removes a row: root of the index the scan runs on
     /// (`iIdxNoSeek` of `sqlite3GenerateRowDelete`), whose entry is deleted after the table row.
     pub delete_idx_no_seek: Option<Pgno>,
+    /// `p->nChange` of a statement the machine ran that returned rows (RETURNING): stored
+    /// when the statement halts, not when it returns its first row.
+    pub pending_changes: Option<i64>,
     /// Nesting of `execute_read_body` / `execute_write_body` (a statement run from inside
     /// another one). The cursors of a statement are closed when the outermost one ends.
     pub exec_depth: u32,

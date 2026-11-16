@@ -429,8 +429,286 @@ impl VirtualTable for GenerateSeriesTable {
     }
 }
 
+/// `series_cursor` of series.c, filled by `seriesFilter` (the C plan, `filter_c`).
+#[derive(Debug, Default, Clone, Copy)]
+struct SeriesC {
+    b_desc: bool,
+    b_done: bool,
+    i_obase: i64,
+    i_oterm: i64,
+    i_ostep: i64,
+    i_base: i64,
+    i_term: i64,
+    i_step: u64,
+    i_value: i64,
+}
+
+/// `span64(a, b)`: a - b as an unsigned 64-bit value (a >= b)
+fn span64(a: i64, b: i64) -> u64 {
+    (a as u64).wrapping_sub(b as u64)
+}
+
+/// `add64`, `sub64`
+fn add64(a: i64, b: u64) -> i64 {
+    (a as u64).wrapping_add(b) as i64
+}
+fn sub64(a: i64, b: u64) -> i64 {
+    (a as u64).wrapping_sub(b) as i64
+}
+
+impl SeriesC {
+    /// `seriesSteps(pCur)`
+    fn steps(&self) -> u64 {
+        if self.b_desc {
+            span64(self.i_base, self.i_term) / self.i_step
+        } else {
+            span64(self.i_term, self.i_base) / self.i_step
+        }
+    }
+
+    /// `series_no_rows:`
+    fn no_rows(&mut self) {
+        self.i_base = 0;
+        self.i_term = 0;
+        self.i_step = 1;
+        self.b_desc = false;
+        self.b_done = true;
+    }
+
+    /// `seriesFilter(pVtabCursor, idxNum, idxStr, argc, argv)`
+    #[allow(clippy::too_many_lines)]
+    fn filter(&mut self, idx_num: i32, argv: &[Value]) {
+        const SMALLEST_INT64: i64 = i64::MIN;
+        const LARGEST_INT64: i64 = i64::MAX;
+        let mut i_arg = 0usize;
+        let mut i_min = SMALLEST_INT64;
+        let mut i_max = LARGEST_INT64;
+        let mut i_limit: i64 = 0;
+        let mut i_offset: i64 = 0;
+        let arg = |i: usize| argv.get(i).cloned().unwrap_or(Value::Null);
+        // If any constraints have a NULL value, then return no rows.
+        if argv.iter().any(Value::is_null) {
+            return self.no_rows();
+        }
+        // Capture the three HIDDEN parameters to the virtual table and insert default values
+        // for any parameters that are omitted.
+        if idx_num & 0x01 != 0 {
+            self.i_obase = arg(i_arg).to_integer_lossy();
+            i_arg += 1;
+        } else {
+            self.i_obase = 0;
+        }
+        if idx_num & 0x02 != 0 {
+            self.i_oterm = arg(i_arg).to_integer_lossy();
+            i_arg += 1;
+        } else {
+            self.i_oterm = 0xffff_ffff;
+        }
+        if idx_num & 0x04 != 0 {
+            self.i_ostep = arg(i_arg).to_integer_lossy();
+            i_arg += 1;
+            if self.i_ostep == 0 {
+                self.i_ostep = 1;
+            }
+        } else {
+            self.i_ostep = 1;
+        }
+        // If there are constraints on the value column but there are no constraints on the
+        // start, stop, and step columns, then initialize the default range to be the entire
+        // range of 64-bit signed integers.
+        if (idx_num & 0x05) == 0 && (idx_num & 0x0380) != 0 {
+            self.i_obase = SMALLEST_INT64;
+        }
+        if (idx_num & 0x06) == 0 && (idx_num & 0x3080) != 0 {
+            self.i_oterm = LARGEST_INT64;
+        }
+        self.i_base = self.i_obase;
+        self.i_term = self.i_oterm;
+        if self.i_ostep > 0 {
+            self.i_step = self.i_ostep as u64;
+        } else if self.i_ostep > SMALLEST_INT64 {
+            self.i_step = (-self.i_ostep) as u64;
+        } else {
+            self.i_step = (LARGEST_INT64 as u64) + 1;
+        }
+        self.b_desc = self.i_ostep < 0;
+        if !self.b_desc && self.i_base > self.i_term {
+            return self.no_rows();
+        }
+        if self.b_desc && self.i_base < self.i_term {
+            return self.no_rows();
+        }
+        // Extract the LIMIT and OFFSET values, but do not apply them yet.
+        if idx_num & 0x20 != 0 {
+            i_limit = arg(i_arg).to_integer_lossy();
+            i_arg += 1;
+            if idx_num & 0x40 != 0 {
+                i_offset = arg(i_arg).to_integer_lossy();
+                i_arg += 1;
+            }
+        }
+        // Narrow the range of iMin and iMax based on constraints on the "value" column.
+        if idx_num & 0x3380 != 0 {
+            if idx_num & 0x0080 != 0 {
+                // value=X
+                let v = arg(i_arg);
+                i_arg += 1;
+                if let Some(r) = series_numeric_float(&v) {
+                    if r == r.ceil() && r >= SMALLEST_INT64 as f64 && r <= LARGEST_INT64 as f64 {
+                        i_min = series_real_to_i64(r);
+                        i_max = i_min;
+                    } else {
+                        return self.no_rows();
+                    }
+                } else {
+                    i_min = v.to_integer_lossy();
+                    i_max = i_min;
+                }
+            } else {
+                if idx_num & 0x0300 != 0 {
+                    // value>X (0x200) or value>=X (0x100)
+                    let v = arg(i_arg);
+                    i_arg += 1;
+                    if let Some(r) = series_numeric_float(&v) {
+                        if r <= SMALLEST_INT64 as f64 {
+                            i_min = SMALLEST_INT64;
+                        } else if r > LARGEST_INT64 as f64 {
+                            return self.no_rows();
+                        } else {
+                            i_min = series_real_to_i64(r.ceil());
+                            if (idx_num & 0x0200) != 0 && r == r.ceil() {
+                                if i_min == LARGEST_INT64 {
+                                    return self.no_rows();
+                                }
+                                i_min += 1;
+                            }
+                        }
+                    } else {
+                        i_min = v.to_integer_lossy();
+                        if (idx_num & 0x0200) != 0 {
+                            if i_min == LARGEST_INT64 {
+                                return self.no_rows();
+                            }
+                            i_min += 1;
+                        }
+                    }
+                }
+                if idx_num & 0x3000 != 0 {
+                    // value<X (0x2000) or value<=X (0x1000)
+                    let v = arg(i_arg);
+                    if let Some(r) = series_numeric_float(&v) {
+                        if r >= LARGEST_INT64 as f64 {
+                            i_max = LARGEST_INT64;
+                        } else if r <= SMALLEST_INT64 as f64 {
+                            return self.no_rows();
+                        } else {
+                            i_max = series_real_to_i64(r.floor());
+                            if (idx_num & 0x2000) != 0 && r == r.floor() {
+                                if i_max == SMALLEST_INT64 {
+                                    return self.no_rows();
+                                }
+                                i_max -= 1;
+                            }
+                        }
+                    } else {
+                        i_max = v.to_integer_lossy();
+                        if idx_num & 0x2000 != 0 {
+                            if i_max == SMALLEST_INT64 {
+                                return self.no_rows();
+                            }
+                            i_max -= 1;
+                        }
+                    }
+                }
+                if i_min > i_max {
+                    return self.no_rows();
+                }
+            }
+            // Try to reduce the range of values to be generated based on constraints on the
+            // "value" column.
+            if !self.b_desc {
+                if self.i_base < i_min {
+                    let span = span64(i_min, self.i_base);
+                    self.i_base = add64(self.i_base, (span / self.i_step).wrapping_mul(self.i_step));
+                    if self.i_base < i_min {
+                        if self.i_base > sub64(LARGEST_INT64, self.i_step) {
+                            return self.no_rows();
+                        }
+                        self.i_base = add64(self.i_base, self.i_step);
+                    }
+                }
+                if self.i_term > i_max {
+                    self.i_term = i_max;
+                }
+            } else {
+                if self.i_base > i_max {
+                    let span = span64(self.i_base, i_max);
+                    self.i_base = sub64(self.i_base, (span / self.i_step).wrapping_mul(self.i_step));
+                    if self.i_base > i_max {
+                        if self.i_base < add64(SMALLEST_INT64, self.i_step) {
+                            return self.no_rows();
+                        }
+                        self.i_base = sub64(self.i_base, self.i_step);
+                    }
+                }
+                if self.i_term < i_min {
+                    self.i_term = i_min;
+                }
+            }
+        }
+        // Adjust iTerm so that it is exactly the last value of the series.
+        if !self.b_desc {
+            if self.i_base > self.i_term {
+                return self.no_rows();
+            }
+            self.i_term = sub64(self.i_term, span64(self.i_term, self.i_base) % self.i_step);
+        } else {
+            if self.i_base < self.i_term {
+                return self.no_rows();
+            }
+            self.i_term = add64(self.i_term, span64(self.i_base, self.i_term) % self.i_step);
+        }
+        // Transform the series generator to output values in the requested order.
+        if ((idx_num & 0x0008) != 0 && !self.b_desc) || ((idx_num & 0x0010) != 0 && self.b_desc) {
+            std::mem::swap(&mut self.i_base, &mut self.i_term);
+            self.b_desc = !self.b_desc;
+        }
+        // Apply LIMIT and OFFSET constraints, if any
+        if idx_num & 0x20 != 0 {
+            if i_offset > 0 {
+                if self.steps() < i_offset as u64 {
+                    return self.no_rows();
+                } else if self.b_desc {
+                    self.i_base = sub64(self.i_base, self.i_step.wrapping_mul(i_offset as u64));
+                } else {
+                    self.i_base = add64(self.i_base, self.i_step.wrapping_mul(i_offset as u64));
+                }
+            }
+            if i_limit >= 0 && self.steps() > i_limit as u64 {
+                self.i_term = add64(self.i_base, ((i_limit - 1) as u64).wrapping_mul(self.i_step));
+            }
+        }
+        self.i_value = self.i_base;
+        self.b_done = false;
+        let _ = i_arg;
+    }
+
+    /// `seriesNext`
+    fn next(&mut self) {
+        if self.i_value == self.i_term {
+            self.b_done = true;
+        } else if self.b_desc {
+            self.i_value = sub64(self.i_value, self.i_step);
+        } else {
+            self.i_value = add64(self.i_value, self.i_step);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct GenerateSeriesCursor {
+    /// set by `filter_c` (C's plan): the cursor runs as series.c's `series_cursor`
+    c: Option<SeriesC>,
     is_eof: bool,
     is_desc: bool,
     raw_start: i64,
@@ -471,6 +749,20 @@ fn value_to_i64(val: &Value) -> i64 {
 }
 
 impl VirtualCursor for GenerateSeriesCursor {
+    fn filter_c(
+        &mut self,
+        _ctx: &mut dyn VTabHostContext,
+        idx_num: i32,
+        _idx_str: Option<&str>,
+        args: &[Value],
+        _in_lists: &[Option<Vec<Value>>],
+    ) -> Result<()> {
+        let mut c = SeriesC::default();
+        c.filter(idx_num, args);
+        self.c = Some(c);
+        Ok(())
+    }
+
     fn filter(
         &mut self,
         _ctx: &mut dyn VTabHostContext,
@@ -478,6 +770,7 @@ impl VirtualCursor for GenerateSeriesCursor {
         _idx_str: Option<&str>,
         args: &[Value],
     ) -> Result<()> {
+        self.c = None;
         if (idx_num & SERIES_BIT_START) == 0 {
             return Err(SqliteError::new(
                 ErrorCode::Error,
@@ -597,6 +890,10 @@ impl VirtualCursor for GenerateSeriesCursor {
     }
 
     fn next(&mut self) -> Result<()> {
+        if let Some(c) = self.c.as_mut() {
+            c.next();
+            return Ok(());
+        }
         if self.is_eof {
             return Ok(());
         }
@@ -621,10 +918,22 @@ impl VirtualCursor for GenerateSeriesCursor {
     }
 
     fn eof(&self) -> bool {
-        self.is_eof
+        match &self.c {
+            Some(c) => c.b_done,
+            None => self.is_eof,
+        }
     }
 
     fn column(&self, col_idx: usize) -> Result<Value> {
+        if let Some(c) = &self.c {
+            // seriesColumn
+            return Ok(Value::Integer(match col_idx {
+                1 => c.i_obase,
+                2 => c.i_oterm,
+                3 => c.i_ostep,
+                _ => c.i_value,
+            }));
+        }
         let val = match col_idx {
             0 => Value::Integer(self.current_value),
             1 => Value::Integer(self.raw_start),
@@ -636,6 +945,9 @@ impl VirtualCursor for GenerateSeriesCursor {
     }
 
     fn rowid(&self) -> Result<i64> {
+        if let Some(c) = &self.c {
+            return Ok(c.i_value);
+        }
         Ok(self.current_value)
     }
 }

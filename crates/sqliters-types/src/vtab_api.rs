@@ -783,6 +783,24 @@ pub trait VirtualCursor: Send + Sync {
         args: &[Value],
     ) -> Result<()>;
 
+    /// `xFilter` as the port of C's VDBE calls it (`OP_VFilter`): `idx_num` / `idx_str` and the
+    /// order of `args` are those of the plan of [`VirtualTable::best_index_calls`] (C's
+    /// xBestIndex), which can differ from the plan of [`VirtualTable::best_index`] that
+    /// [`Self::filter`] receives from the engine's executor. `in_lists[i]` holds the values of
+    /// argument `i` when it is the `ValueList` of an IN operator the module took whole
+    /// (`sqlite3_vtab_in(.., 1)`, `sqlite3_vtab_in_first` / `_next`). The default is
+    /// [`Self::filter`] (modules whose two plans are the same).
+    fn filter_c(
+        &mut self,
+        ctx: &mut dyn VTabHostContext,
+        idx_num: i32,
+        idx_str: Option<&str>,
+        args: &[Value],
+        _in_lists: &[Option<Vec<Value>>],
+    ) -> Result<()> {
+        self.filter(ctx, idx_num, idx_str, args)
+    }
+
     /// Receives [`VTabIndexInfo::plan_hint`] of the chosen plan right before `filter`.
     fn set_plan_hint(&mut self, _hint: u64) {}
 
