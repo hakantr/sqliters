@@ -260,6 +260,32 @@ Ayrıntı: `karar_esligi_v1.md` (işlev eşlemesi, karar tabloları, kapsam tabl
 
 **Kalanlar** (`gorulen_farklar_m3.md`). D49 metinden sayıya önek dönüşümü (`'4.24.2'+'4.24.2'` eski yolda 8, C'de 8,48; anahtar açık makine yolu C ile aynı); D50 bağlama SQLITE_MAX_LENGTH sınırını uygulamıyor; D51 bir DDL hatası prepare yerine step'te; E20–E23 yukarıda.
 
+## M3c — makine: işlem ifadeleri, sanal tablo okumaları, `max_page_count` (dal `performans-A-vdbe-makine`, commit `93270fc`)
+
+**Taşınan / düzeltilen** (ayrıntı `karar_esligi_m3c.md`).
+- **İşlem ifadeleri (E22):** `OP_AutoCommit`, `OP_Savepoint`; `sqlite3VdbeHalt`'ın commit / geri alma kısmı (`halt_transaction`), C'nin `goto vdbe_return` davranışı (SQLITE_BUSY'de program sayacı korunuyor, ertelenmiş FK hatasında ifade durmuyor), `OP_Transaction`'da QueryOnly / CorruptRdOnly denetimi, BUSY'de devam, açılmamış TEMP'in atlanması. BEGIN / COMMIT / ROLLBACK / SAVEPOINT / RELEASE anahtar açıkken C'nin derleme sonucundan geçip makinede çalışıyor; BUSY'den sonra aynı program yeniden adımlanıyor. DDL motorda kaldı.
+- **Sanal tablo okumaları (E21, D35, D37):** okuma host'u yürütme bağlamı içinde; her modül C'nin `xBestIndex` planını alıyor (`VirtualCursor::filter_c`; `seriesFilter`, `statFilter`, `pragmaVtabFilter` satır satır taşındı); FTS5 yardımcı işlevleri, alt tipler, konumlu r-tree imlecinin yazma kilidi. `OP_VInitIn`, `OP_VCheck` taşındı (hiçbir derlemde çalışmadı: modüller `sqlite3_vtab_in(..,1)` istemiyor, `OP_VCheck`'i yalnız üretilmeyen PRAGMA üretiyor). Sanal tablo okuyan SELECT'lerin motora düşmesi bitti.
+- **E23:** `max_page_count` C'deki gibi sayfa ayrılırken sayfalayıcıda denetleniyor.
+- Yolda kapanan C farkları: D52 RETURNING'li ifadenin `changes()` değeri, D53 OR FAIL sonrası başarısız commit'in kodu / iletisi, D54 CLI'de çok ifadeli satırda hatanın yanlış ifadeye atfedilmesi (D53 ve D54 iki yolda da).
+
+**Kanıt** (anahtar açık; sonuçlar `target/perf-work/m3c/`).
+- Yeni işlem derlemi (`gen_tx.py`, 400 betik; savepoint, ertelenmiş FK, tetikleyici, sanal tablo yazması, işlem içinde hata, ikinci bağlantı): API'de C ile aynı **381** (M3a ağacı 133, 394 geri düşme; şimdi 0), CLI'de 383 (M3a 380). Kalan 19 farkın hepsi anahtar kapalıyken de var (E24–E27, D56).
+- Sanal tablo derlemlerinin **sorgu sonuçları** C'ye karşı (eşit / farklı ifade; önce motora düşüyordu): vt_a 8.356 / 1.796 → **9.978 / 179**, vt_b 4.204 / 858 → **4.964 / 98**, vt_t 1.654 / 375 → **1.984 / 45**, vt_x 2.519 / 187 → **2.590 / 66**, vt_e 54 / 1 → **55 / 0**, vt_d 151 / 10 → **159 / 2**. Makinede kalan farkların hepsi D57 (motorun pragma işlevlerinin çıktıları). 10 saniyeyi iki ikilide de aşan ifadeler karşılaştırılmadı.
+- **D37 kapandı** (anahtar açık yol): `SELECT value FROM generate_series(0,3,1) WHERE stop=1` C'deki gibi satır döndürmüyor.
+- M3a'nın derlemleri düşmedi: ops_dml_a 286 / 289 (API / CLI; M3a 283 / 288), ops_dml_v 140 / 139 (138 / 137), diğerleri aynı (ops_dml_f'deki 1 eksik `random()` kullanıyor); sc6 / sc7 geri düşmeleri 10 + 10 → 0; zengin r_a 196.
+- C kapsamı (gcov): `OP_AutoCommit` satır 27 / 28, `OP_Savepoint` 83 / 85, `sqlite3VdbeHalt` 69 / 90, `seriesFilter` 104 / 139; alınmayan dallar sınıflandırıldı. vt_a / vt_b kapsamı ölçülmedi (-O0 kabuk çok yavaş).
+- Çökme takımları (işlemler de makinede): sürücü 120 + 648 (makinede 1.320 ifade, geri düşme 0), CLI `crash_h1` 288 + 2.654, `crash_stmt` 84 + 432; 0 hata.
+- Kendi denetimim: iç içe BEGIN, ertelenmiş FK ile başarısız COMMIT, SAVEPOINT / ROLLBACK TO / bilinmeyen RELEASE, savepoint içinde DDL geri alımı, fts5'e işlem içinde yazma ile; generate_series (D37 dahil), json_each / json_tree, pragma_table_info / index_list, dbstat, rtree, fts5 highlight / bm25 okuyan betikler anahtar açıkken stdout ve dosya baytında C ile aynı (anahtar kapalı eski yolda sanal tablo betiğinin çıktısı farklı).
+- Testler: anahtar kapalı 1028 geçti / 0 başarısız / 337 yok sayıldı (5 yeni); açık 1015 / 13 (bilinen 10 + F8'in 3'ü). DML farksalı kapalı 378 / 400, açık 398 / 400. Ayrışma bulucu kapalı h7b + g06; açık tek fark health/s10_without_rowid (makine C ile aynı, başvuru eski yol). Hız (anahtar kapalı, 1.100 tabanı): toplam 1,020x, geomean 1,001x (W11 1,017–1,025x, gürültü sınırında); `Pager`'a eklenen alan yapının başındayken W12 1,056x yavaşlamıştı, sona taşınınca 0,997x.
+
+**Değişen test beklentisi yok.** Anahtar açıkken yeni düşen 3 test C'de olmayan davranışı sınıyor (F8): `group64_quoted_dots…` ve `test_gate2_3…` (`SELECT main."a.b".*`, `SELECT aux.items.*`; C `near "*": syntax error`), `test_wal_jsonb_window…` (trusted_schema=OFF altında MATCH içeren görünüm; C `unsafe use of MATCH()`). 5 yeni test (`c_align_m3c_tests.rs`).
+
+**Yapılmayanlar.** E28: COMMIT'in yazımı G/Ç hatasıyla düşerse C işlemi geri alıyor, Rust açık bırakıyor (Rust sayfalayıcısında PAGER_ERROR durumu yok). D55 `PRAGMA query_only` motorda yok. DDL kodları (`OP_SetCookie`, `OP_CreateBtree`, `OP_ParseSchema`, `OP_VRename` …) taşınmadı. E11 görünür etkisi olmadığı için taşınmadı (M2'nin önbellek izi yeniden koşulmadı).
+
+**Kalanlar** (`gorulen_farklar_m3c.md`). D56 etkisiz `CREATE INDEX IF NOT EXISTS` / `DROP TABLE IF EXISTS` yazma kilidi alıyor; D57 motorun pragma işlev çıktıları; E24 WAL değişiklik sayacı; E25 cache_size=2 ile fts5 + auto_vacuum boş alan baytları; E26 fts5 DROP'un `total_changes` sayımı; E27 önbellek taşma zamanlaması (E24–E27 anahtar kapalıyken de var); E28.
+
+**Hız (anahtar açık, C'ye göre; M3b konusu).** W03 2,03x, W04 2,56x, W09 4,66x, W10 3,80x, W14 8,36x.
+
 ## Bu adımda görülen, eski motora ait C farkları (dokunulmadı)
 
 | İfade | C | Motor |
