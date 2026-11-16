@@ -17,6 +17,7 @@
 | V4a — pencere işlevleri | `f7df02e` | `window.c`'nin üretici tarafı (yeniden yazım, adlandırılmış / zincirlenmiş pencereler, `sqlite3WindowCodeInit` / `CodeStep` ve yardımcıları, ROWS / RANGE / GROUPS, EXCLUDE), ayrıştırıcı kuralları 93, 318–345 | 24.012 / 24.012 (pencere derlemleri) + V3'ün 87.000'i | 14.532 / 39.300 (%37,0) | 1002 geçti, bilinen 4 başarısız, 337 yok sayıldı |
 | V4b — FROM içinde sanal tablolar ve tablo değerli işlevler | `628a5f5` | `vtab.c` okuma tarafı, CREATE VIRTUAL TABLE şema yüklemesi, `whereLoopAddVirtual` / `xBestIndex`, sanal tablo döngü kodu ve EQP | 23.640 / 23.642 (vtab derlemleri; 2 = D34) + önceki 111.012 | 14.773 / 39.300 (%37,6) | 1011 geçti, bilinen 4 başarısız, 337 yok sayıldı |
 | V5 — DML, UPSERT, RETURNING, tetikleyiciler, yabancı anahtarlar | `4b1ffa5` | `delete.c`, `insert.c`, `update.c`, `upsert.c`, `trigger.c`, `fkey.c` (DML tarafı), RETURNING, ayrıştırıcı kuralları 76, 131, 152, 157–174, 260–277, 309/310 | 65.200 / 65.200 (DML derlemleri; EQP'de 3 = D48) + program düzeyi 62.308 / 62.308 + önceki 134.652 / 134.654 | 26.811 / 39.300 (%68,2) | 1018 geçti, 0 başarısız, 337 yok sayıldı |
+| V6 — DDL: CREATE / DROP / ALTER / ANALYZE / VACUUM / ATTACH / REINDEX | `2d1ede0` | `build.c` DDL kodu, `alter.c`, `analyze.c`, CREATE / DROP TRIGGER, `OP_VCreate`, `sqlite3FkDropTable`, ATTACH / DETACH, VACUUM (PRAGMA V6b'ye kaldı) | 28.367 / 28.367 (DDL derlemleri) + program düzeyi 25.107 / 25.107 | 36.329 / 39.300 (%92,4) | 1032 geçti, 0 başarısız, 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -172,6 +173,32 @@ Ayrıntı: `karar_esligi_v1.md` (işlev eşlemesi, karar tabloları, kapsam tabl
 **Değişen test beklentileri (2).** İkisi de taşıma durumu beklentisiydi, C davranışı değil: `explain_tests.rs::unsupported_statements_are_reported_not_approximated` (`insert into t values(1)` yerine `drop table t`; insert için C'nin hatası `no such table: t` ayrıca sınanıyor) ve `plan_tests.rs::unsupported_in_v3` (örnek artık CREATE TRIGGER; `insert into t(b) values(1)` derleniyor). 3 yeni test (`dml_tests.rs`): UPSERT + RETURNING, tetikleyici alt programı, FK CASCADE; beklenen listeler C'den.
 
 **Kalanlar** (`gorulen_farklar_v5.md`). D42 çelişen ON CONFLICT yan tümceleri kabul ediliyor; D43/D44 prepare farkları; D45 STRICT ileti sütun adı; D46 rtree RETURNING tamsayı (C REAL); D47 birkaç sayfa baytı (eski yolda da); **D48** birbirine bağlı üretilmiş sütunlarda INSERT — zengin derlemde motor yığın taşmasıyla çöküyor; basit biçimde (`c AS (e*b) STORED, e AS (b*c) STORED`) çökmüyor ama C'nin `generated column loop on "e"` hatasını vermeden satırı yazıyor. E16–E19 makine adımına kaydedildi. Öne alınacak veri farkları: D23, D30, D37, D48.
+
+## V6 — DDL: CREATE / DROP / ALTER / ANALYZE / VACUUM / ATTACH / REINDEX
+
+**Taşınan** (ayrıntı `karar_esligi_v6.md`).
+- Yeni `ddl.rs`: build.c'nin DDL kod üretimi (`sqlite3NestedParse`, `sqlite3ChangeCookie`, StartTable / EndTable kodu, CREATE TABLE … AS SELECT, CreateIndex kodu, `sqlite3RefillIndex`, DROP TABLE / INDEX / VIEW, `destroyRootPage` / `destroyTable` ile auto_vacuum kök taşımaları, `sqlite3ClearStatTables`, REINDEX), DROP TRIGGER, VACUUM, ATTACH / DETACH.
+- Yeni `alter.rs`: RENAME TABLE, RENAME COLUMN, ADD COLUMN, DROP COLUMN ve 3.54'ün kısıt biçimleri (DROP CONSTRAINT, SET / DROP NOT NULL, ADD CHECK); iç içe `sqlite_rename_*` SQL'i C'nin yazdığı gibi. Yeni `analyze.rs`: ANALYZE (STAT4'süz derleme).
+- `trigger.rs`: CREATE TRIGGER kodlaması ve C'nin hash sırası (silme dahil); `vtab.rs`: `OP_VCreate`; `fkey.rs`: `sqlite3FkDropTable`; `build.rs`: `sqlite3OpenTempDatabase`; ayrıştırıcının DDL kuralları.
+- Kanıt yolunda bulunan eski üretici kusurları düzeltildi: `DEFAULT -0.0` işareti (V3'ten), `bQuote` değeri, DbFixer hata konumları.
+- **Motora dokunuldu (kurala istisna):** C'nin bağlantı durumu altı yerde motora yansıtıldı (D75–D80: temp veritabanının açılması, tblHash geçmişi, nRowLogEst yükseltmeleri, ALTER sonrası istatistik kaydı, `pragma_quick_check` bağlantısı, `analysis_limit`). Bunlar olmadan bir bloğun sonraki `EXPLAIN`'leri zincirleme farklılaşıyordu; motorun DDL yürütmesi değişmedi.
+- **PRAGMA taşınmadı** (V6b): üretici `Unsupported("PRAGMA (step V6b)")` veriyor. **DDL makineye yönlendirilmedi** (M4).
+
+**Kanıt** (ikili `r2`; sonuçlar `target/perf-work/v6/res/`).
+- 9 DDL derlemi (a, auto_vacuum, ATTACH + temp, WITHOUT ROWID, FK + tetikleyici, fts5 / rtree, ALTER ağırlıklı, elle yazılmış iki hata derlemi): kabul edilen 28.367 ifadenin `EXPLAIN` ve EQP'si C ile aynı, fark 0. Motorun DDL farkları (D59–D74, D81) yüzünden 1.030 ifade yalnız `EXPLAIN` olarak sınandı (çalıştırılmadı).
+- **Program düzeyi:** 25.107 program C'nin döktüğü programla bayt bayt aynı (13 ifadeyi üretici istatistik kuralı gereği desteklemiyor).
+- Katmanlar: wdiff'te yalnız fts5 / rtree derleminde loops ve paths katmanında 2'şer fark (D74, rtree `xBestIndex` satır tahmini; listeleme aynı); şema katmanında 3 blok (C'nin eski istatistikleri ve bir araç farkı).
+- Önceki derlemler (V3, V4a, V4b, V5, zengin V5): V5 ile aynı (bilinen vt_d 2 = D34, dml_r_* EQP 1'er = D48).
+- Tüm ifade türleri: kabul **%68,2 → %92,4** (36.329 / 39.300; kalan 2.929'un hepsi PRAGMA); `EXPLAIN` farkı 486 → 238 (yeni 68'in hepsi motora izlendi: 66 `EXPLAIN PRAGMA` yan etkisi, 1 hata konumu, 1 D58 sınıfı); EQP farkı 170.
+- C tarafı kapsamı (gcov): satır %94,6, dal %86,4; bir yönü hiç alınmayan 32 dal satırı "doğrulanmadı" olarak listelendi.
+- Kendi denetimim: 24 DDL ifadesinin (STRICT / CHECK / `-0.0` varsayılanlı CREATE TABLE, CREATE TABLE AS, kısmi UNIQUE indeks, TEMP tetikleyici, rtree, FK'lı DROP TABLE, dört ALTER biçimi, ANALYZE, REINDEX, VACUUM, ATTACH / DETACH, olmayan veritabanı) `EXPLAIN` çıktısı C ile bayt bayt aynı. auto_vacuum, ANALYZE, temp, ATTACH, ALTER, DROP ve VACUUM içeren bir yürütme betiğinde V6 öncesi ikili ve V6 ikilisi stdout ve dosya baytında C ile aynı (motor değişiklikleri yürütmeyi bozmadı).
+- Testler: anahtar kapalı 1032 geçti / 0 başarısız / 337 yok sayıldı (3 yeni); açık 1017 / 15 (D58 sonrasındaki 15'in aynısı). DML farksalı kapalı 378 / 400, açık 398 / 400; ayrışma bulucu h7b + g06; hız (anahtar kapalı, 1.100 tabanı) toplam 1,004x, geomean 0,996x (r1'deki W02 %3,9 yavaşlaması r2'de giderildi).
+
+**M4 için işlem kodları** (üretilen program sayısı): `SetCookie` 18.292, `ParseSchema` 15.949, `CreateBtree` 10.521, `Expire` 5.166, `DropTable` 2.091, `Destroy` 1.809, `LoadAnalysis` 1.277, `SqlExec` 1.107, `Vacuum` 531, `DropTrigger` 273, `VCreate` 271, `DropIndex` 154, `JournalMode` 146, `VDestroy` 55, `VRename` 2. Makinenin işlev kitaplığına ayrıca `sqlite_attach` / `detach`, `stat_init` / `push` / `get`, `sqlite_rename_table` / `column` / `test` / `quotefix`, `sqlite_drop_column`, `sqlite_add` / `drop` / `find_constraint`, `sqlite_fail` gerekiyor.
+
+**Değişen test beklentileri (2; ikisi de taşıma durumu beklentisiydi).** `explain_tests.rs::unsupported_statements_are_reported_not_approximated`: "create table t(x)" artık program veriyor, "drop table t" C'nin hatasını veriyor (`no such table: t`, konumsuz; `$S/bin/sqlite3` ile doğrulandı), PRAGMA hâlâ desteklenmiyor. `plan_tests.rs::unsupported_in_v3`: CREATE TRIGGER artık program veriyor. 3 yeni test (`v6_drop_table_with_autoindex`, `v6_create_unique_partial_index`, `v6_analyze_one_table`; beklenen listeler C'den).
+
+**Kalanlar** (`gorulen_farklar_v6.md`; hiçbiri üretilen programda değil). Motorun DDL farkları: D59 görünüm / sanal tablo ANALYZE'ı, D60 sistem tablolarının analizi, D61 3.5x ALTER biçimleri motorda yok, D62 VACUUM INTO hata metni, D63 temp'in VACUUM'u, D64 ALTER ve hatadan sonra şema nesli, D65 `ATTACH x'00'`, D66–D68 hata metinleri, D69 ANALYZE satır sırası, D70 "unknown database" hata konumu, D71 `EXPLAIN PRAGMA` yan etkileri (V6b), D72 defer_foreign_keys, D73 NULLS FIRST kabulü, D74 rtree tahmini, D81 nitelenmemiş CREATE INDEX'in başka veritabanındaki tabloyu bulması. E30 / E31 M4 girdisi.
 
 ## M1 — makine: `SELECT` programlarının C gibi çalıştırılması (dal `performans-A-vdbe-makine`)
 
