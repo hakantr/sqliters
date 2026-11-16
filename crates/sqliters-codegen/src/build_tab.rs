@@ -128,10 +128,12 @@ pub(crate) fn sqlite3_check_object_name(p: &mut Parse, z_name: &str, z_type: &st
             p.error_msg(""); // corruptSchema() will supply the error
             return true;
         }
-    } else if p.nested == 0 && z_name.len() >= 7 && z_name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_") {
-        // (only reached by sqlite3_declare_vtab(): other statements that create objects are
-        // not ported. sqlite3ReadOnlyShadowTables(): SQLITE_Defensive is never set for the
-        // generator.)
+    } else if (p.nested == 0
+        && z_name.len() >= 7
+        && z_name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_"))
+        || (crate::ddl::sqlite3_read_only_shadow_tables(p)
+            && crate::vtab::sqlite3_shadow_table_name(p, z_name))
+    {
         p.error_msg(format!("object name reserved for internal use: {z_name}"));
         return true;
     }
@@ -173,12 +175,15 @@ pub fn sqlite3_find_index(p: &Parse, z_name: &str, z_db: Option<&str>) -> IndexI
 /// TABLE statement is parsed, additional action routines will be called to add more
 /// information to this record. At the end of the CREATE TABLE statement, the
 /// sqlite3EndTable() routine is called to complete the construction of the new table record.
-pub fn sqlite3_start_table(p: &mut Parse, name1: &Token, name2: &Token, is_temp: bool, is_view: bool, _is_virtual: bool, _no_err: bool) {
-    if !p.db.init_busy && !p.in_declare_vtab() {
-        // (code generation for CREATE TABLE / CREATE VIEW is a later step)
-        p.not_supported("statement kind (grammar rule not ported)");
-        return;
-    }
+pub fn sqlite3_start_table(
+    p: &mut Parse,
+    name1: &Token,
+    name2: &Token,
+    is_temp: bool,
+    is_view: bool,
+    is_virtual: bool,
+    no_err: bool,
+) {
     let i_db: i32;
     let z_name: String;
     let mut name = Token::EMPTY;
@@ -206,15 +211,38 @@ pub fn sqlite3_start_table(p: &mut Parse, name1: &Token, name2: &Token, is_temp:
         z_name = sqlite3_dequote(p.tok_str(&name));
     }
     p.s_name_token = name;
-    if p.init_i_db == 1 && p.db.init_busy {
-        // if( db->init.iDb==1 ) isTemp = 1;  (only read by the authorizer)
-    }
     if sqlite3_check_object_name(p, &z_name, if is_view { "view" } else { "table" }, &z_name) {
         p.check_schema = true;
         return;
     }
-    // (sqlite3AuthCheck: the engine authorizes. !IN_SPECIAL_PARSE name-collision checks:
-    // skipped while the schema is loaded, db->init.busy)
+    // (if( db->init.iDb==1 ) isTemp = 1: only read by the authorizer; sqlite3AuthCheck: the
+    // generator is not used with an authorizer)
+
+    // Make sure the new table name does not collide with an existing index or table name in
+    // the same database. Note that the name collision checks are skipped while the schema is
+    // loaded (IN_SPECIAL_PARSE / db->init.busy).
+    if p.e_parse_mode == 0 && !p.db.init_busy {
+        let z_db = p.db.a_db[i_db as usize].z_db_s_name.clone();
+        crate::schema::sqlite3_read_schema(p);
+        let t = crate::schema::sqlite3_find_table(p, &z_name, Some(&z_db));
+        if t.nn() {
+            if !no_err {
+                let what = if p.tab(t).is_view() { "view" } else { "table" };
+                let msg = format!("{what} {} already exists", p.tok_str(&name));
+                p.error_msg_tok(msg, &name);
+            } else {
+                crate::build::sqlite3_code_verify_schema(p, i_db);
+                crate::ddl::sqlite3_force_not_read_only(p);
+            }
+            p.check_schema = true;
+            return;
+        }
+        if sqlite3_find_index(p, &z_name, Some(&z_db)).nn() {
+            p.error_msg(format!("there is already an index named {z_name}"));
+            p.check_schema = true;
+            return;
+        }
+    }
     let tab = p.new_tab(Table {
         z_name,
         i_p_key: -1,
@@ -224,6 +252,13 @@ pub fn sqlite3_start_table(p: &mut Parse, name1: &Token, name2: &Token, is_temp:
         ..Table::default()
     });
     p.p_new_table = tab;
+
+    // Begin generating the code that will insert the table record into the schema table.
+    // (The parse of sqlite3_declare_vtab() runs on a Parse object of its own in C whose
+    // program is discarded: no code here.)
+    if !p.db.init_busy && !p.in_declare_vtab() {
+        crate::ddl::start_table_code(p, i_db, is_view, is_virtual);
+    }
 }
 
 /// `sqlite3AddColumn(pParse, sName, sType)`: add a new column to the table currently being
@@ -805,6 +840,14 @@ fn convert_to_without_rowid_table(p: &mut Parse, tab: TableId) {
         t.tab_flags |= TF_HasNotNull;
     }
 
+    // Convert the P3 operand of the OP_CreateBtree opcode from BTREE_INTKEY into
+    // BTREE_BLOBKEY.
+    let codes = !p.db.init_busy && !p.in_declare_vtab();
+    if codes && p.cr_addr_cr_tab != 0 {
+        let a = p.cr_addr_cr_tab;
+        p.v.change_p3(a, crate::ddl::BTREE_BLOBKEY);
+    }
+
     // Locate the PRIMARY KEY index. Or, if this table was originally an INTEGER PRIMARY KEY
     // table, create a new PRIMARY KEY index.
     let pk;
@@ -850,8 +893,14 @@ fn convert_to_without_rowid_table(p: &mut Parse, tab: TableId) {
         x.uniq_not_null = true;
         x.n_column = x.n_key_col;
         n_pk = x.n_key_col as usize;
+        // Bypass the creation of the PRIMARY KEY btree and the sqlite_schema table entry
+        // that are normally generated for the index (the table btree is the PRIMARY KEY).
+        let pk_tnum = x.tnum;
         // The root page of the PRIMARY KEY is the table root page
         x.tnum = tnum;
+        if codes && pk_tnum > 0 {
+            p.v.change_opcode(pk_tnum as i32, sqliters_vdbe::opcodes::OP_Goto);
+        }
     }
 
     // Update the in-memory representation of all UNIQUE indices by converting the final
@@ -919,8 +968,14 @@ fn convert_to_without_rowid_table(p: &mut Parse, tab: TableId) {
 /// table on the disk. So do not write to the disk again. Extract the root page number for the
 /// table from the db->init.newTnum field. (The page number should have been put there by the
 /// sqliteInit.c routine.)
-pub fn sqlite3_end_table(p: &mut Parse, has_end: bool, tab_opts: u32, select: SelectId) {
-    if !has_end && select.is_null() {
+pub fn sqlite3_end_table(
+    p: &mut Parse,
+    cons: Option<&Token>,
+    end: Option<&Token>,
+    tab_opts: u32,
+    select: SelectId,
+) {
+    if end.is_none() && select.is_null() {
         return;
     }
     let tab = p.p_new_table;
@@ -1038,11 +1093,26 @@ pub fn sqlite3_end_table(p: &mut Parse, has_end: bool, tab_opts: u32, select: Se
         estimate_index_width(p, ix);
     }
 
+    // If not initializing, then create a record for the new table in the schema table of the
+    // database.
+    //
+    // If this is a TEMPORARY table, write the entry into the auxiliary file instead of into
+    // the main database file.
+    if !p.db.init_busy && !p.in_declare_vtab() {
+        let n_err = p.n_err;
+        crate::ddl::end_table_code(p, tab, select, tab_opts, end);
+        if p.n_err != n_err || p.unsupported.is_some() {
+            return;
+        }
+    }
+
     // Add the table to the in-memory representation of the database.
     if p.db.init_busy {
         let i_db = p.tab(tab).i_db as usize;
         let key = p.tab(tab).z_name.to_ascii_lowercase();
         p.a_schema[i_db].tbl_hash.insert(key, tab);
+        let zn = p.tab(tab).z_name.clone();
+        p.a_schema[i_db].tbl_order.insert(&zn, tab);
         p.p_new_table = TableId::NULL;
         // If this is the magic sqlite_sequence table used by autoincrement, then record a
         // pointer to this table in the main database structure so that INSERT can find the
@@ -1051,11 +1121,32 @@ pub fn sqlite3_end_table(p: &mut Parse, has_end: bool, tab_opts: u32, select: Se
             p.a_schema[i_db].p_seq_tab = tab;
         }
     }
+
+    if select.is_null() && p.tab(tab).is_ordinary() {
+        if let Some(end) = end {
+            let cons = match cons {
+                Some(c) if c.z != Token::NO_Z => *c,
+                _ => *end,
+            };
+            let ofs = 13 + cons.z as i32 - p.s_name_token.z as i32;
+            p.tabm(tab).add_col_offset = ofs;
+        }
+    }
 }
 
 /// `sqlite3CreateView(pParse, pBegin, pName1, pName2, pCNames, pSelect, isTemp, noErr)`: the
 /// parser calls this routine in order to create a new VIEW.
-pub fn sqlite3_create_view(p: &mut Parse, name1: &Token, name2: &Token, c_names: ExprListId, select: SelectId, is_temp: bool, no_err: bool) {
+#[allow(clippy::too_many_arguments)]
+pub fn sqlite3_create_view(
+    p: &mut Parse,
+    begin: Option<&Token>,
+    name1: &Token,
+    name2: &Token,
+    c_names: ExprListId,
+    select: SelectId,
+    is_temp: bool,
+    no_err: bool,
+) {
     if p.n_var > 0 {
         p.error_msg("parameters are not allowed in views");
         return;
@@ -1071,6 +1162,10 @@ pub fn sqlite3_create_view(p: &mut Parse, name1: &Token, name2: &Token, c_names:
     // allow rowid in view.
     p.tabm(tab).tab_flags |= TF_NoVisibleRowid;
 
+    let mut name = Token::EMPTY;
+    sqlite3_two_part_name(p, name1, name2, &mut name);
+    p.fix_name = p.tok_str(&name).to_owned();
+    p.fix_name_tok = name;
     let i_db = p.tab(tab).i_db;
     // sqlite3FixInit(&sFix, pParse, iDb, "view", pName); sqlite3FixSelect(&sFix, pSelect)
     if fix_select(p, select, i_db) {
@@ -1090,8 +1185,25 @@ pub fn sqlite3_create_view(p: &mut Parse, name1: &Token, name2: &Token, c_names:
         t.p_check = check;
         t.e_tab_type = TABTYP_VIEW as u8;
     }
+    // Locate the end of the CREATE VIEW statement. Make sEnd point to the end.
+    let mut s_end = p.s_last_token;
+    let b = p.z_sql.as_bytes();
+    if b.get(s_end.z as usize).copied().unwrap_or(0) != b';' {
+        s_end.z += s_end.n;
+    }
+    s_end.n = 0;
+    let begin_z = begin.map_or(0, |t| t.z as usize);
+    let mut n = s_end.z as usize - begin_z;
+    while n > 0 && crate::util::is_space(b[begin_z + n - 1]) {
+        n -= 1;
+    }
+    let s_end = Token {
+        z: (begin_z + n - 1) as u32,
+        n: 1,
+    };
+
     // Use sqlite3EndTable() to add the view to the schema table
-    sqlite3_end_table(p, true, 0, SelectId::NULL);
+    sqlite3_end_table(p, None, Some(&s_end), 0, SelectId::NULL);
 }
 
 /// `sqlite3CreateIndex(pParse, pName1, pName2, pTblName, pList, onError, pStart, pPIWhere,
@@ -1126,10 +1238,7 @@ pub fn sqlite3_create_index(
         return;
     }
     if !p.db.init_busy {
-        // (code generation for CREATE INDEX is a later step; the PRIMARY KEY of a WITHOUT
-        // ROWID table declared by a virtual table is not ported either)
-        p.not_supported("statement kind (grammar rule not ported)");
-        return;
+        crate::schema::sqlite3_read_schema(p);
     }
     if sqlite3_has_explicit_nulls(p, list) {
         return;
@@ -1145,11 +1254,20 @@ pub fn sqlite3_create_index(
         // Use the two-part index name to determine the database to search for the table.
         // 'Fix' the table name to this db before looking up the table.
         let (n1, n2) = (*name1.expect("index name"), *name2.expect("index name"));
-        let d = sqlite3_two_part_name(p, &n1, &n2, &mut name);
+        let mut d = sqlite3_two_part_name(p, &n1, &n2, &mut name);
         if d < 0 {
             return;
         }
         have_name = true;
+        if !p.db.init_busy {
+            let t = crate::delete::sqlite3_src_list_lookup(p, tbl_name);
+            if p.unsupported.is_some() {
+                return;
+            }
+            if n2.n == 0 && t.nn() && p.tab(t).i_db == 1 {
+                d = 1;
+            }
+        }
         i_db = d as usize;
         // sqlite3FixInit(&sFix, pParse, iDb, "index", pName); sqlite3FixSrcList(&sFix, pTblName)
         if i_db != 1 {
@@ -1178,6 +1296,15 @@ pub fn sqlite3_create_index(
         i_db = p.tab(tab).i_db as usize;
     }
 
+    if p.tab(tab).z_name.len() >= 7
+        && p.tab(tab).z_name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_")
+        && !p.db.init_busy
+        && tbl_name.nn()
+    {
+        let n = p.tab(tab).z_name.clone();
+        p.error_msg(format!("table {n} may not be indexed"));
+        return;
+    }
     if p.tab(tab).is_view() {
         p.error_msg("views may not be indexed");
         return;
@@ -1205,11 +1332,18 @@ pub fn sqlite3_create_index(
             return;
         }
         let zdb = p.db.a_db[i_db].z_db_s_name.clone();
+        if !p.db.init_busy && crate::schema::sqlite3_find_table(p, &z_name, Some(&zdb)).nn() {
+            p.error_msg(format!("there is already a table named {z_name}"));
+            return;
+        }
         if sqlite3_find_index(p, &z_name, Some(&zdb)).nn() {
             if !if_not_exist {
                 p.error_msg(format!("index {z_name} already exists"));
-            } else {
+            } else if p.db.init_busy {
                 p.error_msg(""); // corruptSchema() will do the error
+            } else {
+                crate::build::sqlite3_code_verify_schema(p, i_db as i32);
+                crate::ddl::sqlite3_force_not_read_only(p);
             }
             return;
         }
@@ -1314,6 +1448,12 @@ pub fn sqlite3_create_index(
             z_coll = sqlite3_column_coll(&p.tab(tab).a_col[j as usize]).map(|z| z.to_owned());
         }
         // if( !zColl ) zColl = sqlite3StrBINARY
+        if !p.db.init_busy
+            && crate::callback::sqlite3_locate_coll_seq(p, z_coll.as_deref().unwrap_or("BINARY"))
+                .is_none()
+        {
+            return;
+        }
         x.a_coll_static[i] = z_coll.is_none();
         x.az_coll[i] = z_coll.unwrap_or_else(|| "BINARY".to_owned());
         x.a_sort_order[i] = p.l(list).a[i].sort_flags & sort_order_mask;
@@ -1347,9 +1487,16 @@ pub fn sqlite3_create_index(
     }
     let ix = p.new_idx(x);
     {
-        let mut n = p.tab(tab).n_row_log_est;
+        let n0 = p.tab(tab).n_row_log_est;
+        let mut n = n0;
         sqlite3_default_row_est(p.idxm(ix), &mut n);
         p.tabm(tab).n_row_log_est = n;
+        if n != n0 && !p.db.init_busy && tbl_name.nn() {
+            // C's live table object is changed by the prepare of CREATE INDEX (also under
+            // EXPLAIN): its row estimate stays raised until the statistics are read again
+            let t = p.tab(tab);
+            p.db.host.note_rowest_clamped(t.i_db as usize, &t.z_name);
+        }
     }
     if p.p_new_table.is_null() {
         estimate_index_width(p, ix);
@@ -1425,13 +1572,34 @@ pub fn sqlite3_create_index(
 
     // Link the new Index structure to its table and to the other in-memory database
     // structures.
-    if tbl_name.nn() {
-        p.idxm(ix).tnum = p.init_new_tnum;
-        // (sqlite3IndexHasDuplicateRootPage: the engine opened the file; a corrupt schema is
-        // not the generator's to detect)
+    if p.db.init_busy {
+        if tbl_name.nn() {
+            p.idxm(ix).tnum = p.init_new_tnum;
+            // (sqlite3IndexHasDuplicateRootPage: the engine opened the file; a corrupt schema
+            // is not the generator's to detect)
+        }
+        p.a_schema[i_db]
+            .idx_hash
+            .insert(z_name.to_ascii_lowercase(), ix);
+    } else if p.tab(tab).has_rowid() || tbl_name.nn() {
+        // If this is the initial CREATE INDEX statement (or CREATE TABLE if the index is an
+        // implied index for a UNIQUE or PRIMARY KEY constraint) then emit code to insert new
+        // index into the schema table and to fill the index with data.
+        if !p.in_declare_vtab() {
+            crate::ddl::create_index_code(
+                p,
+                ix,
+                i_db as i32,
+                tbl_name.nn(),
+                &name,
+                _start,
+                on_error,
+            );
+        }
     }
-    p.a_schema[i_db].idx_hash.insert(z_name.to_ascii_lowercase(), ix);
-    p.tabm(tab).p_index.insert(0, ix);
+    if p.db.init_busy || tbl_name.is_null() {
+        p.tabm(tab).p_index.insert(0, ix);
+    }
     reorder_replace_indexes(p, tab);
 }
 
@@ -1466,10 +1634,25 @@ pub(crate) fn fix_expr_cb(p: &mut Parse, w: &mut Walker, e: ExprId) -> i32 {
         p.em(e).flags |= EP_FromDDL;
     }
     if p.e(e).op == TK_VARIABLE {
-        // db->init.busy: a bound parameter of a schema object reads as NULL
-        p.em(e).op = TK_NULL;
+        if p.db.init_busy {
+            // db->init.busy: a bound parameter of a schema object reads as NULL
+            p.em(e).op = TK_NULL;
+        } else {
+            let msg = format!("{} cannot use variables", fix_kind(w));
+            p.error_msg(msg);
+            return WRC_Abort;
+        }
     }
     WRC_Continue
+}
+
+/// `DbFixer.zType` of a fixer walker (`i2`: 0 view, 1 trigger, 2 index)
+pub(crate) fn fix_kind(w: &Walker) -> &'static str {
+    match w.i2 {
+        1 => "trigger",
+        2 => "index",
+        _ => "view",
+    }
 }
 
 /// `fixSelectCb(p, pSelect)` (`n` is the database of the schema object, `b1` is
@@ -1487,9 +1670,19 @@ pub(crate) fn fix_select_cb(p: &mut Parse, w: &mut Walker, sel: SelectId) -> i32
             {
                 let i_db2 = p.db.a_db.iter().position(|d| d.z_db_s_name.eq_ignore_ascii_case(&zdb)).map_or(-1, |x| x as i32);
                 if w.n != i_db2 {
-                    let kind = if w.i2 == 1 { "trigger" } else { "view" };
-                    let msg = format!("{} {} cannot reference objects in database {}", kind, p.init_az[1], zdb);
-                    p.error_msg(msg);
+                    let kind = fix_kind(w);
+                    let name = if p.db.init_busy {
+                        p.init_az[1].clone()
+                    } else {
+                        p.fix_name.clone()
+                    };
+                    let msg = format!("{kind} {name} cannot reference objects in database {zdb}");
+                    if p.db.init_busy {
+                        p.error_msg(msg);
+                    } else {
+                        let t = p.fix_name_tok;
+                        p.error_msg_tok(msg, &t);
+                    }
                     return WRC_Abort;
                 }
                 let it = &mut p.srcm(src).a[i];
@@ -1563,6 +1756,18 @@ fn init_parse(p: &mut Parse, text: &str) -> bool {
     let saved_unsupported = p.unsupported.take();
     let saved_check = p.check_schema;
     let saved_nc = p.a_nc.len();
+    // (C parses the row on a Parse object of its own: the fields of the statement's Parse
+    // that the schema statement sets are kept)
+    let saved_name_tok = p.s_name_token;
+    let saved_cname = p.cr_constraint_name;
+    let saved_pk_order = p.i_pk_sort_order;
+    let saved_cr = (p.cr_reg_rowid, p.cr_reg_root, p.cr_addr_cr_tab);
+    let saved_fix_name = std::mem::take(&mut p.fix_name);
+    let saved_fix_tok = p.fix_name_tok;
+    let saved_s_arg = p.s_arg;
+    let saved_new_table = p.p_new_table;
+    let saved_new_trigger = p.new_trigger.take();
+    let saved_new_trigger_flag = p.p_new_trigger;
     p.n_err = 0;
     p.n_select = 0;
     p.n_var = 0;
@@ -1580,7 +1785,16 @@ fn init_parse(p: &mut Parse, text: &str) -> bool {
         p.init_errors.push(msg);
     }
     p.init_fail = p.unsupported.take().or(if failed { Some("schema object whose SQL text the generator could not load") } else { None });
-    p.p_new_table = TableId::NULL;
+    p.p_new_table = saved_new_table;
+    p.s_name_token = saved_name_tok;
+    p.cr_constraint_name = saved_cname;
+    p.i_pk_sort_order = saved_pk_order;
+    (p.cr_reg_rowid, p.cr_reg_root, p.cr_addr_cr_tab) = saved_cr;
+    p.fix_name = saved_fix_name;
+    p.fix_name_tok = saved_fix_tok;
+    p.s_arg = saved_s_arg;
+    p.new_trigger = saved_new_trigger;
+    p.p_new_trigger = saved_new_trigger_flag;
     p.a_nc.truncate(saved_nc);
     p.z_sql = saved_sql;
     p.z_tail = saved_tail;
@@ -1777,6 +1991,57 @@ fn sqlite3_init_one(p: &mut Parse, i_db: usize) {
         sqlite3_init_callback(p, i_db, &row);
     }
     sqlite3_analysis_load(p, i_db);
+    // `renameTestSchema()` of an ALTER TABLE after C's last statistics load: the parse of each
+    // CREATE INDEX (`sqlite3CreateIndex()` in PARSE_MODE_RENAME -> `sqlite3DefaultRowEst()`)
+    // raised the row estimate of its table to at least 99
+    for t in host.rowest_clamped_tables(i_db) {
+        if let Some(&tab) = p.a_schema[i_db].tbl_hash.get(&t.to_ascii_lowercase())
+            && p.tab(tab).n_row_log_est < 99
+        {
+            p.tabm(tab).n_row_log_est = 99;
+        }
+    }
+    if host.rowest_clamped(i_db) {
+        let idxs: Vec<IndexId> = p.a_schema[i_db].idx_hash.values().copied().collect();
+        for ix in idxs {
+            let (tab, z) = (p.idx(ix).p_table, p.idx(ix).z_name.clone());
+            if p.idx(ix).idx_type == SQLITE_IDXTYPE_APPDEF as u8
+                && !(z.len() >= 7 && z.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_"))
+                && p.tab(tab).n_row_log_est < 99
+            {
+                p.tabm(tab).n_row_log_est = 99;
+            }
+        }
+    }
+    // C's tblHash is not a fresh load when this connection created or dropped objects since:
+    // replay its history for the iteration order
+    if let Some((base, events)) = host.tbl_hash_log(i_db) {
+        if std::env::var_os("SQLITERS_CG_HASHDBG").is_some() {
+            eprintln!("tblhash {i_db}: base {base:?} events {events:?}");
+        }
+        let mut h: crate::trigger::CHash<()> = crate::trigger::CHash::default();
+        h.insert(schema_tab, ());
+        for n in &base {
+            h.insert(n, ());
+        }
+        for (ins, n) in &events {
+            if *ins {
+                h.insert(n, ());
+            } else {
+                h.remove(n);
+            }
+        }
+        let mut order: crate::trigger::CHash<TableId> = crate::trigger::CHash::default();
+        let names = h.keys();
+        let mut ids = Vec::new();
+        for n in names {
+            if let Some(&t) = p.a_schema[i_db].tbl_hash.get(&n.to_ascii_lowercase()) {
+                ids.push(t);
+            }
+        }
+        order.set_order(ids);
+        p.a_schema[i_db].tbl_order = order;
+    }
     for t in std::mem::take(&mut p.a_schema[i_db].triggers) {
         if let Some(&tab) = p.a_schema[i_db].tbl_hash.get(&t) {
             p.tabm(tab).has_trigger = true;
@@ -2058,7 +2323,12 @@ fn value_from_expr(p: &Parse, mut e: ExprId, affinity: u8) -> Option<Value> {
         if affinity == SQLITE_AFF_BLOB {
             if op == TK_FLOAT {
                 // sqlite3AtoF(pVal->z, &pVal->u.r); pVal->flags = MEM_Real
+                let neg = matches!(&v, Value::Text(t) if t.starts_with('-'));
                 v = type_affinity(SQLITE_AFF_REAL).apply(v);
+                if neg && matches!(v, Value::Real(r) if r == 0.0) {
+                    // (sqlite3AtoF keeps the sign of a negative zero)
+                    v = Value::Real(-0.0);
+                }
             } else if op == TK_INTEGER {
                 // This case is required by -9223372036854775808 and other strings that look
                 // like integers but have values too large for i64.

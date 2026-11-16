@@ -1285,23 +1285,23 @@ impl YyParser {
             13 => {
                 // create_table ::= createkw temp TABLE ifnotexists nm dbnm
                 let (n1, n2, temp, noerr) = (m!(-1).tok, m!(0).tok, m!(-4).i, m!(-2).i);
-                crate::build_tab::sqlite3_start_table(p, &n1, &n2, temp != 0, false, false, noerr != 0);
+                if ddl_supported(p) {
+                    crate::build_tab::sqlite3_start_table(p, &n1, &n2, temp != 0, false, false, noerr != 0);
+                }
             }
             14 => {} // createkw ::= CREATE   (disableLookaside)
             16 => m!(-2).i = 1, // ifnotexists ::= IF NOT EXISTS
             17 => m!(0).i = (!p.db.init_busy) as i32, // temp ::= TEMP
             19 => {
                 // create_table_args ::= LP columnlist conslist_opt RP table_option_set
-                let opts = m!(0).i as u32;
-                crate::build_tab::sqlite3_end_table(p, true, opts, SelectId::NULL);
+                let (opts, cons, end) = (m!(0).i as u32, m!(-2).tok, m!(-1).tok);
+                crate::build_tab::sqlite3_end_table(p, Some(&cons), Some(&end), opts, SelectId::NULL);
             }
             20 => {
                 // create_table_args ::= AS select
                 let s = sl!(0);
-                if p.db.init_busy {
-                    crate::build_tab::sqlite3_end_table(p, false, 0, s);
-                } else {
-                    p.not_supported("statement kind (grammar rule not ported)");
+                if ddl_supported(p) {
+                    crate::build_tab::sqlite3_end_table(p, None, None, 0, s);
                 }
             }
             21 => m!(1).i = 0, // table_option_set ::=
@@ -1487,21 +1487,17 @@ impl YyParser {
             78 => m!(0).i = OE_Replace, // resolvetype ::= REPLACE
             82 => {
                 // cmd ::= createkw temp VIEW ifnotexists nm dbnm eidlist_opt AS select
-                let (n1, n2, cols, s, temp, noerr) = (m!(-4).tok, m!(-3).tok, el!(-2), sl!(0), m!(-7).i, m!(-5).i);
-                if p.db.init_busy {
-                    crate::build_tab::sqlite3_create_view(p, &n1, &n2, cols, s, temp != 0, noerr != 0);
-                } else {
-                    p.not_supported("statement kind (grammar rule not ported)");
+                let (begin, n1, n2, cols, s, temp, noerr) = (m!(-8).tok, m!(-4).tok, m!(-3).tok, el!(-2), sl!(0), m!(-7).i, m!(-5).i);
+                if ddl_supported(p) {
+                    crate::build_tab::sqlite3_create_view(p, Some(&begin), &n1, &n2, cols, s, temp != 0, noerr != 0);
                 }
             }
             239 => {
                 // cmd ::= createkw uniqueflag INDEX ifnotexists nm dbnm ON nm LP sortlist RP where_opt
                 let (n1, n2, tbl, list, oe, start, wh, noerr) = (m!(-7).tok, m!(-6).tok, m!(-4).tok, el!(-2), m!(-10).i, m!(-11).tok, ex!(0), m!(-8).i);
-                if p.db.init_busy {
+                if ddl_supported(p) {
                     let src = sqlite3_src_list_append(p, SrcListId::NULL, Some(&tbl), None);
                     crate::build_tab::sqlite3_create_index(p, Some(&n1), Some(&n2), src, list, oe, Some(&start), wh, SQLITE_SO_ASC, noerr != 0, SQLITE_IDXTYPE_APPDEF as u8);
-                } else {
-                    p.not_supported("statement kind (grammar rule not ported)");
                 }
             }
             241 => m!(1).i = OE_None, // uniqueflag ::=
@@ -1514,7 +1510,9 @@ impl YyParser {
             304 => {
                 // create_vtab ::= createkw VIRTUAL TABLE ifnotexists nm dbnm USING nm
                 let (x, y, z, e) = (m!(-3).tok, m!(-2).tok, m!(0).tok, m!(-4).i);
-                crate::vtab::sqlite3_vtab_begin_parse(p, &x, &y, &z, e != 0);
+                if ddl_supported(p) {
+                    crate::vtab::sqlite3_vtab_begin_parse(p, &x, &y, &z, e != 0);
+                }
             }
             305 => crate::vtab::sqlite3_vtab_arg_init(p), // vtabarg ::=
             306..=308 => {
@@ -1660,16 +1658,16 @@ impl YyParser {
                 } else {
                     p.tstep_lists[list as usize - 1].iter().map(|&i| p.tstep_pool[i as usize - 1].clone()).collect()
                 };
-                crate::trigger::sqlite3_finish_trigger(p, steps);
+                let (a, z) = (m!(-3).tok, m!(0).tok);
+                let all = Token { z: a.z, n: z.z - a.z + z.n };
+                crate::trigger::sqlite3_finish_trigger(p, steps, &all);
             }
             261 => {
                 // trigger_decl ::= temp TRIGGER ifnotexists nm dbnm trigger_time trigger_event ON fullname foreach_clause when_clause
                 let (b, z, c, da, db, e, g, t, noerr) =
                     (m!(-7).tok, m!(-6).tok, m!(-5).i, m!(-4).i, IdListId(m!(-4).id), SrcListId(m!(-2).id), ex!(0), m!(-10).i, m!(-8).i);
-                if p.db.init_busy {
+                if ddl_supported(p) {
                     crate::trigger::sqlite3_begin_trigger(p, &b, &z, c, da, db, e, g, t != 0, noerr != 0);
-                } else {
-                    p.not_supported("statement kind (grammar rule not ported)");
                 }
                 m!(-10).tok = if z.n == 0 { b } else { z };
             }
@@ -1739,6 +1737,163 @@ impl YyParser {
                 let st = crate::trigger::sqlite3_trigger_select_step(p, x, b as usize, e as usize);
                 m!(-2).id = push_step(p, Some(st));
             }
+            // ---- DDL (step V6) ----
+            79 | 83 => {
+                // cmd ::= DROP TABLE ifexists fullname ; cmd ::= DROP VIEW ifexists fullname
+                let (e, x) = (m!(-1).i, SrcListId(m!(0).id));
+                if ddl_supported(p) {
+                    crate::ddl::sqlite3_drop_table(p, x, yyruleno == 83, e != 0);
+                }
+            }
+            248 => {
+                // cmd ::= DROP INDEX ifexists fullname
+                let (e, x) = (m!(-1).i, SrcListId(m!(0).id));
+                if ddl_supported(p) {
+                    crate::ddl::sqlite3_drop_index(p, x, e != 0);
+                }
+            }
+            249 => {
+                // cmd ::= VACUUM vinto
+                let y = ex!(0);
+                if ddl_supported(p) {
+                    crate::ddl::sqlite3_vacuum(p, None, y);
+                }
+            }
+            250 => {
+                // cmd ::= VACUUM nm vinto
+                let (x, y) = (m!(-1).tok, ex!(0));
+                if ddl_supported(p) {
+                    crate::ddl::sqlite3_vacuum(p, Some(&x), y);
+                }
+            }
+            283 => {
+                // cmd ::= DROP TRIGGER ifexists fullname
+                let (e, x) = (m!(-1).i, SrcListId(m!(0).id));
+                if ddl_supported(p) {
+                    crate::ddl::sqlite3_drop_trigger(p, x, e != 0);
+                }
+            }
+            284 => {
+                // cmd ::= ATTACH database_kw_opt expr AS expr key_opt
+                let (f, d, k) = (ex!(-3), ex!(-1), ex!(0));
+                if ddl_supported(p) {
+                    crate::ddl::sqlite3_attach(p, f, d, k);
+                }
+            }
+            285 => {
+                // cmd ::= DETACH database_kw_opt expr
+                let d = ex!(0);
+                if ddl_supported(p) {
+                    crate::ddl::sqlite3_detach(p, d);
+                }
+            }
+            286 => m!(1).id = 0, // key_opt ::=
+            287 => {
+                // key_opt ::= KEY expr
+                let x = m!(0).id;
+                m!(-1).id = x;
+            }
+            288 => {
+                // cmd ::= REINDEX
+                if ddl_supported(p) {
+                    crate::ddl::sqlite3_reindex(p, None, None);
+                }
+            }
+            289 => {
+                // cmd ::= REINDEX nm dbnm
+                let (x, y) = (m!(-1).tok, m!(0).tok);
+                if ddl_supported(p) {
+                    crate::ddl::sqlite3_reindex(p, Some(&x), Some(&y));
+                }
+            }
+            290 => {
+                // cmd ::= ANALYZE
+                if ddl_supported(p) {
+                    crate::analyze::sqlite3_analyze(p, None, None);
+                }
+            }
+            291 => {
+                // cmd ::= ANALYZE nm dbnm
+                let (x, y) = (m!(-1).tok, m!(0).tok);
+                if ddl_supported(p) {
+                    crate::analyze::sqlite3_analyze(p, Some(&x), Some(&y));
+                }
+            }
+            292 => {
+                // cmd ::= ALTER TABLE fullname RENAME TO nm
+                let (x, z) = (SrcListId(m!(-3).id), m!(0).tok);
+                if ddl_supported(p) {
+                    crate::alter::sqlite3_alter_rename_table(p, x, &z);
+                }
+            }
+            293 => {
+                // cmd ::= alter_add carglist
+                let mut y = m!(-1).tok;
+                let last = p.s_last_token;
+                y.n = (last.z as i64 - y.z as i64 + last.n as i64) as u32;
+                crate::alter::sqlite3_alter_finish_add_column(p, &y);
+            }
+            294 => {
+                // alter_add ::= ALTER TABLE fullname ADD kwcolumn_opt nm typetoken
+                let (x, y, z) = (SrcListId(m!(-4).id), m!(-1).tok, m!(0).tok);
+                if ddl_supported(p) {
+                    crate::alter::sqlite3_alter_begin_add_column(p, x);
+                    crate::build_tab::sqlite3_add_column(p, y, z);
+                }
+                m!(-6).tok = y;
+            }
+            295 => {
+                // cmd ::= ALTER TABLE fullname DROP kwcolumn_opt nm
+                let (x, y) = (SrcListId(m!(-3).id), m!(0).tok);
+                if ddl_supported(p) {
+                    crate::alter::sqlite3_alter_drop_column(p, x, &y);
+                }
+            }
+            296 => {
+                // cmd ::= ALTER TABLE fullname RENAME kwcolumn_opt nm TO nm
+                let (x, y, z) = (SrcListId(m!(-5).id), m!(-2).tok, m!(0).tok);
+                if ddl_supported(p) {
+                    crate::alter::sqlite3_alter_rename_column(p, x, &y, &z);
+                }
+            }
+            297 => {
+                // cmd ::= ALTER TABLE fullname DROP CONSTRAINT nm
+                let (x, y) = (SrcListId(m!(-3).id), m!(0).tok);
+                if ddl_supported(p) {
+                    crate::alter::sqlite3_alter_drop_constraint(p, x, Some(&y), None);
+                }
+            }
+            298 => {
+                // cmd ::= ALTER TABLE fullname ALTER kwcolumn_opt nm DROP NOT NULL
+                let (x, y) = (SrcListId(m!(-6).id), m!(-3).tok);
+                if ddl_supported(p) {
+                    crate::alter::sqlite3_alter_drop_constraint(p, x, None, Some(&y));
+                }
+            }
+            299 => {
+                // cmd ::= ALTER TABLE fullname ALTER kwcolumn_opt nm SET NOT NULL onconf
+                let (x, y, z) = (SrcListId(m!(-7).id), m!(-4).tok, m!(-2).tok);
+                if ddl_supported(p) {
+                    crate::alter::sqlite3_alter_set_not_null(p, x, &y, &z);
+                }
+            }
+            300 => {
+                // cmd ::= ALTER TABLE fullname ADD CONSTRAINT nm CHECK LP expr RP onconf
+                let (x, y, z, a, e, b) = (SrcListId(m!(-8).id), m!(-6).tok, m!(-5).tok, m!(-3).tok, ex!(-2), m!(-1).tok);
+                if ddl_supported(p) {
+                    let ze = (a.z as usize + 1, (b.z - a.z - 1) as usize);
+                    crate::alter::sqlite3_alter_add_constraint(p, x, &y, Some(&z), ze, e);
+                }
+            }
+            301 => {
+                // cmd ::= ALTER TABLE fullname ADD CHECK LP expr RP onconf
+                let (x, y, a, e, b) = (SrcListId(m!(-6).id), m!(-4).tok, m!(-3).tok, ex!(-2), m!(-1).tok);
+                if ddl_supported(p) {
+                    let ze = (a.z as usize + 1, (b.z - a.z - 1) as usize);
+                    crate::alter::sqlite3_alter_add_constraint(p, x, &y, None, ze, e);
+                }
+            }
+            253..=257 => p.not_supported("PRAGMA (step V6b)"),
             n if (n as i32) < YYNRULE_WITH_ACTION => {
                 // A rule with an action in parse.y that step V1 does not port: CREATE / DROP /
                 // ALTER, INSERT / UPDATE / DELETE, triggers, PRAGMA, VACUUM, ATTACH, ANALYZE,
@@ -1766,6 +1921,16 @@ impl YyParser {
 fn dml_supported(p: &mut Parse) -> bool {
     if p.db.x_auth {
         p.not_supported("DML statement of a connection with an authorizer");
+        return false;
+    }
+    true
+}
+
+/// The schema statement kinds (step V6) are given to the ported code generator unless the
+/// connection state they depend on is not represented (an authorizer callback).
+fn ddl_supported(p: &mut Parse) -> bool {
+    if p.db.x_auth && !p.db.init_busy && !p.in_declare_vtab() {
+        p.not_supported("DDL statement of a connection with an authorizer");
         return false;
     }
     true

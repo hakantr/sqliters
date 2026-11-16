@@ -11,11 +11,14 @@
 #![allow(non_upper_case_globals)]
 #![allow(clippy::collapsible_if, clippy::collapsible_else_if, clippy::needless_range_loop, clippy::manual_range_contains)]
 
+pub mod alter;
+pub mod analyze;
 pub mod build;
 pub mod build_tab;
 pub mod builtin_funcs;
 pub mod callback;
 pub mod consts;
+pub mod ddl;
 pub mod delete;
 pub mod expr;
 pub mod exprcode;

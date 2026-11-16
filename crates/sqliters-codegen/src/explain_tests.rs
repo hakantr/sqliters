@@ -102,9 +102,19 @@ fn program_sizing() {
 
 #[test]
 fn unsupported_statements_are_reported_not_approximated() {
-    for sql in ["create table t(x)", "drop table t", "pragma page_size"] {
+    for sql in ["pragma page_size"] {
         assert!(matches!(prepare(Db::new(&NoHost), sql), PrepareResult::Unsupported(_)), "{sql}");
     }
+    // DDL is compiled since step V6 (C 3.54.1: CREATE TABLE compiles; "drop table t" without a
+    // schema is "Parse error ...: no such table: t", no error offset).
+    assert!(matches!(
+        prepare(Db::new(&NoHost), "create table t(x)"),
+        PrepareResult::Program(_)
+    ));
+    let PrepareResult::Error { message, offset } = prepare(Db::new(&NoHost), "drop table t") else {
+        panic!("drop table t")
+    };
+    assert_eq!((message.as_str(), offset), ("no such table: t", -1));
     // DML is compiled since step V5: with no schema it is C's error (C 3.54.1:
     // "Parse error near line 1: no such table: t", no error offset).
     let PrepareResult::Error { message, offset } = prepare(Db::new(&NoHost), "insert into t values(1)") else {

@@ -1517,6 +1517,18 @@ fn ensure_stmt_vtabs_connected_inner(
         Stmt::CreateTableAs { query, .. } => {
             ensure_select_vtabs_connected(ctx, query, cte_names, in_view_or_trigger, visited_views)
         }
+        // C's ALTER TABLE ADD COLUMN verifies CHECK / NOT NULL / STRICT constraints with a
+        // nested "SELECT ... FROM pragma_quick_check(..)" (sqlite3AlterFinishAddColumn): the
+        // port of C's code generator reaches that eponymous table through a connected instance.
+        Stmt::AlterTable {
+            action: sqliters_syntax::AlterTableAction::AddColumn { .. },
+            ..
+        } => {
+            let q = QualifiedName::unqualified("pragma_quick_check");
+            let _ =
+                ensure_qname_vtab_connected(ctx, &q, &[], true, in_view_or_trigger, visited_views);
+            Ok(())
+        }
         Stmt::Insert(ins) => {
             let mut local_ctes_buf: Vec<String>;
             let active_ctes: &[String] = if ins.ctes.is_empty() {

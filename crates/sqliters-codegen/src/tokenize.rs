@@ -70,7 +70,7 @@ pub fn id_char(c: u8) -> bool {
 }
 
 /// `keywordCode(z, n, &type)`: the token code of the keyword `z`, `TK_ID` if it is not one.
-fn keyword_code(z: &[u8]) -> u8 {
+pub(crate) fn keyword_code(z: &[u8]) -> u8 {
     if z.len() < 2 || z.len() > 17 {
         return TK_ID;
     }

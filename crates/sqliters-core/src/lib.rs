@@ -3487,7 +3487,17 @@ impl Connection {
     /// generator that is not ported (`"unsupported: ..."`). Nothing else changes.
     #[doc(hidden)]
     pub fn c_generated_program(&self, sql: &str) -> std::result::Result<sqliters_vdbe::vdbeaux::Program, String> {
-        let session = self.shared.enter().map_err(|e| e.message)?;
+        let mut session = self.shared.enter().map_err(|e| e.message)?;
+        // (as for EXPLAIN: the virtual tables C connects while it prepares an ALTER TABLE ADD
+        // COLUMN - pragma_quick_check of the nested constraint check)
+        if let Ok((Some(st @ Stmt::AlterTable { .. }), _)) = parse_one(sql) {
+            let shared = &self.shared;
+            let _ = session.inner_mut().with_default_exec_ctx(
+                shared,
+                ActivitySummary::default(),
+                |ctx| crate::vtab::ensure_stmt_vtabs_connected(ctx, &st),
+            );
+        }
         let (r, _, _) = cgen::c_prepare(session.inner(), sql);
         match r {
             sqliters_codegen::PrepareResult::Program(p) => Ok(*p),
@@ -7337,10 +7347,44 @@ impl Statement {
 
         // `EXPLAIN <stmt>`: C's listing (or C's compile error) when the port of C's code
         // generator supports the statement; the engine's own output otherwise.
+        let _ = cgen::take_c_temp_opened();
+        let _ = cgen::take_c_rowest_clamped();
         let c_explain = match c_explain_of_rejected {
             Some(prog) => Some(prog),
             None => Self::c_explain_of(inner, stmt_opt.as_ref(), &raw_sql)?,
         };
+        // C's ALTER TABLE (RENAME TO, RENAME COLUMN, DROP COLUMN of a non-TEMP table) reads
+        // `temp.sqlite_schema` in a nested statement, which opens the temp database while the
+        // statement is prepared (`sqlite3OpenTempDatabase()`, also under EXPLAIN: the nested
+        // parse clears `explain`). The port of C's code generator decides; the engine's temp
+        // database follows.
+        // The prepare of C's CREATE INDEX raises the row estimate of C's live table (also under
+        // EXPLAIN; `sqlite3DefaultRowEst()`): recorded for the generator's later statements.
+        // (CREATE INDEX only raises an estimate below 99, which only statistics give: without
+        // any, C's prepare has no side effect to mirror and is not run)
+        let c_has_stats = || {
+            inner
+                .db_set
+                .slots()
+                .iter()
+                .any(|s| !s.schema.stat1_rows.is_empty() || !s.c_stat_seen.is_empty())
+        };
+        if matches!(stmt_opt, Some(Stmt::AlterTable { .. }))
+            || (matches!(stmt_opt, Some(Stmt::CreateIndex(_))) && c_has_stats())
+        {
+            let (r, _, _) = cgen::c_prepare_quiet(inner, &raw_sql);
+            inner.db_set.c_alter_compiled =
+                matches!(r, sqliters_codegen::PrepareResult::Program(_));
+        }
+        if cgen::take_c_temp_opened() && !inner.db_set.is_temp_open() {
+            let enc = inner.effective_encoding();
+            inner.db_set.ensure_temp_open(enc, inner.writable_schema)?;
+        }
+        for (i_db, t) in cgen::take_c_rowest_clamped() {
+            if let Some(slot) = inner.db_set.slot_mut(DatabaseId(i_db)) {
+                slot.c_rowest_tables.insert(t);
+            }
+        }
 
         // Diagnostic switch SQLITERS_VDBE_EXEC: C's compile result of an INSERT / UPDATE /
         // DELETE decides before the engine's prepare (C's error is the error of the prepare).

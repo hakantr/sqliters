@@ -3830,7 +3830,9 @@ fn execute_write_body_inner(
                 c_db.and_then(|d| ctx.db_set.slot(d)).is_some_and(|s| s.schema.find_user_table(&ct.name.name).is_some())
             };
             let c_existed = c_exists(ctx);
+            let tbl_before = ctx.db_set.c_tbl_names();
             exec_create_table(ctx, ct)?;
+            ctx.db_set.c_note_tbl_hash_change(&tbl_before);
             if !c_existed && c_exists(ctx) && let Some(d) = c_db {
                 // C: the new objects come from OP_ParseSchema, not from a schema load
                 ctx.db_set.c_note_created(d.index(), &ct.name.name);
@@ -3844,7 +3846,9 @@ fn execute_write_body_inner(
             name,
             query,
         } => {
+            let tbl_before = ctx.db_set.c_tbl_names();
             exec_create_table_as(ctx, *temp, *if_not_exists, name, query, params)?;
+            ctx.db_set.c_note_tbl_hash_change(&tbl_before);
             ctx.db_set.rebind_all_collations(ctx.collations);
             Ok(QueryOutput::default())
         }
@@ -3856,6 +3860,7 @@ fn execute_write_body_inner(
             catalog_sql,
             ..
         } => {
+            let tbl_before = ctx.db_set.c_tbl_names();
             if let Err(e) = exec_create_virtual_table(ctx, *if_not_exists, name, module_name, args, catalog_sql) {
                 // C runs OP_ParseSchema (DBFLAG_SchemaChange) before OP_VCreate: when the
                 // module is missing or its constructor fails in autocommit mode, the
@@ -3867,11 +3872,14 @@ fn execute_write_body_inner(
                 }
                 return Err(e);
             }
+            ctx.db_set.c_note_tbl_hash_change(&tbl_before);
             ctx.db_set.rebind_all_collations(ctx.collations);
             Ok(QueryOutput::default())
         }
         Stmt::CreateView(cv) => {
+            let tbl_before = ctx.db_set.c_tbl_names();
             exec_create_view(ctx, cv)?;
+            ctx.db_set.c_note_tbl_hash_change(&tbl_before);
             Ok(QueryOutput::default())
         }
         Stmt::CreateTrigger(ct) => {
@@ -3879,12 +3887,16 @@ fn execute_write_body_inner(
             Ok(QueryOutput::default())
         }
         Stmt::DropTable { if_exists, name } => {
+            let tbl_before = ctx.db_set.c_tbl_names();
             exec_drop_table(ctx, *if_exists, name)?;
+            ctx.db_set.c_note_tbl_hash_change(&tbl_before);
             ctx.db_set.rebind_all_collations(ctx.collations);
             Ok(QueryOutput::default())
         }
         Stmt::DropView { if_exists, name } => {
+            let tbl_before = ctx.db_set.c_tbl_names();
             exec_drop_view(ctx, *if_exists, name)?;
+            ctx.db_set.c_note_tbl_hash_change(&tbl_before);
             Ok(QueryOutput::default())
         }
         Stmt::DropTrigger { if_exists, name } => {
@@ -3909,10 +3921,28 @@ fn execute_write_body_inner(
                 .flatten()
                 .map(|(id, _)| id.index())
                 .or_else(|| c_vtab_db(ctx.db_set, table));
-            exec_alter_table(ctx, table, action)?;
+            let c_compiled = std::mem::take(&mut ctx.db_set.c_alter_compiled);
+            if let Err(e) = exec_alter_table(ctx, table, action) {
+                // C's RENAME COLUMN / DROP COLUMN program runs renameTestSchema() first: when
+                // it fails afterwards, the schema is not reloaded and the effect of that test
+                // on C's live tables stays (DbSlot::c_rowest_clamped)
+                if c_compiled
+                    && matches!(
+                        action,
+                        AlterTableAction::RenameColumn { .. } | AlterTableAction::DropColumn(_)
+                    )
+                    && let Some(i) = c_db
+                {
+                    ctx.db_set.c_note_rename_test(i);
+                }
+                return Err(e);
+            }
             // C's ALTER TABLE ends with OP_ParseSchema (P4==0) on the database and on temp
             if let Some(i) = c_db {
                 ctx.db_set.c_reparse_schema(i);
+                if !matches!(action, AlterTableAction::AddColumn { .. }) {
+                    ctx.db_set.c_note_rename_test(i);
+                }
             }
             ctx.db_set.rebind_all_collations(ctx.collations);
             Ok(QueryOutput::default())
@@ -3922,7 +3952,9 @@ fn execute_write_body_inner(
             Ok(QueryOutput::default())
         }
         Stmt::Analyze(target) => {
+            let tbl_before = ctx.db_set.c_tbl_names();
             exec_analyze(ctx, target.as_ref())?;
+            ctx.db_set.c_note_tbl_hash_change(&tbl_before);
             // (the ANALYZE program ends with OP_LoadAnalysis, OP_Expire)
             ctx.db_set.c_expire_all();
             // OP_LoadAnalysis: sqlite3AnalysisLoad() on C's existing schema objects

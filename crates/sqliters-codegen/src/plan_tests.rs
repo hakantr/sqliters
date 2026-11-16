@@ -509,12 +509,20 @@ fn planner_dump_of_a_join() {
 #[test]
 fn unsupported_in_v3() {
     let host = TestHost;
-    // (V4b: table-valued functions are ported - see vtab_tests.rs; V5: DML is ported, the DDL
-    // statement kinds are not)
-    for sql in ["create trigger tr after insert on t begin select 1; end"] {
+    // (V4b: table-valued functions are ported - see vtab_tests.rs; V5: DML is ported; V6: the
+    // DDL statement kinds are ported, PRAGMA is not)
+    for sql in ["pragma page_size"] {
         assert!(matches!(crate::prepare(db(&host), sql), PrepareResult::Unsupported(_)), "{sql}");
     }
     assert!(matches!(crate::prepare(db(&host), "insert into t(b) values(1)"), PrepareResult::Program(_)));
+    // C 3.54.1 compiles it (EXPLAIN lists a program): port status, not C behaviour
+    assert!(matches!(
+        crate::prepare(
+            db(&host),
+            "create trigger tr after insert on t begin select 1; end"
+        ),
+        PrepareResult::Program(_)
+    ));
 }
 #[test]
 fn group_by_in_index_order() {
@@ -802,5 +810,228 @@ fn window_objects_dump() {
             "WIN 0 sel=1 func=rank/0 flags=810001 frm=90 start=91 end=86 excl=0 implicit=0 pStart=0 pEnd=0 part=1 ob=1 filter=0 eph=1 accum=1 result=2 csrApp=0 regApp=0 regPart=109 nBuf=4 argCol=6 regOne=110 rs=0 re=0 exprArgs=0 eDelete=1 regArg=125",
         ],
         "{sql}"
+    );
+}
+
+// ---- step V6: schema statements ----
+
+/// C 3.54.1 (`$S/bin/sqlite3`, the schema of [`TestHost`] created by five statements, `.mode list`):
+/// `EXPLAIN DROP TABLE u`.
+#[test]
+fn v6_drop_table_with_autoindex() {
+    check(
+        "EXPLAIN DROP TABLE u",
+        &[
+            "0|Init|0|60|0||0|",
+            "1|Null|0|1|0||0|",
+            "2|OpenWrite|0|1|0|5|0|",
+            "3|Rewind|0|11|0||0|",
+            "4|Column|0|2|2||0|",
+            "5|Ne|3|10|2|BINARY-8|82|",
+            "6|Column|0|0|2||0|",
+            "7|Eq|4|10|2|BINARY-8|82|",
+            "8|Rowid|0|5|0||0|",
+            "9|Delete|0|0|0||2|",
+            "10|Next|0|4|0||1|",
+            "11|Destroy|5|2|0||0|",
+            "12|Null|0|6|7||0|",
+            "13|OpenEphemeral|2|0|6||0|",
+            "14|IfNot|2|22|1||0|",
+            "15|OpenRead|1|1|0|4|0|",
+            "16|Rewind|1|22|0||0|",
+            "17|Column|1|3|13||0|",
+            "18|Ne|2|21|13|BINARY-8|84|",
+            "19|Rowid|1|7|0||0|",
+            "20|Insert|2|6|7||0|",
+            "21|Next|1|17|0||1|",
+            "22|OpenWrite|1|1|0|5|0|",
+            "23|Rewind|2|34|0||0|",
+            "24|Rowid|2|7|0||0|",
+            "25|NotExists|1|33|7||0|",
+            "26|Column|1|0|8||0|",
+            "27|Column|1|1|9||0|",
+            "28|Column|1|2|10||0|",
+            "29|Integer|5|11|0||0|",
+            "30|Column|1|4|12||0|",
+            "31|MakeRecord|8|5|15|BBBDB|0|",
+            "32|Insert|1|15|7||0|",
+            "33|Next|2|24|0||0|",
+            "34|Destroy|4|2|0||0|",
+            "35|Null|0|16|17||0|",
+            "36|OpenEphemeral|4|0|16||0|",
+            "37|IfNot|2|45|1||0|",
+            "38|OpenRead|3|1|0|4|0|",
+            "39|Rewind|3|45|0||0|",
+            "40|Column|3|3|13||0|",
+            "41|Ne|2|44|13|BINARY-8|84|",
+            "42|Rowid|3|17|0||0|",
+            "43|Insert|4|16|17||0|",
+            "44|Next|3|40|0||1|",
+            "45|OpenWrite|3|1|0|5|0|",
+            "46|Rewind|4|57|0||0|",
+            "47|Rowid|4|17|0||0|",
+            "48|NotExists|3|56|17||0|",
+            "49|Column|3|0|18||0|",
+            "50|Column|3|1|19||0|",
+            "51|Column|3|2|20||0|",
+            "52|Integer|4|21|0||0|",
+            "53|Column|3|4|22||0|",
+            "54|MakeRecord|18|5|23|BBBDB|0|",
+            "55|Insert|3|23|17||0|",
+            "56|Next|4|47|0||0|",
+            "57|DropTable|0|0|0|u|0|",
+            "58|SetCookie|0|1|6||0|",
+            "59|Halt|0|0|0||0|",
+            "60|Transaction|0|1|5|0|1|",
+            "61|String8|0|3|0|u|0|",
+            "62|String8|0|4|0|trigger|0|",
+            "63|Goto|0|1|0||0|",
+        ],
+    );
+}
+
+/// C 3.54.1 (`$S/bin/sqlite3`, the schema of [`TestHost`] created by five statements, `.mode list`):
+/// `EXPLAIN CREATE UNIQUE INDEX u_z ON u(z DESC) WHERE z>0`.
+#[test]
+fn v6_create_unique_partial_index() {
+    check(
+        "EXPLAIN CREATE UNIQUE INDEX u_z ON u(z DESC) WHERE z>0",
+        &[
+            "0|Init|0|38|0||0|",
+            "1|Noop|0|37|0||0|",
+            "2|CreateBtree|0|1|2||0|",
+            "3|OpenWrite|0|1|0|5|0|",
+            "4|String8|0|3|0|index|0|",
+            "5|String8|0|4|0|u_z|0|",
+            "6|String8|0|5|0|u|0|",
+            "7|SCopy|1|6|0||0|",
+            "8|String8|0|7|0|CREATE UNIQUE INDEX u_z ON u(z DESC) WHERE z>0|0|",
+            "9|NewRowid|0|2|0||0|",
+            "10|MakeRecord|3|5|8|BBBDB|0|",
+            "11|Insert|0|8|2||24|",
+            "12|SorterOpen|3|0|1|k(2,-,)|0|",
+            "13|OpenRead|1|4|0|3|0|",
+            "14|Rewind|1|22|0||0|",
+            "15|Column|1|2|10||0|",
+            "16|Le|11|21|10|BINARY-8|81|",
+            "17|Column|1|2|12||0|",
+            "18|Rowid|1|13|0||0|",
+            "19|MakeRecord|12|2|9||0|",
+            "20|SorterInsert|3|9|0||0|",
+            "21|Next|1|15|0||0|",
+            "22|OpenWrite|2|1|0|k(2,-,)|17|",
+            "23|SorterSort|3|31|0||0|",
+            "24|Goto|0|27|0||0|",
+            "25|SorterCompare|3|24|9|1|0|",
+            "26|Halt|2067|2|0|u.z|2|",
+            "27|SorterData|3|9|2||0|",
+            "28|SeekEnd|2|0|0||0|",
+            "29|IdxInsert|2|9|0||16|",
+            "30|SorterNext|3|25|0||0|",
+            "31|Close|1|0|0||0|",
+            "32|Close|2|0|0||0|",
+            "33|Close|3|0|0||0|",
+            "34|SetCookie|0|1|6||0|",
+            "35|ParseSchema|0|0|0|name='u_z' AND type='index'|0|",
+            "36|Expire|0|1|0||0|",
+            "37|Halt|0|0|0||0|",
+            "38|Transaction|0|1|5|0|1|",
+            "39|Integer|0|11|0||0|",
+            "40|Goto|0|1|0||0|",
+        ],
+    );
+}
+
+/// C 3.54.1 (`$S/bin/sqlite3`, the schema of [`TestHost`] created by five statements, `.mode list`):
+/// `EXPLAIN ANALYZE t`.
+#[test]
+fn v6_analyze_one_table() {
+    check(
+        "EXPLAIN ANALYZE t",
+        &[
+            "0|Init|0|81|0||0|",
+            "1|ReadCookie|0|3|2||0|",
+            "2|If|3|5|0||0|",
+            "3|SetCookie|0|2|4||0|",
+            "4|SetCookie|0|5|1||0|",
+            "5|CreateBtree|0|2|1||0|",
+            "6|OpenWrite|0|1|0|5|0|",
+            "7|NewRowid|0|1|0||0|",
+            "8|Blob|6|3|0|\u{6}|0|",
+            "9|Insert|0|3|1||8|",
+            "10|Close|0|0|0||0|",
+            "11|Close|0|0|0||0|",
+            "12|Null|0|4|5||0|",
+            "13|Noop|4|0|4||0|",
+            "14|OpenWrite|3|1|0|5|0|",
+            "15|SeekRowid|3|17|1||0|",
+            "16|Rowid|3|5|0||0|",
+            "17|IsNull|5|25|0||0|",
+            "18|String8|0|6|0|table|0|",
+            "19|String8|0|7|0|sqlite_stat1|0|",
+            "20|String8|0|8|0|sqlite_stat1|0|",
+            "21|Copy|2|9|0||0|",
+            "22|String8|0|10|0|CREATE TABLE sqlite_stat1(tbl,idx,stat)|0|",
+            "23|MakeRecord|6|5|4|BBBDB|0|",
+            "24|Insert|3|4|5||0|",
+            "25|SetCookie|0|1|6||0|",
+            "26|ParseSchema|0|0|0|tbl_name='sqlite_stat1' AND type!='trigger'|0|",
+            "27|OpenWrite|0|2|0|3|16|",
+            "28|OpenRead|5|2|0|4|0|",
+            "29|String8|0|18|0|t|0|",
+            "30|String8|0|19|0|t_cd|0|",
+            "31|OpenRead|6|6|0|k(3,-NOCASE,,)|0|",
+            "32|Integer|0|17|0||0|",
+            "33|Integer|3|14|0||0|",
+            "34|Integer|2|15|0||0|",
+            "35|Count|6|16|0||0|",
+            "36|Function|0|14|13|stat_init(4)|0|",
+            "37|Rewind|6|52|0||0|",
+            "38|Integer|0|14|0||0|",
+            "39|Goto|0|48|0||0|",
+            "40|Integer|0|14|0||0|",
+            "41|Column|6|0|16||0|",
+            "42|Ne|16|48|21|NOCASE-8|128|",
+            "43|Integer|1|14|0||0|",
+            "44|Column|6|1|16||0|",
+            "45|Ne|16|49|22|BINARY-8|128|",
+            "46|Integer|2|14|0||0|",
+            "47|Goto|0|50|0||0|",
+            "48|Column|6|0|21||0|",
+            "49|Column|6|1|22||0|",
+            "50|Function|1|13|16|stat_push(2)|0|",
+            "51|Next|6|40|0||0|",
+            "52|Function|0|13|20|stat_get(1)|0|",
+            "53|MakeRecord|18|3|16|BBB|0|",
+            "54|NewRowid|0|12|0||0|",
+            "55|Insert|0|16|12||8|",
+            "56|String8|0|19|0|t_b|0|",
+            "57|OpenRead|6|3|0|k(2,,)|0|",
+            "58|Integer|0|17|0||0|",
+            "59|Integer|2|14|0||0|",
+            "60|Integer|1|15|0||0|",
+            "61|Count|6|16|0||0|",
+            "62|Function|0|14|13|stat_init(4)|0|",
+            "63|Rewind|6|78|0||0|",
+            "64|Integer|0|14|0||0|",
+            "65|Goto|0|71|0||0|",
+            "66|Integer|0|14|0||0|",
+            "67|Column|6|0|16||0|",
+            "68|Ne|16|71|21|BINARY-8|128|",
+            "69|Integer|1|14|0||0|",
+            "70|Goto|0|72|0||0|",
+            "71|Column|6|0|21||0|",
+            "72|Function|1|13|16|stat_push(2)|0|",
+            "73|Next|6|66|0||0|",
+            "74|Function|0|13|20|stat_get(1)|0|",
+            "75|MakeRecord|18|3|16|BBB|0|",
+            "76|NewRowid|0|12|0||0|",
+            "77|Insert|0|16|12||8|",
+            "78|LoadAnalysis|0|0|0||0|",
+            "79|Expire|0|0|0||0|",
+            "80|Halt|0|0|0||0|",
+            "81|Transaction|0|1|5|0|1|",
+            "82|Goto|0|1|0||0|",
+        ],
     );
 }

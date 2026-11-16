@@ -871,3 +871,66 @@ pub fn sqlite3_fk_actions(p: &mut Parse, tab: TableId, changes: ExprListId, reg_
         }
     }
 }
+
+/// `sqlite3FkDropTable(pParse, pName, pTab)`: this function is called to generate code that
+/// runs when table pTab is being dropped from the database. The SrcList passed as the second
+/// argument to this function contains a single entry guaranteed to resolve to table pTab.
+///
+/// Normally, no code is required. However, if either
+///
+///   (a) The table is the parent table of a FK constraint, or
+///   (b) The table is the child table of a deferred FK constraint and it is determined at
+///       runtime that there are outstanding deferred FK constraint violations in the
+///       database,
+///
+/// then the equivalent of "DELETE FROM <tbl>" is executed before dropping the table from the
+/// database. If (a) is true and the DELETE triggers a FK violation, an exception is thrown,
+/// as in "DELETE FROM <tbl>".
+pub fn sqlite3_fk_drop_table(p: &mut Parse, name: SrcListId, tab: TableId) {
+    if (p.db.flags & SQLITE_ForeignKeys) != 0 && p.tab(tab).is_ordinary() {
+        let mut i_skip = 0;
+        crate::select::sqlite3_get_vdbe(p);
+        if sqlite3_fk_references(p, tab).is_empty() {
+            // Search for a deferred foreign key constraint for which this table is the child
+            // table. If one cannot be found, return without generating any code. Otherwise,
+            // jump over the DELETE statement when the deferred foreign key constraint counter
+            // is zero.
+            let deferred = p
+                .tab(tab)
+                .p_fkey
+                .iter()
+                .any(|f| f.is_deferred || (p.db.flags & SQLITE_DeferFKs) != 0);
+            if !deferred {
+                return;
+            }
+            i_skip = p.v.make_label();
+            p.v.add_op2(OP_FkIfZero, 1, i_skip);
+        }
+
+        p.disable_triggers = true;
+        let src = sqlite3_src_list_dup(p, name, 0);
+        crate::delete::sqlite3_delete_from(p, src, ExprId::NULL, ExprListId::NULL, ExprId::NULL);
+        p.disable_triggers = false;
+
+        // If the DELETE has generated immediate foreign key constraint violations, halt the
+        // VDBE program and return an error at this point, before any modifications of the
+        // schema. Since triggers are disabled, it is not possible for this to have occurred
+        // within any sub-program. If FKs are deferred, the violations will be caught at
+        // commit time.
+        if (p.db.flags & SQLITE_DeferFKs) == 0 {
+            let a = p.v.current_addr() + 2;
+            p.v.add_op2(OP_FkIfZero, 0, a);
+            sqlite3_halt_constraint(
+                p,
+                SQLITE_CONSTRAINT_FOREIGNKEY,
+                OE_Abort,
+                P4::NotUsed,
+                P5_ConstraintFK as i32,
+            );
+        }
+
+        if i_skip != 0 {
+            p.v.resolve_label(i_skip);
+        }
+    }
+}

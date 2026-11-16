@@ -424,30 +424,51 @@ fn str_hash(z: &str) -> u32 {
     h
 }
 
-/// A C `Hash` of triggers (`Schema.trigHash`) as far as its element order matters:
-/// `sqlite3TriggerList()` walks the TEMP schema's hash from `first` to the end.
-#[derive(Debug, Clone, Default)]
-pub struct TrigHash {
-    /// The elements in list order (`first`, `next`, ...): (key, hash, trigger)
-    order: Vec<(String, u32, TriggerId)>,
+/// A C `Hash` (hash.c) as far as its element order matters: `sqlite3TriggerList()` walks the
+/// TEMP schema's `trigHash` from `first` to the end; REINDEX and ANALYZE walk `tblHash`.
+#[derive(Debug, Clone)]
+pub struct CHash<T> {
+    /// The elements in list order (`first`, `next`, ...): (key, hash, data)
+    order: Vec<(String, u32, T)>,
     /// `ht[]`: per bucket (count, key of the chain head)
     ht: Vec<(u32, Option<String>)>,
 }
 
-impl TrigHash {
-    /// The triggers in iteration order.
-    pub fn ids(&self) -> Vec<TriggerId> {
+impl<T> Default for CHash<T> {
+    fn default() -> Self {
+        CHash {
+            order: Vec::new(),
+            ht: Vec::new(),
+        }
+    }
+}
+
+/// `Schema.trigHash`
+pub type TrigHash = CHash<TriggerId>;
+
+impl<T: Copy> CHash<T> {
+    /// The data in iteration order.
+    pub fn ids(&self) -> Vec<T> {
         self.order.iter().map(|e| e.2).collect()
     }
     pub fn is_empty(&self) -> bool {
         self.order.is_empty()
     }
+    /// The keys in iteration order.
+    pub fn keys(&self) -> Vec<String> {
+        self.order.iter().map(|e| e.0.clone()).collect()
+    }
+    /// A hash used for its iteration order only: the data in this order (no buckets).
+    pub fn set_order(&mut self, data: Vec<T>) {
+        self.ht.clear();
+        self.order = data.into_iter().map(|d| (String::new(), 0, d)).collect();
+    }
     /// `sqlite3HashFind(pH, zName)`
-    pub fn find(&self, key: &str) -> Option<TriggerId> {
+    pub fn find(&self, key: &str) -> Option<T> {
         self.order.iter().find(|e| e.0.eq_ignore_ascii_case(key)).map(|e| e.2)
     }
     /// `insertElement(pH, pEntry, pNew)`
-    fn insert_element(&mut self, bucket: Option<usize>, elem: (String, u32, TriggerId)) {
+    fn insert_element(&mut self, bucket: Option<usize>, elem: (String, u32, T)) {
         let head = match bucket {
             Some(b) => {
                 let e = &mut self.ht[b];
@@ -464,7 +485,16 @@ impl TrigHash {
         }
     }
     /// `sqlite3HashInsert(pH, pKey, data)` of a new key.
-    pub fn insert(&mut self, key: &str, id: TriggerId) {
+    pub fn insert(&mut self, key: &str, id: T) {
+        if let Some(e) = self
+            .order
+            .iter_mut()
+            .find(|e| e.0.eq_ignore_ascii_case(key))
+        {
+            // an existing key: the data is replaced
+            e.2 = id;
+            return;
+        }
         let h = str_hash(key);
         let count = self.order.len() + 1;
         if count >= 5 && count > 2 * self.ht.len() {
@@ -484,6 +514,31 @@ impl TrigHash {
         }
         let bucket = if self.ht.is_empty() { None } else { Some((h as usize) % self.ht.len()) };
         self.insert_element(bucket, (key.to_owned(), h, id));
+    }
+    /// `sqlite3HashInsert(pH, pKey, 0)`: remove the element of that key
+    /// (`removeElementGivenHash`).
+    pub fn remove(&mut self, key: &str) {
+        let Some(pos) = self
+            .order
+            .iter()
+            .position(|e| e.0.eq_ignore_ascii_case(key))
+        else {
+            return;
+        };
+        let (k, h, _) = self.order.remove(pos);
+        if !self.ht.is_empty() {
+            let b = (h as usize) % self.ht.len();
+            let next = self.order.get(pos).map(|e| e.0.clone());
+            let e = &mut self.ht[b];
+            if e.1.as_deref() == Some(k.as_str()) {
+                e.1 = next;
+            }
+            e.0 -= 1;
+        }
+        if self.order.is_empty() {
+            // sqlite3HashClear(pH)
+            self.ht.clear();
+        }
     }
 }
 
@@ -506,7 +561,7 @@ pub fn sqlite3_begin_trigger(
     table_name: SrcListId,
     when: ExprId,
     is_temp: bool,
-    _no_err: bool,
+    no_err: bool,
 ) {
     let mut name = Token::EMPTY;
     let mut i_db;
@@ -549,7 +604,11 @@ pub fn sqlite3_begin_trigger(
 
     // Ensure the table name matches database name and that the table exists
     let tok_name = sqlite3_name_of_token(p, &name);
-    p.init_az[1].clone_from(&tok_name);
+    if p.db.init_busy {
+        p.init_az[1].clone_from(&tok_name);
+    }
+    p.fix_name = p.tok_str(&name).to_owned();
+    p.fix_name_tok = name;
     if fix_src_list(p, table_name, i_db, true) {
         return;
     }
@@ -562,7 +621,7 @@ pub fn sqlite3_begin_trigger(
         p.error_msg("cannot create triggers on virtual tables");
         return;
     }
-    if (p.tab(tab).tab_flags & TF_Shadow) != 0 && (p.db.flags & SQLITE_Defensive) != 0 {
+    if (p.tab(tab).tab_flags & TF_Shadow) != 0 && crate::ddl::sqlite3_read_only_shadow_tables(p) {
         p.error_msg("cannot create triggers on shadow tables");
         return;
     }
@@ -578,7 +637,16 @@ pub fn sqlite3_begin_trigger(
         p.a_schema.push(SchemaState::default());
     }
     if p.a_schema[i_db as usize].trig_hash.find(&z_name).is_some() {
-        p.error_msg_tok(format!("trigger {} already exists", p.tok_str(&name)), &name);
+        if !no_err {
+            p.error_msg_tok(
+                format!("trigger {} already exists", p.tok_str(&name)),
+                &name,
+            );
+        } else if p.db.init_busy {
+            p.error_msg("");
+        } else {
+            crate::build::sqlite3_code_verify_schema(p, i_db);
+        }
         return;
     }
 
@@ -685,7 +753,7 @@ fn fix_trigger_steps(p: &mut Parse, steps: &[TriggerStep], i_db: i32) -> bool {
 /// `sqlite3FinishTrigger(pParse, pStepList, pAll)`: this routine is called after all of the
 /// trigger actions have been parsed in order to complete the process of building the
 /// trigger (schema load: the trigger joins the schema's trigger hash and its table).
-pub fn sqlite3_finish_trigger(p: &mut Parse, step_list: Vec<TriggerStep>) {
+pub fn sqlite3_finish_trigger(p: &mut Parse, step_list: Vec<TriggerStep>, all: &Token) {
     let Some(mut trig) = p.new_trigger.take() else { return };
     p.p_new_trigger = false;
     if p.n_err != 0 {
@@ -695,10 +763,18 @@ pub fn sqlite3_finish_trigger(p: &mut Parse, step_list: Vec<TriggerStep>) {
     let i_db = trig.i_schema;
     trig.step_list = step_list;
     if trig.step_list.len() as i32 > p.db.a_limit[SQLITE_LIMIT_TRIGGER_STEPS as usize] {
-        p.error_msg(format!("trigger \"{z_name}\" contains too many steps"));
+        p.error_msg(format!(
+            "trigger \"{}\" contains too many steps",
+            crate::ddl::pf_w(&z_name)
+        ));
         return;
     }
-    p.init_az[1].clone_from(&z_name);
+    if p.db.init_busy {
+        p.init_az[1].clone_from(&z_name);
+    }
+    p.fix_name.clone_from(&z_name);
+    // (sqlite3TokenInit(&nameToken, pTrig->zName): a token outside the statement text)
+    p.fix_name_tok = Token::EMPTY;
     let steps = trig.step_list.clone();
     if fix_trigger_steps(p, &steps, i_db) {
         return;
@@ -708,7 +784,41 @@ pub fn sqlite3_finish_trigger(p: &mut Parse, step_list: Vec<TriggerStep>) {
         return;
     }
     if !p.db.init_busy {
-        p.not_supported("statement kind (grammar rule not ported)");
+        // Make sure that triggers do not write into shadow tables of virtual tables when
+        // shadow tables are read-only.
+        if crate::ddl::sqlite3_read_only_shadow_tables(p) {
+            for st in &trig.step_list {
+                if st.p_src.nn() {
+                    let zt = p.src(st.p_src).a[0].z_name.clone().unwrap_or_default();
+                    if crate::vtab::sqlite3_shadow_table_name(p, &zt) {
+                        p.error_msg(format!(
+                            "trigger \"{z_name}\" may not write to shadow table \"{zt}\""
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Make an entry in the sqlite_schema table
+        crate::select::sqlite3_get_vdbe(p);
+        crate::build::sqlite3_begin_write_operation(p, false, i_db);
+        let z = p.tok_str(all).to_owned();
+        let z_db = p.db.a_db[i_db as usize].z_db_s_name.clone();
+        use crate::ddl::{pf_big_q, pf_q};
+        crate::ddl::sqlite3_nested_parse(
+            p,
+            format!(
+                "INSERT INTO {}.sqlite_master VALUES('trigger',{},{},0,'CREATE TRIGGER {}')",
+                pf_big_q(Some(&z_db)),
+                pf_big_q(Some(&z_name)),
+                pf_big_q(Some(&trig.table)),
+                pf_q(&z)
+            ),
+        );
+        crate::ddl::sqlite3_change_cookie(p, i_db);
+        let w = format!("type='trigger' AND name='{}'", pf_q(&z_name));
+        crate::ddl::sqlite3_vdbe_add_parse_schema_op(p, i_db, Some(&w), 0);
         return;
     }
     let same_schema = trig.i_schema == trig.i_tab_schema;

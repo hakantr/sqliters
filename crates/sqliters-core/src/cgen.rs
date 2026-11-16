@@ -97,6 +97,10 @@ impl Host for EngineHost<'_> {
         self.schema_loaded.set(true);
     }
 
+    fn note_temp_opened(&self) {
+        C_TEMP_OPENED.with(|c| c.set(true));
+    }
+
     fn user_functions(&self, name: &str) -> Vec<Arc<FuncDef>> {
         // The functions every connection of the reference build registers at open (FTS5,
         // R-Tree, MATCH) are described by the generator's own table, with C's flags.
@@ -176,6 +180,31 @@ impl Host for EngineHost<'_> {
         })
     }
 
+    fn rowest_clamped_tables(&self, i_db: usize) -> Vec<String> {
+        self.db_set
+            .slots()
+            .get(i_db)
+            .map_or_else(Vec::new, |s| s.c_rowest_tables.iter().cloned().collect())
+    }
+
+    fn note_rowest_clamped(&self, i_db: usize, table: &str) {
+        C_ROWEST.with(|c| c.borrow_mut().push((i_db, table.to_ascii_lowercase())));
+    }
+
+    fn rowest_clamped(&self, i_db: usize) -> bool {
+        self.db_set
+            .slots()
+            .get(i_db)
+            .is_some_and(|s| s.c_rowest_clamped)
+    }
+
+    fn tbl_hash_log(&self, i_db: usize) -> Option<(Vec<String>, Vec<(bool, String)>)> {
+        self.db_set
+            .slots()
+            .get(i_db)
+            .and_then(|s| s.c_tbl_hash.clone())
+    }
+
     fn created_since_load(&self, i_db: usize, name: &str) -> bool {
         self.db_set.slots().get(i_db).is_some_and(|s| s.c_incremental.contains(name))
     }
@@ -232,6 +261,16 @@ impl Host for EngineHost<'_> {
                 },
                 has_find_function: d.find_function,
                 has_update: !entry.is_read_only && !entry.is_eponymous_only,
+                // xRename of the modules C's reference build has (fts5, rtree, geopoly have
+                // one; generate_series, json_each/json_tree, dbstat, the pragma tables do not)
+                has_rename: match entry.module_name.to_ascii_lowercase().as_str() {
+                    "fts5" | "rtree" | "rtree_i32" | "geopoly" => Some(true),
+                    "generate_series" | "json_each" | "json_tree" | "jsonb_each" | "jsonb_tree"
+                    | "dbstat" | "fts5vocab" | "sqlite_dbpage" | "sqlite_stmt" | "carray"
+                    | "fts5_vocab" => Some(false),
+                    m if m.starts_with("pragma_") => Some(false),
+                    _ => None,
+                },
             },
             declare: Some(d.declare_sql.clone()).filter(|s| !s.is_empty()),
         }
@@ -314,6 +353,44 @@ impl Host for EngineHost<'_> {
     }
 }
 
+thread_local! {
+    /// Set when a prepare of the generator found that C's `sqlite3OpenTempDatabase()` opened the
+    /// temp database (see [`take_c_temp_opened`]).
+    static C_TEMP_OPENED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// True (once) if a generator prepare since the last call opened C's temp database: the caller
+/// opens the engine's temp database too (C's `db->aDb[1].pBt` is set from then on).
+pub(crate) fn take_c_temp_opened() -> bool {
+    C_TEMP_OPENED.with(|c| c.replace(false))
+}
+
+thread_local! {
+    /// Tables whose row estimate a generator prepare found C's CREATE INDEX raising (see
+    /// [`take_c_rowest_clamped`]).
+    static C_ROWEST: std::cell::RefCell<Vec<(usize, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The (database, table) pairs whose `nRowLogEst` C's `sqlite3CreateIndex()` raised during the
+/// generator prepares since the last call: the caller records them (`DbSlot::c_rowest_tables`).
+pub(crate) fn take_c_rowest_clamped() -> Vec<(usize, String)> {
+    C_ROWEST.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+thread_local! {
+    /// [`c_prepare_quiet`] is running: no verification dumps.
+    static C_QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`c_prepare`] for a side effect of C's prepare only (the program is not used): the
+/// verification dumps of the planner are not written.
+pub(crate) fn c_prepare_quiet(inner: &ConnectionInner, sql: &str) -> (PrepareResult, usize, bool) {
+    C_QUIET.with(|c| c.set(true));
+    let r = c_prepare(inner, sql);
+    C_QUIET.with(|c| c.set(false));
+    r
+}
+
 /// Run C's parser and code generator over one statement (`sqlite3Prepare`).
 /// The third value: C's `sqlite3Init()` loaded the schemas during this prepare.
 pub(crate) fn c_prepare(inner: &ConnectionInner, sql: &str) -> (PrepareResult, usize, bool) {
@@ -331,7 +408,7 @@ pub(crate) fn c_prepare(inner: &ConnectionInner, sql: &str) -> (PrepareResult, u
         }
     }
     let db = make_db(inner, &host);
-    if where_dump_on() {
+    if where_dump_on() && !C_QUIET.with(std::cell::Cell::get) {
         // Verification aid: the planner's term / loop / path dump on stderr, before the
         // `cg:` trace line of the statement.
         let (r, tail, dump) = sqliters_codegen::prepare_with_where_dump(db, sql);
@@ -409,6 +486,7 @@ fn make_db<'a>(inner: &ConnectionInner, host: &'a EngineHost<'a>) -> Db<'a> {
         db.a_limit[SQLITE_LIMIT_TRIGGER_STEPS as usize] = clamp(inner.db_set.trigger_steps_limit());
     }
     db.x_auth = inner.authorizer.is_some();
+    db.n_analysis_limit = inner.db_set.analysis_limit();
     db.case_sensitive_like = inner.db_set.c_case_sensitive_like();
     db.schema_not_loaded = inner.db_set.c_prepare_unloaded();
     db.encoding_fixed = inner.db_set.c_encoding_fixed();

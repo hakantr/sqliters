@@ -197,7 +197,22 @@ pub fn sqlite3_savepoint(p: &mut Parse, op: i32, name: &Token) {
 /// open it; for a normal prepare the engine opens the temp database when the program runs.)
 pub fn sqlite3_code_verify_schema(p: &mut Parse, i_db: i32) {
     // sqlite3CodeVerifySchemaAtToplevel(sqlite3ParseToplevel(pParse), iDb)
-    p.cookie_mask |= 1u32 << i_db;
+    if (p.cookie_mask & (1u32 << i_db)) == 0 {
+        p.cookie_mask |= 1u32 << i_db;
+        if i_db == 1 {
+            sqlite3_open_temp_database(p);
+        }
+    }
+}
+
+/// `sqlite3OpenTempDatabase(pParse)`: make sure the TEMP database is open and available for
+/// use. C opens the btree while the statement is prepared (not under EXPLAIN; a nested parse
+/// clears `explain`); the engine is told so that it opens its temp database as well.
+pub fn sqlite3_open_temp_database(p: &mut Parse) {
+    if p.db.a_db.len() > 1 && !p.db.a_db[1].has_bt && p.explain == 0 && !p.is_nested_trigger {
+        p.db.a_db[1].has_bt = true;
+        p.db.host.note_temp_opened();
+    }
 }
 
 /// `sqlite3BeginWriteOperation(pParse, setStatement, iDb)`: generate VDBE code that prepares

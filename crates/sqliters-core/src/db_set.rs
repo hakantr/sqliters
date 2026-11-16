@@ -147,6 +147,22 @@ pub struct DbSlot {
     /// `sqlite3AnalysisLoad()` of this database: analysisLoader() then read the sqlite_stat1
     /// rows in reverse rowid order, and the last row of a table sets its `nRowLogEst`.
     pub c_stat_reverse: bool,
+    /// C's `Schema.tblHash` history since the schema was last loaded, when it is not the hash
+    /// of a fresh load (`None`: a load of the current objects in rowid order gives C's hash):
+    /// the names (tables, views, virtual tables) of the last load in rowid order, then the
+    /// names inserted (`true`, OP_ParseSchema) and removed (`false`, OP_DropTable) since. The
+    /// iteration order of the hash (ANALYZE, REINDEX) depends on it.
+    pub c_tbl_hash: Option<(Vec<String>, Vec<(bool, String)>)>,
+    /// ALTER TABLE RENAME TO / RENAME COLUMN / DROP COLUMN ran its "after rename" schema test
+    /// (`renameTestSchema()`) after C reloaded this schema: `sqlite_rename_test()` parsed every
+    /// CREATE INDEX statement, and `sqlite3CreateIndex()` -> `sqlite3DefaultRowEst()` raised
+    /// the `nRowLogEst` of each indexed table to at least 99 (until C next reads the
+    /// statistics or reloads the schema).
+    pub c_rowest_clamped: bool,
+    /// Tables (lower case) whose `nRowLogEst` the prepare of a CREATE INDEX statement raised to
+    /// 99 in C (`sqlite3CreateIndex()` -> `sqlite3DefaultRowEst()` on the live table) since C
+    /// last read the statistics or loaded this schema.
+    pub c_rowest_tables: std::collections::HashSet<String>,
     /// Deferred page size requested via `PRAGMA [schema.]page_size = N` for next `VACUUM`.
     pub next_page_size: Option<u32>,
     /// Deferred auto-vacuum mode requested via `PRAGMA [schema.]auto_vacuum = M` for next `VACUUM`.
@@ -287,6 +303,10 @@ pub struct DatabaseSet {
     c_case_sensitive_like: bool,
     c_prepare_unloaded: bool,
     c_cookie_ahead: Option<usize>,
+    /// The ALTER TABLE statement being run compiled in C (the port of C's code generator gave
+    /// a program): C's program then runs `renameTestSchema()` (see
+    /// [`DbSlot::c_rowest_clamped`]) even when it fails later.
+    pub c_alter_compiled: bool,
     c_analyzed: Vec<usize>,
     c_encoding_fixed: bool,
     /// Number of times C would have run `sqlite3ExpirePreparedStatements(db, 0)` (`OP_Expire`
@@ -326,12 +346,15 @@ impl DatabaseSet {
                 schema: main_schema,
                 schema_instance_id: SchemaInstanceId(1),
                 c_generation: 0,
-            c_loaded: false,
-            c_stat_dirty: false,
-            c_stat_seen: Default::default(),
-            c_stat_stale: Default::default(),
-            c_incremental: Default::default(),
-            c_stat_reverse: false,
+                c_loaded: false,
+                c_stat_dirty: false,
+                c_stat_seen: Default::default(),
+                c_stat_stale: Default::default(),
+                c_incremental: Default::default(),
+                c_stat_reverse: false,
+                c_tbl_hash: None,
+                c_rowest_clamped: false,
+                c_rowest_tables: Default::default(),
                 next_page_size: None,
                 next_auto_vacuum: None,
                 max_page_count: SQLITE_MAX_PAGE_COUNT,
@@ -345,12 +368,15 @@ impl DatabaseSet {
                 schema: Schema::default(),
                 schema_instance_id: SchemaInstanceId(2),
                 c_generation: 0,
-            c_loaded: false,
-            c_stat_dirty: false,
-            c_stat_seen: Default::default(),
-            c_stat_stale: Default::default(),
-            c_incremental: Default::default(),
-            c_stat_reverse: false,
+                c_loaded: false,
+                c_stat_dirty: false,
+                c_stat_seen: Default::default(),
+                c_stat_stale: Default::default(),
+                c_incremental: Default::default(),
+                c_stat_reverse: false,
+                c_tbl_hash: None,
+                c_rowest_clamped: false,
+                c_rowest_tables: Default::default(),
                 next_page_size: None,
                 next_auto_vacuum: None,
                 max_page_count: SQLITE_MAX_PAGE_COUNT,
@@ -386,6 +412,7 @@ impl DatabaseSet {
             c_case_sensitive_like: false,
             c_prepare_unloaded: false,
             c_cookie_ahead: None,
+            c_alter_compiled: false,
             c_analyzed: Vec::new(),
             c_encoding_fixed: false,
             c_expire_seq: 0,
@@ -745,23 +772,12 @@ impl DatabaseSet {
             }
             if after_analyze {
                 slot.c_incremental.clear();
+                slot.c_rowest_clamped = false;
+                slot.c_rowest_tables.clear();
                 // OP_LoadAnalysis -> sqlite3AnalysisLoad()
                 slot.c_stat_reverse = rev;
             }
-            let mut cur = std::collections::HashSet::new();
-            for t in &slot.schema.tables {
-                if t.stat1.has_stat1 {
-                    cur.insert(t.name.to_ascii_lowercase());
-                }
-                if t.without_rowid_pk_stat1.as_ref().is_some_and(|s| s.has_stat1) {
-                    cur.insert(format!("{}\u{1}", t.name.to_ascii_lowercase()));
-                }
-            }
-            for ix in &slot.schema.indexes {
-                if ix.stat1.as_ref().is_some_and(|s| s.has_stat1) {
-                    cur.insert(format!("{}\u{1}{}", ix.table_name.to_ascii_lowercase(), ix.name.to_ascii_lowercase()));
-                }
-            }
+            let cur = c_stat_names(slot);
             for gone in slot.c_stat_seen.difference(&cur) {
                 let table = gone.split('\u{1}').next().unwrap_or("").to_owned();
                 slot.c_stat_stale.insert(table);
@@ -804,6 +820,88 @@ impl DatabaseSet {
     pub fn c_note_analyzed(&mut self, i_db: usize) {
         if !self.c_analyzed.contains(&i_db) {
             self.c_analyzed.push(i_db);
+        }
+    }
+
+    /// The names of the tables, views and virtual tables of every database in `sqlite_schema`
+    /// rowid order (see [`Self::c_note_tbl_hash_change`]).
+    pub fn c_tbl_names(&self) -> Vec<Vec<String>> {
+        self.slots
+            .iter()
+            .map(|slot| {
+                let sc = &slot.schema;
+                let mut v: Vec<(i64, String)> = Vec::new();
+                v.extend(sc.tables.iter().map(|t| (t.schema_rowid, t.name.clone())));
+                v.extend(sc.views.iter().map(|t| (t.schema_rowid, t.name.clone())));
+                v.extend(
+                    sc.virtual_tables
+                        .iter()
+                        .map(|t| (t.schema_rowid, t.name.clone())),
+                );
+                v.sort_by_key(|x| x.0);
+                v.into_iter().map(|x| x.1).collect()
+            })
+            .collect()
+    }
+
+    /// A schema statement of this connection ran: the tables, views and virtual tables it
+    /// created (OP_ParseSchema inserts them into C's `tblHash`) and dropped (OP_DropTable
+    /// removes them) are recorded in [`DbSlot::c_tbl_hash`]. `before` is
+    /// [`Self::c_tbl_names`] before the statement.
+    pub fn c_note_tbl_hash_change(&mut self, before: &[Vec<String>]) {
+        let after = self.c_tbl_names();
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            let (Some(b), Some(a)) = (before.get(i), after.get(i)) else {
+                continue;
+            };
+            let gone: Vec<&String> = b
+                .iter()
+                .filter(|n| !a.iter().any(|x| x.eq_ignore_ascii_case(n)))
+                .collect();
+            let mut new: Vec<&String> = a
+                .iter()
+                .filter(|n| !b.iter().any(|x| x.eq_ignore_ascii_case(n)))
+                .collect();
+            if gone.is_empty() && new.is_empty() {
+                continue;
+            }
+            // (C codes OP_ParseSchema of a nested CREATE TABLE - sqlite_sequence of an
+            // AUTOINCREMENT table - before the one of the table itself)
+            new.sort_by_key(|n| !n.eq_ignore_ascii_case("sqlite_sequence"));
+            let log = slot
+                .c_tbl_hash
+                .get_or_insert_with(|| (b.clone(), Vec::new()));
+            // (a statement nested in this one - a virtual table constructor creating its
+            // shadow tables - recorded its own changes already)
+            let last = |log: &(Vec<String>, Vec<(bool, String)>), n: &str| {
+                log.1
+                    .iter()
+                    .rev()
+                    .find(|e| e.1.eq_ignore_ascii_case(n))
+                    .map(|e| e.0)
+            };
+            for n in gone {
+                if last(log, n) != Some(false) {
+                    log.1.push((false, n.clone()));
+                }
+            }
+            for n in new {
+                if last(log, n) != Some(true) {
+                    log.1.push((true, n.clone()));
+                }
+            }
+        }
+    }
+
+    /// ALTER TABLE (RENAME TO, RENAME COLUMN, DROP COLUMN) of a table of database `i_db` ran
+    /// `renameTestSchema(.., "after rename" / "after drop column", ..)` (see
+    /// [`DbSlot::c_rowest_clamped`]); for a database other than temp the test also parses the
+    /// temp schema.
+    pub fn c_note_rename_test(&mut self, i_db: usize) {
+        for i in [i_db, 1] {
+            if let Some(slot) = self.slots.get_mut(i) {
+                slot.c_rowest_clamped = true;
+            }
         }
     }
 
@@ -850,6 +948,9 @@ impl DatabaseSet {
                     slot.c_stat_seen.clear();
                     slot.c_stat_stale.clear();
                     slot.c_incremental.clear();
+                    slot.c_tbl_hash = None;
+                    slot.c_rowest_clamped = false;
+                    slot.c_rowest_tables.clear();
                 }
                 if i_db == 1 {
                     break;
@@ -873,6 +974,9 @@ impl DatabaseSet {
                 slot.c_stat_seen.clear();
                 slot.c_stat_stale.clear();
                 slot.c_incremental.clear();
+                slot.c_tbl_hash = None;
+                slot.c_rowest_clamped = false;
+                slot.c_rowest_tables.clear();
             }
         }
     }
@@ -889,9 +993,13 @@ impl DatabaseSet {
                 slot.c_stat_reverse = rev;
                 slot.c_generation += 1;
                 slot.c_stat_dirty = false;
-                slot.c_stat_seen.clear();
+                // (the reload read the statistics: C's objects have the ones there are now)
+                slot.c_stat_seen = c_stat_names(slot);
                 slot.c_stat_stale.clear();
                 slot.c_incremental.clear();
+                slot.c_tbl_hash = None;
+                slot.c_rowest_clamped = false;
+                slot.c_rowest_tables.clear();
             }
             if i_db == 1 {
                 break;
@@ -1826,6 +1934,9 @@ impl DatabaseSet {
             c_stat_stale: Default::default(),
             c_incremental: Default::default(),
             c_stat_reverse: false,
+            c_tbl_hash: None,
+            c_rowest_clamped: false,
+            c_rowest_tables: Default::default(),
             next_page_size: None,
             next_auto_vacuum: None,
             max_page_count: SQLITE_MAX_PAGE_COUNT,
@@ -2335,4 +2446,32 @@ mod tests {
         assert_ne!(set.slot(id_c).unwrap().schema_instance_id, inst_a);
         assert_ne!(set.slot(id_c).unwrap().schema_instance_id, inst_b);
     }
+}
+
+/// The tables and indexes (lower case; an index as "<table>\u{1}<index>", the PRIMARY KEY of a
+/// WITHOUT ROWID table as "<table>\u{1}") of a database that have `sqlite_stat1` statistics
+/// in the engine's copy of the schema.
+fn c_stat_names(slot: &DbSlot) -> std::collections::HashSet<String> {
+    let mut cur = std::collections::HashSet::new();
+    for t in &slot.schema.tables {
+        if t.stat1.has_stat1 {
+            cur.insert(t.name.to_ascii_lowercase());
+        }
+        if t.without_rowid_pk_stat1
+            .as_ref()
+            .is_some_and(|s| s.has_stat1)
+        {
+            cur.insert(format!("{}\u{1}", t.name.to_ascii_lowercase()));
+        }
+    }
+    for ix in &slot.schema.indexes {
+        if ix.stat1.as_ref().is_some_and(|s| s.has_stat1) {
+            cur.insert(format!(
+                "{}\u{1}{}",
+                ix.table_name.to_ascii_lowercase(),
+                ix.name.to_ascii_lowercase()
+            ));
+        }
+    }
+    cur
 }

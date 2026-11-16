@@ -176,12 +176,13 @@ fn add_module_argument(p: &mut Parse, tab: TableId, z_arg: Option<String>) {
 /// `sqlite3VtabBeginParse(pParse, pName1, pName2, pModuleName, ifNotExists)`: the parser calls
 /// this routine when it first sees a CREATE VIRTUAL TABLE statement. The module name has been
 /// parsed, but the optional list of parameters that follow the module name are still pending.
-pub fn sqlite3_vtab_begin_parse(p: &mut Parse, name1: &Token, name2: &Token, module_name: &Token, if_not_exists: bool) {
-    if !p.db.init_busy {
-        // (code generation for CREATE VIRTUAL TABLE is a later step)
-        p.not_supported("statement kind (grammar rule not ported)");
-        return;
-    }
+pub fn sqlite3_vtab_begin_parse(
+    p: &mut Parse,
+    name1: &Token,
+    name2: &Token,
+    module_name: &Token,
+    if_not_exists: bool,
+) {
     crate::build_tab::sqlite3_start_table(p, name1, name2, false, false, true, if_not_exists);
     let tab = p.p_new_table;
     if tab.is_null() {
@@ -232,7 +233,53 @@ pub fn sqlite3_vtab_finish_parse(p: &mut Parse, _end: Option<&Token>) {
     // out of sqlite_schema) then do additional initialization work and store the statement
     // text in the sqlite_schema table.
     if !p.db.init_busy {
-        p.not_supported("statement kind (grammar rule not ported)");
+        // Compute the complete text of the CREATE VIRTUAL TABLE statement
+        crate::build::sqlite3_may_abort(p);
+        if let Some(end) = _end {
+            p.s_name_token.n = end.z - p.s_name_token.z + end.n;
+        }
+        let z_stmt = format!(
+            "CREATE VIRTUAL TABLE {}",
+            p.tok_str(&p.s_name_token.clone())
+        );
+
+        // A slot for the record has already been allocated in the schema table. We just need
+        // to update that slot with all the information we've collected.
+        //
+        // The VM register number pParse->u1.cr.regRowid holds the rowid of an entry in the
+        // sqlite_schema table that has already been allocated by sqlite3StartTable(). The
+        // pParse->u1.cr.regRowid register will be the same for all of the nested
+        // sqlite3_exec() calls.
+        let i_db = p.tab(tab).i_db;
+        let z_db = p.db.a_db[i_db as usize].z_db_s_name.clone();
+        let z_name = p.tab(tab).z_name.clone();
+        let reg_rowid = p.cr_reg_rowid;
+        use crate::ddl::pf_big_q;
+        crate::ddl::sqlite3_nested_parse(
+            p,
+            format!(
+                "UPDATE {}.sqlite_master SET type='table', name={}, tbl_name={}, rootpage=0, sql={} WHERE rowid=#{reg_rowid}",
+                pf_big_q(Some(&z_db)),
+                pf_big_q(Some(&z_name)),
+                pf_big_q(Some(&z_name)),
+                pf_big_q(Some(&z_stmt)),
+            ),
+        );
+        crate::select::sqlite3_get_vdbe(p);
+        crate::ddl::sqlite3_change_cookie(p, i_db);
+
+        p.v.add_op0(sqliters_vdbe::opcodes::OP_Expire);
+        let z_where = format!(
+            "name={} AND sql={}",
+            pf_big_q(Some(&z_name)),
+            pf_big_q(Some(&z_stmt))
+        );
+        crate::ddl::sqlite3_vdbe_add_parse_schema_op(p, i_db, Some(&z_where), 0);
+
+        p.n_mem += 1;
+        let i_reg = p.n_mem;
+        p.v.load_string(i_reg, &z_name);
+        p.v.add_op2(sqliters_vdbe::opcodes::OP_VCreate, i_db, i_reg);
     } else {
         // If we are rereading the sqlite_schema table create the in-memory record of the
         // table.
@@ -240,6 +287,8 @@ pub fn sqlite3_vtab_finish_parse(p: &mut Parse, _end: Option<&Token>) {
         let i_db = p.tab(tab).i_db as usize;
         let key = p.tab(tab).z_name.to_ascii_lowercase();
         p.a_schema[i_db].tbl_hash.insert(key, tab);
+        let zn = p.tab(tab).z_name.clone();
+        p.a_schema[i_db].tbl_order.insert(&zn, tab);
         p.p_new_table = TableId::NULL;
     }
 }

@@ -779,6 +779,8 @@ pub struct SchemaState {
     pub loaded: bool,
     /// `tblHash`: all tables and views, by lower-case name
     pub tbl_hash: std::collections::HashMap<String, TableId>,
+    /// The iteration order of C's `tblHash` (hash.c buckets; REINDEX and ANALYZE walk it)
+    pub tbl_order: crate::trigger::CHash<TableId>,
     /// `idxHash`: all (named) indices, by lower-case name
     pub idx_hash: std::collections::HashMap<String, IndexId>,
     /// Objects whose SQL text the generator could not load (a construct that is not ported):
@@ -840,6 +842,8 @@ pub struct Table {
     pub vtab: Option<VTable>,
     /// `pTrigger`: list of triggers on this object, most recent first
     pub p_trigger: Vec<TriggerId>,
+    /// `u.tab.addColOffset`: offset in CREATE TABLE stmt to add a new column
+    pub add_col_offset: i32,
 }
 
 /// `struct VTable`, the part the code generator reads: the instance of a virtual table that
@@ -861,6 +865,8 @@ pub struct VTable {
     pub has_find_function: bool,
     /// `pMod->pModule->xUpdate!=0`
     pub has_update: bool,
+    /// `pModule->xRename!=0` (None: the engine does not know for this module)
+    pub has_rename: Option<bool>,
 }
 
 /// `SQLITE_VTABRISK_*`: allowed values for VTable.eVtabRisk
@@ -1118,6 +1124,28 @@ pub trait Host {
     /// `sqlite3ReadSchema()` -> `sqlite3Init()` did work: C's connection has its schemas loaded
     /// from now on, also when the statement fails afterwards (the engine mirrors that state).
     fn note_schema_loaded(&self) {}
+    /// `sqlite3OpenTempDatabase()` opened the temp database (`db->aDb[1].pBt`) while the
+    /// statement was prepared: C's connection has it open from now on.
+    fn note_temp_opened(&self) {}
+    /// The history of C's `Schema.tblHash` of database `i_db` since its last load when it is
+    /// not a fresh load of the current objects (see `DbSlot::c_tbl_hash` of the engine): the
+    /// names of that load in rowid order, then the names inserted (`true`) and removed.
+    /// C's ALTER TABLE ran `renameTestSchema()` after its last load of the statistics of
+    /// database `i_db`: the tables with a CREATE INDEX have `nRowLogEst` of at least 99.
+    fn rowest_clamped(&self, _i_db: usize) -> bool {
+        false
+    }
+    /// The tables of database `i_db` whose `nRowLogEst` a CREATE INDEX statement raised to 99
+    /// (`sqlite3DefaultRowEst()` on C's live table) after C last read the statistics.
+    fn rowest_clamped_tables(&self, _i_db: usize) -> Vec<String> {
+        Vec::new()
+    }
+    /// The prepare of a CREATE INDEX statement raised the `nRowLogEst` of C's live table
+    /// `table` of database `i_db` to 99 (see [`Host::rowest_clamped_tables`]).
+    fn note_rowest_clamped(&self, _i_db: usize, _table: &str) {}
+    fn tbl_hash_log(&self, _i_db: usize) -> Option<(Vec<String>, Vec<(bool, String)>)> {
+        None
+    }
     /// Application-defined functions named `name` (`db->aFunc`), any arity. Built-in functions
     /// are known to the code generator itself.
     fn user_functions(&self, name: &str) -> Vec<Arc<FuncDef>>;
@@ -1222,6 +1250,8 @@ pub struct Db<'a> {
     pub case_sensitive_like: bool,
     /// `xAuth!=0`: an authorizer callback is registered
     pub x_auth: bool,
+    /// `nAnalysisLimit`: PRAGMA analysis_limit
+    pub n_analysis_limit: i32,
     /// The engine side
     pub host: &'a dyn Host,
 }
@@ -1262,6 +1292,7 @@ impl<'a> Db<'a> {
             encoding_fixed: false,
             case_sensitive_like: false,
             x_auth: false,
+            n_analysis_limit: 0,
             host,
         }
     }
@@ -1416,6 +1447,19 @@ pub struct Parse<'a> {
     pub p_new_table: TableId,
     /// `u1.cr.constraintName`: name of the constraint currently being parsed
     pub cr_constraint_name: Token,
+    /// `u1.cr.regRowid`: register holding rowid of CREATE TABLE entry
+    pub cr_reg_rowid: i32,
+    /// `u1.cr.regRoot`: register holding root page number for new objects
+    pub cr_reg_root: i32,
+    /// `u1.cr.addrCrTab`: address of the OP_CreateBtree opcode on CREATE TABLE
+    pub cr_addr_cr_tab: i32,
+    /// `DbFixer.zType` / `DbFixer.pName` of the fixer in use (non-init statements): the kind
+    /// and the raw name text of the schema object for the error messages of `attach.c`
+    pub fix_type: &'static str,
+    pub fix_name: String,
+    /// `DbFixer.pName` as a token of the statement text (`%T` records the error offset at it;
+    /// EMPTY when C's token points outside the statement)
+    pub fix_name_tok: Token,
     /// `iPkSortOrder`: ASC or DESC for INTEGER PRIMARY KEY
     pub i_pk_sort_order: u8,
     /// `sNameToken`: token with unqualified schema object name
@@ -1578,6 +1622,12 @@ impl<'a> Parse<'a> {
             a_schema: Vec::new(),
             p_new_table: TableId::NULL,
             cr_constraint_name: Token::EMPTY,
+            cr_reg_rowid: 0,
+            cr_reg_root: 0,
+            cr_addr_cr_tab: 0,
+            fix_type: "",
+            fix_name: String::new(),
+            fix_name_tok: Token::EMPTY,
             i_pk_sort_order: 0,
             s_name_token: Token::EMPTY,
             init_i_db: 0,
