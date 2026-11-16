@@ -1707,6 +1707,22 @@ impl ConnectionInner {
         }
     }
 
+    fn set_prepared_connection_encoding(&mut self, enc: TextEncoding) {
+        self.connection_encoding = enc;
+        for slot in self.db_set.slots_mut() {
+            if let Some(bt) = slot.btree.as_mut() { bt.pager_mut().set_prepared_encoding(enc); }
+        }
+    }
+
+    fn restore_main_schema_encoding(&mut self) {
+        let header = self.db_set.main_btree().pager().header();
+        if !header.text_encoding_unset {
+            let enc = header.encoding();
+            self.set_prepared_connection_encoding(enc);
+            self.advisory_expire_generation += 1;
+        }
+    }
+
     #[inline]
     pub(crate) fn check_any_interrupted(&self) -> Result<()> {
         if self.active_interrupt_flag.load(Ordering::SeqCst) {
@@ -1882,12 +1898,10 @@ impl ConnectionInner {
                 let can_end = !self.in_user_btree_tx
                     && self.activity.has_no_active_tx()
                     && !self.activity.has_active_tx_on_instance(inst_id);
+                if sets_text_encoding { self.restore_main_schema_encoding(); }
                 let slot = &mut self.db_set.slots_mut()[idx];
                 let slot_name = slot.name.clone();
                 let bt = slot.btree.as_mut().unwrap();
-                if sets_text_encoding && !bt.pager().header().text_encoding_unset {
-                    self.advisory_expire_generation += 1;
-                }
                 let prev_cookie = slot.schema.schema_cookie;
                 let prev_had_pages = slot.schema.had_pages;
                 let prev_loaded = slot.schema.loaded;
@@ -1909,12 +1923,10 @@ impl ConnectionInner {
                     any_changed = true;
                 }
             } else {
+                if sets_text_encoding { self.restore_main_schema_encoding(); }
                 let slot = &mut self.db_set.slots_mut()[idx];
                 let slot_name = slot.name.clone();
                 let bt = slot.btree.as_mut().unwrap();
-                if sets_text_encoding && !bt.pager().header().text_encoding_unset {
-                    self.advisory_expire_generation += 1;
-                }
                 let prev_cookie = slot.schema.schema_cookie;
                 let prev_had_pages = slot.schema.had_pages;
                 let prev_loaded = slot.schema.loaded;
@@ -5768,6 +5780,11 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) -> Result<()> {
                 inner.busy_policy = if n > 0 { BusyPolicy::TimeoutMs(n as u64) } else { BusyPolicy::None };
             }
             PrepareEffect::WalAutocheckpoint(n) => inner.wal_autocheckpoint_threshold = n,
+            PrepareEffect::Encoding(enc) => {
+                let enc = match enc { 2 => TextEncoding::Utf16Le, 3 => TextEncoding::Utf16Be, _ => TextEncoding::Utf8 };
+                inner.set_prepared_connection_encoding(enc);
+                inner.advisory_expire_generation += 1;
+            }
             PrepareEffect::TempStore(mode) => {
                 let mode = match mode { 1 => TempStoreMode::File, 2 => TempStoreMode::Memory, _ => TempStoreMode::Default };
                 let auto_commit = !(inner.explicit_tx || inner.implicit_savepoint_tx);

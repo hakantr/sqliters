@@ -50,6 +50,7 @@ pub enum PrepareEffect {
     WalAutocheckpoint(i32),
     LockingMode { i_db: Option<usize>, mode: u8 },
     TempStore(u8),
+    Encoding(u8),
 }
 
 /// Names of the pragmas enabled in the C reference build, in pragma.h order.
@@ -81,6 +82,7 @@ pub fn prepare_constant(name: &str) -> bool {
             "wal_autocheckpoint",
             "locking_mode",
             "temp_store",
+            "encoding",
         ]
         .iter()
         .any(|n| name.eq_ignore_ascii_case(n))
@@ -410,6 +412,30 @@ pub fn sqlite3_pragma(
                 ] {
                     p.v.add_op3(op, a, b, c);
                 }
+            }
+        }
+        14 => {
+            // pragma.c:2250–2297; callback.c:181–188. Encoding setters
+            // expire pending statements during prepare, even for the same value.
+            if let Some(z) = right {
+                if !p.db.encoding_fixed {
+                    let enc = match z.to_ascii_lowercase().as_str() {
+                        "utf8" | "utf-8" => Some(1),
+                        "utf16le" | "utf-16le" => Some(2),
+                        "utf16be" | "utf-16be" => Some(3),
+                        "utf16" | "utf-16" => Some(if cfg!(target_endian = "little") { 2 } else { 3 }),
+                        _ => None,
+                    };
+                    if let Some(enc) = enc {
+                        p.db.enc = enc;
+                        p.db.host.note_pragma_effect(PrepareEffect::Encoding(enc));
+                    } else { p.error_msg(&format!("unsupported encoding: {z}")); }
+                }
+            } else {
+                sqlite3_read_schema(p);
+                if p.n_err != 0 { return; }
+                p.v.load_string(1, match p.db.enc { 2 => "UTF-16le", 3 => "UTF-16be", _ => "UTF-8" });
+                p.v.add_op2(OP_ResultRow, 1, 1);
             }
         }
         15 => foreign_key_check(p, i_db, right, z_db.as_deref()),

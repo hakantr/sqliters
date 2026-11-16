@@ -2569,11 +2569,18 @@ impl Pager {
         if self.state == TransactionState::Open && !self.header_loaded {
             let _ = self.ensure_header_loaded()?;
         }
+        self.set_prepared_encoding(enc);
+        Ok(())
+    }
+
+    /// A prepare-time connection encoding change does not read or lock a file.
+    /// Recorded encodings stay intact until schema loading restores the connection
+    /// encoding; empty databases keep the new encoding for their first table.
+    pub fn set_prepared_encoding(&mut self, enc: TextEncoding) {
         if !self.header.file_format_is_set() && self.header.text_encoding_unset {
             self.pending_encoding = Some(enc);
             self.header.text_encoding = enc as u32;
         }
-        Ok(())
     }
 
     /// Installs a header freshly read from the file, keeping the encoding chosen for a

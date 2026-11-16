@@ -1550,6 +1550,9 @@ pub(crate) fn stmt_loads_schema_on_prepare(stmt: &Stmt) -> bool {
     if stmt_requires_schema(stmt) {
         return true;
     }
+    if matches!(stmt, Stmt::Pragma { name, value: None, .. } if name.eq_ignore_ascii_case("encoding")) {
+        return true;
+    }
     matches!(
         stmt,
         Stmt::Pragma { name, .. }

@@ -26,7 +26,8 @@
 | V6b.6 — auto_vacuum hazırlama ve canlı Btree durumu | `9a222cd` | Global nextAutovac, donmuş meta7, TEMP, commit/rollback/savepoint ve yeniden okuma | 6.516/6.516; tam program 5.860/5.860; 220 API akışı aynı | Yeniden ölçülmedi | kapalı 1057/0; açık 1042/15 bilinen; 337 yok sayıldı |
 | V6b.7 — bağlantı/cache PRAGMA hazırlama etkileri | `8fdf60f` | cache_spill, busy_timeout, wal_autocheckpoint; TEMP, EXPLAIN ve ilk kodlama yüklemesi | 7.701 EXPLAIN/EQP, 6.757 tam program, 330+16 API aynı | Yeniden ölçülmedi | kapalı 1063/0; açık 1048/15 bilinen; 337 yok sayıldı |
 | V6b.8 — locking_mode ve hazırlama hataları; D103 açık | `d9f13d7` | Global/yerel kip; tempFile, sayaç, sentaks ve hata konumu | 10093 EXPLAIN/EQP; 8249 tam program; API 487/488 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1071/0; açık 1056/15 bilinen; 337 yok sayıldı |
-| V6b.9 — temp_store hazırlama ve şema temizleme | bu commit | İlk karakter, TEMP işlem koruması, sabit sonuç ve cache_size koruma | 11832 EXPLAIN/EQP; 9216 tam program; API 1047/1048 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1076/0; açık 1061/15 bilinen; 337 yok sayıldı |
+| V6b.9 — temp_store hazırlama ve şema temizleme | `94c2949` | İlk karakter, TEMP işlem koruması, sabit sonuç ve cache_size koruma | 11832 EXPLAIN/EQP; 9216 tam program; API 1047/1048 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1076/0; açık 1061/15 bilinen; 337 yok sayıldı |
+| V6b.10 — encoding hazırlama ve advisory expire; D111 açık | bu commit | Aliaslar, şema/kodlama geri yükleme, dosya kilidi, bekleyen/çalışan ifadeler | 13493 EXPLAIN/EQP; 10012 tam program; API 1721/1722 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1083/0; açık 1068/15 bilinen; 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -395,3 +396,7 @@ locking_mode üretimi ve hazırlama etkileri taşındı. Tutulan kilitte sayfa 1
 ## V6b.9 — geçici saklama hazırlaması
 
 temp_store hazırlama etkileri, TEMP işlem koruması, şema temizleme, cache_size koruma ve donmuş getter C ile karşılaştırıldı. İlk adayın 72 getter farkı kapandı; önceki D103 açık kaldı. Kanıt ve dört kapı [karar_esligi_v6b_9.md](karar_esligi_v6b_9.md) içinde. Sonraki uygun dilim encoding; doğruluk önceliği sürer.
+
+## V6b.10 — kodlama hazırlaması
+
+encoding üretimi ve hazırlama etkileri, aynı atamada advisory expire, sorgunun şema okuması, boş pagerlerin kodlaması ve kilitsiz setter C ile karşılaştırıldı. Üç mevcut dosya kodlaması değişmeden açıldı. Kanıt ve açık sınırlar [karar_esligi_v6b_10.md](karar_esligi_v6b_10.md) içinde. Önce D111 ve sanal tablo bağlama doğrulaması, ardından kalan PRAGMA doğruluk dilimleriyle devam edilecek.
