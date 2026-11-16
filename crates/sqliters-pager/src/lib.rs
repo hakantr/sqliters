@@ -372,6 +372,8 @@ pub struct Pager {
     journal_started_in_tx: bool,
     cache_modified: bool,
     change_counter_bumped: bool,
+    /// C Pager.changeCountDone survives commits while the file lock is retained.
+    change_count_done: bool,
     /// `Pager.dbFileVers` (`pager.c`), change-counter part: the counter of the page 1 image this
     /// pager last loaded from storage (database file or WAL) or last wrote to the database file
     /// itself. A commit stamps `db_file_vers_cc + 1` (`pager_write_changecounter`); a WAL commit
@@ -592,7 +594,11 @@ impl Pager {
             synchronous: 2,
             synchronous_user_set: false,
             default_wal_synchronous: options.default_wal_synchronous.min(3),
-            locking_mode: LockingMode::Normal,
+            // pager.c:5067,5118: memory, private TEMP and immutable files
+            // use tempFile semantics, including exclusiveMode=1.
+            locking_mode: if is_memdb_backing || db_kind == DatabaseKind::PrivateTemporary || options.immutable {
+                LockingMode::Exclusive
+            } else { LockingMode::Normal },
             journal_mode,
             journal_size_limit: -1,
             header: candidate_header,
@@ -641,6 +647,7 @@ impl Pager {
             journal_started_in_tx: false,
             cache_modified: false,
             change_counter_bumped: false,
+            change_count_done: is_memdb_backing || db_kind == DatabaseKind::PrivateTemporary || options.immutable,
             db_file_vers_cc: 0,
             db_file_modified: false,
             set_super: false,
@@ -675,7 +682,7 @@ impl Pager {
     #[inline]
     #[allow(unexpected_cfgs)]
     fn lock_db_file(&self, level: LockLevel) -> Result<()> {
-        if self.immutable {
+        if self.uses_temp_file_semantics() {
             return Ok(());
         }
         if let Some(ref f) = self.file {
@@ -709,8 +716,10 @@ impl Pager {
     }
 
     #[inline]
-    fn unlock_db_file(&self, level: LockLevel) -> Result<()> {
-        if self.immutable {
+    fn unlock_db_file(&mut self, level: LockLevel) -> Result<()> {
+        // pagerUnlockDb resets this even when xUnlock fails.
+        self.change_count_done = self.uses_temp_file_semantics();
+        if self.uses_temp_file_semantics() {
             return Ok(());
         }
         if let Some(ref f) = self.file {
@@ -721,8 +730,8 @@ impl Pager {
 
     /// Acquires `LockLevel::Exclusive` on `.db`, restoring the prior lock level (and releasing any
     /// intermediate `Pending` lock) on failure (`pagerExclusiveLock` in `sqlite/src/pager.c:7635`).
-    fn acquire_exclusive_lock_or_restore(&self) -> Result<()> {
-        if self.immutable {
+    fn acquire_exclusive_lock_or_restore(&mut self) -> Result<()> {
+        if self.uses_temp_file_semantics() {
             return Ok(());
         }
         if let Some(ref f) = self.file {
@@ -732,6 +741,7 @@ impl Pager {
             }
             let shared_lvl = f.lock_level();
             if let Err(e) = f.lock(LockLevel::Exclusive) {
+                self.change_count_done = self.uses_temp_file_semantics();
                 let _ = f.unlock(shared_lvl);
                 if orig == LockLevel::NoLock {
                     let _ = f.unlock(LockLevel::NoLock);
@@ -1174,12 +1184,19 @@ impl Pager {
     /// Updates the pager locking mode (`sqlite3PagerLockingMode`, `pager.c:7404-7415`), returning
     /// the resulting active [`LockingMode`].
     pub fn set_locking_mode(&mut self, mode: LockingMode) -> LockingMode {
-        let is_temp = self.db_kind == DatabaseKind::PrivateTemporary && !self.is_memdb_backing;
-        let wal_heap = self.wal.as_ref().is_some_and(Wal::is_heap_memory);
-        if !is_temp && !wal_heap {
+        if self.can_set_locking_mode() {
             self.locking_mode = mode;
         }
         self.locking_mode
+    }
+
+    /// The mutable-mode guard of sqlite3PagerLockingMode (pager.c:7411).
+    pub fn can_set_locking_mode(&self) -> bool {
+        !self.uses_temp_file_semantics() && !self.wal.as_ref().is_some_and(Wal::is_heap_memory)
+    }
+
+    fn uses_temp_file_semantics(&self) -> bool {
+        self.is_memdb_backing || self.db_kind == DatabaseKind::PrivateTemporary || self.immutable
     }
 
     #[inline]
@@ -1940,6 +1957,26 @@ impl Pager {
             };
             let fl = self.cache.flags(slot);
             if pgno <= db_size && fl & PGHDR_DONT_WRITE == 0 && pgno != lock_byte_pgno {
+                // pager.c:4530: an already-dirty page 1 is stamped on every
+                // physical write, even when changeCountDone skipped forcing
+                // it dirty at commit. MEMDB only uses this file as backing
+                // storage for the Rust cache; C performs no such file write.
+                if pgno == 1 && !self.is_memdb_backing {
+                    let cc = self.db_file_vers_cc.wrapping_add(1);
+                    let data = self.cache.entry_data_mut(slot);
+                    data[24..28].copy_from_slice(&cc.to_be_bytes());
+                    data[92..96].copy_from_slice(&cc.to_be_bytes());
+                    data[96..100].copy_from_slice(&SQLITE_VERSION_NUMBER.to_be_bytes());
+                    self.header.change_counter = cc;
+                    self.header.version_valid_for = cc;
+                    self.header.sqlite_version_number = SQLITE_VERSION_NUMBER;
+                    if let Some(pending) = self.pending_byte_copy.as_mut() {
+                        pending.new_header.change_counter = cc;
+                        pending.new_header.version_valid_for = cc;
+                        pending.new_header.sqlite_version_number = SQLITE_VERSION_NUMBER;
+                    }
+                    self.change_counter_bumped = true;
+                }
                 let offset = u64::from(pgno - 1) * ps;
                 pcache::pctr!(
                     self.cache,
@@ -1957,6 +1994,10 @@ impl Pager {
                     .as_deref()
                     .ok_or_else(|| SqliteError::misuse("database file is not open"))?;
                 file.write_at(self.cache.entry_data(slot), offset)?;
+                if pgno == 1 {
+                    let data = self.cache.entry_data(slot);
+                    self.db_file_vers_cc = u32::from_be_bytes(data[24..28].try_into().unwrap());
+                }
                 self.a_stat[PAGER_STAT_WRITE] += 1;
             } else {
                 pcache::pctr!(
@@ -3958,10 +3999,12 @@ impl Pager {
             patched_hdr.read_version = ver;
             patched_hdr.database_size_pages = n_src_pages;
 
-            let next_cc = self.db_file_vers_cc.wrapping_add(1);
-            patched_hdr.change_counter = next_cc;
-            patched_hdr.version_valid_for = next_cc;
-            patched_hdr.sqlite_version_number = SQLITE_VERSION_NUMBER;
+            if !self.change_count_done || self.use_wal() {
+                let next_cc = self.db_file_vers_cc.wrapping_add(1);
+                patched_hdr.change_counter = next_cc;
+                patched_hdr.version_valid_for = next_cc;
+                patched_hdr.sqlite_version_number = SQLITE_VERSION_NUMBER;
+            }
             if patched_hdr.schema_cookie <= self.tx_orig_header.schema_cookie {
                 patched_hdr.schema_cookie = self.tx_orig_header.schema_cookie.wrapping_add(1);
             }
@@ -4258,10 +4301,12 @@ impl Pager {
         patched_hdr.read_version = ver;
         patched_hdr.database_size_pages = n_src_pages;
 
-        let next_cc = self.db_file_vers_cc.wrapping_add(1);
-        patched_hdr.change_counter = next_cc;
-        patched_hdr.version_valid_for = next_cc;
-        patched_hdr.sqlite_version_number = SQLITE_VERSION_NUMBER;
+        if !self.change_count_done || self.use_wal() {
+            let next_cc = self.db_file_vers_cc.wrapping_add(1);
+            patched_hdr.change_counter = next_cc;
+            patched_hdr.version_valid_for = next_cc;
+            patched_hdr.sqlite_version_number = SQLITE_VERSION_NUMBER;
+        }
         // `sqlite3BtreeUpdateMeta(p->pDest, 1, p->iDestSchema+1)` (`backup.c:456`): the copy's schema
         // cookie is the destination's cookie at the start of its transaction plus one, whatever the
         // source's cookie is.
@@ -4680,10 +4725,12 @@ impl Pager {
             // so retrying `commit` after `SQLITE_BUSY` does not double-increment).
             // Skip overwriting Page 1 header when `pending_byte_copy` is active so Page 1
             // retains its serialized `pgsz_src` header while `self.header` remains `pgsz_dest`.
-            if self.page_count > 0 && self.pending_byte_copy.is_none() {
+            if self.page_count > 0 && self.pending_byte_copy.is_none()
+                && (!self.change_count_done || self.cache.is_dirty(1) || self.page_count != self.tx_orig_page_count)
+            {
                 let p1_slot = self.mark_page_writable(1)?;
                 self.header.database_size_pages = self.page_count;
-                if !self.change_counter_bumped {
+                if !self.change_counter_bumped && !self.change_count_done {
                     // `pager_incr_changecounter` → `pager_write_changecounter`:
                     // `dbFileVers + 1`; `pager_write_pagelist` then copies page 1's bytes
                     // 24..39 back into `dbFileVers`.
@@ -4696,6 +4743,8 @@ impl Pager {
                 let hdr_copy = self.header.clone();
                 hdr_copy.write_into(&mut self.cache.entry_data_mut(p1_slot)[0..DB_HEADER_SIZE]);
             }
+
+            if self.page_count > 0 { self.change_count_done = true; }
 
             // `writeSuperJournal`, then `syncJournal(pPager, 0)`: the EXCLUSIVE lock is taken
             // (a transaction whose cache already wrote pages out holds it), the record count
@@ -4951,6 +5000,8 @@ impl Pager {
             TransactionState::Read => self.finish_tx_to_read_or_open(retain_read),
             TransactionState::Write => {
                 if self.use_wal() {
+                    // PagerSavepoint(SAVEPOINT_ROLLBACK, -1), pager.c:3481.
+                    self.change_count_done = self.uses_temp_file_semantics();
                     let orig_count = self.tx_orig_page_count;
                     // `pagerRollbackWal` calls `pagerUndoCallback` — which restarts the backups
                     // (`sqlite3BackupRestart`) — once per frame this transaction wrote to the
@@ -5002,6 +5053,9 @@ impl Pager {
                     return self.rollback_journal_mode_off(retain_read);
                 }
 
+                // pager_playback resets this; an empty WRITER_LOCKED rollback
+                // only ends the transaction and keeps the retained-lock flag.
+                if self.journal_started_in_tx { self.change_count_done = self.uses_temp_file_semantics(); }
                 let orig_count = self.tx_orig_page_count;
 
                 // If `commit` already started modifying `.db` (`db_file_modified`), restore all
@@ -5324,6 +5378,7 @@ impl Pager {
         if self.state != TransactionState::Write || index >= self.subsavepoints.len() {
             return Ok(());
         }
+        self.change_count_done = self.uses_temp_file_semantics();
         self.release_transient();
         // `sqlite3BtreeSavepoint(SAVEPOINT_ROLLBACK)` → `saveAllCursors(pBt, 0, 0)`: no cursor
         // keeps a page across the rollback (only the b-tree's reference on page 1 stays).

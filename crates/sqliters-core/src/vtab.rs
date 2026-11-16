@@ -3539,6 +3539,13 @@ impl PragmaVTabModule {
             "database_list" => ("CREATE TABLE x(seq,name,file)", 3, false, false, false),
             "collation_list" => ("CREATE TABLE x(seq,name)", 2, false, false, false),
             "compile_options" => ("CREATE TABLE x(compile_options)", 1, false, false, false),
+            "locking_mode" => (
+                "CREATE TABLE x(locking_mode,schema hidden)",
+                1,
+                false,
+                true,
+                false,
+            ),
             "table_list" => (
                 "CREATE TABLE x(schema,name,type,ncol,wr,strict,arg hidden)",
                 6,
@@ -3672,7 +3679,7 @@ impl VirtualTable for PragmaVTabTable {
 
     fn best_index(&self, info: &mut VTabIndexInfo) -> Result<()> {
         let arg_col = self.spec.visible_cols as i32;
-        let schema_col = (self.spec.visible_cols + 1) as i32;
+        let schema_col = (self.spec.visible_cols + usize::from(self.spec.has_arg)) as i32;
         let mut idx_num = 0i32;
         let mut arg_ci = None;
         let mut schema_ci = None;
@@ -3852,8 +3859,11 @@ impl VirtualCursor for PragmaVTabCursor {
         if self.spec.has_arg && col_idx == self.spec.visible_cols {
             return Ok(self.arg_val.clone());
         }
-        if self.spec.has_schema && col_idx == self.spec.visible_cols + 1 {
-            return Ok(self.schema_val.clone());
+        if self.spec.has_schema && col_idx == self.spec.visible_cols + usize::from(self.spec.has_arg) {
+            // pragma.c:3048–3051 indexes azArg by the hidden-column offset.
+            // Schema-only pragmas store their input in azArg[1], while this
+            // column reads azArg[0]. Preserve C's NULL result.
+            return Ok(if self.spec.has_arg { self.schema_val.clone() } else { self.arg_val.clone() });
         }
         Ok(Value::Null)
     }

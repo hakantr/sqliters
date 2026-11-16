@@ -44689,30 +44689,31 @@ fn exec_pragma(
             })
         }
         "LOCKING_MODE" => {
+            let requested = value.and_then(|pv| LockingMode::from_pragma_str(&pragma_to_string(pv)));
+            if schema.is_none() && requested.is_none() {
+                return Ok(single_col("locking_mode", Value::Text(ctx.default_locking_mode.as_str().to_owned())));
+            }
             if db_id == DatabaseId::TEMP {
                 return Ok(single_col(
                     "locking_mode",
                     Value::Text("exclusive".to_owned()),
                 ));
             }
-            if let Some(pv) = value {
-                let s = pragma_to_string(pv);
-                if let Some(req) = LockingMode::from_pragma_str(s.trim()) {
-                    if schema.is_none() {
-                        for (idx, slot) in ctx.db_set.slots_mut().iter_mut().enumerate() {
-                            if idx == DatabaseId::TEMP.index() {
-                                continue;
-                            }
-                            if let Some(ref mut bt) = slot.btree {
-                                let _ = bt.pager_mut().set_locking_mode(req);
-                            }
+            if let Some(req) = requested {
+                if schema.is_none() {
+                    for (idx, slot) in ctx.db_set.slots_mut().iter_mut().enumerate() {
+                        if idx == DatabaseId::TEMP.index() {
+                            continue;
                         }
-                        *ctx.default_locking_mode = req;
-                    } else if let Some(ref mut bt) =
-                        ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
-                    {
-                        let _ = bt.pager_mut().set_locking_mode(req);
+                        if let Some(ref mut bt) = slot.btree {
+                            let _ = bt.pager_mut().set_locking_mode(req);
+                        }
                     }
+                    *ctx.default_locking_mode = req;
+                } else if let Some(ref mut bt) =
+                    ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
+                {
+                    let _ = bt.pager_mut().set_locking_mode(req);
                 }
             }
             let cur = ctx

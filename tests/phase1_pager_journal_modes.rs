@@ -893,9 +893,11 @@ fn test_database_kind_named_private_temporary_and_memory_lifecycle() {
     assert_eq!(spy.counters.temp_db_opens.load(Ordering::Relaxed), 1);
     let tmp_a_path = spy.last_temp_db_path().expect("temp_a path recorded");
     assert!(tmp_a_path.exists());
+    // C tempFile pagers set noLock=1 (pager.c:5067–5070). Even after
+    // materialization SQLITE_FCNTL_LOCKSTATE reports 0 during the write.
     assert_eq!(
         tmp_a.lock_state_for_diagnostics().unwrap(),
-        Some(LockLevel::Reserved)
+        Some(LockLevel::NoLock)
     );
     let pa2 = tmp_a.allocate_raw_page().unwrap();
     tmp_a.write_page(pa2).unwrap()[0..6].copy_from_slice(b"TEMP_A");
@@ -946,7 +948,7 @@ fn test_database_kind_named_private_temporary_and_memory_lifecycle() {
     direct_tmp.begin_write().unwrap();
     assert_eq!(
         direct_tmp.lock_state_for_diagnostics().unwrap(),
-        Some(LockLevel::Reserved)
+        Some(LockLevel::NoLock)
     );
     let dp2 = direct_tmp.allocate_raw_page().unwrap();
     direct_tmp.write_page(dp2).unwrap()[0..4].copy_from_slice(b"OS_T");

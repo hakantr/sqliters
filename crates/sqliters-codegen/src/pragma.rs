@@ -48,6 +48,7 @@ pub enum PrepareEffect {
     CacheSpill { i_db: usize, size: Option<i32>, enabled: bool },
     BusyTimeout(i32),
     WalAutocheckpoint(i32),
+    LockingMode { i_db: Option<usize>, mode: u8 },
 }
 
 /// Names of the pragmas enabled in the C reference build, in pragma.h order.
@@ -77,6 +78,7 @@ pub fn prepare_constant(name: &str) -> bool {
             "cache_spill",
             "busy_timeout",
             "wal_autocheckpoint",
+            "locking_mode",
         ]
         .iter()
         .any(|n| name.eq_ignore_ascii_case(n))
@@ -416,6 +418,29 @@ pub fn sqlite3_pragma(
         }
         20 => index_info(p, pragma.arg != 0, right, z_db.as_deref()),
         21 => index_list(p, right, z_db.as_deref()),
+        26 => {
+            // pragma.c:687–727: a bare query reads the connection default;
+            // qualified queries and successful assignments read the pager mode.
+            let mode = right.and_then(|z| if z.eq_ignore_ascii_case("exclusive") { Some(1u8) }
+                else if z.eq_ignore_ascii_case("normal") { Some(0) } else { None });
+            let result = if z_db.is_none() && mode.is_none() {
+                host_int(p, i_db, "default_locking_mode")
+            } else {
+                let Some(current) = host_int(p, i_db, "locking_mode") else { return; };
+                let result = if let Some(mode) = mode {
+                    let Some(can_set) = host_int(p, i_db, "locking_mode_settable") else { return; };
+                    p.db.host.note_pragma_effect(PrepareEffect::LockingMode {
+                        i_db: z_db.as_ref().map(|_| i_db as usize), mode,
+                    });
+                    if can_set != 0 { i64::from(mode) } else { current }
+                } else { current };
+                Some(result)
+            };
+            if let Some(mode) = result {
+                p.v.load_string(1, if mode != 0 { "exclusive" } else { "normal" });
+                p.v.add_op2(OP_ResultRow, 1, 1);
+            }
+        }
         23 => {
             // journal_mode, pragma.c:733
             let modes = ["delete", "persist", "off", "truncate", "memory", "wal"];

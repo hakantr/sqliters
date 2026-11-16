@@ -32,6 +32,7 @@ struct EngineHost<'a> {
     db_set: &'a crate::db_set::DatabaseSet,
     busy_timeout: Option<i64>,
     wal_autocheckpoint: i32,
+    default_locking_mode: i64,
     /// set by [`Host::note_schema_loaded`]
     schema_loaded: std::cell::Cell<bool>,
     /// The virtual-table instances handed to the generator: id -> (database, table)
@@ -99,9 +100,14 @@ impl Host for EngineHost<'_> {
         C_PRAGMA_EFFECTS.with(|effects| effects.borrow_mut().push(effect));
     }
     fn pragma_int(&self, i_db: usize, name: &str) -> Option<i64> {
+        if name == "default_locking_mode" { return Some(self.default_locking_mode); }
         if name == "busy_timeout" { return self.busy_timeout; }
         if name == "wal_autocheckpoint" { return Some(i64::from(self.wal_autocheckpoint)); }
         let slot = self.db_set.slots().get(i_db)?;
+        if i_db == 1 && slot.btree.is_none() {
+            if name == "locking_mode" { return Some(1); }
+            if name == "locking_mode_settable" { return Some(0); }
+        }
         if i_db == 1 && slot.btree.is_none() && name == "cache_spill" {
             let size = u32::try_from(self.db_set.next_page_size).ok()
                 .filter(|n| sqliters_pager::DatabaseHeader::is_valid_page_size(*n))
@@ -119,6 +125,8 @@ impl Host for EngineHost<'_> {
         let bt = slot.btree.as_ref()?;
         match name {
             "page_size" => Some(i64::from(bt.pager().page_size())),
+            "locking_mode" => Some(i64::from(bt.pager().locking_mode() == sqliters_pager::LockingMode::Exclusive)),
+            "locking_mode_settable" => Some(i64::from(bt.pager().can_set_locking_mode())),
             "auto_vacuum" => Some(bt.auto_vacuum_mode() as i64),
             "auto_vacuum_fixed" => Some(i64::from(bt.pager().is_page_size_fixed())),
             "cache_size" => Some(i64::from(bt.schema_cache_size())),
@@ -441,6 +449,7 @@ pub(crate) fn c_prepare(inner: &ConnectionInner, sql: &str) -> (PrepareResult, u
         db_set: &inner.db_set,
         busy_timeout: match inner.busy_policy { crate::engine::BusyPolicy::TimeoutMs(ms) => i32::try_from(ms).ok().map(i64::from), _ => Some(0) },
         wal_autocheckpoint: inner.wal_autocheckpoint_threshold,
+        default_locking_mode: i64::from(inner.default_locking_mode == sqliters_pager::LockingMode::Exclusive),
         schema_loaded: std::cell::Cell::new(false),
         vtabs: std::cell::RefCell::new(Vec::new()),
     };
@@ -467,6 +476,7 @@ pub(crate) fn c_prepare(inner: &ConnectionInner, sql: &str) -> (PrepareResult, u
 /// The connection state the generator reads (`sqlite3 *db`).
 fn make_db<'a>(inner: &ConnectionInner, host: &'a EngineHost<'a>) -> Db<'a> {
     let mut db = Db::new(host);
+    db.err_byte_offset = inner.c_error_byte_offset;
     db.auto_commit = !(inner.explicit_tx || inner.implicit_savepoint_tx);
     db.enc = match inner.effective_encoding() {
         TextEncoding::Utf8 => 1,

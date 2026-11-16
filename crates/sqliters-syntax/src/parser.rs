@@ -2099,13 +2099,23 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_pragma_value(&mut self) -> Result<PragmaValue> {
-        let neg = if self.eat(TokenKind::Minus) {
-            -1i64
+        let sign = if self.eat(TokenKind::Minus) {
+            Some(-1i64)
+        } else if self.eat(TokenKind::Plus) {
+            Some(1i64)
         } else {
-            let _ = self.eat(TokenKind::Plus);
-            1i64
+            None
         };
+        let neg = sign.unwrap_or(1);
         let tok = self.peek();
+        // parse.y:1732–1741 permits signs only on number tokens. A syntax
+        // error must be reported before the PRAGMA can open TEMP or set flags.
+        if sign.is_some() && !matches!(tok.kind, TokenKind::Integer | TokenKind::Float) {
+            return Err(self.syntax_err_at(tok, "invalid PRAGMA value"));
+        }
+        if tok.kind == TokenKind::Nothing {
+            return Err(self.syntax_err_at(tok, "invalid PRAGMA value"));
+        }
         match tok.kind {
             TokenKind::Integer => {
                 self.advance();
@@ -2146,11 +2156,10 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(PragmaValue::Ident(dequote(tok.text)))
             }
-            _ if tok
-                .text
-                .bytes()
-                .next()
-                .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_') =>
+            _ if Self::can_be_ident(tok.kind)
+                || Self::is_join_kw(tok.kind)
+                || matches!(tok.kind, TokenKind::On | TokenKind::Delete | TokenKind::Default
+                    | TokenKind::CurrentDate | TokenKind::CurrentTime | TokenKind::CurrentTimestamp | TokenKind::With) =>
             {
                 self.advance();
                 Ok(PragmaValue::Ident(dequote(tok.text)))

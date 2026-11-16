@@ -1230,6 +1230,8 @@ impl Host for NoHost {
 
 /// The fields of `sqlite3 *db` the code generator reads.
 pub struct Db<'a> {
+    /// sqlite3.errByteOffset, retained when prepare fails without sqlite3ErrorMsg.
+    pub err_byte_offset: i32,
     /// `flags`: flags settable by pragmas (`SQLITE_ShortColNames`, `SQLITE_DqsDML`, …)
     pub flags: u64,
     /// `mDbFlags`: `DBFLAG_*`
@@ -1283,6 +1285,7 @@ impl<'a> Db<'a> {
         a_limit[SQLITE_LIMIT_PARSER_DEPTH as usize] = 2500;
         a_limit[SQLITE_LIMIT_TRIGGER_STEPS as usize] = 65000;
         Db {
+            err_byte_offset: -1,
             flags: SQLITE_ShortColNames | SQLITE_EnableTrigger | SQLITE_EnableView | SQLITE_CacheSpill
                 | SQLITE_TrustedSchema | SQLITE_DqsDML | SQLITE_DqsDDL | SQLITE_AutoIndex | SQLITE_Comments,
             m_db_flags: 0,
@@ -1563,10 +1566,11 @@ pub struct Parse<'a> {
 
 impl<'a> Parse<'a> {
     pub fn new(db: Db<'a>, z_sql: &str) -> Parse<'a> {
+        let err_byte_offset = db.err_byte_offset;
         Parse {
             db,
             z_err_msg: None,
-            err_byte_offset: -1,
+            err_byte_offset,
             v: Vdbe::new(),
             has_vdbe: false,
             rc: SQLITE_OK,

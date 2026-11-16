@@ -1067,6 +1067,7 @@ pub(crate) struct ConnectionInner {
     pub(crate) legacy_alter_table: bool,
     pub(crate) count_changes: bool,
     pub(crate) wal_autocheckpoint_threshold: i32,
+    pub(crate) c_error_byte_offset: i32,
     pub(crate) default_locking_mode: LockingMode,
     pub(crate) writable_schema: bool,
     pub(crate) working_dir: Option<PathBuf>,
@@ -3363,6 +3364,7 @@ impl Connection {
             legacy_alter_table: false,
             count_changes: false,
             wal_autocheckpoint_threshold: SQLITE_DEFAULT_WAL_AUTOCHECKPOINT,
+            c_error_byte_offset: -1,
             default_locking_mode: LockingMode::Normal,
             writable_schema: false,
             working_dir: None,
@@ -3565,12 +3567,15 @@ impl Connection {
             if session.inner().trace_hook.is_none() {
                 let trimmed = sql.trim_start_matches([' ', '\t', '\r', '\n']);
                 if trimmed.is_empty() {
+                    session.inner_mut().c_error_byte_offset = -1;
                     break;
                 }
                 if let Some((res, tail)) = session
                     .inner_mut()
                     .try_fast_exec_literal_insert_step(&self.shared, trimmed)
                 {
+                    session.inner_mut().c_error_byte_offset = res.as_ref().err()
+                        .and_then(|e| e.offset).and_then(|n| i32::try_from(n).ok()).unwrap_or(-1);
                     res?;
                     sql = tail;
                     continue;
@@ -5746,7 +5751,14 @@ fn apply_all_pragma_pager_flags(inner: &mut ConnectionInner) {
 
 /// pragma.c:1158–1204 and :2733: apply the generator's prepare-time changes even
 /// under EXPLAIN. OP_Expire still belongs to execution, as in C.
-fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) {
+fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) -> Result<()> {
+    if cgen::take_c_temp_opened() && !inner.db_set.is_temp_open() {
+        let enc = inner.effective_encoding();
+        inner.db_set.ensure_temp_open(enc, inner.writable_schema)?;
+    }
+    for (i_db, table) in cgen::take_c_rowest_clamped() {
+        if let Some(slot) = inner.db_set.slot_mut(DatabaseId(i_db)) { slot.c_rowest_tables.insert(table); }
+    }
     use sqliters_codegen::consts::*;
     use sqliters_codegen::pragma::PrepareEffect;
     for effect in cgen::take_c_pragma_effects() {
@@ -5756,6 +5768,19 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) {
                 inner.busy_policy = if n > 0 { BusyPolicy::TimeoutMs(n as u64) } else { BusyPolicy::None };
             }
             PrepareEffect::WalAutocheckpoint(n) => inner.wal_autocheckpoint_threshold = n,
+            PrepareEffect::LockingMode { i_db, mode } => {
+                let mode = if mode == 0 { LockingMode::Normal } else { LockingMode::Exclusive };
+                if let Some(id) = i_db {
+                    if let Some(bt) = inner.db_set.slot_mut(DatabaseId(id)).and_then(|s| s.btree.as_mut()) {
+                        bt.set_locking_mode(mode);
+                    }
+                } else {
+                    inner.default_locking_mode = mode;
+                    for (id, slot) in inner.db_set.slots_mut().iter_mut().enumerate() {
+                        if id != 1 && let Some(bt) = slot.btree.as_mut() { bt.set_locking_mode(mode); }
+                    }
+                }
+            }
             PrepareEffect::CacheSpill { i_db, size, enabled } => {
                 if let Some(n) = size
                     && let Some(bt) = inner.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut())
@@ -5829,12 +5854,13 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) {
             }
         }
     }
+    Ok(())
 }
 
 #[allow(non_upper_case_globals)]
 fn prepare_pragma_program(inner: &mut ConnectionInner, sql: &str) -> Result<Option<Box<sqliters_vdbe::vdbeaux::Program>>> {
     let (result, _, _) = cgen::c_prepare_quiet(inner, sql);
-    apply_codegen_pragma_effects(inner);
+    apply_codegen_pragma_effects(inner)?;
     let program = match result {
         sqliters_codegen::PrepareResult::Program(program) => program,
         sqliters_codegen::PrepareResult::Unsupported(_) => return Ok(None),
@@ -5868,7 +5894,7 @@ fn prepare_auto_vacuum_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, 
 
 #[allow(non_upper_case_globals)]
 fn prepare_constant_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str) -> Result<Option<Box<QueryOutput>>> {
-    use sqliters_vdbe::opcodes::{OP_Int64, OP_Integer};
+    use sqliters_vdbe::opcodes::{OP_Int64, OP_Integer, OP_String8};
     let Some(Stmt::Pragma { name, value, .. }) = stmt else { return Ok(None); };
     if name.eq_ignore_ascii_case("auto_vacuum") && value.is_some() { return Ok(None); }
     if !sqliters_codegen::pragma::prepare_constant(name) {
@@ -5878,9 +5904,22 @@ fn prepare_constant_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql
     let columns = program.a_col_name.iter().take(program.n_res_column as usize).map(|s| s.clone().unwrap_or_default()).collect();
     let mut rows = Vec::new();
     if program.n_res_column != 0 {
-        let Some(op) = program.a_op.iter().find(|op| matches!(op.opcode, OP_Integer | OP_Int64) && op.p2 == 1) else { return Ok(None); };
-        let value = if op.opcode == OP_Integer { i64::from(op.p1) } else { sqliters_vdbe::vdbeaux::int32_to_64(op.p1, op.p3) };
-        rows.push(vec![Value::Integer(value)]);
+        let Some(op) = program.a_op.iter().find(|op| matches!(op.opcode, OP_Integer | OP_Int64 | OP_String8) && op.p2 == 1) else { return Ok(None); };
+        let value = match op.opcode {
+            OP_Integer => Value::Integer(i64::from(op.p1)),
+            OP_Int64 => Value::Integer(sqliters_vdbe::vdbeaux::int32_to_64(op.p1, op.p3)),
+            OP_String8 => {
+                use sqliters_vdbe::vdbeaux::P4;
+                let s = match &op.p4 {
+                    P4::Static(s) => (*s).to_owned(),
+                    P4::Dynamic(s) => { let Ok(s) = String::from_utf8(s.clone()) else { return Ok(None); }; s },
+                    _ => return Ok(None),
+                };
+                Value::Text(s)
+            }
+            _ => unreachable!(),
+        };
+        rows.push(vec![value]);
     }
     Ok(Some(Box::new(QueryOutput { column_names: columns, rows })))
 }
@@ -7381,6 +7420,22 @@ impl Statement {
         sql: &str,
         mode: PrepareMode,
     ) -> Result<Self> {
+        let result = Self::compile_in_session(shared, inner, sql, mode);
+        // prepare.c:821–842: error_msg sets the offset; a bare error keeps
+        // db.errByteOffset. A successful sqlite3Prepare calls ErrorClear.
+        inner.c_error_byte_offset = match &result {
+            Ok(_) => -1,
+            Err(e) => e.offset.and_then(|n| i32::try_from(n).ok()).unwrap_or(-1),
+        };
+        result
+    }
+
+    fn compile_in_session(
+        shared: &Arc<ConnectionShared>,
+        inner: &mut ConnectionInner,
+        sql: &str,
+        mode: PrepareMode,
+    ) -> Result<Self> {
         // `EXPLAIN <stmt>` that the engine's parser rejects, while C's parser and code
         // generator (the port) handle it: the listing (or the error) is C's. The statement
         // object is then built around a stand-in parse tree; only C's program is listed.
@@ -7389,6 +7444,9 @@ impl Statement {
         let c_unloaded = inner.db_set.c_any_schema_unloaded();
         inner.db_set.c_note_encoding_fixed();
         inner.db_set.set_c_prepare_unloaded(c_unloaded);
+        let _ = cgen::take_c_temp_opened();
+        let _ = cgen::take_c_rowest_clamped();
+        let _ = cgen::take_c_pragma_effects();
         let (stmt_opt, tail) = match parse_one(sql) {
             Ok(x) => x,
             Err(e) => {
@@ -7397,7 +7455,9 @@ impl Statement {
                     // rejects it too, the message and the byte offset are C's (e.g. the
                     // first `SELECT` of a connection loses the offset of an error that
                     // `sqlite3Init()` clears, see `Db.encoding_fixed`).
-                    if let (cgen::CExplain::Error { message, offset }, _, loaded) = cgen::c_explain_tail(inner, sql) {
+                    let result = cgen::c_explain_tail(inner, sql);
+                    apply_codegen_pragma_effects(inner)?;
+                    if let (cgen::CExplain::Error { message, offset }, _, loaded) = result {
                         if loaded {
                             // C's sqlite3ReadSchema() loaded the schemas before the error
                             inner.db_set.c_mark_schemas_loaded();
@@ -7407,7 +7467,9 @@ impl Statement {
                     }
                     return Err(e);
                 }
-                match cgen::c_explain_tail(inner, sql) {
+                let result = cgen::c_explain_tail(inner, sql);
+                apply_codegen_pragma_effects(inner)?;
+                match result {
                     (cgen::CExplain::Error { message, offset }, _, loaded) => {
                         if loaded {
                             // C's sqlite3ReadSchema() loaded the schemas before the error
@@ -7504,7 +7566,7 @@ impl Statement {
             Some(prog) => Some(prog),
             None => {
                 let result = Self::c_explain_of(inner, stmt_opt.as_ref(), &raw_sql);
-                apply_codegen_pragma_effects(inner);
+                apply_codegen_pragma_effects(inner)?;
                 result?
             }
         };
@@ -8278,6 +8340,13 @@ impl Statement {
     }
 
     fn reprepare_in_open_tx(&mut self, inner: &mut ConnectionInner) -> Result<()> {
+        let result = self.recompile_in_open_tx(inner);
+        inner.c_error_byte_offset = result.as_ref().err()
+            .and_then(|e| e.offset).and_then(|n| i32::try_from(n).ok()).unwrap_or(-1);
+        result
+    }
+
+    fn recompile_in_open_tx(&mut self, inner: &mut ConnectionInner) -> Result<()> {
         for _ in 0..SQLITE_MAX_SCHEMA_RETRY {
             let parsed_stmt = parse_one(&self.raw_sql).ok().and_then(|(st, _)| st);
             if !inner.db_set.is_temp_open()
@@ -8313,7 +8382,7 @@ impl Statement {
                     (st, c)
                 }
             };
-            apply_codegen_pragma_effects(inner);
+            apply_codegen_pragma_effects(inner)?;
             let c_prepared_pragma = prepare_constant_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
             self.c_prepared_default_cache = prepare_default_cache_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
             let c_prepared_auto_vacuum = prepare_auto_vacuum_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
