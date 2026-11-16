@@ -28,7 +28,8 @@
 | V6b.8 — locking_mode ve hazırlama hataları; D103 açık | `d9f13d7` | Global/yerel kip; tempFile, sayaç, sentaks ve hata konumu | 10093 EXPLAIN/EQP; 8249 tam program; API 487/488 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1071/0; açık 1056/15 bilinen; 337 yok sayıldı |
 | V6b.9 — temp_store hazırlama ve şema temizleme | `94c2949` | İlk karakter, TEMP işlem koruması, sabit sonuç ve cache_size koruma | 11832 EXPLAIN/EQP; 9216 tam program; API 1047/1048 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1076/0; açık 1061/15 bilinen; 337 yok sayıldı |
 | V6b.10 — encoding hazırlama ve advisory expire; D111 açık | `f3762ab` | Aliaslar, şema/kodlama geri yükleme, dosya kilidi, bekleyen/çalışan ifadeler | 13493 EXPLAIN/EQP; 10012 tam program; API 1721/1722 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1083/0; açık 1068/15 bilinen; 337 yok sayıldı |
-| V6b.11 — doğrulama hazırlama durumu; D112/D113 açık | bu commit | D111, ilk sanal tablo ve şema çerezi önizlemesi | 11172 tam program aynı; yeni bozuk şema farkları açık | Yeniden ölçülmedi | kapalı 1087/0; açık 1072/15 bilinen; 337 yok sayıldı |
+| V6b.11 — doğrulama hazırlama durumu; D112/D113 açık | `ad50ddd` | D111, ilk sanal tablo ve şema çerezi önizlemesi | 11172 tam program aynı; yeni bozuk şema farkları açık | Yeniden ölçülmedi | kapalı 1087/0; açık 1072/15 bilinen; 337 yok sayıldı |
+| V6b.12 — şema başlatma sırası; D112 açık | bu commit | D113: yeni yükleme ve açık işlemde main/bağlı/TEMP hata önceliği | 13621 EXPLAIN/EQP; 11240 tam program; API2235/2236 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1092/0; açık 1077/15 bilinen; 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -405,3 +406,7 @@ encoding üretimi ve hazırlama etkileri, aynı atamada advisory expire, sorgunu
 ## V6b.11 — üretici doğrulama durumu
 
 D111 ve ilk sanal tablo bağlama sınırı kapandı; 11.172 tam program aynı ilk-kullanım girdisinde C ile eşleşti. Bağımsız bozuk şema yoklaması D112/D113 farklarını gösterdi; bunlar sonraki adıma önceliklendirildi. Kanıt ve dört kapı [karar_esligi_v6b_11.md](karar_esligi_v6b_11.md) içinde.
+
+## V6b.12 — şema başlatma sırası
+
+D113 hem yeni fiziksel şema yükleyicisinde hem açık işlemde önbellek yenileyicisinde düzeltildi. 256 bozuk şema/işlem girdisi ile isim çözümleme girdisi iki anahtar durumunda C ile karşılaştırıldı; bütün dosya baytları aynı. D112 gereksiz şema okuması sonraki adımdır. Kanıt ve dört kapı [karar_esligi_v6b_12.md](karar_esligi_v6b_12.md) içinde.

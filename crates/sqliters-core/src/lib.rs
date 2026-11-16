@@ -1872,7 +1872,9 @@ impl ConnectionInner {
     fn ensure_schemas_loaded_for_prepare(&mut self, force_recheck_open: bool) -> Result<bool> {
         let mut any_changed = false;
         let slot_cnt = self.db_set.slot_count();
-        for idx in 0..slot_cnt {
+        // prepare.c:459–478: main first, attached databases in reverse order,
+        // then TEMP. This also determines which schema error is reported first.
+        for idx in std::iter::once(0).chain((1..slot_cnt).rev()) {
             let inst_id = self.db_set.slots()[idx].schema_instance_id;
             let already_loaded = self.db_set.slots()[idx].schema.loaded;
             // prepare.c:325–330 -> callback.c:181–188: initializing main's
@@ -1953,7 +1955,10 @@ impl ConnectionInner {
 
     fn refresh_open_tx_schemas(&mut self) -> Result<()> {
         let mut any_changed = false;
-        for (idx, slot) in self.db_set.slots_mut().iter_mut().enumerate() {
+        // The same sqlite3Init order applies when transactions are already open.
+        let slot_cnt = self.db_set.slot_count();
+        for idx in std::iter::once(0).chain((1..slot_cnt).rev()) {
+            let slot = &mut self.db_set.slots_mut()[idx];
             let Some(ref mut bt) = slot.btree else {
                 continue;
             };
