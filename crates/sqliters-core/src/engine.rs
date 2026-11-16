@@ -260,6 +260,8 @@ pub struct StmtTxTracker {
     pub top_level_sql: Option<String>,
     /// Parent tables whose `SQLITE_READ` returned `SQLITE_IGNORE` during compile-time FK check (`fkey.c:984-985`).
     pub ignored_fk_parent_tables: Vec<(DatabaseId, String)>,
+    /// default_cache_size's OP_SetCookie operand, frozen by the producer at prepare.
+    pub prepared_default_cache_size: Option<i32>,
 }
 
 impl StmtTxTracker {
@@ -4017,14 +4019,12 @@ fn execute_write_body_inner(
                     Ok(QueryOutput::default())
                 }
                 "DEFAULT_CACHE_SIZE" => {
-                    if db_id == DatabaseId::TEMP {
-                        return Ok(QueryOutput::default());
-                    }
                     ctx.ensure_write_db(db_id, false)?;
-                    let size = pragma_to_i64(pv).saturating_abs().min(i64::from(i32::MAX)) as i32;
+                    let prepared = ctx.stmt_tx.prepared_default_cache_size;
+                    let size = prepared.unwrap_or_else(|| pragma_to_i64(pv).saturating_abs().min(i64::from(i32::MAX)) as i32);
                     if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree {
                         bt.pager_mut().header_mut()?.default_cache_size = size;
-                        bt.set_cache_size(size);
+                        if prepared.is_none() { bt.set_cache_size(size); }
                     }
                     Ok(QueryOutput::default())
                 }
@@ -44567,12 +44567,6 @@ fn exec_pragma(
             }
         }
         "DEFAULT_CACHE_SIZE" => {
-            if db_id == DatabaseId::TEMP {
-                if value.is_some() {
-                    return Ok(QueryOutput::default());
-                }
-                return Ok(single_col("cache_size", Value::Integer(2000)));
-            }
             if let Some(pv) = value {
                 let size = pragma_to_i64(pv).saturating_abs().min(i64::from(i32::MAX)) as i32;
                 ctx.ensure_write_db(db_id, false)?;
@@ -44589,7 +44583,7 @@ fn exec_pragma(
                     .and_then(|s| s.btree.as_ref())
                     .map_or(0, |bt| bt.pager().header().default_cache_size);
                 let val = if raw == 0 {
-                    2000
+                    -2000
                 } else {
                     i64::from(raw.unsigned_abs())
                 };

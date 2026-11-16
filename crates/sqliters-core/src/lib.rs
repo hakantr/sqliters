@@ -5114,6 +5114,8 @@ pub struct Statement {
     deferred_error: Option<SqliteError>,
     /// Constants frozen by pragma.c at prepare time (flag pragmas and analysis_limit).
     c_prepared_pragma: Option<Box<QueryOutput>>,
+    /// default_cache_size changes the cache at prepare; only this cookie is written on step.
+    c_prepared_default_cache: Option<i32>,
 }
 
 impl fmt::Debug for Statement {
@@ -5781,12 +5783,7 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) {
 }
 
 #[allow(non_upper_case_globals)]
-fn prepare_constant_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str) -> Result<Option<Box<QueryOutput>>> {
-    use sqliters_vdbe::opcodes::{OP_Int64, OP_Integer};
-    let Some(Stmt::Pragma { name, .. }) = stmt else { return Ok(None); };
-    if !sqliters_codegen::pragma::prepare_constant(name) {
-        return Ok(None);
-    }
+fn prepare_pragma_program(inner: &mut ConnectionInner, sql: &str) -> Result<Option<Box<sqliters_vdbe::vdbeaux::Program>>> {
     let (result, _, _) = cgen::c_prepare_quiet(inner, sql);
     apply_codegen_pragma_effects(inner);
     let program = match result {
@@ -5797,6 +5794,25 @@ fn prepare_constant_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql
                 .with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }));
         }
     };
+    Ok(Some(program))
+}
+
+fn prepare_default_cache_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str) -> Result<Option<i32>> {
+    if !matches!(stmt, Some(Stmt::Pragma { name, value: Some(_), .. }) if name.eq_ignore_ascii_case("default_cache_size")) {
+        return Ok(None);
+    }
+    Ok(prepare_pragma_program(inner, sql)?.and_then(|p| p.a_op.iter()
+        .find(|op| op.opcode == sqliters_vdbe::opcodes::OP_SetCookie && op.p2 == 3).map(|op| op.p3)))
+}
+
+#[allow(non_upper_case_globals)]
+fn prepare_constant_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str) -> Result<Option<Box<QueryOutput>>> {
+    use sqliters_vdbe::opcodes::{OP_Int64, OP_Integer};
+    let Some(Stmt::Pragma { name, .. }) = stmt else { return Ok(None); };
+    if !sqliters_codegen::pragma::prepare_constant(name) {
+        return Ok(None);
+    }
+    let Some(program) = prepare_pragma_program(inner, sql)? else { return Ok(None); };
     let columns = program.a_col_name.iter().take(program.n_res_column as usize).map(|s| s.clone().unwrap_or_default()).collect();
     let mut rows = Vec::new();
     if program.n_res_column != 0 {
@@ -7452,6 +7468,7 @@ impl Statement {
             }
         };
         let c_prepared_pragma = prepare_constant_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
+        let c_prepared_default_cache = prepare_default_cache_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
         // C's ALTER TABLE (RENAME TO, RENAME COLUMN, DROP COLUMN of a non-TEMP table) reads
         // `temp.sqlite_schema` in a nested statement, which opens the temp database while the
         // statement is prepared (`sqlite3OpenTempDatabase()`, also under EXPLAIN: the nested
@@ -7681,6 +7698,7 @@ impl Statement {
             lifecycle: StatementLifecycle::Ready,
             deferred_error: None,
             c_prepared_pragma,
+            c_prepared_default_cache,
         })
     }
 
@@ -8251,6 +8269,7 @@ impl Statement {
             };
             apply_codegen_pragma_effects(inner);
             let c_prepared_pragma = prepare_constant_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
+            self.c_prepared_default_cache = prepare_default_cache_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
             let shared = Arc::clone(&self.shared);
             let try_compile = |inner: &mut ConnectionInner,
                                parsed_stmt: &Option<Stmt>|
@@ -10210,6 +10229,7 @@ impl Statement {
                     stmt_sp_slot,
                     top_level_sql,
                     ignored_fk_parent_tables: self.ignored_fk_parent_tables.clone(),
+                    prepared_default_cache_size: self.c_prepared_default_cache,
                     ..StmtTxTracker::default()
                 };
                 let initial_insts = match prelocked_write {
@@ -10334,6 +10354,7 @@ impl Statement {
                 );
                 inner.runtime.stmt_timestamp_ms = prev_ts;
 
+                if self.c_prepared_default_cache.is_some() { self.expired = true; }
                 let mut touched_write_instances =
                     mask_to_instances(&inner.db_set, stmt_tx.touched_write_mask);
                 merge_instances(&mut touched_write_instances, &initial_insts);

@@ -19,7 +19,8 @@
 | V5 — DML, UPSERT, RETURNING, tetikleyiciler, yabancı anahtarlar | `4b1ffa5` | `delete.c`, `insert.c`, `update.c`, `upsert.c`, `trigger.c`, `fkey.c` (DML tarafı), RETURNING, ayrıştırıcı kuralları 76, 131, 152, 157–174, 260–277, 309/310 | 65.200 / 65.200 (DML derlemleri; EQP'de 3 = D48) + program düzeyi 62.308 / 62.308 + önceki 134.652 / 134.654 | 26.811 / 39.300 (%68,2) | 1018 geçti, 0 başarısız, 337 yok sayıldı |
 | V6 — DDL: CREATE / DROP / ALTER / ANALYZE / VACUUM / ATTACH / REINDEX | `2d1ede0` | `build.c` DDL kodu, `alter.c`, `analyze.c`, CREATE / DROP TRIGGER, `OP_VCreate`, `sqlite3FkDropTable`, ATTACH / DETACH, VACUUM (PRAGMA V6b'ye kaldı) | 28.367 / 28.367 (DDL derlemleri) + program düzeyi 25.107 / 25.107 | 36.329 / 39.300 (%92,4) | 1032 geçti, 0 başarısız, 337 yok sayıldı |
 | V6b.1 — PRAGMA ilk dilimi; V6b açık | `84daa83` | 66 adlık kayıt tablosu; bayraklar, analysis_limit, başlıklar, tablo/indeks/FK bilgileri, journal_mode, checkpoint ve optimize'nin geçmiş gerektirmeyen yolları | 3.695 / 3.695 (297 desteklenmiyor); tam program 3.667 / 3.667 | Bu dilimde yeniden ölçülmedi | kapalı 1037/0; açık 1022/15 bilinen; 337 yok sayıldı |
-| V6b.2 — PRAGMA önbellek/günlük/güvenli silme; V6b açık | bu commit | cache_size, journal_size_limit, secure_delete; hazırlama etkileri ve sabit sonuçlar; D83 sıfır önbelleğin yeniden başlatılması | 4.178 / 4.178 (264 desteklenmiyor); tam program 4.176 / 4.176 | Bu dilimde yeniden ölçülmedi | kapalı 1040/0; açık 1025/15 bilinen; 337 yok sayıldı |
+| V6b.2 — PRAGMA önbellek/günlük/güvenli silme; V6b açık | `f1a2e58` | cache_size, journal_size_limit, secure_delete; hazırlama etkileri ve sabit sonuçlar; D83 sıfır önbelleğin yeniden başlatılması | 4.178 / 4.178 (264 desteklenmiyor); tam program 4.176 / 4.176 | Bu dilimde yeniden ölçülmedi | kapalı 1040/0; açık 1025/15 bilinen; 337 yok sayıldı |
+| V6b.3 — default_cache_size hazırlama ve çerez yazımı | bu commit | Hazırlamada önbellek, adımlamada donmuş çerez; reset, TEMP ve i32 sınırları | 4.274/4.274; tam program 4.272/4.272 | Yeniden ölçülmedi | kapalı 1043/0; açık 1028/15 bilinen; 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -223,6 +224,14 @@ Başlangıç `84daa83`. Üç aile hazırlama etkileriyle üreticiye taşındı. 
 **Dört kapı:** kapalı 1040 geçti/0 başarısız; açık 1025 geçti/15 önceki başarısız; iki durumda 337 yok sayıldı. DML 378/400 ve 398/400, başarısız seed/sınıf kümeleri aynı. Ayrışma bulucu 245 senaryoda 241 L0, 2 L1, 1 L4, 1 L6; bilinen g06 stderr farkı sürüyor. Rust1.100 tabanına karşı toplam 0,997x, geomean 0,991x, 14 özet aynı. W06 tabana göre 1,020x; V6b.1'e göre 15 tekrarda 0,994x. Hız ayarı uygulanmadı.
 
 **V6b açık:** 21 pragma, page_size/case_sensitive_like ayarları, ertelenmiş FK yaşam döngüsü, optimize kullanım ve D82 görünüm geçmişi bekliyor. Sonraki doğruluk adımı default_cache_size dahil kalan hazırlama etkilerini, ardından synchronous, page_size ve auto_vacuum durumunu tamamlamak. [Farklar ve açık işler](gorulen_farklar_v6b_2.md). ileriPlanlama/ yayın sonrasına bırakıldı.
+
+## V6b.3 — default_cache_size hazırlama etkisi
+
+Başlangıç f1a2e58. D71'in bu ailesi kapandı: önbellek prepare/EXPLAIN sırasında ayarlanır, step yalnız hazırlanan çerezi yazar. Başka önbellek ayarının değeri step'te geri alınmaz. RunOnlyOnce reset/yeniden çalıştırmada hazırlama etkisini tekrar uygular. D86: sıfır çerez -2000 döndürür; TEMP gerçek çerezini yazar; i32 dönüşümü C Atoi/AbsInt32 değeridir.
+
+C kanıtı: kabul edilen 4274 EXPLAIN/EQP, 4272 tam program ve 275 ardışık ifade aynı; 0 fark. API lifetime dizisi iki kipte çıktı ve dosya baytlarında C ile aynı. Üç yeni test; kapalı 1043/0, açık 1028/15 bilinen, 337 yok sayıldı. DML 378/400 ve 398/400 hata kümeleri aynı; ayrışma bulucu 241/2/1/1 ve bilinen g06 stderr farkı. Rust1.100 hız kapısı toplam 1,003x, geomean 1,000x; 14 özet aynı. Hız ayarı uygulanmadı.
+
+[Karar eşliği](karar_esligi_v6b_3.md), [alınmayan dallar](karar_esligi_v6b_3_dallar.md), [farklar](gorulen_farklar_v6b_3.md). V6b açık; sıradaki adım synchronous ve pager eşzamanlama bayrakları. ileriPlanlama/ değerlendirilmedi.
 
 ## M1 — makine: `SELECT` programlarının C gibi çalıştırılması (dal `performans-A-vdbe-makine`)
 
