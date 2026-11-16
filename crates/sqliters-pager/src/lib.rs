@@ -399,6 +399,9 @@ pub struct Pager {
     /// port of C's VDBE for the statements it runs (`PRAGMA max_page_count`); the engine's
     /// executor checks the page count after its writes instead.
     mx_pgno: Pgno,
+    /// PAGER_FULLFSYNC / PAGER_CKPT_FULLFSYNC, independent of the safety level.
+    full_fsync: bool,
+    checkpoint_full_fsync: bool,
 }
 
 impl Pager {
@@ -649,6 +652,8 @@ impl Pager {
             sp_page_buf_pool: Vec::new(),
             backup_trackers: Vec::new(),
             backup_raw_staging: None,
+            full_fsync: false,
+            checkpoint_full_fsync: false,
         })
     }
 
@@ -757,10 +762,8 @@ impl Pager {
     fn wal_sync_flags(&self) -> Option<SyncFlags> {
         if self.is_memdb_backing || self.db_kind == DatabaseKind::PrivateTemporary {
             None
-        } else if self.synchronous >= 3 {
-            Some(SyncFlags::Full)
-        } else if self.synchronous == 2 {
-            Some(SyncFlags::Normal)
+        } else if self.synchronous >= 2 {
+            Some(self.file_sync_flags())
         } else {
             None
         }
@@ -770,10 +773,8 @@ impl Pager {
     fn ckpt_sync_flags(&self) -> Option<SyncFlags> {
         if self.is_memdb_backing || self.db_kind == DatabaseKind::PrivateTemporary {
             None
-        } else if self.synchronous >= 3 {
-            Some(SyncFlags::Full)
         } else if self.synchronous >= 1 {
-            Some(SyncFlags::Normal)
+            Some(if self.checkpoint_full_fsync { SyncFlags::Full } else { self.file_sync_flags() })
         } else {
             None
         }
@@ -1146,8 +1147,23 @@ impl Pager {
 
     #[inline]
     pub fn set_synchronous(&mut self, level: u8) {
-        self.synchronous = level.min(3);
+        self.synchronous = level.min(6);
         self.synchronous_user_set = true;
+    }
+
+    pub fn set_full_sync_flags(&mut self, full: bool, checkpoint: bool) {
+        self.full_fsync = full;
+        self.checkpoint_full_fsync = checkpoint;
+    }
+
+    #[inline]
+    fn file_sync_flags(&self) -> SyncFlags {
+        if self.full_fsync { SyncFlags::Full } else { SyncFlags::Normal }
+    }
+
+    #[inline]
+    fn data_sync_flags(&self) -> SyncFlags {
+        if self.full_fsync { SyncFlags::FullDataOnly } else { SyncFlags::DataOnly }
     }
 
     #[inline]
@@ -1823,11 +1839,7 @@ impl Pager {
                     }
                     let _ = hdr_sz;
 
-                    let sflags = if self.synchronous >= 3 {
-                        SyncFlags::Full
-                    } else {
-                        SyncFlags::Normal
-                    };
+                    let sflags = self.file_sync_flags();
                     if self.synchronous >= 2 {
                         jfile.sync(sflags)?;
                     }
@@ -1835,7 +1847,7 @@ impl Pager {
                     hdr12[0..8].copy_from_slice(&JOURNAL_MAGIC);
                     hdr12[8..12].copy_from_slice(&self.journal_records_written.to_be_bytes());
                     jfile.write_at(&hdr12, self.journal_hdr)?;
-                    jfile.sync(SyncFlags::Normal)?;
+                    jfile.sync(if self.full_fsync { SyncFlags::FullDataOnly } else { sflags })?;
                 }
                 self.journal_hdr = self.journal_off;
                 if new_hdr {
@@ -4669,7 +4681,7 @@ impl Pager {
                 && self.db_kind != DatabaseKind::PrivateTemporary
                 && self.synchronous > 0
             {
-                self.db_file()?.sync(SyncFlags::Normal)?;
+                self.db_file()?.sync(self.file_sync_flags())?;
             }
 
             self.cache.truncate(self.page_count);
@@ -4971,7 +4983,7 @@ impl Pager {
                         self.db_file()?.truncate(orig_size)?;
                     }
                     if self.db_kind != DatabaseKind::PrivateTemporary && self.synchronous > 0 {
-                        self.db_file()?.sync(SyncFlags::Normal)?;
+                        self.db_file()?.sync(self.file_sync_flags())?;
                     }
                     self.db_file_modified = false;
                 }
@@ -5132,7 +5144,7 @@ impl Pager {
                 && self.db_kind == DatabaseKind::NamedDisk
                 && let Some(ref jpath) = self.journal_path
             {
-                let sync_dir = is_commit && self.synchronous >= 3;
+                let sync_dir = is_commit && self.synchronous == 3;
                 self.vfs.delete(jpath, sync_dir)?;
             }
             return Ok(());
@@ -5150,11 +5162,7 @@ impl Pager {
                     let jfd = self.journal_file.as_deref().expect("checked Some");
                     jfd.truncate(0)?;
                     if self.synchronous >= 2 {
-                        let sflags = if self.synchronous >= 3 {
-                            SyncFlags::Full
-                        } else {
-                            SyncFlags::Normal
-                        };
+                        let sflags = self.file_sync_flags();
                         jfd.sync(sflags)?;
                     }
                 }
@@ -5178,7 +5186,7 @@ impl Pager {
                     }
 
                     if self.synchronous > 0 {
-                        jfd.sync(SyncFlags::DataOnly)?;
+                        jfd.sync(self.data_sync_flags())?;
                     }
 
                     if limit > 0 {
@@ -5965,8 +5973,8 @@ impl Pager {
                 }
             }
 
-            if !self.is_memdb_backing && self.db_kind != DatabaseKind::PrivateTemporary {
-                self.db_file()?.sync(SyncFlags::Normal)?;
+            if !self.pager_no_sync() {
+                self.db_file()?.sync(self.file_sync_flags())?;
             }
             Ok(())
         })();
@@ -6003,13 +6011,9 @@ impl Pager {
                 let res: Result<()> = (|| {
                     jf.truncate(0)?;
                     if self.journal_mode == JournalMode::Persist && self.synchronous > 0 {
-                        jf.sync(SyncFlags::DataOnly)?;
+                        jf.sync(self.data_sync_flags())?;
                     } else if self.journal_mode == JournalMode::Truncate && self.synchronous >= 2 {
-                        let sflags = if self.synchronous >= 3 {
-                            SyncFlags::Full
-                        } else {
-                            SyncFlags::Normal
-                        };
+                        let sflags = self.file_sync_flags();
                         jf.sync(sflags)?;
                     }
                     Ok(())

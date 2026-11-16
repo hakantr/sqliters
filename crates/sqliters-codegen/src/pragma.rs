@@ -42,6 +42,7 @@ pub enum PrepareEffect {
         i_db: Option<usize>,
         mode: u8,
     },
+    Synchronous { i_db: usize, level: u8 },
 }
 
 /// Names of the pragmas enabled in the C reference build, in pragma.h order.
@@ -65,6 +66,7 @@ pub fn prepare_constant(name: &str) -> bool {
             "cache_size",
             "journal_size_limit",
             "secure_delete",
+            "synchronous",
         ]
         .iter()
         .any(|n| name.eq_ignore_ascii_case(n))
@@ -151,12 +153,19 @@ fn host_int(p: &mut Parse, i_db: i32, name: &str) -> Option<i64> {
 
 /// sqlite3GetBoolean, pragma.c:73–102. Negative numbers use the default.
 pub fn get_boolean(z: &str, default: bool) -> bool {
+    get_safety_level(z, true, u8::from(default)) != 0
+}
+
+/// pragma.c:getSafetyLevel. SYNCHRONOUS handles numeric values separately.
+pub fn get_safety_level(z: &str, omit_full: bool, default: u8) -> u8 {
     if z.as_bytes().first().is_some_and(u8::is_ascii_digit) {
-        return sqlite3_get_int32(z).unwrap_or(0) != 0;
+        return u8::from(sqlite3_get_int32(z).unwrap_or(0) != 0);
     }
     match z.to_ascii_lowercase().as_str() {
-        "on" | "yes" | "true" => true,
-        "no" | "off" | "false" => false,
+        "on" | "yes" | "true" => 1,
+        "no" | "off" | "false" => 0,
+        "full" if !omit_full => 2,
+        "extra" if !omit_full => 3,
         _ => default,
     }
 }
@@ -445,6 +454,22 @@ pub fn sqlite3_pragma(
             if let Some(n) = mode {
                 return_int(p, n);
             }
+        }
+        36 => {
+            // pragma.c:1132–1153: pDb->safety_level is one greater than the result.
+            if let Some(z) = right {
+                if !p.db.auto_commit {
+                    p.error_msg("Safety level may not be changed inside a transaction");
+                } else if i_db != 1 {
+                    let level = if z.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+                        sqlite3_get_int32(z).unwrap_or(0)
+                    } else {
+                        i32::from(get_safety_level(z, false, 1))
+                    };
+                    let level = ((level.wrapping_add(1) & 7).max(1) - 1) as u8;
+                    p.db.host.note_pragma_effect(PrepareEffect::Synchronous { i_db: i_db as usize, level });
+                }
+            } else if let Some(n) = host_int(p, i_db, "synchronous") { return_int(p, n); }
         }
         37 => table_info(p, pragma.arg != 0, right, z_db.as_deref()),
         38 => table_list(p, right, z_db.as_deref()),

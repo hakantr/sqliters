@@ -527,7 +527,7 @@ impl VfsFile for HarnessVfsFile {
     fn sync(&self, flags: SyncFlags) -> sqliters_types::Result<()> {
         self.inner.sync(flags)?;
         self.counters.sync_count.fetch_add(1, Ordering::Relaxed);
-        if flags == SyncFlags::Full {
+        if matches!(flags, SyncFlags::Full | SyncFlags::FullDataOnly) {
             self.counters.fullsync_count.fetch_add(1, Ordering::Relaxed);
         }
         if self.pending_dir_sync.swap(false, Ordering::AcqRel) {

@@ -69,3 +69,41 @@ fn default_cache_size_is_per_schema_and_survives_cookie_rollback() {
     assert_eq!(int(&conn, "PRAGMA aux.cache_size"), 43);
     assert_eq!(int(&conn, "PRAGMA aux.default_cache_size"), -2000);
 }
+
+#[test]
+fn synchronous_changes_at_prepare_without_reapplying_at_step() {
+    let conn = Connection::open_in_memory().unwrap();
+    let mut setter = conn.prepare("PRAGMA synchronous=EXTRA").unwrap();
+    let mut snapshot = conn.prepare("PRAGMA synchronous").unwrap();
+    conn.prepare("PRAGMA synchronous=4").unwrap();
+    assert_eq!(int(&conn, "PRAGMA synchronous"), 4);
+    setter.step().unwrap();
+    assert_eq!(int(&conn, "PRAGMA synchronous"), 4);
+    assert!(matches!(snapshot.step().unwrap(), StepResult::Row(ref r) if r.values()[0] == Value::Integer(3)));
+    conn.prepare("EXPLAIN PRAGMA synchronous=6").unwrap();
+    assert_eq!(int(&conn, "PRAGMA synchronous"), 6);
+    conn.prepare("PRAGMA temp.synchronous=3").unwrap();
+    assert_eq!(int(&conn, "PRAGMA temp.synchronous"), 0);
+    conn.execute("BEGIN").unwrap();
+    for schema in ["main", "temp"] {
+        let sql = format!("PRAGMA {schema}.synchronous=2");
+        let err = conn.prepare(&sql).err().expect("transaction must reject setter");
+        assert_eq!(err.message, "Safety level may not be changed inside a transaction");
+    }
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(int(&conn, "PRAGMA synchronous"), 6);
+}
+
+#[test]
+fn synchronous_preserves_c_numeric_mask_and_text_defaults() {
+    let conn = Connection::open_in_memory().unwrap();
+    for (literal, n) in [
+        ("0", 0), ("1", 1), ("2", 2), ("3", 3), ("4", 4), ("5", 5),
+        ("6", 6), ("7", 0), ("8", 0), ("9", 1), ("15", 0),
+        ("2147483647", 0), ("2147483648", 0), ("-1", 1),
+        ("'3junk'", 3), ("'unknown'", 1), ("FULL", 2), ("EXTRA", 3),
+    ] {
+        conn.prepare(&format!("PRAGMA synchronous={literal}")).unwrap();
+        assert_eq!(int(&conn, "PRAGMA synchronous"), n, "{literal}");
+    }
+}

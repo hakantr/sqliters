@@ -154,6 +154,8 @@ pub enum SyncFlags {
     Normal,
     Full,
     DataOnly,
+    /// SQLITE_SYNC_FULL | SQLITE_SYNC_DATAONLY (0x13).
+    FullDataOnly,
 }
 
 /// Open file handle corresponding to `sqlite3_file` / `sqlite3_io_methods`.
@@ -2168,12 +2170,16 @@ impl VfsFile for OsFile {
         let file = self.file_ref()?;
         #[cfg(unix)]
         {
-            sys::unix::sync_fd(file, flags == SyncFlags::Full, flags == SyncFlags::DataOnly)?;
+            sys::unix::sync_fd(
+                file,
+                matches!(flags, SyncFlags::Full | SyncFlags::FullDataOnly),
+                matches!(flags, SyncFlags::DataOnly | SyncFlags::FullDataOnly),
+            )?;
         }
         #[cfg(windows)]
         {
             let res = match flags {
-                SyncFlags::DataOnly => file.sync_data(),
+                SyncFlags::DataOnly | SyncFlags::FullDataOnly => file.sync_data(),
                 SyncFlags::Normal | SyncFlags::Full => file.sync_all(),
             };
             res.map_err(|e| {

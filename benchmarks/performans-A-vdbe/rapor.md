@@ -20,7 +20,8 @@
 | V6 — DDL: CREATE / DROP / ALTER / ANALYZE / VACUUM / ATTACH / REINDEX | `2d1ede0` | `build.c` DDL kodu, `alter.c`, `analyze.c`, CREATE / DROP TRIGGER, `OP_VCreate`, `sqlite3FkDropTable`, ATTACH / DETACH, VACUUM (PRAGMA V6b'ye kaldı) | 28.367 / 28.367 (DDL derlemleri) + program düzeyi 25.107 / 25.107 | 36.329 / 39.300 (%92,4) | 1032 geçti, 0 başarısız, 337 yok sayıldı |
 | V6b.1 — PRAGMA ilk dilimi; V6b açık | `84daa83` | 66 adlık kayıt tablosu; bayraklar, analysis_limit, başlıklar, tablo/indeks/FK bilgileri, journal_mode, checkpoint ve optimize'nin geçmiş gerektirmeyen yolları | 3.695 / 3.695 (297 desteklenmiyor); tam program 3.667 / 3.667 | Bu dilimde yeniden ölçülmedi | kapalı 1037/0; açık 1022/15 bilinen; 337 yok sayıldı |
 | V6b.2 — PRAGMA önbellek/günlük/güvenli silme; V6b açık | `f1a2e58` | cache_size, journal_size_limit, secure_delete; hazırlama etkileri ve sabit sonuçlar; D83 sıfır önbelleğin yeniden başlatılması | 4.178 / 4.178 (264 desteklenmiyor); tam program 4.176 / 4.176 | Bu dilimde yeniden ölçülmedi | kapalı 1040/0; açık 1025/15 bilinen; 337 yok sayıldı |
-| V6b.3 — default_cache_size hazırlama ve çerez yazımı | bu commit | Hazırlamada önbellek, adımlamada donmuş çerez; reset, TEMP ve i32 sınırları | 4.274/4.274; tam program 4.272/4.272 | Yeniden ölçülmedi | kapalı 1043/0; açık 1028/15 bilinen; 337 yok sayıldı |
+| V6b.3 — default_cache_size hazırlama ve çerez yazımı | `556932a` | Hazırlamada önbellek, adımlamada donmuş çerez; reset, TEMP ve i32 sınırları | 4.274/4.274; tam program 4.272/4.272 | Yeniden ölçülmedi | kapalı 1043/0; açık 1028/15 bilinen; 337 yok sayıldı |
+| V6b.4 — synchronous hazırlama ve eşitleme bayrakları | bu commit | C sayısal maske, işlem hatası, TEMP; fullfsync/CKPT ve FULL+DATAONLY | 4.829/4.829; tam program 4.589/4.589; 896 GÇ senaryosu aynı | Yeniden ölçülmedi | kapalı 1045/0; açık 1030/15 bilinen; 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -365,3 +366,7 @@ C kanıtı: kabul edilen 4274 EXPLAIN/EQP, 4272 tam program ve 275 ardışık if
 | `SELECT CAST(x'41ABCD42' AS TEXT);` | ham baytlar | iki kez U+FFFD |
 
 Bu farklar `EXPLAIN` önekiyle artık C ile aynı; yürütme yolu taşındığında kapanacak.
+
+## V6b.4 — synchronous
+
+Hazırlama etkisi ve sonuç anı C gibi taşındı; 4–6 seviyeleri, TEMP ve işlem içi hatalar doğrulandı. Sayfalayıcı güvenlik seviyesi ile fullfsync bayrakları ayrıldı. Dört kapı ve 896 gerçek GÇ senaryosu [karar_esligi_v6b_4.md](karar_esligi_v6b_4.md) içinde; alınmayan dallar ayrı listede. V6b sürüyor; sonraki dilim page_size ve auto_vacuum.

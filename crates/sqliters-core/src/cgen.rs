@@ -104,6 +104,7 @@ impl Host for EngineHost<'_> {
             "cache_size" => Some(i64::from(bt.schema_cache_size())),
             "journal_size_limit" => Some(bt.pager().journal_size_limit()),
             "secure_delete" => Some(i64::from(bt.secure_delete_setting())),
+            "synchronous" => Some(if i_db == 1 { 0 } else { i64::from(bt.pager().synchronous()) }),
             _ => None,
         }
     }

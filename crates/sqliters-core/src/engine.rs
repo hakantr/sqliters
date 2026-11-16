@@ -1198,6 +1198,7 @@ fn exec_attach_database(
     let main_secure_delete = ctx.db_set.main_btree_mut().secure_delete(None);
     new_bt.secure_delete(Some(main_secure_delete));
     new_bt.set_cell_size_check(ctx.db_set.cell_size_check());
+    new_bt.pager_mut().set_full_sync_flags(ctx.db_set.c_flags_toggled() & 8 != 0, ctx.db_set.c_flags_toggled() & 16 != 0);
     if !parsed.is_private_temp && *ctx.default_locking_mode == LockingMode::Exclusive {
         let _ = new_bt.set_locking_mode(LockingMode::Exclusive);
     }
@@ -1549,7 +1550,7 @@ pub(crate) fn stmt_loads_schema_on_prepare(stmt: &Stmt) -> bool {
         Stmt::Pragma { name, .. }
             if matches!(
                 name.to_ascii_uppercase().as_str(),
-                "AUTO_VACUUM" | "INCREMENTAL_VACUUM" | "DEFAULT_CACHE_SIZE" | "CACHE_SIZE"
+                "AUTO_VACUUM" | "INCREMENTAL_VACUUM" | "DEFAULT_CACHE_SIZE" | "CACHE_SIZE" | "SYNCHRONOUS"
             )
     )
 }
@@ -44846,7 +44847,7 @@ fn exec_pragma(
                     .slot(db_id)
                     .and_then(|s| s.btree.as_ref())
                     .map_or(2, |bt| bt.pager().synchronous());
-                Ok(single_col("synchronous", Value::Integer(i64::from(cur))))
+                Ok(single_col("synchronous", Value::Integer(if db_id == DatabaseId::TEMP { 0 } else { i64::from(cur) })))
             }
         }
         "CACHE_SIZE" => {

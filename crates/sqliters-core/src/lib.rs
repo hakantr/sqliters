@@ -5746,6 +5746,19 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) {
                     }
                 }
             }
+            PrepareEffect::Synchronous { i_db, level } => {
+                if let Some(bt) = inner.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut()) {
+                    bt.set_synchronous(level);
+                }
+                let flags = inner.db_set.c_flags_toggled();
+                let spill = inner.db_set.cache_spill;
+                for slot in inner.db_set.slots_mut() {
+                    if let Some(bt) = slot.btree.as_mut() {
+                        bt.set_cache_spill(spill);
+                        bt.pager_mut().set_full_sync_flags(flags & SQLITE_FullFSync != 0, flags & SQLITE_CkptFullFSync != 0);
+                    }
+                }
+            }
             PrepareEffect::Flags { flags, reset_deferred, reset_schema } => {
                 let defaults = sqliters_codegen::Db::new(&sqliters_codegen::NoHost).flags;
                 let mask = sqliters_codegen::pragma::flag_masks().fold(0, |a, b| a | b);
@@ -5761,7 +5774,10 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) {
                 inner.db_set.cache_spill = flags & SQLITE_CacheSpill != 0;
                 if !(inner.explicit_tx || inner.implicit_savepoint_tx) {
                     for slot in inner.db_set.slots_mut() {
-                        if let Some(bt) = slot.btree.as_mut() { bt.set_cache_spill(flags & SQLITE_CacheSpill != 0); }
+                        if let Some(bt) = slot.btree.as_mut() {
+                            bt.set_cache_spill(flags & SQLITE_CacheSpill != 0);
+                            bt.pager_mut().set_full_sync_flags(flags & SQLITE_FullFSync != 0, flags & SQLITE_CkptFullFSync != 0);
+                        }
                     }
                 }
                 for slot in inner.db_set.slots_mut() {
