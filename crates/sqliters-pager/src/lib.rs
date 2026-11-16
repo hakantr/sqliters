@@ -1245,6 +1245,17 @@ impl Pager {
         self.cache.set_cachesize(size);
     }
 
+    /// Read-only sqlite3PcacheSetSpillsize(0), for a pragma prepared without a schema read.
+    pub fn spill_size(&self) -> i32 {
+        self.cache.number_of_cache_pages_for(self.header.page_size).max(self.cache.sz_spill())
+    }
+
+    /// New Btree cache defaults before TEMP exists in a read-only generator inspection.
+    pub fn initial_spill_size(page_size: u32) -> i32 {
+        ((-1024 * i64::from(sqliters_types::SQLITE_DEFAULT_CACHE_SIZE))
+            / (i64::from(page_size) + pcache::PCACHE_SZ_EXTRA)) as i32
+    }
+
     /// `sqlite3PagerSetSpillsize` (`PRAGMA cache_spill = N`, and the value the pragma reports):
     /// `size == 0` only queries.
     pub fn set_spill_size(&mut self, size: i32) -> i32 {
@@ -2633,6 +2644,7 @@ impl Pager {
                 self.bump_data_version();
                 self.header.page_size = size;
                 self.pcache_reset();
+                self.pcache_sync_page_size();
             }
             self.header.reserved_bytes = bytes[20];
             self.page_size_fixed = true;
@@ -2654,6 +2666,7 @@ impl Pager {
             self.bump_data_version();
             self.header.page_size = size;
             self.pcache_reset();
+            self.pcache_sync_page_size();
         }
     }
 

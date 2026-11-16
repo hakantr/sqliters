@@ -1169,11 +1169,15 @@ impl PageCache {
 
     /// `numberOfCachePages`.
     pub(crate) fn number_of_cache_pages(&self) -> i32 {
+        self.number_of_cache_pages_for(self.sz_page)
+    }
+
+    pub(crate) fn number_of_cache_pages_for(&self, page_size: u32) -> i32 {
         if self.sz_cache >= 0 {
             self.sz_cache
         } else {
             let n =
-                (-1024 * i64::from(self.sz_cache)) / (i64::from(self.sz_page) + PCACHE_SZ_EXTRA);
+                (-1024 * i64::from(self.sz_cache)) / (i64::from(page_size) + PCACHE_SZ_EXTRA);
             n.min(1_000_000_000) as i32
         }
     }

@@ -30,6 +30,8 @@ struct EngineHost<'a> {
     functions: &'a FunctionRegistry,
     collations: &'a CollationRegistry,
     db_set: &'a crate::db_set::DatabaseSet,
+    busy_timeout: Option<i64>,
+    wal_autocheckpoint: i32,
     /// set by [`Host::note_schema_loaded`]
     schema_loaded: std::cell::Cell<bool>,
     /// The virtual-table instances handed to the generator: id -> (database, table)
@@ -97,7 +99,15 @@ impl Host for EngineHost<'_> {
         C_PRAGMA_EFFECTS.with(|effects| effects.borrow_mut().push(effect));
     }
     fn pragma_int(&self, i_db: usize, name: &str) -> Option<i64> {
+        if name == "busy_timeout" { return self.busy_timeout; }
+        if name == "wal_autocheckpoint" { return Some(i64::from(self.wal_autocheckpoint)); }
         let slot = self.db_set.slots().get(i_db)?;
+        if i_db == 1 && slot.btree.is_none() && name == "cache_spill" {
+            let size = u32::try_from(self.db_set.next_page_size).ok()
+                .filter(|n| sqliters_pager::DatabaseHeader::is_valid_page_size(*n))
+                .unwrap_or(self.db_set.attach_page_size());
+            return Some(i64::from(sqliters_pager::Pager::initial_spill_size(size)));
+        }
         // A read-only generator inspection predicts sqlite3OpenTempDatabase without
         // opening the real TEMP Btree. Its new BtShared has no fixed size or auto-vacuum
         // flags (btree.c:2729–2755), before this PRAGMA's prepare effects are applied.
@@ -112,6 +122,7 @@ impl Host for EngineHost<'_> {
             "auto_vacuum" => Some(bt.auto_vacuum_mode() as i64),
             "auto_vacuum_fixed" => Some(i64::from(bt.pager().is_page_size_fixed())),
             "cache_size" => Some(i64::from(bt.schema_cache_size())),
+            "cache_spill" => Some(i64::from(bt.pager().spill_size())),
             "journal_size_limit" => Some(bt.pager().journal_size_limit()),
             "secure_delete" => Some(i64::from(bt.secure_delete_setting())),
             "synchronous" => Some(if i_db == 1 { 0 } else { i64::from(bt.pager().synchronous()) }),
@@ -428,6 +439,8 @@ pub(crate) fn c_prepare(inner: &ConnectionInner, sql: &str) -> (PrepareResult, u
         functions: &inner.functions,
         collations: &inner.collations,
         db_set: &inner.db_set,
+        busy_timeout: match inner.busy_policy { crate::engine::BusyPolicy::TimeoutMs(ms) => i32::try_from(ms).ok().map(i64::from), _ => Some(0) },
+        wal_autocheckpoint: inner.wal_autocheckpoint_threshold,
         schema_loaded: std::cell::Cell::new(false),
         vtabs: std::cell::RefCell::new(Vec::new()),
     };

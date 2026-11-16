@@ -45,6 +45,9 @@ pub enum PrepareEffect {
     Synchronous { i_db: usize, level: u8 },
     PageSize { i_db: usize, size: i32 },
     AutoVacuum { i_db: usize, mode: u8 },
+    CacheSpill { i_db: usize, size: Option<i32>, enabled: bool },
+    BusyTimeout(i32),
+    WalAutocheckpoint(i32),
 }
 
 /// Names of the pragmas enabled in the C reference build, in pragma.h order.
@@ -71,6 +74,9 @@ pub fn prepare_constant(name: &str) -> bool {
             "synchronous",
             "page_size",
             "auto_vacuum",
+            "cache_spill",
+            "busy_timeout",
+            "wal_autocheckpoint",
         ]
         .iter()
         .any(|n| name.eq_ignore_ascii_case(n))
@@ -329,6 +335,12 @@ pub fn sqlite3_pragma(
                 p.v.add_op0(OP_Expire);
             }
         }
+        5 => {
+            // pragma.c:2656–2662: an invalid integer leaves the handler unchanged.
+            let value = right.and_then(sqlite3_get_int32).map(|n| n.max(0));
+            if let Some(n) = value { p.db.host.note_pragma_effect(PrepareEffect::BusyTimeout(n)); }
+            if let Some(n) = value.map(i64::from).or_else(|| host_int(p, i_db, "busy_timeout")) { return_int(p, n); }
+        }
         6 => {
             // pragma.c:882–889: Schema.cache_size, changed during prepare.
             if let Some(z) = right {
@@ -344,6 +356,16 @@ pub fn sqlite3_pragma(
                 });
                 return_int(p, n);
             }
+        }
+        7 => {
+            // pragma.c:917–933. This pragma does not read the schema.
+            if let Some(z) = right {
+                let size = sqlite3_get_int32(z);
+                let enabled = get_boolean(z, size.unwrap_or(1) != 0);
+                p.db.host.note_pragma_effect(PrepareEffect::CacheSpill { i_db: i_db as usize, size, enabled });
+            } else if p.db.flags & SQLITE_CacheSpill == 0 {
+                return_int(p, 0);
+            } else if let Some(n) = host_int(p, i_db, "cache_spill") { return_int(p, n); }
         }
         8 if right.is_none() => {} // case_sensitive_like query is empty
         13 => {
@@ -503,6 +525,12 @@ pub fn sqlite3_pragma(
         }
         37 => table_info(p, pragma.arg != 0, right, z_db.as_deref()),
         38 => table_list(p, right, z_db.as_deref()),
+        42 => {
+            // pragma.c:2428–2435: sqlite3Atoi failure disables the callback.
+            let value = right.map(|z| sqlite3_get_int32(z).unwrap_or(0).max(0));
+            if let Some(n) = value { p.db.host.note_pragma_effect(PrepareEffect::WalAutocheckpoint(n)); }
+            if let Some(n) = value.map(i64::from).or_else(|| host_int(p, i_db, "wal_autocheckpoint")) { return_int(p, n); }
+        }
         43 => {
             // wal_checkpoint, pragma.c:2407
             p.n_mem = 3;

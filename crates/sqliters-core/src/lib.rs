@@ -1858,6 +1858,10 @@ impl ConnectionInner {
         for idx in 0..slot_cnt {
             let inst_id = self.db_set.slots()[idx].schema_instance_id;
             let already_loaded = self.db_set.slots()[idx].schema.loaded;
+            // prepare.c:325–330 -> callback.c:181–188: initializing main's
+            // recorded encoding expires pending statements even if the encoding
+            // stays UTF-8. Statements already running keep their current program.
+            let sets_text_encoding = idx == 0 && !already_loaded && !self.db_set.c_encoding_fixed();
             let Some(tx_state) = self.db_set.slots()[idx]
                 .btree
                 .as_ref()
@@ -1880,6 +1884,9 @@ impl ConnectionInner {
                 let slot = &mut self.db_set.slots_mut()[idx];
                 let slot_name = slot.name.clone();
                 let bt = slot.btree.as_mut().unwrap();
+                if sets_text_encoding && !bt.pager().header().text_encoding_unset {
+                    self.advisory_expire_generation += 1;
+                }
                 let prev_cookie = slot.schema.schema_cookie;
                 let prev_had_pages = slot.schema.had_pages;
                 let prev_loaded = slot.schema.loaded;
@@ -1904,6 +1911,9 @@ impl ConnectionInner {
                 let slot = &mut self.db_set.slots_mut()[idx];
                 let slot_name = slot.name.clone();
                 let bt = slot.btree.as_mut().unwrap();
+                if sets_text_encoding && !bt.pager().header().text_encoding_unset {
+                    self.advisory_expire_generation += 1;
+                }
                 let prev_cookie = slot.schema.schema_cookie;
                 let prev_had_pages = slot.schema.had_pages;
                 let prev_loaded = slot.schema.loaded;
@@ -5720,6 +5730,20 @@ fn stmt_references_temp_catalog(stmt: &Stmt, db_set: &DatabaseSet) -> bool {
     }
 }
 
+/// pragma.c:setAllPagerFlags. Pending global flags are applied only in autocommit.
+fn apply_all_pragma_pager_flags(inner: &mut ConnectionInner) {
+    use sqliters_codegen::consts::{SQLITE_FullFSync, SQLITE_CkptFullFSync};
+    if inner.explicit_tx || inner.implicit_savepoint_tx { return; }
+    let flags = inner.db_set.c_flags_toggled();
+    let spill = inner.db_set.cache_spill;
+    for slot in inner.db_set.slots_mut() {
+        if let Some(bt) = slot.btree.as_mut() {
+            bt.set_cache_spill(spill);
+            bt.pager_mut().set_full_sync_flags(flags & SQLITE_FullFSync != 0, flags & SQLITE_CkptFullFSync != 0);
+        }
+    }
+}
+
 /// pragma.c:1158–1204 and :2733: apply the generator's prepare-time changes even
 /// under EXPLAIN. OP_Expire still belongs to execution, as in C.
 fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) {
@@ -5728,6 +5752,17 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) {
     for effect in cgen::take_c_pragma_effects() {
         match effect {
             PrepareEffect::AnalysisLimit(n) => inner.db_set.set_analysis_limit(n),
+            PrepareEffect::BusyTimeout(n) => {
+                inner.busy_policy = if n > 0 { BusyPolicy::TimeoutMs(n as u64) } else { BusyPolicy::None };
+            }
+            PrepareEffect::WalAutocheckpoint(n) => inner.wal_autocheckpoint_threshold = n,
+            PrepareEffect::CacheSpill { i_db, size, enabled } => {
+                if let Some(n) = size
+                    && let Some(bt) = inner.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut())
+                { bt.set_spill_size(n); }
+                inner.db_set.cache_spill = enabled;
+                apply_all_pragma_pager_flags(inner);
+            }
             PrepareEffect::CacheSize { i_db, size } => {
                 if let Some(bt) = inner.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut()) {
                     bt.set_cache_size(size);
@@ -5762,14 +5797,7 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) {
                 if let Some(bt) = inner.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut()) {
                     bt.set_synchronous(level);
                 }
-                let flags = inner.db_set.c_flags_toggled();
-                let spill = inner.db_set.cache_spill;
-                for slot in inner.db_set.slots_mut() {
-                    if let Some(bt) = slot.btree.as_mut() {
-                        bt.set_cache_spill(spill);
-                        bt.pager_mut().set_full_sync_flags(flags & SQLITE_FullFSync != 0, flags & SQLITE_CkptFullFSync != 0);
-                    }
-                }
+                apply_all_pragma_pager_flags(inner);
             }
             PrepareEffect::Flags { flags, reset_deferred, reset_schema } => {
                 let defaults = sqliters_codegen::Db::new(&sqliters_codegen::NoHost).flags;
@@ -5784,14 +5812,7 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) {
                 inner.db_set.set_trusted_schema(flags & SQLITE_TrustedSchema != 0);
                 inner.db_set.set_cell_size_check(flags & SQLITE_CellSizeCk != 0);
                 inner.db_set.cache_spill = flags & SQLITE_CacheSpill != 0;
-                if !(inner.explicit_tx || inner.implicit_savepoint_tx) {
-                    for slot in inner.db_set.slots_mut() {
-                        if let Some(bt) = slot.btree.as_mut() {
-                            bt.set_cache_spill(flags & SQLITE_CacheSpill != 0);
-                            bt.pager_mut().set_full_sync_flags(flags & SQLITE_FullFSync != 0, flags & SQLITE_CkptFullFSync != 0);
-                        }
-                    }
-                }
+                apply_all_pragma_pager_flags(inner);
                 for slot in inner.db_set.slots_mut() {
                     if let Some(bt) = slot.btree.as_mut() { bt.set_writable_schema(inner.writable_schema); }
                 }
@@ -7667,6 +7688,9 @@ impl Statement {
 
         apply_prepare_auto_vacuum_pragma(inner, &mut artifacts, c_prepared_auto_vacuum);
         if let Some(prog) = &c_explain {
+            // sqlite3VdbeList lists instructions; it does not run their transactions.
+            artifacts.category = Some(StmtCategory::NoLockPragma);
+            artifacts.requires_schema = false;
             artifacts.column_names = explain_column_names(prog.explain);
             // The parameters of the statement as C numbers them.
             artifacts.max_param = artifacts.max_param.max(prog.n_var as usize);
@@ -8350,6 +8374,8 @@ impl Statement {
             }
             self.c_prepared_pragma = c_prepared_pragma;
             if let Some(prog) = &c_explain {
+                artifacts.category = Some(StmtCategory::NoLockPragma);
+                artifacts.requires_schema = false;
                 artifacts.column_names = explain_column_names(prog.explain);
             }
             let c_machine = Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some())?;
@@ -9114,7 +9140,7 @@ impl Statement {
                 inner.activity.start(hid, false, false);
                 let summary = inner.activity.summary_excluding(hid, &inner.db_set);
                 let prev_ts = inner.runtime.stmt_timestamp_ms;
-                if prev_ts.is_none() {
+                if prev_ts.is_none() && self.c_explain.is_none() {
                     inner.runtime.stmt_timestamp_ms = Some(
                         inner
                             .db_set
@@ -9132,7 +9158,12 @@ impl Statement {
                     &mut stmt_tx,
                     &mut expire_self_only,
                     |ctx| {
-                        if let Some(out) = &self.c_prepared_pragma {
+                        if let Some(prog) = &self.c_explain {
+                            Ok(QueryOutput {
+                                column_names: explain_column_names(prog.explain),
+                                rows: c_list_rows(prog, ctx.encoding()),
+                            })
+                        } else if let Some(out) = &self.c_prepared_pragma {
                             *ctx.expire_self_only = true;
                             if matches!(&stmt_clone, Stmt::Pragma { name, value: Some(_), .. }
                                 if sqliters_codegen::pragma::flag_mask(name).is_some())

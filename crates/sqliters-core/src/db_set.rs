@@ -1378,16 +1378,15 @@ impl DatabaseSet {
     ) -> Result<&mut DbSlot> {
         if self.slots[1].btree.is_none() {
             let opts = PagerOpenOptions {
-                // build.c:5430: temp uses db->nextPagesize, not the main Btree's size.
-                default_page_size: u32::try_from(self.next_page_size).ok()
-                    .filter(|n| sqliters_pager::DatabaseHeader::is_valid_page_size(*n))
-                    .unwrap_or(self.attach_page_size),
+                // C first opens with the build default, then applies nextPagesize.
+                default_page_size: self.attach_page_size,
                 lock_geometry: Some(self.lock_geometry),
                 db_kind: Some(DatabaseKind::PrivateTemporary),
                 temp_in_memory: self.temp_store.is_memory(),
                 ..PagerOpenOptions::default()
             };
             let mut bt = Btree::open_private_temporary(Arc::clone(&self.disk_vfs), opts)?;
+            bt.pager_mut().set_pragma_page_size(self.next_page_size);
             bt.set_interrupt_flag(Some(Arc::clone(&self.interrupt_flag)));
             bt.set_writable_schema(writable_schema);
             bt.set_cell_size_check(self.cell_size_check);

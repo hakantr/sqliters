@@ -1199,6 +1199,7 @@ fn exec_attach_database(
     let main_secure_delete = ctx.db_set.main_btree_mut().secure_delete(None);
     new_bt.secure_delete(Some(main_secure_delete));
     new_bt.set_cell_size_check(ctx.db_set.cell_size_check());
+    new_bt.set_cache_spill(ctx.db_set.cache_spill);
     new_bt.pager_mut().set_full_sync_flags(ctx.db_set.c_flags_toggled() & 8 != 0, ctx.db_set.c_flags_toggled() & 16 != 0);
     if !parsed.is_private_temp && *ctx.default_locking_mode == LockingMode::Exclusive {
         let _ = new_bt.set_locking_mode(LockingMode::Exclusive);
@@ -1543,6 +1544,9 @@ pub(crate) enum StmtCategory {
 
 /// Returns `true` when `stmt` must load `sqlite_schema` at `prepare` time (`PragFlg_NeedSchema` / `prepare.c`).
 pub(crate) fn stmt_loads_schema_on_prepare(stmt: &Stmt) -> bool {
+    if let Stmt::Explain { stmt: inner, .. } = stmt {
+        return stmt_loads_schema_on_prepare(inner);
+    }
     if stmt_requires_schema(stmt) {
         return true;
     }
@@ -44802,7 +44806,6 @@ fn exec_pragma(
             // value: an integer sets the spill size (0 leaves it), and the value read as a
             // boolean (default: the integer is non-zero) switches spilling on or off for every
             // pager — applied at once only in autocommit mode (`setAllPagerFlags`).
-            pragma_need_schema(ctx, db_id)?;
             if let Some(pv) = value {
                 let mut size: i32 = 1;
                 let int_val = match pv {
