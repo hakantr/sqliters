@@ -18,6 +18,7 @@
 | V4b — FROM içinde sanal tablolar ve tablo değerli işlevler | `628a5f5` | `vtab.c` okuma tarafı, CREATE VIRTUAL TABLE şema yüklemesi, `whereLoopAddVirtual` / `xBestIndex`, sanal tablo döngü kodu ve EQP | 23.640 / 23.642 (vtab derlemleri; 2 = D34) + önceki 111.012 | 14.773 / 39.300 (%37,6) | 1011 geçti, bilinen 4 başarısız, 337 yok sayıldı |
 | V5 — DML, UPSERT, RETURNING, tetikleyiciler, yabancı anahtarlar | `4b1ffa5` | `delete.c`, `insert.c`, `update.c`, `upsert.c`, `trigger.c`, `fkey.c` (DML tarafı), RETURNING, ayrıştırıcı kuralları 76, 131, 152, 157–174, 260–277, 309/310 | 65.200 / 65.200 (DML derlemleri; EQP'de 3 = D48) + program düzeyi 62.308 / 62.308 + önceki 134.652 / 134.654 | 26.811 / 39.300 (%68,2) | 1018 geçti, 0 başarısız, 337 yok sayıldı |
 | V6 — DDL: CREATE / DROP / ALTER / ANALYZE / VACUUM / ATTACH / REINDEX | `2d1ede0` | `build.c` DDL kodu, `alter.c`, `analyze.c`, CREATE / DROP TRIGGER, `OP_VCreate`, `sqlite3FkDropTable`, ATTACH / DETACH, VACUUM (PRAGMA V6b'ye kaldı) | 28.367 / 28.367 (DDL derlemleri) + program düzeyi 25.107 / 25.107 | 36.329 / 39.300 (%92,4) | 1032 geçti, 0 başarısız, 337 yok sayıldı |
+| V6b.1 — PRAGMA ilk dilimi; V6b açık | bu commit | 66 adlık kayıt tablosu; bayraklar, analysis_limit, başlıklar, tablo/indeks/FK bilgileri, journal_mode, checkpoint ve optimize'nin geçmiş gerektirmeyen yolları | 3.695 / 3.695 (297 desteklenmiyor); tam program 3.667 / 3.667 | Bu dilimde yeniden ölçülmedi | kapalı 1037/0; açık 1022/15 bilinen; 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -199,6 +200,18 @@ Ayrıntı: `karar_esligi_v1.md` (işlev eşlemesi, karar tabloları, kapsam tabl
 **Değişen test beklentileri (2; ikisi de taşıma durumu beklentisiydi).** `explain_tests.rs::unsupported_statements_are_reported_not_approximated`: "create table t(x)" artık program veriyor, "drop table t" C'nin hatasını veriyor (`no such table: t`, konumsuz; `$S/bin/sqlite3` ile doğrulandı), PRAGMA hâlâ desteklenmiyor. `plan_tests.rs::unsupported_in_v3`: CREATE TRIGGER artık program veriyor. 3 yeni test (`v6_drop_table_with_autoindex`, `v6_create_unique_partial_index`, `v6_analyze_one_table`; beklenen listeler C'den).
 
 **Kalanlar** (`gorulen_farklar_v6.md`; hiçbiri üretilen programda değil). Motorun DDL farkları: D59 görünüm / sanal tablo ANALYZE'ı, D60 sistem tablolarının analizi, D61 3.5x ALTER biçimleri motorda yok, D62 VACUUM INTO hata metni, D63 temp'in VACUUM'u, D64 ALTER ve hatadan sonra şema nesli, D65 `ATTACH x'00'`, D66–D68 hata metinleri, D69 ANALYZE satır sırası, D70 "unknown database" hata konumu, D71 `EXPLAIN PRAGMA` yan etkileri (V6b), D72 defer_foreign_keys, D73 NULLS FIRST kabulü, D74 rtree tahmini, D81 nitelenmemiş CREATE INDEX'in başka veritabanındaki tabloyu bulması. E30 / E31 M4 girdisi.
+
+## V6b.1 — PRAGMA üreticisinin ilk dilimi
+
+**Durum: V6b tamamlanmadı.** `e9ba0e2` üzerinden başlandı. `ileriPlanlama/` dosyaları değerlendirilmedi. Çalışma sırası eksik davranışları kapatmaya göre seçiliyor; doğruluğu kanıtlanmamış kodda performans ayarı yapılmıyor.
+
+Beş gramer kuralı üreticiye bağlandı; C başvurusunun `pragma.h` tablosundaki 66 ad ve sütunları üretim aracıyla taşındı. Bayraklar, analysis_limit, başlık değerleri, default_cache_size programı, page_size sorgusu, page_count/max_page_count, journal_mode, incremental_vacuum, tablo/indeks/FK bilgileri, foreign_key_check, pragma_list, wal_checkpoint ve optimize'nin kullanım geçmişi gerektirmeyen yolları destekleniyor. Bayrak/analysis_limit hazırlama etkileri EXPLAIN dahil C zamanında uygulanıyor; sonuçlar hazırlamadaki değerini koruyor, OP_Expire çalıştırmada etkiliyor. Genel PRAGMA yürütmesi eski yürütücüde kalıyor.
+
+**Kanıt:** 3.992 girdiden 3.695 kabul edilen EXPLAIN/EQP çıktısı C ile aynı, 0 farklı, 297 açık desteklenmiyor. Ayrı prepare-only sürücüde tam programlar 3.667/3.667 aynı, 279 desteklenmiyor. Ardışık ayarlarda 153/153 aynı, bir görünüm geçmişi desteklenmiyor. Beş yeni regresyon testi; bunlardan biri gerçek C 3.54.1 ile 270 ifade karşılaştırıyor. C kapsamı 466/990 satır (%47,1), 337/706 dal (%47,7); taşınmayan tüm sqlite3Pragma gövdesi paydada. Hiç alınmayan 369 dal ayrı ayrı sınıflandırıldı. [Karar eşliği](karar_esligi_v6b_1.md), [dal kayıtları](karar_esligi_v6b_1_dallar.md).
+
+**Dört kapı:** anahtar kapalı 1037 geçti/0 başarısız; açık 1022 geçti / 15 önceki başarısız; iki durumda 337 yok sayıldı. DML 378/400 ve 398/400; başarısız seed/sınıf kümeleri V6 ile aynı. Ayrışma bulucu245 senaryoda 241 L0, 2 L1, 1 L4, 1 L6; önceden bilinen g06 stderr farkı sürüyor. Rust1.100 tabanına karşı 7 denemede toplam 0,999x, geomean 0,996x, 14 özet aynı. **W06 önceki V6'ya karşı 15 tekrarda 1,020x yavaş; açık performans borcu.**
+
+**Kalanlar:** 24 pragma henüz taşınmadı; page_size/case_sensitive_like ayarları, defer_foreign_keys yaşam döngüsü (D72), optimize kullanım geçmişi ve özel VFS/yetkilendirici/hata enjeksiyonu açık. D71'in bayrak/analysis_limit kısmı kapandı; pager/encoding hazırlama etkileri bekliyor. Yeni **D82**: başka şemada aynı adla gizlenen görünümün table_list sütun sayısı önceki kullanıma bağlı; eski yürütücü ilk sorguda C'den farklı, üretici bu bağlamı açıkça desteklemiyor. Ayrıntı ve sonraki doğruluk sırası [fark kaydında](gorulen_farklar_v6b_1.md).
 
 ## M1 — makine: `SELECT` programlarının C gibi çalıştırılması (dal `performans-A-vdbe-makine`)
 

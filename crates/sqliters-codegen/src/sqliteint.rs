@@ -1121,6 +1121,13 @@ pub struct DbInfo {
 /// What the code generator asks of the engine: the schema adapter and the registries of
 /// application-defined functions and collations.
 pub trait Host {
+    /// A connection/pager value read at prepare time by pragma.c. `None` means that
+    /// the host does not represent this state; the generator must not approximate it.
+    fn pragma_int(&self, _i_db: usize, _name: &str) -> Option<i64> {
+        None
+    }
+    /// pragma.c changes these values during prepare, including under EXPLAIN.
+    fn note_pragma_effect(&self, _effect: crate::pragma::PrepareEffect) {}
     /// `sqlite3ReadSchema()` -> `sqlite3Init()` did work: C's connection has its schemas loaded
     /// from now on, also when the statement fails afterwards (the engine mirrors that state).
     fn note_schema_loaded(&self) {}

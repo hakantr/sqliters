@@ -1893,7 +1893,18 @@ impl YyParser {
                     crate::alter::sqlite3_alter_add_constraint(p, x, &y, None, ze, e);
                 }
             }
-            253..=257 => p.not_supported("PRAGMA (step V6b)"),
+            253 => {
+                let (x, z) = (m!(-1).tok, m!(0).tok);
+                crate::pragma::sqlite3_pragma(p, &x, &z, None, false);
+            }
+            254 | 256 => {
+                let (x, z, y) = (m!(-3).tok, m!(-2).tok, m!(0).tok);
+                crate::pragma::sqlite3_pragma(p, &x, &z, Some(&y), yyruleno == 256);
+            }
+            255 | 257 => {
+                let (x, z, y) = (m!(-4).tok, m!(-3).tok, m!(-1).tok);
+                crate::pragma::sqlite3_pragma(p, &x, &z, Some(&y), yyruleno == 257);
+            }
             n if (n as i32) < YYNRULE_WITH_ACTION => {
                 // A rule with an action in parse.y that step V1 does not port: CREATE / DROP /
                 // ALTER, INSERT / UPDATE / DELETE, triggers, PRAGMA, VACUUM, ATTACH, ANALYZE,

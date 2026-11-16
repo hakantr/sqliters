@@ -93,6 +93,16 @@ fn func_flags(flags: FunctionFlags) -> u32 {
 }
 
 impl Host for EngineHost<'_> {
+    fn note_pragma_effect(&self, effect: sqliters_codegen::pragma::PrepareEffect) {
+        C_PRAGMA_EFFECTS.with(|effects| effects.borrow_mut().push(effect));
+    }
+    fn pragma_int(&self, i_db: usize, name: &str) -> Option<i64> {
+        let bt = self.db_set.slots().get(i_db)?.btree.as_ref()?;
+        match name {
+            "page_size" => Some(i64::from(bt.pager().page_size())),
+            _ => None,
+        }
+    }
     fn note_schema_loaded(&self) {
         self.schema_loaded.set(true);
     }
@@ -354,9 +364,14 @@ impl Host for EngineHost<'_> {
 }
 
 thread_local! {
+    static C_PRAGMA_EFFECTS: std::cell::RefCell<Vec<sqliters_codegen::pragma::PrepareEffect>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Set when a prepare of the generator found that C's `sqlite3OpenTempDatabase()` opened the
     /// temp database (see [`take_c_temp_opened`]).
     static C_TEMP_OPENED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn take_c_pragma_effects() -> Vec<sqliters_codegen::pragma::PrepareEffect> {
+    C_PRAGMA_EFFECTS.with(|effects| std::mem::take(&mut *effects.borrow_mut()))
 }
 
 /// True (once) if a generator prepare since the last call opened C's temp database: the caller
@@ -424,6 +439,7 @@ pub(crate) fn c_prepare(inner: &ConnectionInner, sql: &str) -> (PrepareResult, u
 /// The connection state the generator reads (`sqlite3 *db`).
 fn make_db<'a>(inner: &ConnectionInner, host: &'a EngineHost<'a>) -> Db<'a> {
     let mut db = Db::new(host);
+    db.auto_commit = !(inner.explicit_tx || inner.implicit_savepoint_tx);
     db.enc = match inner.effective_encoding() {
         TextEncoding::Utf8 => 1,
         TextEncoding::Utf16Le => 2,
@@ -432,16 +448,22 @@ fn make_db<'a>(inner: &ConnectionInner, host: &'a EngineHost<'a>) -> Db<'a> {
     if !inner.db_set.dqs_dml() {
         db.flags &= !SQLITE_DqsDML;
     }
-    if !inner.db_set.trusted_schema() {
-        db.flags &= !SQLITE_TrustedSchema;
-    }
     // The flag pragmas (automatic_index, reverse_unordered_selects, short_column_names,
     // full_column_names): the bits that differ from C's default.
     db.flags ^= inner.db_set.c_flags_toggled();
+    // This flag also has a db_config API: the engine holds its absolute value.
+    if inner.db_set.trusted_schema() {
+        db.flags |= SQLITE_TrustedSchema;
+    } else {
+        db.flags &= !SQLITE_TrustedSchema;
+    }
     // The connection flags of DML code generation (PRAGMA foreign_keys, recursive_triggers,
     // count_changes, writable_schema) and the authorizer (`db->xAuth`).
     {
-        use sqliters_codegen::consts::{SQLITE_CountRows, SQLITE_ForeignKeys, SQLITE_RecTriggers, SQLITE_WriteSchema};
+        use sqliters_codegen::consts::{SQLITE_CountRows, SQLITE_ForeignKeys, SQLITE_RecTriggers, SQLITE_WriteSchema, SQLITE_NoSchemaError};
+        // These bits also have connection APIs. Their absolute values override the
+        // pragma mirror, including when db_config clears a previously enabled flag.
+        db.flags &= !(SQLITE_CountRows | SQLITE_ForeignKeys | SQLITE_RecTriggers | SQLITE_WriteSchema | SQLITE_NoSchemaError);
         if inner.foreign_keys {
             db.flags |= SQLITE_ForeignKeys;
         }
@@ -451,10 +473,15 @@ fn make_db<'a>(inner: &ConnectionInner, host: &'a EngineHost<'a>) -> Db<'a> {
         if inner.count_changes {
             db.flags |= SQLITE_CountRows;
         }
-        if inner.writable_schema {
-            db.flags |= SQLITE_WriteSchema;
+        if inner.db_set.writable_schema_flag() {
+            // main.c:1014: DBCONFIG_WRITABLE_SCHEMA controls the same two bits as
+            // PRAGMA writable_schema. They must also be cleared together.
+            db.flags |= SQLITE_WriteSchema | SQLITE_NoSchemaError;
         }
     }
+    if inner.legacy_alter_table { db.flags |= sqliters_codegen::consts::SQLITE_LegacyAlter; }
+    if inner.db_set.cell_size_check() { db.flags |= sqliters_codegen::consts::SQLITE_CellSizeCk; }
+    if !inner.db_set.cache_spill { db.flags &= !sqliters_codegen::consts::SQLITE_CacheSpill; }
     // sqlite3_db_config(SQLITE_DBCONFIG_ENABLE_VIEW / _ENABLE_TRIGGER / _DEFENSIVE)
     {
         use sqliters_codegen::consts::{SQLITE_Defensive, SQLITE_EnableTrigger, SQLITE_EnableView};

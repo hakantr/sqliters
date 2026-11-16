@@ -28,6 +28,7 @@ pub mod insert;
 pub mod merge;
 pub mod parse;
 pub mod parse_tables;
+pub mod pragma;
 pub mod resolve;
 pub mod schema;
 pub mod select;

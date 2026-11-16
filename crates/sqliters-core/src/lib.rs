@@ -3499,6 +3499,9 @@ impl Connection {
             );
         }
         let (r, _, _) = cgen::c_prepare(session.inner(), sql);
+        // The verification oracle is read-only; its prepare effects must not leak
+        // into a later prepare/reprepare, including one on another connection.
+        let _ = cgen::take_c_pragma_effects();
         match r {
             sqliters_codegen::PrepareResult::Program(p) => Ok(*p),
             sqliters_codegen::PrepareResult::Error { message, .. } => Err(format!("error: {message}")),
@@ -5109,6 +5112,8 @@ pub struct Statement {
     /// The error of a scan that failed after it had produced rows: reported once the rows
     /// are used up (see `StmtTxTracker::partial_rows`).
     deferred_error: Option<SqliteError>,
+    /// Constants frozen by pragma.c at prepare time (flag pragmas and analysis_limit).
+    c_prepared_pragma: Option<Box<QueryOutput>>,
 }
 
 impl fmt::Debug for Statement {
@@ -5712,6 +5717,72 @@ fn stmt_references_temp_catalog(stmt: &Stmt, db_set: &DatabaseSet) -> bool {
         }
         _ => false,
     }
+}
+
+/// pragma.c:1158–1204 and :2733: apply the generator's prepare-time changes even
+/// under EXPLAIN. OP_Expire still belongs to execution, as in C.
+fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) {
+    use sqliters_codegen::consts::*;
+    use sqliters_codegen::pragma::PrepareEffect;
+    for effect in cgen::take_c_pragma_effects() {
+        match effect {
+            PrepareEffect::AnalysisLimit(n) => inner.db_set.set_analysis_limit(n),
+            PrepareEffect::CacheSize { i_db, size } => {
+                if let Some(bt) = inner.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut()) {
+                    bt.set_cache_size(size);
+                }
+            }
+            PrepareEffect::Flags { flags, reset_deferred, reset_schema } => {
+                let defaults = sqliters_codegen::Db::new(&sqliters_codegen::NoHost).flags;
+                let mask = sqliters_codegen::pragma::flag_masks().fold(0, |a, b| a | b);
+                inner.db_set.set_c_pragma_flags_at_prepare(flags ^ defaults, mask);
+                inner.foreign_keys = flags & SQLITE_ForeignKeys != 0;
+                inner.recursive_triggers = flags & SQLITE_RecTriggers != 0;
+                inner.legacy_alter_table = flags & SQLITE_LegacyAlter != 0;
+                inner.count_changes = flags & SQLITE_CountRows != 0;
+                inner.db_set.set_writable_schema_flag(flags & SQLITE_WriteSchema != 0);
+                inner.writable_schema = inner.db_set.writable_schema_effective();
+                inner.db_set.set_trusted_schema(flags & SQLITE_TrustedSchema != 0);
+                inner.db_set.set_cell_size_check(flags & SQLITE_CellSizeCk != 0);
+                inner.db_set.cache_spill = flags & SQLITE_CacheSpill != 0;
+                if !(inner.explicit_tx || inner.implicit_savepoint_tx) {
+                    for slot in inner.db_set.slots_mut() {
+                        if let Some(bt) = slot.btree.as_mut() { bt.set_cache_spill(flags & SQLITE_CacheSpill != 0); }
+                    }
+                }
+                for slot in inner.db_set.slots_mut() {
+                    if let Some(bt) = slot.btree.as_mut() { bt.set_writable_schema(inner.writable_schema); }
+                }
+                if reset_deferred { inner.deferred_fk_suspects.clear(); }
+                if reset_schema {
+                    inner.db_set.c_reset_all_schemas();
+                    for slot in inner.db_set.slots_mut() { slot.schema = Schema::default(); }
+                    inner.schema_generation += 1;
+                    inner.v1_expire_generation += 1;
+                }
+            }
+        }
+    }
+}
+
+#[allow(non_upper_case_globals)]
+fn prepare_constant_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str) -> Option<Box<QueryOutput>> {
+    use sqliters_vdbe::opcodes::{OP_Int64, OP_Integer};
+    let Some(Stmt::Pragma { name, .. }) = stmt else { return None; };
+    if sqliters_codegen::pragma::flag_mask(name).is_none() && !name.eq_ignore_ascii_case("analysis_limit") {
+        return None;
+    }
+    let (result, _, _) = cgen::c_prepare_quiet(inner, sql);
+    apply_codegen_pragma_effects(inner);
+    let sqliters_codegen::PrepareResult::Program(program) = result else { return None; };
+    let columns = program.a_col_name.iter().take(program.n_res_column as usize).map(|s| s.clone().unwrap_or_default()).collect();
+    let mut rows = Vec::new();
+    if program.n_res_column != 0 {
+        let op = program.a_op.iter().find(|op| matches!(op.opcode, OP_Integer | OP_Int64) && op.p2 == 1)?;
+        let value = if op.opcode == OP_Integer { i64::from(op.p1) } else { sqliters_vdbe::vdbeaux::int32_to_64(op.p1, op.p3) };
+        rows.push(vec![Value::Integer(value)]);
+    }
+    Some(Box::new(QueryOutput { column_names: columns, rows }))
 }
 
 fn apply_prepare_auto_vacuum_pragma(
@@ -7349,10 +7420,16 @@ impl Statement {
         // generator supports the statement; the engine's own output otherwise.
         let _ = cgen::take_c_temp_opened();
         let _ = cgen::take_c_rowest_clamped();
+        let _ = cgen::take_c_pragma_effects();
         let c_explain = match c_explain_of_rejected {
             Some(prog) => Some(prog),
-            None => Self::c_explain_of(inner, stmt_opt.as_ref(), &raw_sql)?,
+            None => {
+                let result = Self::c_explain_of(inner, stmt_opt.as_ref(), &raw_sql);
+                apply_codegen_pragma_effects(inner);
+                result?
+            }
         };
+        let c_prepared_pragma = prepare_constant_pragma(inner, stmt_opt.as_ref(), &raw_sql);
         // C's ALTER TABLE (RENAME TO, RENAME COLUMN, DROP COLUMN of a non-TEMP table) reads
         // `temp.sqlite_schema` in a nested statement, which opens the temp database while the
         // statement is prepared (`sqlite3OpenTempDatabase()`, also under EXPLAIN: the nested
@@ -7541,6 +7618,10 @@ impl Statement {
         }
 
         let c_machine = Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some())?;
+        if let Some(out) = &c_prepared_pragma {
+            artifacts.category = Some(StmtCategory::NoLockPragma);
+            artifacts.column_names = out.column_names.clone();
+        }
         if let Some(prog) = &c_write
             && artifacts.category != Some(StmtCategory::Control)
         {
@@ -7577,6 +7658,7 @@ impl Statement {
             unparsed_tail,
             lifecycle: StatementLifecycle::Ready,
             deferred_error: None,
+            c_prepared_pragma,
         })
     }
 
@@ -8145,6 +8227,8 @@ impl Statement {
                     (st, c)
                 }
             };
+            apply_codegen_pragma_effects(inner);
+            let c_prepared_pragma = prepare_constant_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql);
             let shared = Arc::clone(&self.shared);
             let try_compile = |inner: &mut ConnectionInner,
                                parsed_stmt: &Option<Stmt>|
@@ -8195,6 +8279,11 @@ impl Statement {
                 Err(err) => return Err(err),
             };
             apply_prepare_auto_vacuum_pragma(inner, &mut artifacts);
+            if let Some(out) = &c_prepared_pragma {
+                artifacts.category = Some(StmtCategory::NoLockPragma);
+                artifacts.column_names = out.column_names.clone();
+            }
+            self.c_prepared_pragma = c_prepared_pragma;
             if let Some(prog) = &c_explain {
                 artifacts.column_names = explain_column_names(prog.explain);
             }
@@ -8954,6 +9043,9 @@ impl Statement {
 
             StmtCategory::NoLockPragma => {
                 let stmt_clone = self.stmt.clone().expect("non-empty statement");
+                let expires_all = self.c_prepared_pragma.is_some()
+                    && matches!(&stmt_clone, Stmt::Pragma { name, value: Some(_), .. }
+                        if sqliters_codegen::pragma::flag_mask(name).is_some());
                 inner.activity.start(hid, false, false);
                 let summary = inner.activity.summary_excluding(hid, &inner.db_set);
                 let prev_ts = inner.runtime.stmt_timestamp_ms;
@@ -8975,7 +9067,15 @@ impl Statement {
                     &mut stmt_tx,
                     &mut expire_self_only,
                     |ctx| {
-                        if let Stmt::Pragma {
+                        if let Some(out) = &self.c_prepared_pragma {
+                            *ctx.expire_self_only = true;
+                            if matches!(&stmt_clone, Stmt::Pragma { name, value: Some(_), .. }
+                                if sqliters_codegen::pragma::flag_mask(name).is_some())
+                            {
+                                ctx.db_set.c_expire_all();
+                            }
+                            Ok((**out).clone())
+                        } else if let Stmt::Pragma {
                             ref name,
                             value: Some(_),
                             ..
@@ -8991,6 +9091,9 @@ impl Statement {
                     },
                 );
                 inner.runtime.stmt_timestamp_ms = prev_ts;
+                if expires_all && res.is_ok() {
+                    inner.advisory_expire_generation += 1;
+                }
                 inner.end_autocommit_started_reads(stmt_tx.started_read_mask, summary);
                 if expire_self_only {
                     self.expired = true;

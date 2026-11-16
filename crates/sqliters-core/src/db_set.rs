@@ -748,6 +748,11 @@ impl DatabaseSet {
         self.c_expire_seq
     }
 
+    /// pragma.c mutates db->flags while preparing; OP_Expire runs on step.
+    pub(crate) fn set_c_pragma_flags_at_prepare(&mut self, flags: u64, mask: u64) {
+        self.c_flags_toggled = (self.c_flags_toggled & !mask) | (flags & mask);
+    }
+
     /// Records that flag `bit` of C's `db->flags` now differs (`true`) or not from its default.
     pub fn set_c_flag_toggled(&mut self, bit: u64, toggled: bool) {
         // (C's flag pragmas end with OP_Expire)
