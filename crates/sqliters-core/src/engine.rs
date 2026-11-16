@@ -43280,17 +43280,11 @@ fn exec_pragma(
         }
         "TEMP_STORE" => {
             if let Some(pv) = value {
-                let mode = match pv {
-                    PragmaValue::Integer(1) => TempStoreMode::File,
-                    PragmaValue::Integer(2) => TempStoreMode::Memory,
-                    PragmaValue::Integer(_) => TempStoreMode::Default,
-                    PragmaValue::Ident(s) | PragmaValue::String(s) => {
-                        TempStoreMode::from_pragma_str(s)
-                    }
-                };
+                let mode = TempStoreMode::from_pragma_str(&pragma_to_string(pv));
                 if ctx.db_set.set_temp_store(mode, is_in_autocommit(ctx))? {
                     // invalidateTempStorage(): sqlite3ResetAllSchemasOfConnection()
-                    ctx.db_set.c_reset_all_schemas();
+                    ctx.db_set.c_clear_all_schemas();
+                    for slot in ctx.db_set.slots_mut() { slot.schema = Schema::default(); }
                     *ctx.schema_generation += 1;
                     *ctx.v1_expire_generation += 1;
                 }

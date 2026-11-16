@@ -5768,6 +5768,16 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) -> Result<()> {
                 inner.busy_policy = if n > 0 { BusyPolicy::TimeoutMs(n as u64) } else { BusyPolicy::None };
             }
             PrepareEffect::WalAutocheckpoint(n) => inner.wal_autocheckpoint_threshold = n,
+            PrepareEffect::TempStore(mode) => {
+                let mode = match mode { 1 => TempStoreMode::File, 2 => TempStoreMode::Memory, _ => TempStoreMode::Default };
+                let auto_commit = !(inner.explicit_tx || inner.implicit_savepoint_tx);
+                if inner.db_set.set_temp_store(mode, auto_commit)? {
+                    inner.db_set.c_clear_all_schemas();
+                    for slot in inner.db_set.slots_mut() { slot.schema = Schema::default(); }
+                    inner.schema_generation += 1;
+                    inner.v1_expire_generation += 1;
+                }
+            }
             PrepareEffect::LockingMode { i_db, mode } => {
                 let mode = if mode == 0 { LockingMode::Normal } else { LockingMode::Exclusive };
                 if let Some(id) = i_db {
@@ -8320,11 +8330,13 @@ impl Statement {
         {
             return true;
         }
-        if self.category != Some(StmtCategory::Control) && self.has_detached_slot(inner) {
-            return true;
-        }
+        // C detects schema changes through OP_Transaction. A constant PRAGMA
+        // has no such check and keeps its prepared result when TEMP closes.
         if !self.requires_schema {
             return false;
+        }
+        if self.category != Some(StmtCategory::Control) && self.has_detached_slot(inner) {
+            return true;
         }
         match self.mode {
             PrepareMode::V1 => {

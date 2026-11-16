@@ -25,7 +25,8 @@
 | V6b.5 — page_size hazırlama ve global VACUUM isteği | `94421ed` | Ham açılış başlığı, donmuş sorgu, TEMP, geçersiz istek, şemalar arası VACUUM ve WAL sıfırı | 5.545/5.545; tam program 5.129/5.129; 176 API akışı aynı | Yeniden ölçülmedi | kapalı 1049/0; açık 1034/15 bilinen; 337 yok sayıldı |
 | V6b.6 — auto_vacuum hazırlama ve canlı Btree durumu | `9a222cd` | Global nextAutovac, donmuş meta7, TEMP, commit/rollback/savepoint ve yeniden okuma | 6.516/6.516; tam program 5.860/5.860; 220 API akışı aynı | Yeniden ölçülmedi | kapalı 1057/0; açık 1042/15 bilinen; 337 yok sayıldı |
 | V6b.7 — bağlantı/cache PRAGMA hazırlama etkileri | `8fdf60f` | cache_spill, busy_timeout, wal_autocheckpoint; TEMP, EXPLAIN ve ilk kodlama yüklemesi | 7.701 EXPLAIN/EQP, 6.757 tam program, 330+16 API aynı | Yeniden ölçülmedi | kapalı 1063/0; açık 1048/15 bilinen; 337 yok sayıldı |
-| V6b.8 — locking_mode ve hazırlama hataları; D103 açık | bu commit | Global/yerel kip; tempFile, sayaç, sentaks ve hata konumu | 10093 EXPLAIN/EQP; 8249 tam program; API 487/488 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1071/0; açık 1056/15 bilinen; 337 yok sayıldı |
+| V6b.8 — locking_mode ve hazırlama hataları; D103 açık | `d9f13d7` | Global/yerel kip; tempFile, sayaç, sentaks ve hata konumu | 10093 EXPLAIN/EQP; 8249 tam program; API 487/488 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1071/0; açık 1056/15 bilinen; 337 yok sayıldı |
+| V6b.9 — temp_store hazırlama ve şema temizleme | bu commit | İlk karakter, TEMP işlem koruması, sabit sonuç ve cache_size koruma | 11832 EXPLAIN/EQP; 9216 tam program; API 1047/1048 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1076/0; açık 1061/15 bilinen; 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -390,3 +391,7 @@ Hazırlama etkisi ve donmuş sorgu taşındı; nextPagesize bağlantı geneline 
 ## V6b.8 — kilit kipi ve hazırlama doğruluğu
 
 locking_mode üretimi ve hazırlama etkileri taşındı. Tutulan kilitte sayfa 1 sayaç yaşamı, fiziksel damga, erken/geç sentaks etkileri ve hata konumu geçmişi C ile karşılaştırıldı. Eski yürütücüde tüketilmeyen TVF argümanı D103 açık bırakıldı; başarı sayılmadı. Dört kapı, API/dosya/GÇ kanıtı ve alınmayan dallar [karar_esligi_v6b_8.md](karar_esligi_v6b_8.md) içinde. Sonraki uygun dilim temp_store; doğruluk önceliği sürer.
+
+## V6b.9 — geçici saklama hazırlaması
+
+temp_store hazırlama etkileri, TEMP işlem koruması, şema temizleme, cache_size koruma ve donmuş getter C ile karşılaştırıldı. İlk adayın 72 getter farkı kapandı; önceki D103 açık kaldı. Kanıt ve dört kapı [karar_esligi_v6b_9.md](karar_esligi_v6b_9.md) içinde. Sonraki uygun dilim encoding; doğruluk önceliği sürer.

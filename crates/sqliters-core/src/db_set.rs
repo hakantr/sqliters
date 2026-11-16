@@ -79,13 +79,9 @@ impl TempStoreMode {
 
     /// Parses a `PRAGMA temp_store = ...` value matching `getTempStore` (`pragma.c:141-151`).
     pub fn from_pragma_str(s: &str) -> Self {
-        let trimmed = s.trim();
-        match trimmed.as_bytes().first().copied() {
-            Some(b'0') if trimmed.len() == 1 => Self::Default,
-            Some(b'1') if trimmed.len() == 1 => Self::File,
-            Some(b'2') if trimmed.len() == 1 => Self::Memory,
-            _ if trimmed.eq_ignore_ascii_case("file") => Self::File,
-            _ if trimmed.eq_ignore_ascii_case("memory") => Self::Memory,
+        match sqliters_codegen::pragma::get_temp_store(s) {
+            1 => Self::File,
+            2 => Self::Memory,
             _ => Self::Default,
         }
     }
@@ -966,9 +962,14 @@ impl DatabaseSet {
     /// (`sqlite3SchemaClear`: `iGeneration++` if `DB_SchemaLoaded`). C does this when a
     /// transaction that changed the schema is rolled back and at the end of VACUUM.
     pub fn c_reset_all_schemas(&mut self) {
+        // sqlite3RollbackAll also calls sqlite3ExpirePreparedStatements(db, 0).
+        self.c_expire_all();
+        self.c_clear_all_schemas();
+    }
+
+    /// build.c:652–673: clearing schemas alone does not expire active VDBEs.
+    pub fn c_clear_all_schemas(&mut self) {
         self.c_cookie_ahead = None;
-        // (sqlite3RollbackAll: "sqlite3ExpirePreparedStatements(db, 0)" comes with it)
-        self.c_expire_seq += 1;
         for slot in &mut self.slots {
             if slot.c_loaded {
                 slot.c_generation += 1;

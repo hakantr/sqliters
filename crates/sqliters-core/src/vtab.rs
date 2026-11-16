@@ -3539,6 +3539,7 @@ impl PragmaVTabModule {
             "database_list" => ("CREATE TABLE x(seq,name,file)", 3, false, false, false),
             "collation_list" => ("CREATE TABLE x(seq,name)", 2, false, false, false),
             "compile_options" => ("CREATE TABLE x(compile_options)", 1, false, false, false),
+            "temp_store" => ("CREATE TABLE x(temp_store)", 1, false, false, false),
             "locking_mode" => (
                 "CREATE TABLE x(locking_mode,schema hidden)",
                 1,

@@ -49,6 +49,7 @@ pub enum PrepareEffect {
     BusyTimeout(i32),
     WalAutocheckpoint(i32),
     LockingMode { i_db: Option<usize>, mode: u8 },
+    TempStore(u8),
 }
 
 /// Names of the pragmas enabled in the C reference build, in pragma.h order.
@@ -79,6 +80,7 @@ pub fn prepare_constant(name: &str) -> bool {
             "busy_timeout",
             "wal_autocheckpoint",
             "locking_mode",
+            "temp_store",
         ]
         .iter()
         .any(|n| name.eq_ignore_ascii_case(n))
@@ -188,6 +190,16 @@ pub fn get_auto_vacuum(z: &str) -> u8 {
     else if z.eq_ignore_ascii_case("full") { 1 }
     else if z.eq_ignore_ascii_case("incremental") { 2 }
     else { match sqlite3_get_int32(z).unwrap_or(0) { 1 => 1, 2 => 2, _ => 0 } }
+}
+
+/// pragma.c:141–151: numeric values use only the first character.
+pub fn get_temp_store(z: &str) -> u8 {
+    match z.as_bytes().first() {
+        Some(c @ b'0'..=b'2') => c - b'0',
+        _ if z.eq_ignore_ascii_case("file") => 1,
+        _ if z.eq_ignore_ascii_case("memory") => 2,
+        _ => 0,
+    }
 }
 
 /// sqlite3DecOrHexToI64: strict decimal, or unsigned hex with at most 16 significant digits.
@@ -550,6 +562,21 @@ pub fn sqlite3_pragma(
         }
         37 => table_info(p, pragma.arg != 0, right, z_db.as_deref()),
         38 => table_list(p, right, z_db.as_deref()),
+        39 => {
+            // pragma.c:159–192,992–997: changeTempStorage runs during prepare.
+            let Some(current) = host_int(p, i_db, "temp_store") else { return; };
+            if let Some(z) = right {
+                let mode = get_temp_store(z);
+                if i64::from(mode) != current {
+                    let Some(temp_txn) = host_int(p, 1, "temp_transaction") else { return; };
+                    if p.db.a_db[1].has_bt && (!p.db.auto_commit || temp_txn != 0) {
+                        p.error_msg("temporary storage cannot be changed from within a transaction");
+                        return;
+                    }
+                    p.db.host.note_pragma_effect(PrepareEffect::TempStore(mode));
+                }
+            } else { return_int(p, current); }
+        }
         42 => {
             // pragma.c:2428–2435: sqlite3Atoi failure disables the callback.
             let value = right.map(|z| sqlite3_get_int32(z).unwrap_or(0).max(0));

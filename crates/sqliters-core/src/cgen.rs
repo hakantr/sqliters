@@ -100,6 +100,11 @@ impl Host for EngineHost<'_> {
         C_PRAGMA_EFFECTS.with(|effects| effects.borrow_mut().push(effect));
     }
     fn pragma_int(&self, i_db: usize, name: &str) -> Option<i64> {
+        if name == "temp_store" { return Some(self.db_set.temp_store().as_int()); }
+        if name == "temp_transaction" {
+            return Some(i64::from(self.db_set.slots().get(1)?.btree.as_ref()
+                .is_some_and(|bt| bt.transaction_state() != sqliters_pager::TransactionState::Open)));
+        }
         if name == "default_locking_mode" { return Some(self.default_locking_mode); }
         if name == "busy_timeout" { return self.busy_timeout; }
         if name == "wal_autocheckpoint" { return Some(i64::from(self.wal_autocheckpoint)); }
