@@ -286,6 +286,12 @@ Ayrıntı: `karar_esligi_v1.md` (işlev eşlemesi, karar tabloları, kapsam tabl
 
 **Hız (anahtar açık, C'ye göre; M3b konusu).** W03 2,03x, W04 2,56x, W09 4,66x, W10 3,80x, W14 8,36x.
 
+### D58 düzeltmesi (M3c'den sonra, aynı dal)
+
+- **D58 kapandı:** anahtar açıkken motorun ön derlemesinin reddettiği bir SELECT'te artık C'nin derleme sonucu karar veriyor (`lib.rs` `c_read_decides`): C'nin hatası C'nin konumuyla, ya da C'nin programı makinede. `SELECT main."a.b".* FROM (SELECT 1)` ve benzerleri C gibi `near "*": syntax error`; yeni test `d58_rejected_select_gets_c_compile_error`. Bilinmeyen sütun / tablo, UNION sütun sayısı gibi yaygın hatalar C ile aynı kaldı.
+- **E29 (düzeltirken bulundu ve düzeltildi):** kod üreticisine yalnız `sqlite3_vtab_config()` ile verilen risk bayrağı geçiyordu; motorun modül düzeyindeki risk bayrağı geçmiyordu. Bu yüzden görünüm içindeki `DirectOnly` modül üreticide derleniyordu; C ve motor `unsafe use of virtual table` veriyor. Artık `effective_risk_flags()` geçiyor. Yerleşik modüller (generate_series, json_each, json_tree, pragma_table_info, dbstat, fts5, rtree) görünüm içinde `trusted_schema` kapalı ve açıkken iki yolda da C ile aynı.
+- Testler: anahtar kapalı 1029 geçti / 0 başarısız / 337 yok sayıldı; açık 1014 / 15 = bilinen 10 + F8'in 3'ü (`group64_quoted_dots…` ve `test_gate2_3…` artık C'nin hatasını aldığı için düşüyor) + **F9'un 2'si**: `SELECT random(*)` C'de hatasız bir satır döndürüyor, `w REGEXP '^alpha'` için C'nin iletisi `no such function: REGEXP` (C kitaplığına karşı bir C programıyla doğrulandı). Beklentiler değiştirilmedi: anahtar kapalıyken eski yol bu davranışı veriyor.
+
 ## Bu adımda görülen, eski motora ait C farkları (dokunulmadı)
 
 | İfade | C | Motor |

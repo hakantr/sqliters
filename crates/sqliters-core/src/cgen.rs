@@ -223,9 +223,11 @@ impl Host for EngineHost<'_> {
                 module_name: entry.module_name.clone(),
                 b_constraint: d.constraint_support,
                 b_all_schemas: false,
-                e_vtab_risk: match d.config_risk_flags {
-                    Some(VTabRiskFlags::Innocuous) => sqliters_codegen::sqliteint::SQLITE_VTABRISK_Low,
-                    Some(VTabRiskFlags::DirectOnly) => sqliters_codegen::sqliteint::SQLITE_VTABRISK_High,
+                // (the engine's module-level risk flags stand in for sqlite3_vtab_config() calls
+                // a module would make in xConnect: the same flags the engine's own checks use)
+                e_vtab_risk: match entry.effective_risk_flags() {
+                    VTabRiskFlags::Innocuous => sqliters_codegen::sqliteint::SQLITE_VTABRISK_Low,
+                    VTabRiskFlags::DirectOnly => sqliters_codegen::sqliteint::SQLITE_VTABRISK_High,
                     _ => sqliters_codegen::sqliteint::SQLITE_VTABRISK_Normal,
                 },
                 has_find_function: d.find_function,

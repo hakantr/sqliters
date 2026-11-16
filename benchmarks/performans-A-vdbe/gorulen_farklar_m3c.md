@@ -62,3 +62,27 @@ C reports `near "*": syntax error` (with the caret line). With `SQLITERS_VDBE_EX
 asks the generator. The generator itself gives C's error (`EXPLAIN SELECT main."a.b".* …` prints C's text). This is
 the reason `group64_quoted_dots…` and `test_gate2_3…` still differ from C on the switch-on path. Fix: on the switch-on
 path, let C's compile result decide for SELECT exactly as M3a does for DML (an engine prepare error must not win).
+
+**D58 closed** (after M3c, same branch): on the switch-on path an engine prepare error of a SELECT no longer wins;
+C's compile result decides (`c_read_decides` in `lib.rs`): C's error with C's offset, or C's program on the machine.
+The three statements above now give `near "*": syntax error` with C's offset (test
+`c_align_m3c_tests::d58_rejected_select_gets_c_compile_error`). `group64_quoted_dots…` and `test_gate2_3…` still
+fail with the switch on, now because they expect the engine to accept these statements (F8).
+
+## E29 — the generator ignored the engine's module-level risk flags (found while fixing D58)
+
+`cgen.rs` handed the generator only the risk set through `sqlite3_vtab_config()` (`declared.config_risk_flags`);
+the engine's modules can also declare it at module level (`risk_flags()`), and the engine's own checks use
+`effective_risk_flags()`. A DirectOnly module inside a view therefore compiled in the generator, where C (and the
+engine) report `unsafe use of virtual table "…"`. Visible once D58 let the generator decide rejected SELECTs
+(`test_lazy_xconnect…`, `phase7_gate_3…`). Fixed: the generator gets `effective_risk_flags()`. Built-in modules in
+views under `trusted_schema=OFF/ON` (generate_series, json_each, json_tree, pragma_table_info, dbstat, fts5, rtree):
+output identical to C on both paths.
+
+## F9 — two tests assert non-C behaviour (switch on)
+
+- `group46_65_inline_shortcircuit_star_arg_and_custom_collation_regressions` expects `SELECT random(*)` to fail;
+  C 3.54.1 (C program against the amalgamation) prepares it and returns a row.
+- `test_group54_regexp_match_unregistered_and_custom_registration` expects `no such function: regexp` for
+  `w REGEXP '^alpha'`; C's library reports `no such function: REGEXP` (the operator as written; offset 28).
+Left unchanged: the old path (switch off) gives the asserted behaviour.

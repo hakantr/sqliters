@@ -5198,6 +5198,28 @@ fn write_artifacts(stmt: Option<Stmt>) -> CompiledArtifacts {
     }
 }
 
+/// The statement object of a SELECT that C compiles and the engine's prepare rejects
+/// (diagnostic switch `SQLITERS_VDBE_EXEC`): the machine runs C's program
+/// ([`Statement::c_machine_of`] fills in the program).
+fn read_artifacts(stmt: Option<Stmt>, column_names: Vec<String>) -> CompiledArtifacts {
+    let mut max_param = 0usize;
+    let mut named_params = HashMap::new();
+    if let Some(st) = &stmt {
+        collect_stmt_params(st, &mut max_param, &mut named_params);
+    }
+    CompiledArtifacts {
+        stmt,
+        requires_schema: true,
+        category: Some(StmtCategory::Read),
+        compiled_vdbe: None,
+        compiled_fast_read: None,
+        column_names,
+        max_param,
+        named_params,
+        ignored_fk_parent_tables: Vec::new(),
+    }
+}
+
 struct CompiledArtifacts {
     stmt: Option<Stmt>,
     requires_schema: bool,
@@ -7370,6 +7392,21 @@ impl Statement {
                 );
             }
         };
+        // Diagnostic switch SQLITERS_VDBE_EXEC: a SELECT the engine's prepare rejects is
+        // decided by C's compile result, as an INSERT / UPDATE / DELETE is (c_write_of): C's
+        // error is the error of the prepare; a statement C compiles runs C's program on the
+        // machine. `err` stays when the generator leaves the statement to the engine.
+        let c_read_decides = |inner: &mut ConnectionInner, stmt: Option<Stmt>, err: SqliteError| -> Result<CompiledArtifacts> {
+            if !vdbe_host::exec_switch_on() || !matches!(stmt, Some(Stmt::Select(_))) {
+                return Err(err);
+            }
+            let probe = read_artifacts(stmt.clone(), Vec::new());
+            match vdbe_host::machine_program(inner, stmt.as_ref(), &raw_sql, probe.max_param) {
+                Err(c_err) => Err(c_err),
+                Ok(Some(prog)) => Ok(read_artifacts(stmt, vdbe_host::column_names(&prog).unwrap_or_default())),
+                Ok(None) => Err(err),
+            }
+        };
         let is_create_vtab = matches!(stmt_opt, Some(Stmt::CreateVirtualTable { .. }));
         let mut artifacts = match try_compile(inner, stmt_opt.clone()) {
             Ok(a) => a,
@@ -7418,22 +7455,33 @@ impl Statement {
             {
                 // Cached schema might be stale due to an external writer: check on-disk cookies once!
                 if inner.ensure_schemas_loaded_for_prepare(true)? {
-                    match try_compile(inner, stmt_opt) {
+                    match try_compile(inner, stmt_opt.clone()) {
+                        Ok(a) => a,
+                        Err(e) => match c_read_decides(inner, stmt_opt, e) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tr_failed(inner);
+                                return Err(e);
+                            }
+                        },
+                    }
+                } else {
+                    match c_read_decides(inner, stmt_opt, err) {
                         Ok(a) => a,
                         Err(e) => {
                             tr_failed(inner);
                             return Err(e);
                         }
                     }
-                } else {
-                    tr_failed(inner);
-                    return Err(err);
                 }
             }
-            Err(err) => {
-                tr_failed(inner);
-                return Err(err);
-            }
+            Err(err) => match c_read_decides(inner, stmt_opt.clone(), err) {
+                Ok(a) => a,
+                Err(e) => {
+                    tr_failed(inner);
+                    return Err(e);
+                }
+            },
         };
 
         apply_prepare_auto_vacuum_pragma(inner, &mut artifacts);

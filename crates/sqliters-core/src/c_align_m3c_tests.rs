@@ -175,3 +175,20 @@ fn m3c_virtual_table_reads_take_c_plans() {
         vec!["7", "10", "13", "10", "7", "4", "1", "a", "b", "sqlite_schema", "t2", "sqlite_autoindex_t2_1", "t2a", "t2a"]
     );
 }
+
+/// D58: a SELECT the engine's own prepare rejects is decided by C's compile result on the switch-on path
+/// (`sqlite3` 3.54.1: `near "*": syntax error` at the `*`; the engine said `no such table: main.a.b`).
+#[test]
+fn d58_rejected_select_gets_c_compile_error() {
+    let conn = Connection::open_in_memory().unwrap();
+    let _on = crate::vdbe_host::ForceMachine::on();
+    for (sql, ofs) in [
+        ("SELECT main.\"a.b\".* FROM (SELECT 1)", 18usize),
+        ("SELECT aux.items.* FROM (SELECT 1)", 17),
+        ("SELECT x.y.* FROM (SELECT 1) AS y", 11),
+    ] {
+        let e = conn.prepare(sql).err().expect("C rejects the statement");
+        assert_eq!(e.message, "near \"*\": syntax error", "{sql}");
+        assert_eq!(e.offset, Some(ofs), "{sql}");
+    }
+}
