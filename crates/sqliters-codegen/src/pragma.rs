@@ -44,6 +44,7 @@ pub enum PrepareEffect {
     },
     Synchronous { i_db: usize, level: u8 },
     PageSize { i_db: usize, size: i32 },
+    AutoVacuum { i_db: usize, mode: u8 },
 }
 
 /// Names of the pragmas enabled in the C reference build, in pragma.h order.
@@ -69,6 +70,7 @@ pub fn prepare_constant(name: &str) -> bool {
             "secure_delete",
             "synchronous",
             "page_size",
+            "auto_vacuum",
         ]
         .iter()
         .any(|n| name.eq_ignore_ascii_case(n))
@@ -172,6 +174,14 @@ pub fn get_safety_level(z: &str, omit_full: bool, default: u8) -> u8 {
     }
 }
 
+/// pragma.c:125–132: words are exact; other strings use sqlite3Atoi.
+pub fn get_auto_vacuum(z: &str) -> u8 {
+    if z.eq_ignore_ascii_case("none") { 0 }
+    else if z.eq_ignore_ascii_case("full") { 1 }
+    else if z.eq_ignore_ascii_case("incremental") { 2 }
+    else { match sqlite3_get_int32(z).unwrap_or(0) { 1 => 1, 2 => 2, _ => 0 } }
+}
+
 /// sqlite3DecOrHexToI64: strict decimal, or unsigned hex with at most 16 significant digits.
 fn dec_or_hex(z: &str) -> Option<i64> {
     let (value, rc) = sqlite3_dec_or_hex_to_i64(z);
@@ -269,6 +279,24 @@ pub fn sqlite3_pragma(
                 p.v.add_op2(OP_ResultRow, 1, 1);
                 p.v.reusable();
             }
+        }
+        3 => {
+            // pragma.c:802–845: prepare changes flags; the program writes meta[7].
+            if let Some(z) = right {
+                let mode = get_auto_vacuum(z);
+                let Some(current) = host_int(p, i_db, "auto_vacuum") else { return; };
+                let Some(fixed) = host_int(p, i_db, "auto_vacuum_fixed") else { return; };
+                p.db.host.note_pragma_effect(PrepareEffect::AutoVacuum { i_db: i_db as usize, mode });
+                if (fixed == 0 || (mode != 0) == (current != 0)) && mode != 0 {
+                    let addr = p.v.current_addr();
+                    p.v.add_op3(OP_Transaction, i_db, 1, 0);
+                    p.v.add_op3(OP_ReadCookie, i_db, 1, 4);
+                    p.v.add_op3(OP_If, 1, addr + 4, 0);
+                    p.v.add_op3(OP_Halt, SQLITE_OK, OE_Abort, 0);
+                    p.v.add_op3(OP_SetCookie, i_db, 7, i32::from(mode) - 1);
+                    p.v.uses_btree(i_db, p.db.a_db[i_db as usize].sharable);
+                }
+            } else if let Some(n) = host_int(p, i_db, "auto_vacuum") { return_int(p, n); }
         }
         4 => {
             // PragTyp_FLAG, pragma.c:1158

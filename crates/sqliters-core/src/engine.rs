@@ -262,6 +262,7 @@ pub struct StmtTxTracker {
     pub ignored_fk_parent_tables: Vec<(DatabaseId, String)>,
     /// default_cache_size's OP_SetCookie operand, frozen by the producer at prepare.
     pub prepared_default_cache_size: Option<i32>,
+    pub prepared_incremental_vacuum: Option<i32>,
 }
 
 impl StmtTxTracker {
@@ -1636,27 +1637,10 @@ pub(crate) fn stmt_requires_schema(stmt: &Stmt) -> bool {
 
 /// Parses `PRAGMA auto_vacuum = <val>` matching `getAutoVacuum` (`sqlite/src/pragma.c:125-132`).
 pub(crate) fn parse_auto_vacuum_pragma(pv: &PragmaValue) -> AutoVacuumMode {
-    match pv {
-        PragmaValue::Integer(1) => AutoVacuumMode::Full,
-        PragmaValue::Integer(2) => AutoVacuumMode::Incremental,
-        PragmaValue::Integer(_) => AutoVacuumMode::None,
-        PragmaValue::Ident(s) | PragmaValue::String(s) => {
-            let trimmed = s.trim();
-            if trimmed.eq_ignore_ascii_case("none") {
-                return AutoVacuumMode::None;
-            }
-            if trimmed.eq_ignore_ascii_case("full") {
-                return AutoVacuumMode::Full;
-            }
-            if trimmed.eq_ignore_ascii_case("incremental") {
-                return AutoVacuumMode::Incremental;
-            }
-            match trimmed.parse::<i32>() {
-                Ok(1) => AutoVacuumMode::Full,
-                Ok(2) => AutoVacuumMode::Incremental,
-                _ => AutoVacuumMode::None,
-            }
-        }
+    match sqliters_codegen::pragma::get_auto_vacuum(&pragma_to_string(pv)) {
+        1 => AutoVacuumMode::Full,
+        2 => AutoVacuumMode::Incremental,
+        _ => AutoVacuumMode::None,
     }
 }
 
@@ -2483,8 +2467,7 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                             trip_err = Some(e);
                         }
                         if bt.transaction_state() == TransactionState::Write {
-                            bt.pager_mut()
-                                .rollback_to_subsavepoint(sp.subsavepoint_depth)?;
+                            bt.rollback_to_subsavepoint(sp.subsavepoint_depth)?;
                         }
                     }
                 }
@@ -4030,20 +4013,15 @@ fn execute_write_body_inner(
                     Ok(QueryOutput::default())
                 }
                 "AUTO_VACUUM" => {
-                    let e_auto = parse_auto_vacuum_pragma(pv);
-                    let slot = ctx.db_set.slot_mut(db_id).unwrap();
-                    slot.next_auto_vacuum = Some(e_auto);
-                    let has_av_on_disk = slot
-                        .btree
-                        .as_ref()
-                        .is_some_and(|bt| bt.pager().header().largest_root_btree_page != 0);
-                    if has_av_on_disk {
-                        ctx.ensure_write_db(db_id, true)?;
-                        let incr_flag = u32::from(e_auto == AutoVacuumMode::Incremental);
-                        if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree {
-                            bt.pager_mut().header_mut()?.incremental_vacuum_mode = incr_flag;
-                            let _ = bt.set_configured_auto_vacuum(e_auto);
-                        }
+                    // The prepared program always opens a write transaction, even when meta[4]
+                    // later selects its early Halt. SetCookie also changes the Btree's live flag.
+                    let incr = ctx.stmt_tx.prepared_incremental_vacuum.unwrap_or_else(|| i32::from(parse_auto_vacuum_pragma(pv) == AutoVacuumMode::Incremental));
+                    ctx.ensure_write_db(db_id, false)?;
+                    if let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
+                        && bt.pager().header().largest_root_btree_page != 0
+                    {
+                        bt.pager_mut().header_mut()?.incremental_vacuum_mode = incr as u32;
+                        let _ = bt.set_configured_auto_vacuum(if incr == 0 { AutoVacuumMode::Full } else { AutoVacuumMode::Incremental });
                     }
                     Ok(QueryOutput::default())
                 }
@@ -4437,7 +4415,7 @@ where
                         if let Some(sp_slot) = stmt_sp_slot
                             && bt.transaction_state() == TransactionState::Write
                         {
-                            let _ = bt.pager_mut().rollback_to_subsavepoint(sp_slot);
+                            let _ = bt.rollback_to_subsavepoint(sp_slot);
                             let _ = bt.pager_mut().release_subsavepoint(sp_slot);
                         }
                     }
@@ -4547,7 +4525,7 @@ fn nested_stmt_journal_end(ctx: &mut ExecContext<'_>, slot: Option<(DatabaseId, 
     };
     if let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
         if !ok {
-            let _ = bt.pager_mut().rollback_to_subsavepoint(depth);
+            let _ = bt.rollback_to_subsavepoint(depth);
         }
         let _ = bt.pager_mut().release_subsavepoint(depth);
     }
@@ -41847,7 +41825,7 @@ pub(crate) fn exec_vacuum_checked(
                     bt.pager().is_pager_memdb(),
                     bt.pager().db_kind(),
                     u32::try_from(ctx.db_set.next_page_size).ok(),
-                    slot.next_auto_vacuum
+                    ctx.db_set.next_auto_vacuum
                         .unwrap_or_else(|| bt.auto_vacuum_mode()),
                     bt.pager().synchronous(),
                     Arc::clone(bt.pager().vfs()),
@@ -42056,7 +42034,7 @@ pub(crate) fn exec_vacuum_checked(
                 bt.pager().lock_geometry(),
                 bt.pager().header().clone(),
                 u32::try_from(ctx.db_set.next_page_size).ok(),
-                slot.next_auto_vacuum
+                ctx.db_set.next_auto_vacuum
                     .unwrap_or_else(|| bt.auto_vacuum_mode()),
             )
         };
@@ -44472,17 +44450,11 @@ fn exec_pragma(
             }
         }
         "AUTO_VACUUM" => {
-            if db_id == DatabaseId::TEMP {
-                if value.is_some() {
-                    return Ok(QueryOutput::default());
-                }
-                return Ok(single_col("auto_vacuum", Value::Integer(0)));
-            }
             if let Some(pv) = value {
                 let e_auto = parse_auto_vacuum_pragma(pv);
+                ctx.db_set.next_auto_vacuum = Some(e_auto);
                 let ok = {
                     let slot = ctx.db_set.slot_mut(db_id).unwrap();
-                    slot.next_auto_vacuum = Some(e_auto);
                     slot.btree
                         .as_mut()
                         .is_some_and(|bt| bt.set_configured_auto_vacuum(e_auto))

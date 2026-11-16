@@ -22,7 +22,8 @@
 | V6b.2 — PRAGMA önbellek/günlük/güvenli silme; V6b açık | `f1a2e58` | cache_size, journal_size_limit, secure_delete; hazırlama etkileri ve sabit sonuçlar; D83 sıfır önbelleğin yeniden başlatılması | 4.178 / 4.178 (264 desteklenmiyor); tam program 4.176 / 4.176 | Bu dilimde yeniden ölçülmedi | kapalı 1040/0; açık 1025/15 bilinen; 337 yok sayıldı |
 | V6b.3 — default_cache_size hazırlama ve çerez yazımı | `556932a` | Hazırlamada önbellek, adımlamada donmuş çerez; reset, TEMP ve i32 sınırları | 4.274/4.274; tam program 4.272/4.272 | Yeniden ölçülmedi | kapalı 1043/0; açık 1028/15 bilinen; 337 yok sayıldı |
 | V6b.4 — synchronous hazırlama ve eşitleme bayrakları | `a608629` | C sayısal maske, işlem hatası, TEMP; fullfsync/CKPT ve FULL+DATAONLY | 4.829/4.829; tam program 4.589/4.589; 896 GÇ senaryosu aynı | Yeniden ölçülmedi | kapalı 1045/0; açık 1030/15 bilinen; 337 yok sayıldı |
-| V6b.5 — page_size hazırlama ve global VACUUM isteği | bu commit | Ham açılış başlığı, donmuş sorgu, TEMP, geçersiz istek, şemalar arası VACUUM ve WAL sıfırı | 5.545/5.545; tam program 5.129/5.129; 176 API akışı aynı | Yeniden ölçülmedi | kapalı 1049/0; açık 1034/15 bilinen; 337 yok sayıldı |
+| V6b.5 — page_size hazırlama ve global VACUUM isteği | `94421ed` | Ham açılış başlığı, donmuş sorgu, TEMP, geçersiz istek, şemalar arası VACUUM ve WAL sıfırı | 5.545/5.545; tam program 5.129/5.129; 176 API akışı aynı | Yeniden ölçülmedi | kapalı 1049/0; açık 1034/15 bilinen; 337 yok sayıldı |
+| V6b.6 — auto_vacuum hazırlama ve canlı Btree durumu | bu commit | Global nextAutovac, donmuş meta7, TEMP, commit/rollback/savepoint ve yeniden okuma | 6.516/6.516; tam program 5.860/5.860; 220 API akışı aynı | Yeniden ölçülmedi | kapalı 1057/0; açık 1042/15 bilinen; 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -375,3 +376,7 @@ Hazırlama etkisi ve sonuç anı C gibi taşındı; 4–6 seviyeleri, TEMP ve i�
 ## V6b.5 — page_size
 
 Hazırlama etkisi ve donmuş sorgu taşındı; nextPagesize bağlantı geneline alındı. Açılıştaki ham başlık okuması, TEMP, farklı şemanın VACUUM işlemi, geçersiz istek ve WAL sıfırlaması C ile doğrulandı. Dört kapı, 176 API akışı ve alınmayan dallar [karar_esligi_v6b_5.md](karar_esligi_v6b_5.md) içinde. Sonraki adım auto_vacuum; V6b sürüyor.
+
+## V6b.6 — auto_vacuum
+
+Üretici, hazırlama etkileri ve meta7 yazımı taşındı. Global istek, donmuş sorgu/operand, TEMP ve canlı Btree bayraklarının commit/rollback sonrası ömrü C ile eşleştirildi. Dört kapı, 220 API akışı ve her alınmayan dal [karar_esligi_v6b_6.md](karar_esligi_v6b_6.md) içinde. Sonraki dilim cache_spill, busy_timeout ve wal_autocheckpoint; V6b sürüyor.

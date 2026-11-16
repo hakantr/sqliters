@@ -2710,6 +2710,14 @@ impl Pager {
         if self.state != TransactionState::Open {
             return Ok(());
         }
+        // lockBtree (btree.c:3451–3454) refreshes BtShared's live flags from
+        // page 1, including a page already cached in a memory or temporary DB.
+        if self.page_count > 0
+            && (self.is_memdb_backing
+                || (self.db_kind == DatabaseKind::PrivateTemporary && self.file.is_none()))
+        {
+            self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
+        }
         if self.is_memdb_backing {
             self.lock_db_file(LockLevel::Shared)?;
             self.header_loaded = true;
@@ -3351,7 +3359,9 @@ impl Pager {
         if self.header.text_encoding == 0 {
             self.header.text_encoding = 1;
         }
-        self.header.sqlite_version_number = SQLITE_VERSION_NUMBER;
+        // newDatabase zeroes bytes 24..99. pager_write_changecounter stamps
+        // the SQLite version when page 1 is written during commit.
+        self.header.sqlite_version_number = 0;
         self.header.write_into(&mut page1[0..DB_HEADER_SIZE]);
 
         // Page 1 B-tree header at offset 100: empty table leaf B-tree (flags = 0x0d)
@@ -4795,9 +4805,6 @@ impl Pager {
                     self.subsavepoints.clear();
                     self.header_loaded = true;
                     self.page_size_fixed = self.page_count > 0;
-                    if self.page_count > 0 {
-                        self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
-                    }
                     self.notify_backup_self_commit();
 
                     if cleanup_benign {
@@ -4858,6 +4865,7 @@ impl Pager {
                         self.bump_data_version();
                     }
                     self.header = pending.new_header;
+                    self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
                     self.page_count = pending.new_page_count;
                     self.next_page_size = None;
                 }
@@ -4882,9 +4890,6 @@ impl Pager {
                 self.subsavepoints.clear();
                 self.header_loaded = !cold_journal_leftover;
                 self.page_size_fixed = self.page_count > 0;
-                if self.page_count > 0 {
-                    self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
-                }
                 self.notify_backup_self_commit();
 
                 if cleanup_benign {
@@ -4958,11 +4963,6 @@ impl Pager {
                         self.db_file_vers_cc = self.header.change_counter;
                     }
                     self.page_size_fixed = orig_count > 0;
-                    self.configured_auto_vacuum = if orig_count > 0 {
-                        AutoVacuumMode::from_header(&self.header)
-                    } else {
-                        self.tx_orig_auto_vacuum
-                    };
                     self.tx_journaled.clear_all();
                     self.set_super = false;
                     self.commit_phase_one_done = false;
@@ -5044,11 +5044,6 @@ impl Pager {
                 self.page_count = orig_count;
                 self.header = self.tx_orig_header.clone();
                 self.page_size_fixed = orig_count > 0;
-                self.configured_auto_vacuum = if orig_count > 0 {
-                    AutoVacuumMode::from_header(&self.header)
-                } else {
-                    self.tx_orig_auto_vacuum
-                };
                 self.tx_journaled.clear_all();
                 self.commit_phase_one_done = false;
                 self.db_file_modified = false;
@@ -5105,16 +5100,12 @@ impl Pager {
             }
             self.cache.clean_all();
             self.page_size_fixed = self.page_count > 0;
-            if self.page_count > 0 {
-                self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
-            }
             self.header_loaded = true;
         } else if was_modified {
             // Disk DB with `journal_mode=OFF` (`savepoint-13.4`): discard dirty in-memory cache
             // and mark `header_loaded = false` so subsequent reads reload untouched pages from disk!
             self.pcache_reset();
             self.header = self.tx_orig_header.clone();
-            self.configured_auto_vacuum = self.tx_orig_auto_vacuum;
             self.page_count = 0;
             self.page_size_fixed = false;
             self.header_loaded = false;
@@ -5551,13 +5542,20 @@ impl Pager {
         }
         if self.page_count == 0 {
             self.page_size_fixed = self.tx_orig_page_count > 0;
-            self.configured_auto_vacuum = self.tx_orig_auto_vacuum;
         } else {
-            self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
             let hdr_copy = self.header.clone();
             if let Some(p1) = self.cache.get_data_mut(1) {
                 hdr_copy.write_into(&mut p1[0..DB_HEADER_SIZE]);
             }
+        }
+        Ok(())
+    }
+
+    /// sqlite3BtreeSavepoint calls newDatabase after restoring the pager's image.
+    /// The low-level pager rollback itself may leave an empty database.
+    pub fn initialize_empty_btree_after_savepoint(&mut self) -> Result<()> {
+        if self.state == TransactionState::Write && self.page_count == 0 {
+            self.initialize_empty_database()?;
         }
         Ok(())
     }

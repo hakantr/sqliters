@@ -1032,7 +1032,7 @@ impl VdbeHost for WriteHost<'_, '_> {
             return Ok(());
         }
         if op == sqliters_vdbe::vdbe::SAVEPOINT_ROLLBACK {
-            bt.pager_mut().rollback_to_subsavepoint(depth)
+            bt.rollback_to_subsavepoint(depth)
         } else {
             bt.pager_mut().release_subsavepoint(depth)
         }

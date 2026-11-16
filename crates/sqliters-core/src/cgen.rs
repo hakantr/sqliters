@@ -98,9 +98,19 @@ impl Host for EngineHost<'_> {
     }
     fn pragma_int(&self, i_db: usize, name: &str) -> Option<i64> {
         let slot = self.db_set.slots().get(i_db)?;
+        // A read-only generator inspection predicts sqlite3OpenTempDatabase without
+        // opening the real TEMP Btree. Its new BtShared has no fixed size or auto-vacuum
+        // flags (btree.c:2729–2755), before this PRAGMA's prepare effects are applied.
+        if i_db == 1 && slot.btree.is_none()
+            && matches!(name, "auto_vacuum" | "auto_vacuum_fixed")
+        {
+            return Some(0);
+        }
         let bt = slot.btree.as_ref()?;
         match name {
             "page_size" => Some(i64::from(bt.pager().page_size())),
+            "auto_vacuum" => Some(bt.auto_vacuum_mode() as i64),
+            "auto_vacuum_fixed" => Some(i64::from(bt.pager().is_page_size_fixed())),
             "cache_size" => Some(i64::from(bt.schema_cache_size())),
             "journal_size_limit" => Some(bt.pager().journal_size_limit()),
             "secure_delete" => Some(i64::from(bt.secure_delete_setting())),

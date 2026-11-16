@@ -2704,7 +2704,7 @@ impl ConnectionInner {
                                 && bt.transaction_state() == TransactionState::Write
                             {
                                 if let Err(rb_err) =
-                                    bt.pager_mut().rollback_to_subsavepoint(sp_slot)
+                                    bt.rollback_to_subsavepoint(sp_slot)
                                 {
                                     return self.poison_with(rb_err);
                                 }
@@ -3703,7 +3703,6 @@ impl Connection {
         {
             let main_slot = inner.db_set.main_slot_mut();
             main_slot.schema = Schema::default();
-            main_slot.next_auto_vacuum = None;
         }
         inner.schema_generation += 1;
         inner.v1_expire_generation += 1;
@@ -5115,6 +5114,7 @@ pub struct Statement {
     c_prepared_pragma: Option<Box<QueryOutput>>,
     /// default_cache_size changes the cache at prepare; only this cookie is written on step.
     c_prepared_default_cache: Option<i32>,
+    c_prepared_auto_vacuum: Option<PreparedAutoVacuum>,
 }
 
 impl fmt::Debug for Statement {
@@ -5745,6 +5745,13 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) {
                     }
                 }
             }
+            PrepareEffect::AutoVacuum { i_db, mode } => {
+                let mode = match mode { 1 => AutoVacuumMode::Full, 2 => AutoVacuumMode::Incremental, _ => AutoVacuumMode::None };
+                inner.db_set.next_auto_vacuum = Some(mode);
+                if let Some(bt) = inner.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut()) {
+                    let _ = bt.set_configured_auto_vacuum(mode);
+                }
+            }
             PrepareEffect::PageSize { i_db, size } => {
                 inner.db_set.next_page_size = size;
                 if let Some(bt) = inner.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut()) {
@@ -5826,10 +5833,23 @@ fn prepare_default_cache_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>
         .find(|op| op.opcode == sqliters_vdbe::opcodes::OP_SetCookie && op.p2 == 3).map(|op| op.p3)))
 }
 
+#[derive(Clone, Copy)]
+enum PreparedAutoVacuum { NoOp, SetCookie(i32) }
+
+fn prepare_auto_vacuum_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str) -> Result<Option<PreparedAutoVacuum>> {
+    if !matches!(stmt, Some(Stmt::Pragma { name, value: Some(_), .. }) if name.eq_ignore_ascii_case("auto_vacuum")) {
+        return Ok(None);
+    }
+    Ok(prepare_pragma_program(inner, sql)?.map(|p| p.a_op.iter()
+        .find(|op| op.opcode == sqliters_vdbe::opcodes::OP_SetCookie && op.p2 == 7)
+        .map_or(PreparedAutoVacuum::NoOp, |op| PreparedAutoVacuum::SetCookie(op.p3))))
+}
+
 #[allow(non_upper_case_globals)]
 fn prepare_constant_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str) -> Result<Option<Box<QueryOutput>>> {
     use sqliters_vdbe::opcodes::{OP_Int64, OP_Integer};
-    let Some(Stmt::Pragma { name, .. }) = stmt else { return Ok(None); };
+    let Some(Stmt::Pragma { name, value, .. }) = stmt else { return Ok(None); };
+    if name.eq_ignore_ascii_case("auto_vacuum") && value.is_some() { return Ok(None); }
     if !sqliters_codegen::pragma::prepare_constant(name) {
         return Ok(None);
     }
@@ -5847,43 +5867,22 @@ fn prepare_constant_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql
 fn apply_prepare_auto_vacuum_pragma(
     inner: &mut ConnectionInner,
     artifacts: &mut CompiledArtifacts,
+    prepared: Option<PreparedAutoVacuum>,
 ) {
-    // `sqlite3Pragma` (`pragma.c:802-845`) updates `nextAutovac` and `sqlite3BtreeSetAutoVacuum`
-    // at `prepare` time, emitting `setMeta6` (`StmtCategory::Write`) only when `ok && e_auto != None`!
-    if let Some(Stmt::Pragma {
-        ref schema,
-        ref name,
-        value: Some(ref pv),
-    }) = artifacts.stmt
+    if let Some(p) = prepared {
+        artifacts.category = Some(match p { PreparedAutoVacuum::NoOp => StmtCategory::NoLockPragma, PreparedAutoVacuum::SetCookie(_) => StmtCategory::Write });
+        return;
+    }
+    // Authorizer contexts still use the engine's compiler. Apply the same prepare decision.
+    if let Some(Stmt::Pragma { schema, name, value: Some(pv) }) = &artifacts.stmt
         && name.eq_ignore_ascii_case("auto_vacuum")
     {
-        let target_db = match schema.as_deref() {
-            None => Some(DatabaseId::MAIN),
-            Some(s) => inner.db_set.find_db_id(s),
-        };
-        match target_db {
-            None | Some(DatabaseId::TEMP) => {
-                artifacts.category = Some(StmtCategory::NoLockPragma);
-            }
-            Some(db_id) => {
-                let e_auto = parse_auto_vacuum_pragma(pv);
-                let ok = if let Some(slot) = inner.db_set.slot_mut(db_id) {
-                    slot.next_auto_vacuum = Some(e_auto);
-                    slot.btree
-                        .as_mut()
-                        .is_some_and(|bt| bt.set_configured_auto_vacuum(e_auto))
-                } else {
-                    false
-                };
-                artifacts.category = Some(
-                    if ok && matches!(e_auto, AutoVacuumMode::Full | AutoVacuumMode::Incremental) {
-                        StmtCategory::Write
-                    } else {
-                        StmtCategory::NoLockPragma
-                    },
-                );
-            }
-        }
+        let id = schema.as_deref().map_or(Some(DatabaseId::MAIN), |s| inner.db_set.find_db_id(s));
+        let mode = parse_auto_vacuum_pragma(pv);
+        inner.db_set.next_auto_vacuum = Some(mode);
+        let ok = id.and_then(|id| inner.db_set.slot_mut(id)).and_then(|s| s.btree.as_mut())
+            .is_some_and(|bt| bt.set_configured_auto_vacuum(mode));
+        artifacts.category = Some(if ok && mode != AutoVacuumMode::None { StmtCategory::Write } else { StmtCategory::NoLockPragma });
     }
 }
 
@@ -7490,6 +7489,7 @@ impl Statement {
         };
         let c_prepared_pragma = prepare_constant_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
         let c_prepared_default_cache = prepare_default_cache_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
+        let c_prepared_auto_vacuum = prepare_auto_vacuum_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
         // C's ALTER TABLE (RENAME TO, RENAME COLUMN, DROP COLUMN of a non-TEMP table) reads
         // `temp.sqlite_schema` in a nested statement, which opens the temp database while the
         // statement is prepared (`sqlite3OpenTempDatabase()`, also under EXPLAIN: the nested
@@ -7665,7 +7665,7 @@ impl Statement {
             },
         };
 
-        apply_prepare_auto_vacuum_pragma(inner, &mut artifacts);
+        apply_prepare_auto_vacuum_pragma(inner, &mut artifacts, c_prepared_auto_vacuum);
         if let Some(prog) = &c_explain {
             artifacts.column_names = explain_column_names(prog.explain);
             // The parameters of the statement as C numbers them.
@@ -7720,6 +7720,7 @@ impl Statement {
             deferred_error: None,
             c_prepared_pragma,
             c_prepared_default_cache,
+            c_prepared_auto_vacuum,
         })
     }
 
@@ -8291,6 +8292,8 @@ impl Statement {
             apply_codegen_pragma_effects(inner);
             let c_prepared_pragma = prepare_constant_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
             self.c_prepared_default_cache = prepare_default_cache_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
+            let c_prepared_auto_vacuum = prepare_auto_vacuum_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
+            self.c_prepared_auto_vacuum = c_prepared_auto_vacuum;
             let shared = Arc::clone(&self.shared);
             let try_compile = |inner: &mut ConnectionInner,
                                parsed_stmt: &Option<Stmt>|
@@ -8340,7 +8343,7 @@ impl Statement {
                 }
                 Err(err) => return Err(err),
             };
-            apply_prepare_auto_vacuum_pragma(inner, &mut artifacts);
+            apply_prepare_auto_vacuum_pragma(inner, &mut artifacts, c_prepared_auto_vacuum);
             if let Some(out) = &c_prepared_pragma {
                 artifacts.category = Some(StmtCategory::NoLockPragma);
                 artifacts.column_names = out.column_names.clone();
@@ -9146,6 +9149,7 @@ impl Statement {
                         {
                             // Prepare-time already handled `next_auto_vacuum` and `set_configured_auto_vacuum`;
                             // when classified as `NoLockPragma`, execution is a 0-op `SQLITE_DONE`!
+                            *ctx.expire_self_only = true;
                             Ok(QueryOutput::default())
                         } else {
                             execute_nolock_stmt(ctx, &stmt_clone, &self.params)
@@ -10251,6 +10255,7 @@ impl Statement {
                     top_level_sql,
                     ignored_fk_parent_tables: self.ignored_fk_parent_tables.clone(),
                     prepared_default_cache_size: self.c_prepared_default_cache,
+                    prepared_incremental_vacuum: match self.c_prepared_auto_vacuum { Some(PreparedAutoVacuum::SetCookie(n)) => Some(n), _ => None },
                     ..StmtTxTracker::default()
                 };
                 let initial_insts = match prelocked_write {
@@ -10375,7 +10380,7 @@ impl Statement {
                 );
                 inner.runtime.stmt_timestamp_ms = prev_ts;
 
-                if self.c_prepared_default_cache.is_some() { self.expired = true; }
+                if self.c_prepared_default_cache.is_some() || self.c_prepared_auto_vacuum.is_some() { self.expired = true; }
                 let mut touched_write_instances =
                     mask_to_instances(&inner.db_set, stmt_tx.touched_write_mask);
                 merge_instances(&mut touched_write_instances, &initial_insts);

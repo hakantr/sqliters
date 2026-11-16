@@ -744,6 +744,13 @@ impl Btree {
         self.rollback_with_trip(extended::SQLITE_ABORT_ROLLBACK, false, false)
     }
 
+    /// sqlite3BtreeSavepoint(SAVEPOINT_ROLLBACK): restore page images, then
+    /// recreate page 1 if the restored database was initially empty.
+    pub fn rollback_to_subsavepoint(&mut self, index: usize) -> Result<()> {
+        self.pager.rollback_to_subsavepoint(index)?;
+        self.pager.initialize_empty_btree_after_savepoint()
+    }
+
     #[inline]
     pub const fn transaction_state(&self) -> TransactionState {
         self.pager.transaction_state()

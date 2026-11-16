@@ -163,8 +163,6 @@ pub struct DbSlot {
     /// 99 in C (`sqlite3CreateIndex()` -> `sqlite3DefaultRowEst()` on the live table) since C
     /// last read the statistics or loaded this schema.
     pub c_rowest_tables: std::collections::HashSet<String>,
-    /// Deferred auto-vacuum mode requested via `PRAGMA [schema.]auto_vacuum = M` for next `VACUUM`.
-    pub next_auto_vacuum: Option<AutoVacuumMode>,
     /// Per-database `PRAGMA [schema.]max_page_count` limit.
     pub max_page_count: u32,
     /// Whether URI `8_3_names=1` short super-journal/sidecar naming is enabled on this slot.
@@ -314,6 +312,8 @@ pub struct DatabaseSet {
     c_expire_seq: u64,
     /// sqlite3.nextPagesize, shared by every schema; invalid requests replace older ones.
     pub(crate) next_page_size: i32,
+    /// sqlite3.nextAutovac: the last request, even if the Btree refused to change.
+    pub(crate) next_auto_vacuum: Option<AutoVacuumMode>,
 }
 
 impl std::fmt::Debug for DatabaseSet {
@@ -355,7 +355,6 @@ impl DatabaseSet {
                 c_tbl_hash: None,
                 c_rowest_clamped: false,
                 c_rowest_tables: Default::default(),
-                next_auto_vacuum: None,
                 max_page_count: SQLITE_MAX_PAGE_COUNT,
                 enable_8_3_names: main_enable_8_3_names,
                 active_backups: 0,
@@ -376,7 +375,6 @@ impl DatabaseSet {
                 c_tbl_hash: None,
                 c_rowest_clamped: false,
                 c_rowest_tables: Default::default(),
-                next_auto_vacuum: None,
                 max_page_count: SQLITE_MAX_PAGE_COUNT,
                 enable_8_3_names: false,
                 active_backups: 0,
@@ -415,6 +413,7 @@ impl DatabaseSet {
             c_encoding_fixed: false,
             c_expire_seq: 0,
             next_page_size: 0,
+            next_auto_vacuum: None,
             xferopt_delta: std::sync::atomic::AtomicU64::new(0),
             open_blobs: std::collections::HashMap::new(),
             vtab_registry: crate::vtab::VTabRegistry::new(),
@@ -1944,7 +1943,6 @@ impl DatabaseSet {
             c_tbl_hash: None,
             c_rowest_clamped: false,
             c_rowest_tables: Default::default(),
-            next_auto_vacuum: None,
             max_page_count: SQLITE_MAX_PAGE_COUNT,
             enable_8_3_names,
             active_backups: 0,
