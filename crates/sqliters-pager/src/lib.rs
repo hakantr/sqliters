@@ -2845,7 +2845,20 @@ impl Pager {
             }
             return Err(e);
         }
-        self.set_state(TransactionState::Read);
+        // lockBtree (btree.c:3322–3323): a failed page 1 acquisition
+        // must abort the read instead of being reduced to page1_ref=false.
+        self.state = TransactionState::Read;
+        if !self.page1_ref && !self.header_probe {
+            match self.pager_get(1, false) {
+                Ok(_) => self.page1_ref = true,
+                Err(error) => {
+                    // SharedLock succeeded: end the read snapshot without
+                    // treating its WAL as a failed open.
+                    let _ = self.finish_tx_to_read_or_open(false);
+                    return Err(error);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -7303,6 +7316,7 @@ mod tests {
         /// Fail reads that touch the file prefix outside C's version probe.
         fail_db_prefix_read: std::sync::atomic::AtomicBool,
         fail_db_file_size: std::sync::atomic::AtomicBool,
+        fail_page1_payload_read: std::sync::atomic::AtomicBool,
         db_reads: Mutex<Vec<(u64, usize)>>,
         /// `xFileSize` of `<db>-wal` fails.
         fail_wal_file_size: std::sync::atomic::AtomicBool,
@@ -7370,6 +7384,11 @@ mod tests {
 
     impl VfsFile for FaultFile {
         fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+            if self.ctl.fail_page1_payload_read.load(std::sync::atomic::Ordering::Relaxed)
+                && buf.len() >= 512 && ((self.is_db && offset == 0) || self.is_wal)
+            {
+                return Err(SqliteError::with_extended(extended::SQLITE_IOERR_READ, "disk I/O error"));
+            }
             if self.is_db {
                 self.ctl.db_reads.lock().unwrap().push((offset, buf.len()));
                 if offset < 24 && self.ctl.fail_db_prefix_read.load(std::sync::atomic::Ordering::Relaxed) {
@@ -7538,6 +7557,38 @@ mod tests {
         assert_eq!(pager.data_version(), version.wrapping_add(1));
         pager.end_read_if_unused().unwrap();
         pager.close().unwrap();
+    }
+
+    #[test]
+    fn page1_read_error_aborts_snapshot_and_preserves_wal_mode() {
+        for wal in [false, true] {
+            for mode in [LockingMode::Normal, LockingMode::Exclusive] {
+                let ctl = Arc::new(FaultCtl::default());
+                let vfs = Arc::new(FaultVfs { inner: Arc::new(MemoryVfs::new()), ctl: ctl.clone() });
+                let mut pager = Pager::open_with_vfs(vfs, Some(Path::new("page1_error.db")),
+                    OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB).unwrap();
+                pager.begin_write().unwrap();
+                pager.commit().unwrap();
+                if wal { pager.set_journal_mode(JournalMode::Wal).unwrap(); }
+                pager.set_locking_mode(mode);
+                pager.shrink_memory();
+                ctl.fail_page1_payload_read.store(true, std::sync::atomic::Ordering::Relaxed);
+                let err = pager.begin_read().unwrap_err();
+                assert_eq!(err.extended_code, extended::SQLITE_IOERR_READ);
+                assert_eq!(pager.transaction_state(), TransactionState::Open);
+                assert_eq!(pager.page_refcount(1), 0);
+                assert!(!pager.page1_ref);
+                if wal {
+                    assert_eq!(pager.journal_mode(), JournalMode::Wal);
+                    assert!(pager.wal.is_some());
+                }
+                ctl.fail_page1_payload_read.store(false, std::sync::atomic::Ordering::Relaxed);
+                pager.begin_read().unwrap();
+                pager.read_page(1).unwrap();
+                pager.end_read_if_unused().unwrap();
+                pager.close().unwrap();
+            }
+        }
     }
 
     /// An 8-page database in WAL mode on a [`FaultVfs`], with `synchronous = FULL`.

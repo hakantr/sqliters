@@ -2375,6 +2375,36 @@ impl ConnectionInner {
         )
     }
 
+    fn abort_read_io_error(
+        &mut self,
+        hid: HandleId,
+        err: &SqliteError,
+        shared: &ConnectionShared,
+    ) -> SqliteError {
+        // vdbeaux.c:3370–3401: SQLITE_IOERR also rolls back a read-only
+        // reader's whole transaction. INTERRUPT on a reader is different.
+        self.activity.remove(hid);
+        let summary = self.activity.summary_excluding(hid, &self.db_set);
+        let had_tx = !self.is_autocommit()
+            || self.db_set.slots().iter().any(|s| s.btree.as_ref()
+                .is_some_and(|bt| bt.transaction_state() == TransactionState::Write));
+        let rb = self.with_default_exec_ctx(shared, summary, |ctx| rollback_all_databases(ctx, true));
+        if let Err(e) = rb { return self.poison_with(e); }
+        self.db_set.set_c_pragma_flags_at_prepare(0, sqliters_codegen::consts::SQLITE_DeferFKs);
+        self.deferred_fk_suspects.clear();
+        // main.c:1556 calls the hook before VdbeHalt enables autocommit.
+        let hook_error = if had_tx { self.commit_hooks.invoke_rollback_hook().err() } else { None };
+        self.explicit_tx = false;
+        self.implicit_savepoint_tx = false;
+        self.in_user_btree_tx = false;
+        self.savepoints.clear();
+        self.schema_changed_in_tx = false;
+        self.mutation_pipeline.clear();
+        if had_tx { self.rollback_count += 1; }
+        self.publish(shared);
+        hook_error.unwrap_or_else(|| err.clone())
+    }
+
     fn abort_write_statement(
         &mut self,
         hid: HandleId,
@@ -5128,6 +5158,8 @@ pub struct Statement {
     raw_sql: String,
     stmt: Option<Stmt>,
     requires_schema: bool,
+    /// A failed reprepare never entered VdbeExec and must not run its IOERR halt rollback.
+    read_io_during_prepare: bool,
     category: Option<StmtCategory>,
     compiled_vdbe: Option<Arc<VdbeProgram>>,
     compiled_fast_read: Option<Arc<fast_read::FastReadPlan>>,
@@ -7906,6 +7938,7 @@ impl Statement {
             raw_sql,
             stmt: artifacts.stmt,
             requires_schema: artifacts.requires_schema,
+            read_io_during_prepare: false,
             category: artifacts.category,
             compiled_vdbe: artifacts.compiled_vdbe,
             compiled_fast_read: artifacts.compiled_fast_read,
@@ -9004,6 +9037,27 @@ impl Statement {
         inner: &mut ConnectionInner,
     ) -> Result<StepResult> {
         inner.ensure_usable()?;
+        self.read_io_during_prepare = false;
+        let result = self.step_in_session_impl(shared, inner);
+        let file_reader = self.category == Some(StmtCategory::Read)
+            && self.c_machine.as_ref().map_or(self.requires_schema, |program| program.b_is_reader);
+        if file_reader && !self.read_io_during_prepare
+            && let Err(error) = &result && error.code == ErrorCode::IoErr
+            && let Some(hid) = self.handle_id
+        {
+            let error = inner.abort_read_io_error(hid, error, shared);
+            self.lifecycle = StatementLifecycle::Halted { last_error: Some(error.clone()) };
+            return Err(error);
+        }
+        result
+    }
+
+    fn step_in_session_impl(
+        &mut self,
+        shared: &Arc<ConnectionShared>,
+        inner: &mut ConnectionInner,
+    ) -> Result<StepResult> {
+        inner.ensure_usable()?;
         let Some(hid) = self.handle_id else {
             return Err(SqliteError::misuse("statement already finalized"));
         };
@@ -9251,10 +9305,13 @@ impl Statement {
         }
         let is_advisory_expired = self.expired
             || self.compiled_advisory_expire_generation != inner.advisory_expire_generation;
+        let prepare_pending = is_advisory_expired
+            || (self.category != Some(StmtCategory::Control) && self.needs_reprepare(inner));
         if self.category != Some(StmtCategory::Control)
             && (self.requires_schema || !matches!(self.stmt, Some(Stmt::Select(_))))
             && let Err(e) = inner.refresh_open_tx_schemas()
         {
+            self.read_io_during_prepare = prepare_pending;
             self.lifecycle = StatementLifecycle::Halted {
                 last_error: Some(e.clone()),
             };
@@ -9272,6 +9329,7 @@ impl Statement {
                 return Err(err);
             }
             if let Err(e) = self.reprepare_in_open_tx(inner) {
+                self.read_io_during_prepare = true;
                 self.lifecycle = StatementLifecycle::Halted {
                     last_error: Some(e.clone()),
                 };

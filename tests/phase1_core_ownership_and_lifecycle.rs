@@ -1820,6 +1820,7 @@ struct SpyFaultState {
     lock_events: Mutex<Vec<(bool, LockLevel)>>,
     fail_next_main_db_write: AtomicBool,
     fail_all_main_db_writes: AtomicBool,
+    fail_page1_read: AtomicBool,
 }
 
 impl SpyFaultState {
@@ -1871,6 +1872,9 @@ impl VfsFile for SpyFaultMainFile {
             .lock()
             .unwrap()
             .push((offset, buf.len()));
+        if offset == 0 && buf.len() >= 512 && self.state.fail_page1_read.load(Ordering::SeqCst) {
+            return Err(SqliteError::with_extended(extended::SQLITE_IOERR_READ, "disk I/O error"));
+        }
         self.inner.read_at(buf, offset)
     }
 
@@ -1976,6 +1980,60 @@ impl Vfs for SpyFaultVfs {
 
     fn full_pathname(&self, path: &Path) -> SqlResult<PathBuf> {
         self.inner.full_pathname(path)
+    }
+}
+
+#[test]
+fn test_read_io_error_aborts_deferred_transactions_and_preserves_change_counters() {
+    for begin in ["", "BEGIN", "SAVEPOINT s"] {
+        for prepared in [false, true] {
+            let vfs = Arc::new(SpyFaultVfs::new());
+            let conn = Connection::open_with_vfs(vfs.clone(), Some(Path::new("/read_io.db")),
+                OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB).unwrap();
+            conn.execute_batch("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4); SELECT * FROM t;").unwrap();
+            let changes = (conn.changes(), conn.total_changes(), conn.last_insert_rowid());
+            let rollbacks = Arc::new(AtomicU64::new(0));
+            let observed = rollbacks.clone();
+            conn.rollback_hook(Some(Box::new(move || { observed.fetch_add(1, Ordering::SeqCst); }))).unwrap();
+            if !begin.is_empty() { conn.execute_batch(begin).unwrap(); }
+            let mut stmt = if prepared { Some(conn.prepare("SELECT a,b FROM t ORDER BY a").unwrap()) } else { None };
+            conn.prepare("PRAGMA shrink_memory").unwrap();
+            vfs.state.fail_page1_read.store(true, Ordering::SeqCst);
+            let error = if let Some(s) = stmt.as_mut() {
+                s.step().unwrap_err()
+            } else {
+                conn.query("SELECT a,b FROM t ORDER BY a", &[]).unwrap_err()
+            };
+            assert_eq!(error.extended_code, extended::SQLITE_IOERR_READ, "{begin}: {prepared}");
+            assert!(conn.is_autocommit(), "{begin}: {prepared}");
+            assert_eq!(rollbacks.load(Ordering::SeqCst), u64::from(!begin.is_empty()));
+            assert_eq!((conn.changes(), conn.total_changes(), conn.last_insert_rowid()), changes);
+            vfs.state.fail_page1_read.store(false, Ordering::SeqCst);
+            if let Some(s) = stmt { assert_eq!(s.finalize().unwrap_err().extended_code, extended::SQLITE_IOERR_READ); }
+            assert_eq!(conn.query("SELECT a,b FROM t ORDER BY a", &[]).unwrap().rows.len(), 2);
+            conn.try_close().unwrap();
+        }
+    }
+}
+
+#[test]
+fn test_reprepare_io_error_preserves_deferred_transaction() {
+    for begin in ["BEGIN", "SAVEPOINT s"] {
+        let vfs = Arc::new(SpyFaultVfs::new());
+        let conn = Connection::open_with_vfs(vfs.clone(), Some(Path::new("/prepare_io.db")),
+            OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB).unwrap();
+        conn.execute_batch("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); SELECT * FROM t;").unwrap();
+        conn.execute_batch(begin).unwrap();
+        let mut stmt = conn.prepare("SELECT a,b FROM t ORDER BY a").unwrap();
+        conn.execute_batch("PRAGMA writable_schema=RESET; PRAGMA shrink_memory;").unwrap();
+        vfs.state.fail_page1_read.store(true, Ordering::SeqCst);
+        assert_eq!(stmt.step().unwrap_err().extended_code, extended::SQLITE_IOERR_READ);
+        assert!(!conn.is_autocommit(), "{begin}");
+        vfs.state.fail_page1_read.store(false, Ordering::SeqCst);
+        assert_eq!(stmt.finalize().unwrap_err().extended_code, extended::SQLITE_IOERR_READ);
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(conn.query("SELECT a,b FROM t ORDER BY a", &[]).unwrap().rows.len(), 1);
+        conn.try_close().unwrap();
     }
 }
 
