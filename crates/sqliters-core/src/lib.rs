@@ -944,6 +944,8 @@ pub(crate) enum RunningExec {
     },
     MaterializedNoLock {
         rows: std::vec::IntoIter<Vec<Value>>,
+        /// `sqlite3VdbeList` leaves the VM running at EOF; reset/finalize halt it.
+        explain: Option<Arc<sqliters_vdbe::vdbeaux::Program>>,
     },
     ReturningWrite {
         rows: std::vec::IntoIter<Vec<Value>>,
@@ -1007,6 +1009,8 @@ pub(crate) enum PendingDrop {
 
 pub(crate) enum ActivityFinish {
     NoLock,
+    /// EXPLAIN's transaction and change counters were handled by `finish_explain`.
+    ExplainHalted,
     ReadDone {
         lease_cursors: Vec<(SchemaInstanceId, CursorId)>,
         read_instances: SmallInstVec,
@@ -2114,6 +2118,33 @@ impl ConnectionInner {
         }
     }
 
+    /// `sqlite3VdbeReset` -> `sqlite3VdbeHalt` for `sqlite3VdbeList`.
+    /// The lease remains active through the transaction callbacks, as in C.
+    fn finish_explain(
+        &mut self,
+        hid: HandleId,
+        prog: &sqliters_vdbe::vdbeaux::Program,
+        shared: &ConnectionShared,
+    ) -> Result<()> {
+        let summary = self.activity.summary_excluding(hid, &self.db_set);
+        let result = if prog.b_is_reader {
+            let result = self.with_default_exec_ctx(shared, summary, |ctx| {
+                vdbe_host::halt_transaction(ctx, prog.read_only)
+            });
+            // No EXPLAIN opcode executes, so its nChange remains zero.
+            if prog.change_cnt_on {
+                self.set_halt_changes(0);
+                self.publish(shared);
+            }
+            result.and_then(|error| error.map_or(Ok(()), Err))
+        } else {
+            Ok(())
+        };
+        let cleanup = self.finish_activity(hid, ActivityFinish::ExplainHalted, shared);
+        self.maybe_run_wal_autocheckpoint();
+        result.and(cleanup)
+    }
+
     fn finish_activity(
         &mut self,
         hid: HandleId,
@@ -2154,7 +2185,7 @@ impl ConnectionInner {
                 self.finish_deferred_fk_reader(_removed.is_some_and(|l| l.is_reader), summary);
                 Ok(())
             }
-            ActivityFinish::PendingCommitAborted => Ok(()),
+            ActivityFinish::PendingCommitAborted | ActivityFinish::ExplainHalted => Ok(()),
 
             ActivityFinish::ReadDone {
                 lease_cursors,
@@ -2938,9 +2969,10 @@ impl ConnectionInner {
                 },
                 shared,
             ),
-            RunningExec::MaterializedNoLock { .. } => {
-                self.finish_activity(hid, ActivityFinish::NoLock, shared)
-            }
+            RunningExec::MaterializedNoLock { explain, .. } => match explain {
+                Some(prog) => self.finish_explain(hid, &prog, shared),
+                None => self.finish_activity(hid, ActivityFinish::NoLock, shared),
+            },
             RunningExec::ReturningWrite { abort_snapshot, pending_changes, .. } => {
                 if let Some(n) = pending_changes {
                     self.set_halt_changes(n);
@@ -9560,7 +9592,11 @@ impl Statement {
                 let expires_all = self.c_prepared_pragma.is_some()
                     && matches!(&stmt_clone, Stmt::Pragma { name, value: Some(_), .. }
                         if sqliters_codegen::pragma::flag_mask(name).is_some());
-                inner.activity.start(hid, self.c_is_reader, false);
+                inner.activity.start(
+                    hid,
+                    self.c_is_reader,
+                    self.c_explain.as_ref().is_some_and(|p| !p.read_only),
+                );
                 let summary = inner.activity.summary_excluding(hid, &inner.db_set);
                 let prev_ts = inner.runtime.stmt_timestamp_ms;
                 if prev_ts.is_none() && self.c_explain.is_none() {
@@ -9638,8 +9674,18 @@ impl Statement {
                             self.lifecycle =
                                 StatementLifecycle::Running(RunningExec::MaterializedNoLock {
                                     rows: iter,
+                                    explain: self.c_explain.clone(),
                                 });
                             Ok(StepResult::Row(Row::new(first_row)))
+                        } else if self.c_explain.is_some() {
+                            // Even an empty EQP remains VDBE_RUN_STATE (vdbeaux.c:2288).
+                            self.lifecycle = StatementLifecycle::Running(
+                                RunningExec::MaterializedNoLock {
+                                    rows: iter,
+                                    explain: self.c_explain.clone(),
+                                },
+                            );
+                            Ok(StepResult::Done)
                         } else {
                             let _ = inner.finish_activity(hid, ActivityFinish::NoLock, shared);
                             inner.maybe_run_wal_autocheckpoint();
@@ -11284,9 +11330,12 @@ impl Statement {
                 }
             }
 
-            RunningExec::MaterializedNoLock { rows } => {
+            RunningExec::MaterializedNoLock { rows, explain } => {
                 if let Some(vals) = rows.next() {
                     Ok(StepResult::Row(Row::new(vals)))
+                } else if explain.is_some() {
+                    // sqlite3VdbeNextOpcode returns DONE without sqlite3VdbeHalt.
+                    Ok(StepResult::Done)
                 } else {
                     let _ = inner.finish_activity(hid, ActivityFinish::NoLock, shared);
                     inner.maybe_run_wal_autocheckpoint();

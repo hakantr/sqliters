@@ -185,7 +185,9 @@ pub fn sqlite3_delete_from(p: &mut Parse, tab_list: SrcListId, where_: ExprId, o
 
     // Begin generating code.
     sqlite3_get_vdbe(p);
-    // if( pParse->nested==0 ) sqlite3VdbeCountChanges(v);
+    if p.nested == 0 {
+        p.v.change_cnt_on = true;
+    }
     sqlite3_begin_write_operation(p, b_complex, i_db);
 
     // If we are trying to delete from a view, realize that view into an ephemeral table.

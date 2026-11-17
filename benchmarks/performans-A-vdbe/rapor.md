@@ -43,6 +43,7 @@
 | V6b.23 — D128 hazırlama ve hata kodu | `92b69eb` | Parse.rc, atılan COLLATE, dar tamsayı makine yolu | 13344 tam program; 636+438 native aynı; bütün dosyalar aynı | 1,047× taban; W14 1,364× | kapalı 1116/0; açık 1101/15 bilinen; 337 yok sayıldı |
 | V6b.24 — compile_options | `3a17161` | 42 seçenek, get/used, Reusable ve hata konumu | 13372 tam program; 3990 native aynı; bütün dosyalar aynı | 1,052× taban; W14 1,369× | kapalı 1117/0; açık 1102/15 bilinen; 337 yok sayıldı |
 | V6b.25 — defer_foreign_keys; D131 açık | bu commit | Prepare/live bayrak, normal FK/işlem sonu, RESTRICT yazım sırası | 13414 tam program; 1624/1644 native aynı (20 D52); bütün dosyalar aynı; D131 6 fark açık | 1,050× taban; W14 1,358× | kapalı 1118/0; açık 1103/15 bilinen; 337 yok sayıldı |
+| V6b.26 — EXPLAIN yazıcı ömrü | bu commit | RUN/EOF/reset/finalize, changeCntOn, bekleyen işlem kapanışı | 72+408 native aynı; 120/192 kapanış tam aynı, 72 D132; eski altı D131 aynı | 1.060x taban; W14 1.369x | kapalı 1119/0; açık 1104/15 bilinen; 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -475,3 +476,7 @@ Sabit C başvuru derlemesinin 42 seçenekli tanı profili gerçek üreticide; ge
 ## V6b.25 — defer_foreign_keys ve normal FK kapanışı
 
 Prepare anı ile live bayrak ayrıldı; normal işlem sonu ve şema yükleme etkileri hizalandı. Erken RESTRICT denetimi C’nin parent yazımı sonrası FK eylem sırasına taşındı; D130 başlık bayt farkı kapandı. 1624/1644 native tam aynı; kalan 20 eski D52 ve bağımsız altı D131 açıktır. Bütün dosya baytları eşit. Sonraki doğruluk işi EXPLAIN yazıcı sayacı ve bekleyen işlem kapanışıdır. Kanıt [karar_esligi_v6b_25.md](karar_esligi_v6b_25.md) içinde.
+
+## V6b.26 — EXPLAIN yazıcı ömrü ve D131
+
+EXPLAIN, açıkladığı programın yazıcı sayımına katılır ve EOF sonrasında reset/finalize’a kadar etkin kalır. Kapanıştaki değişiklik sayacı, FK hatası ve BUSY C ile hizalandı; commit-hook hata metni D132 olarak açık. 72+408 native akış ve eski altı D131 aynı; bütün ana dosya baytları eşit. D52/D103/E28 ve kalan PRAGMA/M4 işleri açık. Kanıt [karar_esligi_v6b_26.md](karar_esligi_v6b_26.md) içinde.

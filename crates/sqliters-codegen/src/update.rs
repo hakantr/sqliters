@@ -337,7 +337,9 @@ pub fn sqlite3_update(
         }
     }
 
-    // if( pParse->nested==0 ) sqlite3VdbeCountChanges(v);
+    if p.nested == 0 {
+        p.v.change_cnt_on = true;
+    }
     sqlite3_begin_write_operation(p, !trigger.is_empty() || has_fk != 0, i_db);
 
     // Allocate required registers.

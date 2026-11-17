@@ -336,6 +336,8 @@ pub struct Vdbe {
     pub n_res_alloc: u16,
     /// `prepFlags`
     pub prep_flags: u8,
+    /// `changeCntOn`: set by `sqlite3VdbeCountChanges()` for top-level DML.
+    pub change_cnt_on: bool,
     /// `Parse.nTempReg` / `Parse.nRangeReg` are reset by [`Vdbe::end_coroutine`]; the code
     /// generator reads this flag after the call and clears its pools (C does it through
     /// `v->pParse`).
@@ -750,6 +752,7 @@ impl Vdbe {
             min_write_file_format: self.min_write_file_format,
             expmask: self.expmask,
             prep_flags: self.prep_flags,
+            change_cnt_on: self.change_cnt_on,
         }
     }
 }
@@ -800,6 +803,8 @@ pub struct Program {
     pub read_only: bool,
     /// `bIsReader`: true for statements that read
     pub b_is_reader: bool,
+    /// `changeCntOn`: publish `nChange` when a reader halts, including EXPLAIN DML.
+    pub change_cnt_on: bool,
     /// `usesStmtJournal`
     pub uses_stmt_journal: bool,
     /// `explain`: 0 normal, 1 EXPLAIN, 2 EXPLAIN QUERY PLAN

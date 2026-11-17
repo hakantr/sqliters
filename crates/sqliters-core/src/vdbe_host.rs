@@ -1157,7 +1157,7 @@ impl VdbeHost for WriteHost<'_, '_> {
 /// The part of `sqlite3VdbeHalt(p)` that ends the transaction, for a statement that ran
 /// without error and changes no row itself (`OP_AutoCommit`, `OP_Savepoint` RELEASE of the
 /// transaction savepoint). See [`VdbeHost::halt_transaction`].
-fn halt_transaction(ctx: &mut ExecContext<'_>, read_only: bool) -> Result<Option<SqliteError>> {
+pub(crate) fn halt_transaction(ctx: &mut ExecContext<'_>, read_only: bool) -> Result<Option<SqliteError>> {
     use crate::engine::CommitFailureDisposition;
     let auto_commit = !*ctx.explicit_tx && !*ctx.implicit_savepoint_tx;
     // "if( !sqlite3VtabInSync(db) && db->autoCommit && db->nVdbeWrite==(p->readOnly==0) )"
@@ -1187,6 +1187,7 @@ fn halt_transaction(ctx: &mut ExecContext<'_>, read_only: bool) -> Result<Option
                     // "if( rc==SQLITE_BUSY && p->readOnly ){ sqlite3VdbeLeave(p); return SQLITE_BUSY; }"
                     return Err(e);
                 }
+                Err((e, CommitFailureDisposition::LeaveOpen)) if e.code == ErrorCode::Busy => Err(e),
                 Err((e, CommitFailureDisposition::LeaveOpen)) if e.code == ErrorCode::Constraint => Err(e),
                 Err((e, CommitFailureDisposition::LeaveOpen)) => {
                     // An I/O error of the commit (two-phase commit): C rolls the transaction back

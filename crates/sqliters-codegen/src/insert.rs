@@ -386,7 +386,9 @@ pub fn sqlite3_insert(p: &mut Parse, tab_list: SrcListId, select: SelectId, colu
 
     // Allocate a VDBE
     sqlite3_get_vdbe(p);
-    // if( pParse->nested==0 ) sqlite3VdbeCountChanges(v);
+    if p.nested == 0 {
+        p.v.change_cnt_on = true;
+    }
     sqlite3_begin_write_operation(p, select.nn() || !trigger.is_empty(), i_db);
 
     // If the statement is of the form
