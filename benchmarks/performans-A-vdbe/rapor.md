@@ -510,3 +510,8 @@ MMAP_SIZE hazırlama etkisi ve VFS sınırı üreticiye taşındı; TEMP dosyas�
 ## V6b.33 — VFS fetch/unfetch yaşamı
 
 Unix VFS'de gerçek read-only mmap, fetch lease sayısı, EOF256 ve aktif ref sırasında limit guardı eklendi. 10.051 C/model/Rust işlemi ve dosya hashleri aynı. Pager bağlantısı yapılmadığından D142 altı örnekte açık; D144 dört örnek de sürüyor. Native mmap240/250, TEMP270/270, tam program144/144, elle CLI16/16. Dört kapıdaki eski fark kümeleri korundu; OFF(1131, 4, 337), ON(1117, 18, 337); hız Rust1.100 tabanına 1.210x ve14 digest farkı0. Mremap, mmap hata günlüğü ve hata enjeksiyonu tamamlandı sayılmaz. [Kanıt](karar_esligi_v6b_33.md). Kullanıcının sohbet devri için [devam belgesi](devir_v6b_33.md); sıradaki iş V6b.34/D142 sayfalayıcı bağlantısı.
+
+
+## V6b.34 — D142 sayfalayıcı bağlantısı
+
+B-tree imleçleri Unix xFetch lease'lerini PCache'den ayrı tutuyor. Etkin okuyucunun mmap sınırını koruduğu altı önceki D142 akışı artık eşit. Dosya büyümesinden doğan 36 yeni fark SIZE_HINT ile kapandı ve büyüme/geometri 52/52 oldu. Önceki native mmap 246/250, genişletilmiş native 433/440. Kalıcı dosya hashleri eşit. Kalan çıktılar önceki dört D144 ve yedi hata/bozuk dosya farkıyla aynı. Gcov 150 dal kaydetti ve alınmayan 47 çıkış tek tek sınıflandırıldı. OFF 1135/4/337, ON 1121/18/337. DML ve ayrışma bulucu V6b.33 ile aynı. Rust 1.100 tabanına süre oranı 1,225 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_34.md).

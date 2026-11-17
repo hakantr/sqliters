@@ -7,7 +7,7 @@ mod pcache;
 pub mod super_journal;
 pub mod wal;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,7 @@ use sqliters_types::{
     SQLITE_VERSION_NUMBER, SqliteError, TextEncoding, decode_db_header_page_size, extended,
 };
 use sqliters_vfs::{
-    LockLevel, MemoryVfs, OpenFlags, OsVfs, ShmOpenOptions, SyncFlags, Vfs, VfsFile,
+    FetchPage, LockLevel, MemoryVfs, OpenFlags, OsVfs, ShmOpenOptions, SyncFlags, Vfs, VfsFile,
 };
 
 pub use header::{AutoVacuumMode, DB_HEADER_SIZE, DatabaseHeader};
@@ -260,6 +260,15 @@ fn derive_sidecar_path(canonical_db_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// Source of a cursor's page reference. Mapped acquisitions have distinct identities even
+/// when they refer to the same page number. A PCache reference follows its page on rekey.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct PageSource(u64);
+
+impl PageSource {
+    pub const CACHE: Self = Self(0);
+}
+
 /// Manages page-level reads, writes, caching, rollback journaling, WAL protocol, crash recovery,
 /// and sub-savepoints.
 pub struct Pager {
@@ -322,6 +331,9 @@ pub struct Pager {
 
     /// The page cache (`Pager.pPCache`): content and C's bookkeeping, see `pcache.rs`.
     cache: PageCache,
+    /// Live PGHDR_MMAP equivalents, separate from PCache and its reference counts.
+    mapped_pages: HashMap<PageSource, FetchPage>,
+    next_mapped_id: u64,
     /// `Pager.doNotSpill` (`SPILLFLAG_OFF` / `SPILLFLAG_ROLLBACK` / `SPILLFLAG_NOSYNC`).
     do_not_spill: u8,
     /// A page reference taken by a page access of a caller that holds no reference itself
@@ -343,6 +355,8 @@ pub struct Pager {
     /// page up to this size is still written when the cache lets it go, and a page up to
     /// this size that the b-tree allocates again is read from the file.
     db_size: Pgno,
+    /// Pager.dbHintSize limits size hints during a rollback journal write.
+    db_hint_size: Pgno,
     /// `BtShared.bDoTruncate`: the image was shortened in this transaction, so a page
     /// appended now "may contain content that is required in the event of a rollback" and is
     /// fetched with its content (and journalled) instead of `PAGER_GET_NOCONTENT`.
@@ -416,6 +430,8 @@ pub struct Pager {
     checkpoint_full_fsync: bool,
     /// Pager.szMmap. pagerOpentemp does not apply a pending request to the VFS.
     mmap_limit: i64,
+    use_fetch: bool,
+    mapping_attempted: bool,
 }
 
 impl Pager {
@@ -638,10 +654,13 @@ impl Pager {
             },
             do_not_spill: 0,
             transient_pin: 0,
+            mapped_pages: HashMap::new(),
+            next_mapped_id: 0,
             page1_ref: false,
             header_probe: false,
             pcache_epoch: 0,
             db_size: 0,
+            db_hint_size: 0,
             image_truncated: false,
             a_stat: [0; 4],
             state: TransactionState::Open,
@@ -677,6 +696,8 @@ impl Pager {
             full_fsync: false,
             checkpoint_full_fsync: false,
             mmap_limit: 0,
+            use_fetch: false,
+            mapping_attempted: false,
         })
     }
 
@@ -733,6 +754,9 @@ impl Pager {
 
     #[inline]
     fn unlock_db_file(&mut self, level: LockLevel) -> Result<()> {
+        if level == LockLevel::NoLock {
+            self.release_mapped_pages();
+        }
         // pagerUnlockDb resets this even when xUnlock fails.
         self.change_count_done = self.uses_temp_file_semantics();
         if self.uses_temp_file_semantics() {
@@ -1087,6 +1111,8 @@ impl Pager {
         self.readonly = readonly;
         self.journal_mode = JournalMode::Memory;
         self.file = Some(mem_file);
+        self.use_fetch = false;
+        self.mapping_attempted = false;
         self.pcache_reset();
         self.header = DatabaseHeader::new_with_page_size(self.header.page_size);
         self.header_loaded = false;
@@ -1341,6 +1367,7 @@ impl Pager {
     #[inline]
     fn pcache_sync_page_size(&mut self) {
         if self.cache.page_size() != self.header.page_size {
+            self.release_mapped_pages();
             self.cache.set_page_size(self.header.page_size);
             self.transient_pin = 0;
             self.page1_ref = false;
@@ -1350,6 +1377,7 @@ impl Pager {
 
     /// `pager_reset`: every page leaves the cache.
     fn pcache_reset(&mut self) {
+        self.release_mapped_pages();
         self.cache.clear();
         self.transient_pin = 0;
         self.page1_ref = false;
@@ -1361,6 +1389,21 @@ impl Pager {
     #[inline]
     pub const fn pcache_epoch(&self) -> u32 {
         self.pcache_epoch
+    }
+
+    fn release_mapped_pages(&mut self) {
+        if !self.mapped_pages.is_empty() {
+            self.mapped_pages.clear();
+            self.pcache_epoch = self.pcache_epoch.wrapping_add(1);
+        }
+    }
+
+    fn invalidate_mapping(&mut self) {
+        if (std::mem::take(&mut self.mapping_attempted) || self.use_fetch)
+            && let Some(file) = &self.file
+        {
+            let _ = file.unfetch_all();
+        }
     }
 
     /// Gives back the reference a page access took on behalf of a caller without one.
@@ -1391,6 +1434,7 @@ impl Pager {
             self.reader_snapshot_held = false;
         }
         if st == TransactionState::Open {
+            self.release_mapped_pages();
             self.release_transient();
             if self.page1_ref {
                 self.page1_ref = false;
@@ -1466,6 +1510,95 @@ impl Pager {
             return Err(SqliteError::corrupt("database disk image is malformed"));
         }
         Ok(())
+    }
+
+    /// getAndInitPage: acquire a b-tree cursor page with the cursor's PAGER_GET_READONLY flag.
+    #[inline]
+    pub fn pin_btree_page(&mut self, pgno: Pgno, readonly: bool) -> Result<PageSource> {
+        if self.use_fetch && pgno > 1 && pgno <= self.page_count.max(self.db_size) {
+            if let Some(source) = self.pin_mapped_page(pgno, readonly, true)? {
+                return Ok(source);
+            }
+        }
+        self.page_ref_btree(pgno)?;
+        Ok(PageSource::CACHE)
+    }
+
+    /// sqlite3PagerGet with PAGER_GET_READONLY for raw pages such as overflow pages.
+    #[inline]
+    pub fn pin_readonly_page(&mut self, pgno: Pgno) -> Result<PageSource> {
+        if self.use_fetch && pgno > 1
+            && let Some(source) = self.pin_mapped_page(pgno, true, false)?
+        {
+            return Ok(source);
+        }
+        self.page_ref(pgno)?;
+        Ok(PageSource::CACHE)
+    }
+
+    /// getPageMMap: a WAL frame shadows the database file. In a write transaction or TEMP,
+    /// a normal cached copy wins, but only after attempting xFetch.
+    #[cold]
+    fn pin_mapped_page(&mut self, pgno: Pgno, readonly: bool, btree: bool) -> Result<Option<PageSource>> {
+        if self.state != TransactionState::Read
+            && !(self.state == TransactionState::Write && readonly)
+        {
+            return Ok(None);
+        }
+        self.release_transient();
+        if let Some(wal) = &self.wal
+            && wal.find_frame(pgno)?.is_some()
+        {
+            return Ok(None);
+        }
+        let Some(file) = &self.file else {
+            return Ok(None);
+        };
+        self.mapping_attempted = true;
+        let page_size = self.header.page_size;
+        let Some(page) = file.fetch(u64::from(pgno - 1) * u64::from(page_size), page_size as usize)? else {
+            return Ok(None);
+        };
+        if (self.state == TransactionState::Write || self.uses_temp_file_semantics())
+            && self.page_lookup(pgno)
+        {
+            return Ok(Some(PageSource::CACHE));
+        }
+        if page.data().len() != page_size as usize
+            || (btree && self.page_load_check.is_some_and(|check| {
+                !check(pgno, self.header.usable_size(), page.data())
+            }))
+        {
+            return Err(SqliteError::corrupt("database disk image is malformed"));
+        }
+
+        self.mapped_pages.try_reserve(1)
+            .map_err(|_| SqliteError::new(ErrorCode::NoMem, "out of memory"))?;
+        self.next_mapped_id += 1;
+        let source = PageSource(self.next_mapped_id);
+        self.mapped_pages.insert(source, page);
+        Ok(Some(source))
+    }
+
+    /// Read exactly the image selected by a live cursor reference.
+    #[inline]
+    pub fn pinned_page(&mut self, pgno: Pgno, source: PageSource) -> Result<&[u8]> {
+        if source == PageSource::CACHE {
+            return self.read_page_unchecked(pgno);
+        }
+        self.mapped_pages.get(&source)
+            .map(FetchPage::data)
+            .ok_or_else(|| SqliteError::misuse("stale mapped page reference"))
+    }
+
+    /// sqlite3PagerUnrefNotNull on the cursor's original page source.
+    #[inline]
+    pub fn unpin_page(&mut self, pgno: Pgno, source: PageSource) {
+        if source == PageSource::CACHE {
+            self.page_unref(pgno);
+        } else {
+            self.mapped_pages.remove(&source);
+        }
     }
 
     /// `sqlite3PagerGet(.., PAGER_GET_NOCONTENT)`: the caller does not care what the page
@@ -2014,6 +2147,13 @@ impl Pager {
         } else {
             self.page_count
         };
+        if self.db_hint_size < db_size
+            && pgnos.first().is_some_and(|&pgno| pgnos.len() > 1 || pgno > self.db_hint_size)
+            && let Some(file) = self.file.as_ref()
+        {
+            let _ = file.size_hint(u64::from(db_size) * ps);
+            self.db_hint_size = db_size;
+        }
         for &pgno in pgnos {
             let Some(slot) = self.cache.slot_of(pgno) else {
                 continue;
@@ -2617,15 +2757,31 @@ impl Pager {
         self.fix_mmap_limit();
     }
 
-    fn fix_mmap_limit(&self) {
+    #[inline]
+    pub const fn uses_fetch(&self) -> bool {
+        self.use_fetch
+    }
+
+    #[inline]
+    pub fn has_mapped_pages(&self) -> bool {
+        !self.mapped_pages.is_empty()
+    }
+
+    fn fix_mmap_limit(&mut self) {
         if let Some(file) = self.file.as_ref() {
+            self.use_fetch = self.mmap_limit > 0 && file.supports_fetch();
             let _ = file.mmap_size(self.mmap_limit);
         }
     }
 
     /// Read-only generator inspection of the built-in VFS limit contract.
     pub fn predict_mmap_size(&self, request: Option<i64>) -> Result<Option<i64>> {
-        self.mmap_size().map(|current| current.map(|n| request.map_or(n, |limit| limit.min(0x7fff0000))))
+        self.mmap_size().map(|current| {
+            current.map(|n| match request {
+                Some(limit) if limit >= 0 && self.mapped_pages.is_empty() => limit.min(0x7fff0000),
+                _ => n,
+            })
+        })
     }
 
     #[inline]
@@ -3000,6 +3156,7 @@ impl Pager {
                 self.notify_backup_restart();
                 self.bump_data_version();
                 self.pcache_reset();
+                self.invalidate_mapping();
             }
             let cached_header = !recovered && !version_changed && self.header_loaded && self.page_size_fixed
                 && self.cache.slot_of(1).is_some()
@@ -3128,7 +3285,17 @@ impl Pager {
                 .file
                 .as_deref()
                 .ok_or_else(|| SqliteError::misuse("NamedDisk database missing file"))?;
-            self.wal.as_mut().unwrap().begin_read_transaction(db_f)?
+            self.wal.as_mut().unwrap().begin_read_transaction(db_f)
+        };
+        let changed = match changed {
+            Ok(changed) => changed,
+            Err(e) => {
+                if self.mapping_attempted {
+                    self.pcache_reset();
+                    self.invalidate_mapping();
+                }
+                return Err(e);
+            }
         };
         self.has_held_shared_lock = true;
         if self.wal.as_ref().unwrap().is_readonly() {
@@ -3141,6 +3308,7 @@ impl Pager {
             self.pcache_reset();
         }
         if changed {
+            self.invalidate_mapping();
             // Page 1 is reloaded from the new snapshot (`readDbPage` refreshes `dbFileVers`).
             self.dv_wal_page1_written = false;
             // `pagerBeginReadTransaction`: `sqlite3WalBeginReadTransaction` reported a wal-index
@@ -3387,6 +3555,7 @@ impl Pager {
         self.journal_hdr = 0;
         self.tx_journal_end.clear();
         self.db_size = self.page_count;
+        self.db_hint_size = self.db_size;
         self.image_truncated = false;
         self.journal_sector_size = self.effective_sector_size();
         self.journal_started_in_tx = false;
@@ -4635,6 +4804,9 @@ impl Pager {
     /// `Write -> Open`) or ending a read transaction (`Read -> Read` or `Read -> Open`), matching
     /// `pager_end_transaction` (`pager.c:2209-2214`) and `pager_unlock` (`pager.c:1901-1940`).
     fn finish_tx_to_read_or_open(&mut self, retain_read: bool) -> Result<()> {
+        if !retain_read {
+            self.release_mapped_pages();
+        }
         if self.use_wal() {
             if self.locking_mode == LockingMode::Normal
                 && self.wal.as_mut().unwrap().exclusive_mode_transition(0)?
@@ -4936,8 +5108,13 @@ impl Pager {
                     self.page_count
                 };
                 let target_size = u64::from(effective_disk_pages) * ps;
-                if self.db_file()?.file_size()? < target_size {
-                    self.db_file()?.truncate(target_size)?;
+                let file = self.db_file()?;
+                let current_size = file.file_size()?;
+                if current_size < target_size {
+                    if target_size - current_size >= ps {
+                        let _ = file.size_hint(target_size);
+                    }
+                    file.truncate(target_size)?;
                 }
             }
 
@@ -5550,6 +5727,7 @@ impl Pager {
             return Ok(());
         }
         self.change_count_done = self.uses_temp_file_semantics();
+        self.release_mapped_pages();
         if self.transaction_savepoint && index == 0 && !self.use_wal() && self.journal_started_in_tx {
             // Transaction savepoint rollback uses pSavepoint=NULL, starts at
             // journal offset zero and reads the main-journal header.
@@ -5885,6 +6063,7 @@ impl Pager {
         }
 
         let mut first_err: Option<SqliteError> = None;
+        self.release_mapped_pages();
 
         if self.state != TransactionState::Open
             && let Err(e) = self.rollback_retaining_read(false)

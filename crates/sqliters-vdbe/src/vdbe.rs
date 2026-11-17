@@ -941,16 +941,21 @@ fn sqlite3_log_est(mut x: u64) -> i16 {
 
 /// The reason why the machine does not run `prog` (`None`: every opcode is ported).
 pub fn unsupported_reason(prog: &Program) -> Option<String> {
-    unsupported(prog, false)
+    unsupported(prog, false, false)
 }
 
 /// [`unsupported_reason`] for a program that writes (`OP_Transaction` with `P2!=0`, the
 /// write opcodes).
 pub fn unsupported_reason_write(prog: &Program) -> Option<String> {
-    unsupported(prog, true)
+    unsupported(prog, true, false)
 }
 
-fn unsupported(prog: &Program, write: bool) -> Option<String> {
+/// For the checked single-table mapped read, allow the sorter's BINARY UTF-16 keys.
+pub fn unsupported_reason_mapped_read(prog: &Program) -> Option<String> {
+    unsupported(prog, false, true)
+}
+
+fn unsupported(prog: &Program, write: bool, mapped_read: bool) -> Option<String> {
     if !prog.p_program.is_empty() && !write {
         return Some("sub-programs".to_owned());
     }
@@ -1161,7 +1166,11 @@ fn unsupported(prog: &Program, write: bool) -> Option<String> {
             _ => {}
         }
         if let P4::KeyInfo(k) = &op.p4 {
-            if k.enc != 1 && !prog.references_like {
+            let binary_sort = mapped_read && op.opcode == OP_SorterOpen
+                && k.a_coll.iter().flatten().all(|c| {
+                    c.name.eq_ignore_ascii_case("BINARY") && c.enc == k.enc
+                });
+            if k.enc != 1 && !prog.references_like && !binary_sort {
                 return Some("UTF-16 key".to_owned());
             }
             // An application-defined collation can fail in this engine (its callback returns a

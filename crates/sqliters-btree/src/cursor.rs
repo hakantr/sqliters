@@ -441,7 +441,6 @@ impl Btree {
             // (an empty database file has no page a cursor could hold)
             return Ok(());
         }
-        let slot = (id.0 >> 32) as usize;
         let Some(cur) = self.cursor_ref(id) else {
             return Ok(());
         };
@@ -453,7 +452,7 @@ impl Btree {
             return Ok(());
         }
         let is_index = matches!(cur.kind, CursorKind::Index { .. });
-        let role = 16 + (slot % 96) as u8;
+        let readonly = !cur.writable;
         // (C keeps a cursor that was only positioned by a failed seek as it is; a cursor that
         // was never moved holds nothing)
         let stack: Option<CursorStack> = match &cur.state {
@@ -468,7 +467,7 @@ impl Btree {
             }
             BtreeCursorState::RequireSeek { .. } | BtreeCursorState::Fault(_) => None,
         };
-        let vc = self.vc_open(root, role);
+        let vc = self.vc_open_registry(root, (id.0 >> 32) as u32, readonly);
         if is_index {
             self.vcursors[vc].is_index = true;
         }
@@ -509,12 +508,10 @@ impl Btree {
     /// `OP_Close` in the middle of a program (the transfer of a table, then of each index):
     /// the C cursor behind `id` gives its pages back now; then [`Self::close_cursor`].
     pub fn close_cursor_c(&mut self, id: CursorId) -> bool {
-        let slot = (id.0 >> 32) as usize;
         if let Some(cur) = self.cursor_ref(id)
             && cur.c_cursor
         {
-            let root = cur.root_pgno;
-            self.vc_close(root, 16 + (slot % 96) as u8);
+            self.vc_close_registry(cur.root_pgno, (id.0 >> 32) as u32, false);
         }
         self.close_cursor(id)
     }
@@ -524,6 +521,12 @@ impl Btree {
     pub fn close_cursor(&mut self, id: CursorId) -> bool {
         let slot = (id.0 >> 32) as usize;
         let cur_gen = id.0 as u32;
+        if self.pager.has_mapped_pages()
+            && let Some(cur) = self.cursor_ref(id)
+            && cur.c_cursor
+        {
+            self.vc_close_registry(cur.root_pgno, slot as u32, true);
+        }
         // (C's programs leave their cursors open until the statement halts — `closeAllCursors`;
         // the C cursor behind this one keeps its pages until then.)
         if let Some(entry) = self.cursor_slots.get_mut(slot)

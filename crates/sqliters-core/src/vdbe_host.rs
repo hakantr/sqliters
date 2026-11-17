@@ -101,6 +101,87 @@ pub(crate) fn machine_program(
     read_machine_program(inner, stmt, raw_sql, n_param, false, false, None)
 }
 
+/// A materialized legacy read cannot hold the page that C has at ResultRow. Use the
+/// streaming machine for a single mapped b-tree when its program uses only the
+/// cursor, projection, rowid-bound, count and binary sorter operations below.
+#[allow(non_upper_case_globals)]
+pub(crate) fn mapped_table_read_program(
+    inner: &ConnectionInner,
+    stmt: Option<&Stmt>,
+    sql: &str,
+    n_param: usize,
+) -> Option<Arc<Program>> {
+    use sqliters_syntax::{SelectCore, TableOrSubquery};
+    use sqliters_vdbe::opcodes::*;
+
+    if inner.authorizer.is_some()
+        || !inner.db_set.slots().iter().any(|slot| {
+            slot.btree.as_ref().is_some_and(|bt| bt.pager().uses_fetch())
+        })
+    {
+        return None;
+    }
+    let Some(Stmt::Select(select)) = stmt else {
+        return None;
+    };
+    let SelectCore::Select { from: Some(from), .. } = &select.body.head else {
+        return None;
+    };
+    if !select.ctes.is_empty() || !select.body.compounds.is_empty() || !from.joins.is_empty() {
+        return None;
+    }
+    let TableOrSubquery::Table { name, table_args: None, .. } = &from.head else {
+        return None;
+    };
+    let (db, crate::db_set::RelationRef::Table(table)) =
+        inner.db_set.find_relation_ref_in_set(name).ok()?? else {
+            return None;
+        };
+    if table.root_pgno <= 1 || table.without_rowid
+        || !inner.db_set.slot(db)?.btree.as_ref()?.pager().uses_fetch()
+    {
+        return None;
+    }
+    let PrepareResult::Program(program) = crate::cgen::select_schema_probe(inner, sql).0 else {
+        return None;
+    };
+    if program.explain != 0
+        || program.n_var as usize != n_param
+        || program.btree_mask != 1u32.checked_shl(db.index() as u32)?
+        || sqliters_vdbe::vdbe::unsupported_reason_mapped_read(&program).is_some()
+    {
+        return None;
+    }
+    let mut opens = program.a_op.iter().filter(|op| op.opcode == OP_OpenRead);
+    let open = opens.next()?;
+    if opens.next().is_some()
+        || (open.p2 != table.root_pgno as i32
+            && !program.a_op.iter().any(|op| op.opcode == OP_Count && op.p3 == 0))
+    {
+        return None;
+    }
+    if !program.a_op.iter().all(|op| match op.opcode {
+        OP_Init | OP_Halt | OP_Transaction | OP_Goto | OP_OpenRead | OP_Close
+        | OP_Rewind | OP_Last | OP_Next | OP_Prev | OP_Count | OP_Rowid | OP_Column
+        | OP_SeekRowid | OP_SeekGE | OP_SeekGT | OP_SeekLE | OP_SeekLT | OP_NotExists
+        | OP_Integer | OP_Int64 | OP_Null | OP_Variable | OP_Copy | OP_SCopy
+        | OP_MustBeInt | OP_IsNull | OP_IfNot | OP_IfPos | OP_OffsetLimit | OP_DecrJumpZero
+        | OP_RealAffinity | OP_ResultRow | OP_Noop => true,
+        OP_SorterOpen => matches!(&op.p4, P4::KeyInfo(key) if
+            inner.collations.get_custom("BINARY").is_none()
+                && key.a_coll.iter().flatten().all(|c| c.name.eq_ignore_ascii_case("BINARY"))),
+        OP_SorterInsert | OP_SorterSort | OP_SorterData | OP_SorterNext
+        | OP_OpenPseudo | OP_MakeRecord => true,
+        OP_Function => matches!(&op.p4, P4::FuncCtx(call)
+            if call.p_func.name.eq_ignore_ascii_case("length")
+                && !inner.functions.has_scalar_name("length")),
+        _ => false,
+    }) {
+        return None;
+    }
+    Some(Arc::new(*program))
+}
+
 /// LIKE's binding and index selection depend on prepare-time function metadata.
 pub(crate) fn like_machine_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, bound_values: Option<&[Value]>,

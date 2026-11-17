@@ -90,3 +90,22 @@ fn remapping_and_file_writes_produce_fresh_fetch_bytes() {
     file.mmap_size(4096).unwrap();
     assert!(file.fetch(4096, 512).unwrap().is_none());
 }
+
+#[test]
+fn truncate_caps_the_existing_mapping_even_after_the_file_regrows() {
+    let scratch = Scratch::new();
+    let file = scratch.file();
+    file.write_at(&[1; 16384], 0).unwrap();
+    file.mmap_size(16384).unwrap();
+    let lease = file.fetch(8192, 4096).unwrap().unwrap();
+
+    file.truncate(8192).unwrap();
+    assert!(file.fetch(8192, 4096).unwrap().is_none());
+    assert_eq!(lease.data(), &[1; 4096]);
+    drop(lease);
+
+    file.write_at(&[2; 8192], 8192).unwrap();
+    assert!(file.fetch(8192, 4096).unwrap().is_none());
+    file.unfetch_all().unwrap();
+    assert_eq!(file.fetch(8192, 4096).unwrap().unwrap().data(), &[2; 4096]);
+}

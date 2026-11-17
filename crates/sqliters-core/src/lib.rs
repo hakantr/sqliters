@@ -7456,8 +7456,9 @@ impl Statement {
         inner: &mut ConnectionInner,
         lease_cursors: Vec<(SchemaInstanceId, CursorId)>,
         read_instances: SmallInstVec,
+        mapped_program: Option<Arc<sqliters_vdbe::vdbeaux::Program>>,
     ) -> MachineStart {
-        self.machine_start_inner(hid, shared, inner, lease_cursors, read_instances, false)
+        self.machine_start_inner(hid, shared, inner, lease_cursors, read_instances, mapped_program, false)
     }
 
     fn machine_start_inner(
@@ -7467,12 +7468,13 @@ impl Statement {
         inner: &mut ConnectionInner,
         lease_cursors: Vec<(SchemaInstanceId, CursorId)>,
         read_instances: SmallInstVec,
+        mapped_program: Option<Arc<sqliters_vdbe::vdbeaux::Program>>,
         retried: bool,
     ) -> MachineStart {
-        let Some(prog) = self.c_machine.clone() else {
+        let Some(prog) = self.c_machine.clone().or(mapped_program) else {
             return MachineStart::Fallback(lease_cursors, read_instances);
         };
-        let mut vm = match self.c_machine_vm.take() {
+        let mut vm = match self.c_machine_vm.take().filter(|vm| Arc::ptr_eq(&vm.prog, &prog)) {
             Some(vm) => vm,
             None => Box::new(sqliters_vdbe::vdbe::Vdbe::new(prog)),
         };
@@ -7531,7 +7533,7 @@ impl Statement {
                 {
                     self.c_machine = Some(prog);
                     self.reprepare_machine_vm(counters);
-                    return self.machine_start_inner(hid, shared, inner, lease_cursors, read_instances, true);
+                    return self.machine_start_inner(hid, shared, inner, lease_cursors, read_instances, None, true);
                 }
                 MachineStart::Fallback(lease_cursors, read_instances)
             }
@@ -8955,6 +8957,7 @@ impl Statement {
                     || inner.db_set.c_defer_foreign_keys()
                     || inner.simulated_cleanup_io_error.is_some()
                     || inner.db_set.vtab_registry().has_any_in_tx()
+                    || inner.db_set.main_slot().btree.as_ref().is_some_and(|bt| bt.pager().uses_fetch())
                 {
                     PointOutcome::Fallback
                 } else {
@@ -9221,7 +9224,9 @@ impl Statement {
                 let inner = session.inner_mut();
                 if let Err(e) = inner.ensure_usable() {
                     Some(Err(e))
-                } else if inner.trace_hook.is_some() || inner.authorizer.is_some() {
+                } else if inner.trace_hook.is_some() || inner.authorizer.is_some()
+                    || inner.db_set.main_slot().btree.as_ref().is_some_and(|bt| bt.pager().uses_fetch())
+                {
                     None
                 } else {
                     try_fast_read_plan_fields(
@@ -9509,6 +9514,13 @@ impl Statement {
         }
     }
 
+    fn mapped_read_program(&self, inner: &ConnectionInner) -> Option<Arc<sqliters_vdbe::vdbeaux::Program>> {
+        if self.category != Some(StmtCategory::Read) || self.c_machine.is_some() || self.expired {
+            return None;
+        }
+        vdbe_host::mapped_table_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len())
+    }
+
     fn start_execution_in_session(
         &mut self,
         hid: HandleId,
@@ -9518,11 +9530,14 @@ impl Statement {
         if let Some(fast_res) = self.try_fast_compiled_main_write(hid, shared, inner) {
             return fast_res;
         }
-        if let Some(fast_res) = self.try_fast_read_plan(hid, shared, inner) {
-            return fast_res;
-        }
-        if let Some(fast_res) = self.try_fast_compiled_main_read(hid, shared, inner) {
-            return fast_res;
+        let mut mapped_program = self.mapped_read_program(inner);
+        if mapped_program.is_none() {
+            if let Some(fast_res) = self.try_fast_read_plan(hid, shared, inner) {
+                return fast_res;
+            }
+            if let Some(fast_res) = self.try_fast_compiled_main_read(hid, shared, inner) {
+                return fast_res;
+            }
         }
         let is_advisory_expired = self.expired
             || self.compiled_advisory_expire_generation != inner.advisory_expire_generation;
@@ -9556,7 +9571,10 @@ impl Statement {
                 };
                 return Err(e);
             }
-            if let Some(fast_res) = self.try_fast_read_plan(hid, shared, inner) {
+            mapped_program = self.mapped_read_program(inner);
+            if mapped_program.is_none()
+                && let Some(fast_res) = self.try_fast_read_plan(hid, shared, inner)
+            {
                 return fast_res;
             }
         }
@@ -9853,7 +9871,7 @@ impl Statement {
                     }
                 }
 
-                if let Some(ref prog) = self.compiled_vdbe {
+                if mapped_program.is_none() && let Some(ref prog) = self.compiled_vdbe {
                     let tx_db_mask = prog.referenced_db_mask();
                     let mut rem = tx_db_mask;
                     while rem != 0 {
@@ -10020,7 +10038,9 @@ impl Statement {
                 // Diagnostic switch SQLITERS_VDBE_EXEC — sqlite3Step: "if( db->nVdbeActive==0 ){
                 // AtomicStore(&db->u1.isInterrupted, 0); }": an interrupt is for the statements
                 // that were running when it was requested.
-                if self.c_machine.is_some() && inner.activity.summary_excluding(hid, &inner.db_set).other_active == 0 {
+                if (self.c_machine.is_some() || mapped_program.is_some())
+                    && inner.activity.summary_excluding(hid, &inner.db_set).other_active == 0
+                {
                     inner.active_interrupt_flag.store(false, Ordering::SeqCst);
                 }
 
@@ -10127,6 +10147,7 @@ impl Statement {
                             cleanup_started_reads(inner, &started_here);
                             return self.start_execution_in_session(hid, shared, inner);
                         }
+                        mapped_program = self.mapped_read_program(inner);
                         specs = prepared_read_roots(
                             self.stmt.as_ref().expect("non-empty statement"),
                             self.requires_schema,
@@ -10259,8 +10280,8 @@ impl Statement {
 
                 // Diagnostic switch SQLITERS_VDBE_EXEC: the statement runs on the port of C's
                 // virtual machine, one row per step.
-                if self.c_machine.is_some() {
-                    match self.machine_start(hid, shared, inner, lease_cursors, read_instances) {
+                if self.c_machine.is_some() || mapped_program.is_some() {
+                    match self.machine_start(hid, shared, inner, lease_cursors, read_instances, mapped_program) {
                         MachineStart::Stepped(r) => return r,
                         // (the program is of another schema version, or names a database the
                         // engine did not put in a transaction: the engine's executor)

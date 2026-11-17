@@ -2537,6 +2537,10 @@ impl Wal {
             ));
         }
 
+        if cur_db_size < n_req {
+            let _ = db_file.size_hint(n_req);
+        }
+
         // Build deduplicated `(pgno, latest_frame)` list over `(start_backfill, mx_safe_frame]`
         // sorted in ascending `pgno` order (`walIteratorInit` / `walIteratorNext`, `wal.c:1833-2099`)!
         //
@@ -2652,6 +2656,10 @@ impl Wal {
                 return Err(SqliteError::corrupt(
                     "WAL header database size exceeds current database plus WAL frames",
                 ));
+            }
+
+            if cur_db_size < n_req {
+                let _ = db_file.size_hint(n_req);
             }
 
             let mut latest_by_pgno: HashMap<Pgno, u32> = HashMap::new();

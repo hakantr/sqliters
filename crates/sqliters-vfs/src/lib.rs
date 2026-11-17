@@ -229,6 +229,16 @@ pub trait VfsFile: Send + Sync {
         Ok(None)
     }
 
+    /// SQLITE_FCNTL_SIZE_HINT. A backend may use it to prepare for upcoming writes.
+    fn size_hint(&self, _size: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether the file exposes the optional xFetch and xUnfetch methods.
+    fn supports_fetch(&self) -> bool {
+        false
+    }
+
     /// `xFetch`: a read-only page and a lease that is released when the page is
     /// dropped. The owned bytes keep mapped memory out of the safe pager API.
     fn fetch(&self, _offset: u64, _amount: usize) -> Result<Option<FetchPage>> {
@@ -2161,6 +2171,22 @@ impl Drop for OsFile {
 }
 
 impl VfsFile for OsFile {
+    fn size_hint(&self, size: u64) -> Result<()> {
+        #[cfg(unix)]
+        {
+            fetch::size_hint(&self.fetch_state, self.file_ref()?, size)
+        }
+        #[cfg(windows)]
+        {
+            let _ = size;
+            Ok(())
+        }
+    }
+
+    fn supports_fetch(&self) -> bool {
+        cfg!(unix)
+    }
+
     fn mmap_size(&self, new_limit: i64) -> Result<Option<i64>> {
         let file = self.file_ref()?;
         #[cfg(unix)]
@@ -2232,8 +2258,7 @@ impl VfsFile for OsFile {
         let file = self.file_ref()?;
         #[cfg(unix)]
         {
-            use std::os::fd::AsRawFd;
-            sys::unix::ftruncate_fd(file.as_raw_fd(), size, extended::SQLITE_IOERR_TRUNCATE)
+            fetch::truncate(&self.fetch_state, file, size)
         }
         #[cfg(windows)]
         {

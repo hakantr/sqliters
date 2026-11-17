@@ -512,6 +512,15 @@ pub(crate) fn program_has_like(p: &sqliters_vdbe::vdbeaux::Program) -> bool {
 }
 
 pub(crate) fn select_schema_use(inner: &ConnectionInner, sql: &str) -> Option<SelectSchemaUse> {
+    let (result, reads_schema) = select_schema_probe(inner, sql);
+    match result {
+        PrepareResult::Program(p) => Some(SelectSchemaUse { reads_schema, btree_mask: Some(p.btree_mask), is_reader: Some(p.b_is_reader), has_like: program_has_like(&p) }),
+        PrepareResult::Error { .. } => Some(SelectSchemaUse { reads_schema, btree_mask: None, is_reader: None, has_like: false }),
+        PrepareResult::Unsupported(_) => None,
+    }
+}
+
+pub(crate) fn select_schema_probe(inner: &ConnectionInner, sql: &str) -> (PrepareResult, bool) {
     let effects = take_c_pragma_effects();
     let temp = take_c_temp_opened();
     let rowest = take_c_rowest_clamped();
@@ -521,11 +530,7 @@ pub(crate) fn select_schema_use(inner: &ConnectionInner, sql: &str) -> Option<Se
     C_PRAGMA_EFFECTS.with(|c| *c.borrow_mut() = effects);
     C_TEMP_OPENED.with(|c| c.set(temp));
     C_ROWEST.with(|c| *c.borrow_mut() = rowest);
-    match result {
-        PrepareResult::Program(p) => Some(SelectSchemaUse { reads_schema, btree_mask: Some(p.btree_mask), is_reader: Some(p.b_is_reader), has_like: program_has_like(&p) }),
-        PrepareResult::Error { .. } => Some(SelectSchemaUse { reads_schema, btree_mask: None, is_reader: None, has_like: false }),
-        PrepareResult::Unsupported(_) => None,
-    }
+    (result, reads_schema)
 }
 
 fn c_prepare_impl(inner: &ConnectionInner, sql: &str, schema_probe: bool, bound_values: Option<&[Value]>) -> (PrepareResult, usize, bool) {

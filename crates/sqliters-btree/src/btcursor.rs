@@ -15,6 +15,7 @@
 //! Writes still go through the functions of `insert.rs` / `lib.rs`; the machine saves the
 //! positions of its cursors around them (`saveAllCursors`).
 
+use sqliters_pager::PageSource;
 use sqliters_types::{Pgno, Result, SqliteError};
 
 use crate::Btree;
@@ -46,6 +47,7 @@ pub const BTREE_BULKLOAD: u8 = 0x01;
 #[derive(Clone, Copy, Debug, Default)]
 struct PageMeta {
     pgno: Pgno,
+    source: PageSource,
     /// `hdrOffset`: 100 for page 1, 0 otherwise
     hdr: u16,
     leaf: bool,
@@ -402,9 +404,11 @@ impl Btree {
     fn bc_release_all_cursor_pages(&mut self, cur: &mut BtCursor) {
         if self.bc_live(cur) && cur.i_page >= 0 {
             for i in 0..cur.i_page as usize {
-                self.pager.page_unref(cur.ap[i].pgno);
+                let page = cur.ap[i];
+                self.pager.unpin_page(page.pgno, page.source);
             }
-            self.pager.page_unref(cur.ap[cur.i_page as usize].pgno);
+            let page = cur.ap[cur.i_page as usize];
+            self.pager.unpin_page(page.pgno, page.source);
         }
         cur.i_page = -1;
     }
@@ -419,23 +423,23 @@ impl Btree {
 
     /// `getAndInitPage` + `btreeInitPage` (`decodeFlags`): a reference on `pgno` and its
     /// `MemPage` fields.
-    fn bc_get_and_init_page(&mut self, pgno: Pgno) -> Result<PageMeta> {
+    fn bc_get_and_init_page(&mut self, pgno: Pgno, readonly: bool) -> Result<PageMeta> {
         if pgno == 0 || pgno > self.pager.page_count() {
             return Err(corrupt());
         }
-        self.pager.page_ref_btree(pgno)?;
+        let source = self.pager.pin_btree_page(pgno, readonly)?;
         let usable = self.pager.usable_size();
         let page_size = self.pager.page_size();
         let hdr: usize = if pgno == 1 { 100 } else { 0 };
-        let d = match self.pager.read_page(pgno) {
+        let d = match self.pager.pinned_page(pgno, source) {
             Ok(d) => d,
             Err(e) => {
-                self.pager.page_unref(pgno);
+                self.pager.unpin_page(pgno, source);
                 return Err(e);
             }
         };
         let mut ok = d.len() >= hdr + 12;
-        let mut m = PageMeta { pgno, hdr: hdr as u16, ..PageMeta::default() };
+        let mut m = PageMeta { pgno, source, hdr: hdr as u16, ..PageMeta::default() };
         if ok {
             let flag = d[hdr];
             m.leaf = flag & 0x08 != 0;
@@ -468,7 +472,7 @@ impl Btree {
             }
         }
         if !ok {
-            self.pager.page_unref(pgno);
+            self.pager.unpin_page(pgno, source);
             return Err(corrupt());
         }
         Ok(m)
@@ -483,7 +487,7 @@ impl Btree {
     /// `btreeParseCell(pPage, iCell, pInfo)`.
     fn bc_parse_cell(&mut self, m: PageMeta, i_cell: usize) -> Result<CellInfo> {
         let usable = self.pager.usable_size();
-        let d = self.pager.read_page(m.pgno)?;
+        let d = self.pager.pinned_page(m.pgno, m.source)?;
         if i_cell >= usize::from(m.n_cell) {
             return Err(corrupt());
         }
@@ -570,7 +574,7 @@ impl Btree {
     pub fn bc_payload_fetch(&mut self, cur: &BtCursor) -> Result<&[u8]> {
         let m = *cur.pg();
         let info = cur.info;
-        let d = self.pager.read_page(m.pgno)?;
+        let d = self.pager.pinned_page(m.pgno, m.source)?;
         let start = info.payload as usize;
         let mut amt = usize::from(info.n_local);
         if start > d.len() {
@@ -598,15 +602,15 @@ impl Btree {
                 }
             }
         }
-        self.pager.page_ref(ovfl)?;
-        let next = match self.pager.read_page_unchecked(ovfl) {
+        let source = self.pager.pin_readonly_page(ovfl)?;
+        let next = match self.pager.pinned_page(ovfl, source) {
             Ok(d) => get4(d, 0),
             Err(e) => {
-                self.pager.page_unref(ovfl);
+                self.pager.unpin_page(ovfl, source);
                 return Err(e);
             }
         };
-        self.pager.page_unref(ovfl);
+        self.pager.unpin_page(ovfl, source);
         Ok(next)
     }
 
@@ -628,7 +632,7 @@ impl Btree {
         let mut out = 0usize;
         let mut next_page: Pgno = 0;
         {
-            let d = self.pager.read_page(m.pgno)?;
+            let d = self.pager.pinned_page(m.pgno, m.source)?;
             let pl = info.payload as usize;
             if offset < n_local {
                 let mut a = amt;
@@ -693,10 +697,16 @@ impl Btree {
                     // SQLITE_DIRECT_OVERFLOW_READ: (1) read (2) offset==0 (3,4,5) the pager
                     // allows it (6) at least 4 bytes have already been written to the buffer.
                     let direct = offset == 0 && out >= 4 && self.pager.direct_overflow_read_ok(next_page);
-                    if !direct {
-                        self.pager.page_ref(next_page)?;
-                    }
-                    let res = match self.pager.read_page_unchecked(next_page) {
+                    let source = if direct {
+                        None
+                    } else {
+                        Some(self.pager.pin_readonly_page(next_page)?)
+                    };
+                    let raw = match source {
+                        Some(source) => self.pager.pinned_page(next_page, source),
+                        None => self.pager.read_page_unchecked(next_page),
+                    };
+                    let res = match raw {
                         Ok(d) => {
                             let s = offset as usize + 4;
                             if s + a as usize > d.len() {
@@ -708,8 +718,8 @@ impl Btree {
                         }
                         Err(e) => Err(e),
                     };
-                    if !direct {
-                        self.pager.page_unref(next_page);
+                    if let Some(source) = source {
+                        self.pager.unpin_page(next_page, source);
                     }
                     next_page = res?;
                     offset = 0;
@@ -743,9 +753,9 @@ impl Btree {
         cur.cur_flags &= !(BTCF_VALID_NKEY | BTCF_VALID_OVFL);
         cur.ai_idx[cur.i_page as usize] = cur.ix;
         cur.ix = 0;
-        let m = self.bc_get_and_init_page(new_pgno)?;
+        let m = self.bc_get_and_init_page(new_pgno, cur.cur_flags & BTCF_WRITE_FLAG == 0)?;
         if m.n_cell < 1 || m.int_key != cur.cur_int_key {
-            self.pager.page_unref(new_pgno);
+            self.pager.unpin_page(new_pgno, m.source);
             return Err(corrupt());
         }
         cur.i_page += 1;
@@ -758,9 +768,9 @@ impl Btree {
         cur.info.n_size = 0;
         cur.cur_flags &= !(BTCF_VALID_NKEY | BTCF_VALID_OVFL);
         cur.ix = cur.ai_idx[cur.i_page as usize - 1];
-        let leaf = cur.ap[cur.i_page as usize].pgno;
+        let leaf = cur.ap[cur.i_page as usize];
         cur.i_page -= 1;
-        self.pager.page_unref(leaf);
+        self.pager.unpin_page(leaf.pgno, leaf.source);
     }
 
     /// `moveToRoot`: `Ok(false)` is `SQLITE_EMPTY`.
@@ -769,10 +779,9 @@ impl Btree {
         let mut skip_init = false;
         if cur.i_page >= 0 {
             if cur.i_page > 0 {
-                self.pager.page_unref(cur.ap[cur.i_page as usize].pgno);
-                cur.i_page -= 1;
                 while cur.i_page > 0 {
-                    self.pager.page_unref(cur.ap[cur.i_page as usize].pgno);
+                    let page = cur.ap[cur.i_page as usize];
+                    self.pager.unpin_page(page.pgno, page.source);
                     cur.i_page -= 1;
                 }
                 skip_init = true;
@@ -787,7 +796,7 @@ impl Btree {
                 }
                 cur.clear_cursor();
             }
-            match self.bc_get_and_init_page(cur.pgno_root) {
+            match self.bc_get_and_init_page(cur.pgno_root, cur.cur_flags & BTCF_WRITE_FLAG == 0) {
                 Ok(m) => {
                     cur.ap[0] = m;
                     cur.i_page = 0;
@@ -814,7 +823,7 @@ impl Btree {
                 return Err(corrupt());
             }
             let subpage = {
-                let d = self.pager.read_page(root.pgno)?;
+                let d = self.pager.pinned_page(root.pgno, root.source)?;
                 get4(d, usize::from(root.hdr) + 8)
             };
             cur.e_state = CURSOR_VALID;
@@ -830,7 +839,7 @@ impl Btree {
     /// pointer when `i == nCell`.
     #[inline]
     fn bc_child(&mut self, m: PageMeta, i: usize) -> Result<Pgno> {
-        let d = self.pager.read_page(m.pgno)?;
+        let d = self.pager.pinned_page(m.pgno, m.source)?;
         if i >= usize::from(m.n_cell) {
             Ok(get4(d, usize::from(m.hdr) + 8))
         } else {
@@ -965,7 +974,7 @@ impl Btree {
             let c: i32;
             let mut found_interior = false;
             {
-                let d = self.pager.read_page(m.pgno)?;
+                let d = self.pager.pinned_page(m.pgno, m.source)?;
                 loop {
                     let n_cell_key = Self::bc_cell_int_key(d, &m, idx as usize)?;
                     if n_cell_key < int_key {
@@ -1013,7 +1022,7 @@ impl Btree {
 
     /// `indexCellCompare`: 99 when the cell does not lie entirely on the page.
     fn bc_index_cell_compare(&mut self, m: PageMeta, idx: usize, key: &mut dyn IdxKeyCompare) -> Result<i32> {
-        let d = self.pager.read_page(m.pgno)?;
+        let d = self.pager.pinned_page(m.pgno, m.source)?;
         let cell = Self::bc_find_cell(d, &m, idx) + usize::from(m.child_ptr_size);
         if cell + 2 > d.len() {
             return Ok(99);
@@ -1081,7 +1090,7 @@ impl Btree {
                 // Some(c): compared on the page; None: the record flows over onto overflow
                 // pages.
                 let on_page: Option<i32> = {
-                    let d = self.pager.read_page(m.pgno)?;
+                    let d = self.pager.pinned_page(m.pgno, m.source)?;
                     let cell = Self::bc_find_cell(d, &m, idx as usize) + usize::from(m.child_ptr_size);
                     if cell + 2 > d.len() {
                         cur.info.n_size = 0;
@@ -1528,6 +1537,7 @@ impl Btree {
         let n = (cur.i_page + 1).max(0) as usize;
         let mut pages = [0 as Pgno; BTCURSOR_MAX_DEPTH];
         for (i, p) in pages.iter_mut().enumerate().take(n) {
+            debug_assert_eq!(cur.ap[i].source, PageSource::CACHE);
             *p = cur.ap[i].pgno;
         }
         let vc = self.vc_lend(cur.pgno_root, &pages[..n], &cur.ai_idx[..n], cur.has_key_info);

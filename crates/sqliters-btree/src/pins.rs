@@ -16,6 +16,7 @@
 //!   `balance_nonroot`, free-list trunks, overflow pages, pointer-map pages) are taken and
 //!   given back where C does it, through [`Btree::pin`] / [`Btree::unpin`].
 
+use sqliters_pager::PageSource;
 use sqliters_types::{Pgno, Result};
 
 use crate::Btree;
@@ -30,8 +31,13 @@ pub(crate) struct VCursor {
     pub(crate) root: Pgno,
     /// Distinguishes several C cursors of one statement on the same b-tree.
     pub(crate) role: u8,
+    // Live registry cursors have distinct slots. A later cursor on the same
+    // slot may reuse the legacy stack until statement_end.
+    registry_slot: Option<u32>,
     /// `apPage[0..=iPage]`.
     pages: [Pgno; VC_MAX_DEPTH],
+    sources: [PageSource; VC_MAX_DEPTH],
+    readonly: bool,
     /// `aiIdx[]`: the child slot taken on each interior page of the stack (kept by the
     /// seeks whose position a following write reuses).
     ai: [u16; VC_MAX_DEPTH],
@@ -96,16 +102,27 @@ impl Btree {
     /// The cursor of the running statement on b-tree `root` with `role`, opened if the
     /// statement has none yet (C: `OP_OpenRead` / `OP_OpenWrite`; no page is fetched).
     pub fn vc_open(&mut self, root: Pgno, role: u8) -> usize {
+        self.vc_open_at(root, role, None, role != VC_WRITE)
+    }
+
+    pub(crate) fn vc_open_registry(&mut self, root: Pgno, slot: u32, readonly: bool) -> usize {
+        self.vc_open_at(root, VC_READ, Some(slot), readonly)
+    }
+
+    fn vc_open_at(&mut self, root: Pgno, role: u8, registry_slot: Option<u32>, readonly: bool) -> usize {
         let base = self.vc_frames.last().copied().unwrap_or(0);
         for (i, c) in self.vcursors.iter().enumerate().skip(base) {
-            if c.root == root && c.role == role {
+            if c.root == root && c.role == role && c.registry_slot == registry_slot {
                 return i;
             }
         }
         self.vcursors.push(VCursor {
             root,
             role,
+            registry_slot,
+            readonly,
             pages: [0; VC_MAX_DEPTH],
+            sources: [PageSource::CACHE; VC_MAX_DEPTH],
             ai: [0; VC_MAX_DEPTH],
             n: 0,
             epoch: self.pager.pcache_epoch(),
@@ -129,7 +146,10 @@ impl Btree {
         let mut c = VCursor {
             root,
             role: VC_MACHINE,
+            registry_slot: None,
+            readonly: false,
             pages: [0; VC_MAX_DEPTH],
+            sources: [PageSource::CACHE; VC_MAX_DEPTH],
             ai: [0; VC_MAX_DEPTH],
             n: n as u8,
             epoch: self.pager.pcache_epoch(),
@@ -260,13 +280,31 @@ impl Btree {
     pub fn vc_close(&mut self, root: Pgno, role: u8) {
         let base = self.vc_frames.last().copied().unwrap_or(0);
         if let Some(i) = (base..self.vcursors.len())
-            .find(|&i| self.vcursors[i].root == root && self.vcursors[i].role == role)
+            .find(|&i| {
+                let c = &self.vcursors[i];
+                c.root == root && c.role == role && c.registry_slot.is_none()
+            })
         {
-            self.vc_release_all(i);
-            self.vcursors[i].root = 0;
-            if i + 1 == self.vcursors.len() {
-                self.vcursors.pop();
-            }
+            self.vc_close_at(i);
+        }
+    }
+
+    /// Close this registry cursor's mapped pages when its statement halts, even while
+    /// other statements on the same pager remain suspended.
+    pub(crate) fn vc_close_registry(&mut self, root: Pgno, slot: u32, mapped_only: bool) {
+        if let Some(i) = self.vcursors.iter().rposition(|c| {
+            c.root == root && c.registry_slot == Some(slot)
+                && (!mapped_only || c.sources[..c.n as usize].iter().any(|&s| s != PageSource::CACHE))
+        }) {
+            self.vc_close_at(i);
+        }
+    }
+
+    fn vc_close_at(&mut self, i: usize) {
+        self.vc_release_all(i);
+        self.vcursors[i].root = 0;
+        if i + 1 == self.vcursors.len() {
+            self.vcursors.pop();
         }
     }
 
@@ -315,7 +353,7 @@ impl Btree {
         if self.vcursors[vc].role & VC_SILENT == 0 {
             for i in 0..n {
                 let pg = self.vcursors[vc].pages[i];
-                self.pager.page_unref(pg);
+                self.pager.unpin_page(pg, self.vcursors[vc].sources[i]);
             }
         }
         self.vcursors[vc].n = 0;
@@ -348,7 +386,10 @@ impl Btree {
         for c in &mut self.vcursors {
             let n = c.n as usize;
             for &(a, b) in swaps {
-                for p in &mut c.pages[..n] {
+                for (p, source) in c.pages[..n].iter_mut().zip(&c.sources[..n]) {
+                    if *source != PageSource::CACHE {
+                        continue;
+                    }
                     if *p == a {
                         *p = b;
                     } else if *p == b {
@@ -357,6 +398,25 @@ impl Btree {
                 }
             }
         }
+    }
+
+    fn vc_pin(&mut self, vc: usize, pgno: Pgno) -> Result<PageSource> {
+        let cursor = &self.vcursors[vc];
+        if cursor.role & VC_SILENT != 0 {
+            return Ok(PageSource::CACHE);
+        }
+        self.pager.pin_btree_page(pgno, cursor.readonly)
+    }
+
+    fn vc_page_data(&mut self, vc: usize, pgno: Pgno) -> Result<&[u8]> {
+        let cursor = &self.vcursors[vc];
+        if self.pager.has_mapped_pages()
+            && cursor.role & VC_SILENT == 0
+            && let Some(i) = cursor.pages[..cursor.n as usize].iter().rposition(|&p| p == pgno)
+        {
+            return self.pager.pinned_page(pgno, cursor.sources[i]);
+        }
+        self.pager.read_page(pgno)
     }
 
     /// `moveToRoot`: a cursor that holds pages keeps the root and gives the others back, the
@@ -375,18 +435,17 @@ impl Btree {
                 let i = self.vcursors[vc].n as usize - 1;
                 let pg = self.vcursors[vc].pages[i];
                 if !silent {
-                    self.pager.page_unref(pg);
+                    self.pager.unpin_page(pg, self.vcursors[vc].sources[i]);
                 }
                 self.vcursors[vc].n -= 1;
             }
             return Ok(());
         }
         let root = self.vcursors[vc].root;
-        if self.vcursors[vc].role & VC_SILENT == 0 {
-            self.pager.page_ref_btree(root)?;
-        }
+        let source = self.vc_pin(vc, root)?;
         let c = &mut self.vcursors[vc];
         c.pages[0] = root;
+        c.sources[0] = source;
         c.n = 1;
         Ok(())
     }
@@ -396,11 +455,10 @@ impl Btree {
         if self.vcursors[vc].n as usize >= VC_MAX_DEPTH {
             return Ok(());
         }
-        if self.vcursors[vc].role & VC_SILENT == 0 {
-            self.pager.page_ref_btree(child)?;
-        }
+        let source = self.vc_pin(vc, child)?;
         let c = &mut self.vcursors[vc];
         c.pages[c.n as usize] = child;
+        c.sources[c.n as usize] = source;
         c.n += 1;
         Ok(())
     }
@@ -477,6 +535,7 @@ impl Btree {
         let c = &mut self.vcursors[vc];
         if (c.n as usize) < VC_MAX_DEPTH {
             c.pages[c.n as usize] = child;
+            c.sources[c.n as usize] = PageSource::CACHE;
             c.n += 1;
         }
     }
@@ -491,7 +550,7 @@ impl Btree {
             c.n -= 1;
             let pg = c.pages[c.n as usize];
             if c.role & VC_SILENT == 0 {
-                self.pager.page_unref(pg);
+                self.pager.unpin_page(pg, c.sources[c.n as usize]);
             }
         }
     }
@@ -511,7 +570,7 @@ impl Btree {
                 return Ok(false);
             }
             let hdr = if pg == 1 { 100 } else { 0 };
-            let d = self.pager.read_page(pg)?;
+            let d = self.vc_page_data(vc, pg)?;
             if d.len() < usable || hdr + 12 > d.len() || d[hdr] & 0x08 != 0 {
                 return Ok(false);
             }
@@ -565,9 +624,9 @@ impl Btree {
     // ------------------------------------------------------------------------------------
 
     /// `(flags byte, nCell)` of a page the cursor holds.
-    fn vcr_meta(&mut self, pg: Pgno) -> Result<(u8, usize)> {
+    fn vcr_meta(&mut self, vc: usize, pg: Pgno) -> Result<(u8, usize)> {
         let hdr = if pg == 1 { 100 } else { 0 };
-        let d = self.pager.read_page(pg)?;
+        let d = self.vc_page_data(vc, pg)?;
         if hdr + 12 > d.len() {
             return Err(sqliters_types::SqliteError::corrupt("b-tree page buffer too small"));
         }
@@ -575,10 +634,10 @@ impl Btree {
     }
 
     /// Child pointer `idx` of interior page `pg` (`idx == nCell`: the right-most pointer).
-    fn vcr_child(&mut self, pg: Pgno, idx: usize) -> Result<Pgno> {
+    fn vcr_child(&mut self, vc: usize, pg: Pgno, idx: usize) -> Result<Pgno> {
         let hdr = if pg == 1 { 100 } else { 0 };
         let usable = self.pager.usable_size() as usize;
-        let d = self.pager.read_page(pg)?;
+        let d = self.vc_page_data(vc, pg)?;
         let n_cell = crate::balance::get2(d, hdr + 3);
         let child = if idx >= n_cell {
             crate::balance::get4(d, hdr + 8)
@@ -596,9 +655,9 @@ impl Btree {
     }
 
     /// The integer key of cell `idx` of table page `pg` (leaf: after the payload size).
-    fn vcr_int_key(&mut self, pg: Pgno, idx: usize) -> Result<i64> {
+    fn vcr_int_key(&mut self, vc: usize, pg: Pgno, idx: usize) -> Result<i64> {
         let hdr = if pg == 1 { 100 } else { 0 };
-        let d = self.pager.read_page(pg)?;
+        let d = self.vc_page_data(vc, pg)?;
         let leaf = d[hdr] & 0x08 != 0;
         let ptr = hdr + if leaf { 8 } else { 12 } + 2 * idx;
         if ptr + 2 > d.len() {
@@ -636,9 +695,9 @@ impl Btree {
     /// What a table cursor on cell `ix` of page `pg` sees when that page is a table leaf
     /// with more than `ix` cells: the key of the cell, the key of the last cell, the number
     /// of cells. `None` otherwise.
-    fn vcr_leaf_peek(&mut self, pg: Pgno, ix: usize) -> Result<Option<(i64, i64, usize)>> {
+    fn vcr_leaf_peek(&mut self, vc: usize, pg: Pgno, ix: usize) -> Result<Option<(i64, i64, usize)>> {
         let hdr = if pg == 1 { 100 } else { 0 };
-        let d = self.pager.read_page(pg)?;
+        let d = self.vc_page_data(vc, pg)?;
         if hdr + 12 > d.len() {
             return Err(sqliters_types::SqliteError::corrupt("b-tree page buffer too small"));
         }
@@ -674,11 +733,10 @@ impl Btree {
             return Err(sqliters_types::SqliteError::corrupt("b-tree deeper than BTCURSOR_MAX_DEPTH"));
         }
         self.vcursors[vc].ai[n - 1] = self.vcursors[vc].ix;
-        if self.vcursors[vc].role & VC_SILENT == 0 {
-            self.pager.page_ref_btree(child)?;
-        }
+        let source = self.vc_pin(vc, child)?;
         let c = &mut self.vcursors[vc];
         c.pages[n] = child;
+        c.sources[n] = source;
         c.n += 1;
         c.ix = 0;
         Ok(())
@@ -692,7 +750,7 @@ impl Btree {
         c.n -= 1;
         let pg = c.pages[n - 1];
         if c.role & VC_SILENT == 0 {
-            self.pager.page_unref(pg);
+            self.pager.unpin_page(pg, c.sources[n - 1]);
         }
     }
 
@@ -700,12 +758,12 @@ impl Btree {
     fn vcr_leftmost(&mut self, vc: usize) -> Result<()> {
         loop {
             let pg = self.vc_top(vc);
-            let (fl, _) = self.vcr_meta(pg)?;
+            let (fl, _) = self.vcr_meta(vc, pg)?;
             if fl & 0x08 != 0 {
                 return Ok(());
             }
             let ix = usize::from(self.vcursors[vc].ix);
-            let child = self.vcr_child(pg, ix)?;
+            let child = self.vcr_child(vc, pg, ix)?;
             self.vcr_to_child(vc, child)?;
         }
     }
@@ -714,13 +772,13 @@ impl Btree {
     fn vcr_rightmost(&mut self, vc: usize) -> Result<()> {
         loop {
             let pg = self.vc_top(vc);
-            let (fl, n_cell) = self.vcr_meta(pg)?;
+            let (fl, n_cell) = self.vcr_meta(vc, pg)?;
             if fl & 0x08 != 0 {
                 self.vcursors[vc].ix = n_cell.saturating_sub(1) as u16;
                 return Ok(());
             }
             self.vcursors[vc].ix = n_cell as u16;
-            let child = self.vcr_child(pg, n_cell)?;
+            let child = self.vcr_child(vc, pg, n_cell)?;
             self.vcr_to_child(vc, child)?;
         }
     }
@@ -738,12 +796,12 @@ impl Btree {
         self.vc_move_to_root(vc)?;
         self.vcursors[vc].ix = 0;
         let root = self.vcursors[vc].pages[0];
-        let (fl, n_cell) = self.vcr_meta(root)?;
+        let (fl, n_cell) = self.vcr_meta(vc, root)?;
         if n_cell > 0 {
             return Ok(true);
         }
         if fl & 0x08 == 0 {
-            let child = self.vcr_child(root, 0)?;
+            let child = self.vcr_child(vc, root, 0)?;
             self.vcr_to_child(vc, child)?;
             return Ok(true);
         }
@@ -828,13 +886,13 @@ impl Btree {
             return Ok(false);
         }
         let pg = self.vc_top(vc);
-        let (fl, n_cell) = self.vcr_meta(pg)?;
+        let (fl, n_cell) = self.vcr_meta(vc, pg)?;
         let leaf = fl & 0x08 != 0;
         self.vcursors[vc].ix += 1;
         let ix = usize::from(self.vcursors[vc].ix);
         if ix >= n_cell {
             if !leaf {
-                let child = self.vcr_child(pg, n_cell)?;
+                let child = self.vcr_child(vc, pg, n_cell)?;
                 self.vcr_to_child(vc, child)?;
                 return self.vcr_leftmost(vc).map(|()| true);
             }
@@ -847,7 +905,7 @@ impl Btree {
                 }
                 self.vcr_to_parent(vc);
                 let ppg = self.vc_top(vc);
-                let (pfl, pn) = self.vcr_meta(ppg)?;
+                let (pfl, pn) = self.vcr_meta(vc, ppg)?;
                 if usize::from(self.vcursors[vc].ix) < pn {
                     if pfl & 0x01 != 0 {
                         // table b-tree: the divider is not an entry
@@ -888,10 +946,10 @@ impl Btree {
             return Ok(false);
         }
         let pg = self.vc_top(vc);
-        let (fl, _) = self.vcr_meta(pg)?;
+        let (fl, _) = self.vcr_meta(vc, pg)?;
         if fl & 0x08 == 0 {
             let ix = usize::from(self.vcursors[vc].ix);
-            let child = self.vcr_child(pg, ix)?;
+            let child = self.vcr_child(vc, pg, ix)?;
             self.vcr_to_child(vc, child)?;
             self.vcr_rightmost(vc)?;
             return Ok(true);
@@ -905,7 +963,7 @@ impl Btree {
         }
         self.vcursors[vc].ix -= 1;
         let pg = self.vc_top(vc);
-        let (fl, _) = self.vcr_meta(pg)?;
+        let (fl, _) = self.vcr_meta(vc, pg)?;
         if fl & 0x01 != 0 && fl & 0x08 == 0 {
             return self.vc_prev(vc);
         }
@@ -916,13 +974,13 @@ impl Btree {
     pub(crate) fn vc_rowid(&mut self, vc: usize) -> Result<i64> {
         let pg = self.vc_top(vc);
         let ix = usize::from(self.vcursors[vc].ix);
-        self.vcr_int_key(pg, ix)
+        self.vcr_int_key(vc, pg, ix)
     }
 
     /// Whether the cell the (table) cursor says it is on holds `rowid`.
     pub(crate) fn vc_cell_rowid_is(&mut self, vc: usize, rowid: i64) -> Result<bool> {
         let pg = self.vc_top(vc);
-        let (fl, n_cell) = self.vcr_meta(pg)?;
+        let (fl, n_cell) = self.vcr_meta(vc, pg)?;
         if fl != 0x0d || usize::from(self.vcursors[vc].ix) >= n_cell {
             return Ok(false);
         }
@@ -936,7 +994,7 @@ impl Btree {
             return Ok(());
         }
         let pg = self.vc_top(vc);
-        let (fl, n_cell) = self.vcr_meta(pg)?;
+        let (fl, n_cell) = self.vcr_meta(vc, pg)?;
         if fl & 0x08 != 0 && n_cell > 0 && usize::from(self.vcursors[vc].ix) < n_cell - 1 {
             self.vcursors[vc].ix = (n_cell - 1) as u16;
             self.vcursors[vc].nkey = None;
@@ -952,7 +1010,7 @@ impl Btree {
             if self.vcursors[vc].valid && self.vcursors[vc].skip == 0 && self.vc_depth(vc) > 0 {
                 // inside a leaf: no reference moves
                 let pg = self.vc_top(vc);
-                let (fl, n_cell) = self.vcr_meta(pg)?;
+                let (fl, n_cell) = self.vcr_meta(vc, pg)?;
                 let ix = usize::from(self.vcursors[vc].ix);
                 if fl & 0x08 != 0 && ix + 1 < n_cell {
                     let room = (n_cell - 1 - ix) as u64;
@@ -977,7 +1035,7 @@ impl Btree {
     pub fn vc_note_rowid(&mut self, vc: usize) -> Result<()> {
         if self.vcursors[vc].valid && self.vc_depth(vc) > 0 {
             let pg = self.vc_top(vc);
-            let (fl, n_cell) = self.vcr_meta(pg)?;
+            let (fl, n_cell) = self.vcr_meta(vc, pg)?;
             if fl == 0x0d && usize::from(self.vcursors[vc].ix) < n_cell {
                 let k = self.vc_rowid(vc)?;
                 self.vcursors[vc].nkey = Some(k);
@@ -1001,7 +1059,7 @@ impl Btree {
         {
             let pg = self.vc_top(vc);
             let ix = usize::from(self.vcursors[vc].ix);
-            peek = self.vcr_leaf_peek(pg, ix)?;
+            peek = self.vcr_leaf_peek(vc, pg, ix)?;
             if !peek.is_some_and(|(k, _, _)| k == nk) {
                 // (what the cursor remembers does not describe the page any more: forget it)
                 peek = None;
@@ -1066,7 +1124,7 @@ impl Btree {
             // ("idx = upr>>(1-biasRight)", then halving) on the cell pointer array.
             let (leaf, n_cell, idx, c, exact_leaf, child) = {
                 let hdr = if pg == 1 { 100 } else { 0 };
-                let d = self.pager.read_page(pg)?;
+                let d = self.vc_page_data(vc, pg)?;
                 if hdr + 12 > d.len() || d.len() < usable {
                     return Err(sqliters_types::SqliteError::corrupt("b-tree page buffer too small"));
                 }
