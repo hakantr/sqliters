@@ -93,6 +93,8 @@ pub struct Expr {
     pub flags: u32,
     /// `u.zToken`: token value, zero terminated and dequoted (valid unless `EP_IntValue`)
     pub z_token: Option<String>,
+    /// C token bytes when an internal string bound is not valid UTF-8.
+    pub z_token_raw: Option<Box<[u8]>>,
     /// `u.iValue`: non-negative integer value if `EP_IntValue`
     pub i_value: i32,
     /// Left subnode
@@ -165,6 +167,18 @@ impl Expr {
     #[inline]
     pub fn tok(&self) -> &str {
         self.z_token.as_deref().unwrap_or("")
+    }
+    pub fn tok_bytes(&self) -> &[u8] {
+        self.z_token_raw.as_deref().unwrap_or_else(|| self.tok().as_bytes())
+    }
+    pub fn set_token_bytes(&mut self, bytes: Vec<u8>) {
+        match String::from_utf8(bytes) {
+            Ok(text) => { self.z_token = Some(text); self.z_token_raw = None; }
+            Err(error) => {
+                self.z_token = Some(String::from_utf8_lossy(error.as_bytes()).into_owned());
+                self.z_token_raw = Some(error.into_bytes().into_boxed_slice());
+            }
+        }
     }
     /// `ExprAlwaysTrue(E)`
     #[inline]

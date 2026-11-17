@@ -1653,8 +1653,8 @@ pub fn sqlite3_expr_code_target(p: &mut Parse, mut e: ExprId, target: i32) -> i3
             target
         }
         TK_STRING => {
-            let z = p.e(e).tok().to_owned();
-            p.v.load_string(target, &z);
+            let z = p.e(e).tok_bytes().to_vec();
+            p.v.add_op4(OP_String8, 0, target, 0, P4::Dynamic(z));
             target
         }
         TK_NULLS => {

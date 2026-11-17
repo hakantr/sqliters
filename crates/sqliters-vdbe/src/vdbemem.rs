@@ -3,9 +3,8 @@
 //! Port of SQLite 3.54.1, C's names and C's order of operations. A cell owns its text / blob
 //! bytes (`z`, with `n == z.len()`), so the storage-class flags `MEM_Dyn` / `MEM_Static` /
 //! `MEM_Ephem` / `MEM_Term` have no counterpart; the type flags are C's bits. Text is kept as
-//! bytes in the database encoding; the machine is used for UTF-8 databases only (the engine
-//! keeps UTF-16 databases on the old execution path), so `sqlite3VdbeChangeEncoding` is the
-//! identity here.
+//! bytes in the cell's encoding. UTF-16 execution is enabled for the supported LIKE read
+//! path; other programs retain their existing routing restrictions.
 
 use std::sync::Arc;
 
@@ -46,6 +45,8 @@ pub type CollCmp = Arc<dyn Fn(&[u8], &[u8]) -> i32 + Send + Sync>;
 /// `struct CollSeq` at run time: the name and the comparison function.
 #[derive(Clone)]
 pub struct CollRt {
+    /// CollSeq.enc; NOCASE/RTRIM compare UTF-8 even in a UTF-16 database.
+    pub enc: u8,
     pub name: String,
     /// `sqlite3IsBinary(pColl)`: the BINARY collation (`binCollFunc`)
     pub is_binary: bool,
@@ -59,6 +60,7 @@ impl CollRt {
     pub fn from_custom(cc: sqliters_types::CustomCollation) -> CollRt {
         let f = std::sync::Arc::clone(&cc.comparator);
         CollRt {
+            enc: 1,
             name: cc.name.to_string(),
             is_binary: false,
             cmp: Arc::new(move |a: &[u8], b: &[u8]| {
@@ -125,6 +127,7 @@ pub fn nocase_coll_func(a: &[u8], b: &[u8]) -> i32 {
         if x != y {
             return i32::from(x) - i32::from(y);
         }
+        if x == 0 { break; }
     }
     a.len() as i32 - b.len() as i32
 }
@@ -140,7 +143,7 @@ pub fn builtin_coll(name: &str) -> Option<CollRt> {
     } else {
         return None;
     };
-    Some(CollRt { name: name.to_owned(), is_binary, cmp: Arc::new(f), custom: None })
+    Some(CollRt { enc: 1, name: name.to_owned(), is_binary, cmp: Arc::new(f), custom: None })
 }
 
 /// `struct sqlite3_value` / `Mem`.
@@ -269,6 +272,15 @@ impl Mem {
         }
     }
 
+    /// sqlite3VdbeChangeEncoding, for a text cell only.
+    pub fn change_encoding(&mut self, encoding: u8) {
+        if self.flags & MEM_STR != 0 && self.enc != encoding {
+            self.z = crate::utf::translate_bytes(&self.z, self.enc, encoding);
+            self.enc = encoding;
+            self.flags |= MEM_TERM;
+        }
+    }
+
     /// `sqlite3VdbeIntValue`
     pub fn int_value(&self) -> i64 {
         let flags = self.flags;
@@ -277,10 +289,30 @@ impl Mem {
         } else if flags & MEM_REAL != 0 {
             sqlite3_real_to_i64(self.r)
         } else if flags & (MEM_STR | MEM_BLOB) != 0 {
-            sqlite_atoi64(&self.z).0
+            self.integer_value_rc().0
         } else {
             0
         }
+    }
+
+    /// `sqlite3Atoi64(..., pMem->enc)`: scan the zero high bytes before parsing
+    /// the low-byte prefix, preserving the UTF-16 nonNum return-code decision.
+    fn integer_value_rc(&self) -> (i64, i32) {
+        if self.enc == 1 {
+            return sqlite_atoi64(&self.z);
+        }
+        let mut ascii = Vec::with_capacity(self.z.len() / 2);
+        let mut non_num = false;
+        for unit in self.z.chunks_exact(2) {
+            let (lo, hi) = if self.enc == 2 { (unit[0], unit[1]) } else { (unit[1], unit[0]) };
+            if hi != 0 {
+                non_num = true;
+                break;
+            }
+            ascii.push(lo);
+        }
+        let (value, rc) = sqlite_atoi64(&ascii);
+        (value, if non_num && (0..2).contains(&rc) { 1 } else { rc })
     }
 
     /// `sqlite3MemRealValueRC`: the value and the return code of `sqlite3AtoF`.
@@ -289,7 +321,23 @@ impl Mem {
         if self.z.is_empty() {
             return (0.0, 0);
         }
-        sqlite_atof(&self.z)
+        if self.enc == 1 {
+            return sqlite_atof(&self.z);
+        }
+        // sqlite3MemRealValueRCSlowPath copies ASCII code units only. A
+        // nonzero high byte forces rc=-100 even after an earlier terminator.
+        let mut ascii = Vec::with_capacity(self.z.len() / 2);
+        let mut non_num = false;
+        for unit in self.z.chunks_exact(2) {
+            let (lo, hi) = if self.enc == 2 { (unit[0], unit[1]) } else { (unit[1], unit[0]) };
+            if hi != 0 {
+                non_num = true;
+                break;
+            }
+            ascii.push(lo);
+        }
+        let (value, rc) = sqlite_atof(&ascii);
+        (value, if non_num { -100 } else { rc })
     }
 
     /// `sqlite3VdbeRealValue`
@@ -355,7 +403,7 @@ impl Mem {
         if self.flags & (MEM_INT | MEM_REAL | MEM_INT_REAL | MEM_NULL) == 0 {
             let (r, rc) = self.real_value_rc();
             self.r = r;
-            let (mut ix, a_rc) = sqlite_atoi64(&self.z);
+            let (mut ix, a_rc) = self.integer_value_rc();
             if ((rc & 2) == 0 && a_rc < 2) || {
                 ix = sqlite3_real_to_i64(self.r);
                 sqlite3_real_same_as_int(self.r, ix)
@@ -371,13 +419,17 @@ impl Mem {
 
     /// `sqlite3VdbeMemCast(pMem, aff, encoding)`
     pub fn cast(&mut self, aff: u8) {
+        self.cast_with_encoding(aff, 1);
+    }
+
+    pub fn cast_with_encoding(&mut self, aff: u8, encoding: u8) {
         if self.flags & MEM_NULL != 0 {
             return;
         }
         match aff {
             SQLITE_AFF_BLOB => {
                 if self.flags & MEM_BLOB == 0 {
-                    self.apply_affinity(SQLITE_AFF_TEXT);
+                    self.apply_affinity_with_encoding(SQLITE_AFF_TEXT, encoding);
                     if self.flags & MEM_STR != 0 {
                         self.set_type_flag(MEM_BLOB);
                     }
@@ -390,8 +442,13 @@ impl Mem {
             SQLITE_AFF_REAL => self.realify(),
             _ => {
                 self.flags |= (self.flags & MEM_BLOB) >> 3;
-                self.apply_affinity(SQLITE_AFF_TEXT);
+                self.apply_affinity_with_encoding(SQLITE_AFF_TEXT, encoding);
                 self.flags &= !(MEM_INT | MEM_REAL | MEM_INT_REAL | MEM_BLOB | MEM_ZERO);
+                if encoding != 1 {
+                    self.z.truncate(self.z.len() & !1);
+                }
+                self.change_encoding(encoding);
+                self.flags |= MEM_TERM;
             }
         }
     }
@@ -403,7 +460,7 @@ impl Mem {
             self.i = i_value;
             return true;
         }
-        let (v, rc) = sqlite_atoi64(&self.z);
+        let (v, rc) = self.integer_value_rc();
         self.i = v;
         rc == 0
     }
@@ -430,6 +487,10 @@ impl Mem {
 
     /// `applyAffinity(pRec, affinity, enc)` (vdbe.c), also `sqlite3ValueApplyAffinity`.
     pub fn apply_affinity(&mut self, affinity: u8) {
+        self.apply_affinity_with_encoding(affinity, 1);
+    }
+
+    pub fn apply_affinity_with_encoding(&mut self, affinity: u8, encoding: u8) {
         if affinity >= SQLITE_AFF_NUMERIC {
             if self.flags & MEM_INT == 0 {
                 if self.flags & (MEM_REAL | MEM_INT_REAL) == 0 {
@@ -446,6 +507,7 @@ impl Mem {
             // representation.
             if self.flags & MEM_STR == 0 && self.flags & (MEM_REAL | MEM_INT | MEM_INT_REAL) != 0 {
                 self.stringify(true);
+                self.change_encoding(encoding);
             }
             self.flags &= !(MEM_REAL | MEM_INT | MEM_INT_REAL);
         }
@@ -459,7 +521,7 @@ impl Mem {
         let (r, rc) = self.real_value_rc();
         self.r = r;
         if rc <= 0 {
-            let (ix, a_rc) = sqlite_atoi64(&self.z);
+            let (ix, a_rc) = self.integer_value_rc();
             if (rc & 2) == 0 && a_rc <= 1 {
                 self.i = ix;
                 MEM_INT
@@ -468,7 +530,7 @@ impl Mem {
             }
         } else {
             if (rc & 2) == 0 {
-                let (ix, a_rc) = sqlite_atoi64(&self.z);
+                let (ix, a_rc) = self.integer_value_rc();
                 if a_rc == 0 {
                     self.i = ix;
                     return MEM_INT;
@@ -666,6 +728,15 @@ pub fn sqlite3_int_float_compare(i: i64, r: f64) -> i32 {
     }
 }
 
+/// vdbeCompareMemStringWithEncodingChange: compare data in CollSeq.enc.
+pub fn compare_text_bytes(a: &[u8], a_enc: u8, b: &[u8], b_enc: u8, coll: &CollRt) -> i32 {
+    let a = if a_enc == coll.enc { std::borrow::Cow::Borrowed(a) }
+        else { std::borrow::Cow::Owned(crate::utf::translate_bytes(a, a_enc, coll.enc)) };
+    let b = if b_enc == coll.enc { std::borrow::Cow::Borrowed(b) }
+        else { std::borrow::Cow::Owned(crate::utf::translate_bytes(b, b_enc, coll.enc)) };
+    (coll.cmp)(&a, &b)
+}
+
 /// `sqlite3MemCompare(pMem1, pMem2, pColl)`
 pub fn sqlite3_mem_compare(m1: &Mem, m2: &Mem, coll: Option<&CollRt>) -> i32 {
     let f1 = m1.flags;
@@ -707,7 +778,7 @@ pub fn sqlite3_mem_compare(m1: &Mem, m2: &Mem, coll: Option<&CollRt>) -> i32 {
             return -1;
         }
         if let Some(c) = coll {
-            return (c.cmp)(&m1.z, &m2.z);
+            return compare_text_bytes(&m1.z, m1.enc, &m2.z, m2.enc, c);
         }
     }
     sqlite3_blob_compare(m1, m2)

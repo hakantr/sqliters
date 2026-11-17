@@ -916,6 +916,9 @@ fn cmp_ascii_nocase_bytes(a: &[u8], b: &[u8]) -> Ordering {
         if ca != cb {
             return ca.cmp(&cb);
         }
+        if ca == 0 {
+            break;
+        }
     }
     a.len().cmp(&b.len())
 }
@@ -3404,6 +3407,12 @@ impl std::hash::Hash for HashGroupBucketKey {
                     Collation::NoCase => {
                         for &b in s.as_bytes() {
                             state.write_u64(u64::from(b.to_ascii_lowercase()));
+                            if b == 0 {
+                                // NOCASE compares the prefix through NUL and then the
+                                // full byte lengths. Equal keys must have equal hashes.
+                                state.write_usize(s.len());
+                                break;
+                            }
                         }
                     }
                 }

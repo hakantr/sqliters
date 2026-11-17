@@ -425,7 +425,7 @@ pub fn sqlite3_vdbe_record_compare_with_skip(a_key1: &[u8], p: &mut UnpackedReco
                     p.err_code = 11;
                     return 0; // Corruption
                 } else if let Some(coll) = key_info.a_coll.get(i).and_then(|c| c.as_ref()) {
-                    rc = (coll.cmp)(&a_key1[d..d + n as usize], &rhs.z);
+                    rc = crate::vdbemem::compare_text_bytes(&a_key1[d..d + n as usize], key_info.enc, &rhs.z, rhs.enc, coll);
                 } else {
                     let n_cmp = (n as usize).min(rhs.z.len());
                     rc = match a_key1[d..d + n_cmp].cmp(&rhs.z[..n_cmp]) {

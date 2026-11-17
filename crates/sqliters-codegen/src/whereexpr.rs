@@ -1168,14 +1168,9 @@ pub fn expr_analyze(p: &mut Parse, w: &mut WhereInfo, wc: WcId, idx_term: usize)
                 }
                 s2[pc] = s2[pc].wrapping_add(1);
             }
-            // The bounds are C strings; a bound that is no longer valid UTF-8 after its last
-            // byte was incremented cannot be held by the token text of this port.
-            let (Ok(t1), Ok(t2)) = (String::from_utf8(s1), String::from_utf8(s2)) else {
-                p.not_supported("LIKE optimization with a range bound that is not valid UTF-8");
-                return;
-            };
-            p.em(p_str1).z_token = Some(t1);
-            p.em(p_str2).z_token = Some(t2);
+            // C keeps raw string bytes, including a malformed UTF-8 upper bound.
+            p.em(p_str1).set_token_bytes(s1);
+            p.em(p_str2).set_token_bytes(s2);
 
             let z_coll_seq_name = if no_case { "NOCASE" } else { "BINARY" };
             let mut new_expr1 = sqlite3_expr_dup(p, p_left, 0);

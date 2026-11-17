@@ -1161,7 +1161,7 @@ fn unsupported(prog: &Program, write: bool) -> Option<String> {
             _ => {}
         }
         if let P4::KeyInfo(k) = &op.p4 {
-            if k.enc != 1 && !(prog.references_like && k.a_coll.iter().flatten().all(|c| c.name.eq_ignore_ascii_case("binary"))) {
+            if k.enc != 1 && !prog.references_like {
                 return Some("UTF-16 key".to_owned());
             }
             // An application-defined collation can fail in this engine (its callback returns a
@@ -1525,7 +1525,8 @@ impl Vdbe {
     fn bind_ops<H: VdbeHost>(a_op: &[VdbeOp], host: &mut H) -> Result<Vec<OpRt>> {
         let mut rt = vec![OpRt::None; a_op.len()];
         let find = |c: &CollSeq, host: &mut H| -> Result<Arc<CollRt>> {
-            if let Some(b) = builtin_coll(&c.name) {
+            if let Some(mut b) = builtin_coll(&c.name) {
+                b.enc = c.enc;
                 return Ok(Arc::new(b));
             }
             match host.find_collation(&c.name) {
@@ -2251,11 +2252,7 @@ impl Vdbe {
                     let m = &mut self.a_mem[op.p2 as usize];
                     m.z.clear();
                     if op.opcode == OP_String8 && encoding != sqliters_types::TextEncoding::Utf8 {
-                        // Generated database_list strings are lossless UTF-8.
-                        // General invalid UTF-8 translation remains unported.
-                        let text = std::str::from_utf8(&z[..n])
-                            .map_err(|_| internal("unsupported UTF-16 String8 with invalid UTF-8"))?;
-                        encoding.encode_into(text, &mut m.z);
+                        m.z = crate::utf::translate_bytes(&z[..n], 1, encoding as u8);
                         if m.z.len() as i64 > i64::from(limit_length) { return Err(too_big()); }
                     } else {
                         m.z.extend_from_slice(&z[..n]);
@@ -2611,7 +2608,7 @@ impl Vdbe {
                 OP_Cast => {
                     let m = &mut self.a_mem[op.p1 as usize];
                     m.expand_blob();
-                    m.cast(op.p2 as u8);
+                    m.cast_with_encoding(op.p2 as u8, host.text_encoding() as u8);
                 }
 
                 OP_Eq | OP_Ne | OP_Lt | OP_Le | OP_Gt | OP_Ge => {
@@ -3294,6 +3291,10 @@ impl Vdbe {
                                 rec.flags &= !MEM_INT;
                             }
                         }
+                    }
+                    // C cells reaching record serialization carry database encoding.
+                    for cell in &mut self.a_mem[d0..d0 + n_field] {
+                        cell.change_encoding(host.text_encoding() as u8);
                     }
                     // Loop through the elements that will make up the record to figure out
                     // how much space is required for the new record.

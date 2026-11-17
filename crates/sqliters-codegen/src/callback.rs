@@ -26,7 +26,8 @@ fn intern_coll(p: &mut Parse, name: &str) -> Arc<CollSeq> {
     if let Some(c) = p.a_coll.iter().find(|c| c.name == name) {
         return c.clone();
     }
-    let c = Arc::new(CollSeq { name: name.to_owned(), enc: p.db.enc });
+    let enc = if name.eq_ignore_ascii_case("NOCASE") || name.eq_ignore_ascii_case("RTRIM") { 1 } else { p.db.enc };
+    let c = Arc::new(CollSeq { name: name.to_owned(), enc });
     p.a_coll.push(c.clone());
     c
 }

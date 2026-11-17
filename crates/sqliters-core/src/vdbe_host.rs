@@ -1291,6 +1291,8 @@ pub(crate) fn run_write(
     vm.rewind();
     for (i, v) in params.iter().enumerate() {
         vm.bind(i + 1, v);
+        vm.a_var[i].change_encoding(ctx.encoding() as u8);
+        vm.a_var[i].enc = ctx.encoding() as u8;
     }
     vm.trace_sql(sql);
     RUNS.with(|r| r.set(r.get() + 1));
@@ -1450,6 +1452,8 @@ pub(crate) fn step(
         vm.rewind();
         for (i, v) in params.iter().enumerate() {
             vm.bind(i + 1, v);
+            vm.a_var[i].change_encoding(inner.effective_encoding() as u8);
+            vm.a_var[i].enc = inner.effective_encoding() as u8;
         }
         vm.trace_sql(sql);
         vm.expire_seq = inner.db_set.c_expire_seq();

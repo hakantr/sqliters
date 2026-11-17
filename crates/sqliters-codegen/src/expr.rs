@@ -756,6 +756,7 @@ fn expr_dup(p: &mut Parse, e: ExprId, dup_flags: i32) -> ExprId {
                 op2: old.op2,
                 flags: old.flags,
                 z_token: old.z_token.clone(),
+                z_token_raw: old.z_token_raw.clone(),
                 i_value: old.i_value,
                 p_left: old.p_left,
                 p_right: old.p_right,
@@ -770,6 +771,7 @@ fn expr_dup(p: &mut Parse, e: ExprId, dup_flags: i32) -> ExprId {
                 op2: old.op2,
                 flags: old.flags,
                 z_token: old.z_token.clone(),
+                z_token_raw: old.z_token_raw.clone(),
                 i_value: old.i_value,
                 ..Expr::default()
             },
@@ -1986,7 +1988,7 @@ pub fn sqlite3_expr_compare(p: &Parse, use_parse: bool, a: ExprId, b: ExprId, i_
             if !str_ieq(za, pb.tok()) {
                 return 2;
             }
-        } else if pb.z_token.is_some() && pa.op != TK_COLUMN && pa.op != TK_AGG_COLUMN && za != pb.tok() {
+        } else if pb.z_token.is_some() && pa.op != TK_COLUMN && pa.op != TK_AGG_COLUMN && pa.tok_bytes() != pb.tok_bytes() {
             return 2;
         }
     }

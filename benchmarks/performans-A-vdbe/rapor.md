@@ -498,3 +498,7 @@ Hazırlama etkisi, iki LIKE kaydı, BUSY/expire ve paylaşılan builtin bayrakla
 ## V6b.30 — bağlı LIKE yeniden üretimi
 
 Bağlı değer, maskeli bind/clear ve dummy Variable üretimi C ile hizalandı; V1, EXPLAIN ve sayaç aktarımı denetlendi. D139 ana matrisinde 40/48 tam eşit, 8 UTF-16 NOCASE farkı açık. 144 bound açıklama, 48 ömür, 84 API/parametre ve 144 tam program karşılaştırması aynı. D140 NUL/NOCASE ve D141 ham Unicode üst sınırı farkları doğrulandı; sıradaki iş kodlama/collation/ham token baytlarıdır. D52/D103/E28 ve kalan PRAGMA/M4 sürer. Kanıt [karar_esligi_v6b_30.md](karar_esligi_v6b_30.md).
+
+## V6b.31 — UTF-16 LIKE ve ham kodlama kararları
+
+D139 kalan UTF-16 NOCASE, D140 NUL karşılaştırma/gruplama ve D141 ham Unicode aralık örnekleri eşitlendi. Açılan UTF-16 yolda bulunan TEXT/BLOB CAST ve sayısal dönüşüm farkları giderildi. 528 tam program, 72 ek SQL, 489145 ham dönüşüm/karşılaştırma ve 1587945 sayısal hücre gözleminde fark yok. İki anahtar testi ve dört kapı denetlendi; eski kusur/beklenti kümeleri korundu. Genel geçersiz TEXT API temsili, NOMEM, GLOB, kalan PRAGMA/M4 ve E28 açıktır. [Karar eşliği](karar_esligi_v6b_31.md).

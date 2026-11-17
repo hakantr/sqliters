@@ -2898,3 +2898,6 @@ mod tests {
         assert!(bt.btree_mut(DatabaseId(2)).is_err());
     }
 }
+
+/// C SQLite byte encoding conversion.
+pub mod utf;

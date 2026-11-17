@@ -291,6 +291,7 @@ impl Collation {
                 for (&ba, &bb) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
                     let la = ba.to_ascii_lowercase();
                     let lb = bb.to_ascii_lowercase();
+                    if la == 0 && lb == 0 { break; }
                     match la.cmp(&lb) {
                         Ordering::Equal => continue,
                         non_eq => return non_eq,
