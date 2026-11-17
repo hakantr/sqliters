@@ -13,12 +13,16 @@ mod sys {
 }
 
 pub mod shm;
+#[cfg(unix)]
+mod fetch;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+#[cfg(windows)]
+use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -158,6 +162,24 @@ pub enum SyncFlags {
     FullDataOnly,
 }
 
+/// An `xFetch` result. Dropping it returns exactly one reference to its VFS.
+/// The byte copy is immutable; the lease controls the underlying mapping's
+/// lifetime independently of the caller's use of that copy.
+pub struct FetchPage {
+    data: Vec<u8>,
+    _lease: Box<dyn Send + Sync>,
+}
+
+impl FetchPage {
+    pub fn new(data: Vec<u8>, lease: Box<dyn Send + Sync>) -> Self {
+        Self { data, _lease: lease }
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+}
+
 /// Open file handle corresponding to `sqlite3_file` / `sqlite3_io_methods`.
 pub trait VfsFile: Send + Sync {
     /// Reads up to `buf.len()` bytes starting at `offset`.
@@ -205,6 +227,17 @@ pub trait VfsFile: Send + Sync {
     /// only queries it. None means SQLITE_NOTFOUND for this VFS.
     fn mmap_size(&self, _new_limit: i64) -> Result<Option<i64>> {
         Ok(None)
+    }
+
+    /// `xFetch`: a read-only page and a lease that is released when the page is
+    /// dropped. The owned bytes keep mapped memory out of the safe pager API.
+    fn fetch(&self, _offset: u64, _amount: usize) -> Result<Option<FetchPage>> {
+        Ok(None)
+    }
+
+    /// `xUnfetch(fd, 0, NULL)`: invalidate the mapping after all leases return.
+    fn unfetch_all(&self) -> Result<()> {
+        Ok(())
     }
 
     /// Explicitly releases locks, closes (or defers closing under active POSIX locks) the
@@ -2095,7 +2128,10 @@ struct OsFile {
     delete_on_close: bool,
     readonly: bool,
     pending_dir_sync: AtomicBool,
+    #[cfg(windows)]
     mmap_size_max: AtomicI64,
+    #[cfg(unix)]
+    fetch_state: Arc<Mutex<fetch::FetchState>>,
     lock_geometry: LockGeometry,
     min_shm_granularity: usize,
     lock_level: Mutex<LockLevel>,
@@ -2126,16 +2162,41 @@ impl Drop for OsFile {
 
 impl VfsFile for OsFile {
     fn mmap_size(&self, new_limit: i64) -> Result<Option<i64>> {
+        let file = self.file_ref()?;
+        #[cfg(unix)]
+        {
+            fetch::set_limit(&self.fetch_state, file, new_limit).map(Some)
+        }
+        #[cfg(windows)]
+        {
+            let _ = file;
+            let old = if new_limit >= 0 {
+                self.mmap_size_max.swap(new_limit.min(0x7fff0000), AtomicOrdering::Relaxed)
+            } else {
+                self.mmap_size_max.load(AtomicOrdering::Relaxed)
+            };
+            Ok(Some(old))
+        }
+    }
+
+    fn fetch(&self, offset: u64, amount: usize) -> Result<Option<FetchPage>> {
+        let file = self.file_ref()?;
+        #[cfg(unix)]
+        {
+            fetch::fetch(&self.fetch_state, file, offset, amount)
+        }
+        #[cfg(windows)]
+        {
+            let _ = (file, offset, amount);
+            Ok(None)
+        }
+    }
+
+    fn unfetch_all(&self) -> Result<()> {
         self.file_ref()?;
-        // os_unix.c:4228–4244, the reference mxMmap is 0x7fff0000.
-        // This VFS has no outstanding xFetch pointers. Mapping is advisory;
-        // storing its limit does not require mapping pages.
-        let old = if new_limit >= 0 {
-            self.mmap_size_max.swap(new_limit.min(0x7fff0000), AtomicOrdering::Relaxed)
-        } else {
-            self.mmap_size_max.load(AtomicOrdering::Relaxed)
-        };
-        Ok(Some(old))
+        #[cfg(unix)]
+        fetch::unfetch_all(&self.fetch_state)?;
+        Ok(())
     }
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
         let file = self.file_ref()?;
@@ -2694,6 +2755,10 @@ impl VfsFile for OsFile {
             return Ok(());
         }
 
+        // unixClose unmaps before closing the descriptor. A caller must return
+        // all xFetch leases first; retain their owner defensively if it did not.
+        #[cfg(unix)]
+        let _ = fetch::unfetch_all(&self.fetch_state);
         let unlock_res = self.unlock(LockLevel::NoLock);
         let mut first_err = unlock_res.err();
 
@@ -3525,7 +3590,10 @@ impl Vfs for OsVfs {
             delete_on_close,
             readonly,
             pending_dir_sync: AtomicBool::new(pending_dir_sync),
+            #[cfg(windows)]
             mmap_size_max: AtomicI64::new(0),
+            #[cfg(unix)]
+            fetch_state: Arc::new(Mutex::new(fetch::FetchState::default())),
             lock_geometry: self.lock_geometry,
             min_shm_granularity: self.min_shm_granularity,
             lock_level: Mutex::new(LockLevel::NoLock),

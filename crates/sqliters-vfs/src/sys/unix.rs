@@ -821,6 +821,69 @@ impl Drop for SysShmBacking {
     }
 }
 
+/// Read-only database mapping used by unixFetch. Raw pointers remain inside
+/// the FFI boundary; upper layers receive owned bytes and a separate lease.
+pub(crate) struct ReadMapping {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: the mapping owns its address range until Drop. Moving the owner
+// between threads cannot invalidate it; access is serialized by FetchState's
+// mutex. No reference into mapped memory is exposed to Rust callers.
+unsafe impl Send for ReadMapping {}
+
+impl ReadMapping {
+    pub(crate) fn map(file: &File, len: usize) -> Option<Self> {
+        debug_assert!(len > 0 && len <= 0x7fff0000);
+        // SAFETY: the caller established a nonzero file-backed length; offset
+        // zero is page aligned. The kernel chooses the address. The successful
+        // mapping is owned here and unmapped exactly once in Drop.
+        let raw = unsafe {
+            mmap(core::ptr::null_mut(), len, PROT_READ, MAP_SHARED, file.as_raw_fd(), 0)
+        };
+        if raw as usize == MAP_FAILED_ADDR {
+            return None;
+        }
+        let Some(ptr) = NonNull::new(raw.cast::<u8>()) else {
+            // SAFETY: even a null successful mapping must be unmapped before
+            // declining it; Rust's NonNull cannot represent that address.
+            let _ = unsafe { munmap(raw, len) };
+            return None;
+        };
+        Some(Self { ptr, len })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn copy(&self, offset: usize, amount: usize) -> Vec<u8> {
+        assert!(offset <= self.len && amount <= self.len - offset);
+        let mut bytes = Vec::with_capacity(amount);
+        for i in offset..offset + amount {
+            // SAFETY: bounds were checked against the live mapping; AtomicU8
+            // has byte alignment. Atomic loads expose no Rust references to
+            // bytes the OS page cache can also update. Database locking is the
+            // caller's responsibility, as for xRead/xFetch in SQLite's VFS.
+            let byte = unsafe {
+                (&*self.ptr.as_ptr().add(i).cast::<std::sync::atomic::AtomicU8>())
+                    .load(Ordering::Relaxed)
+            };
+            bytes.push(byte);
+        }
+        bytes
+    }
+}
+
+impl Drop for ReadMapping {
+    fn drop(&mut self) {
+        // SAFETY: this object exclusively owns the successful mmap address
+        // and length; FetchState never drops it while a fetch lease is held.
+        let _ = unsafe { munmap(self.ptr.as_ptr().cast(), self.len) };
+    }
+}
+
 /// OS page-aligned `mmap` view over a portion of the `-shm` file (`MapView` OS backend).
 ///
 /// Raw pointers never leave this struct: upper layers access WAL-index fields strictly through

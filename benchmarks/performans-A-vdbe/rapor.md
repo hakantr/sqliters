@@ -506,3 +506,7 @@ D139 kalan UTF-16 NOCASE, D140 NUL karşılaştırma/gruplama ve D141 ham Unicod
 ## V6b.32 — mmap hazırlama etkisi ve TEMP dosya ömrü
 
 MMAP_SIZE hazırlama etkisi ve VFS sınırı üreticiye taşındı; TEMP dosyası ilk yazma yerine ilk dirty spill’de açılır, küçük commit dirty sayfaları önbellekte bırakır. 270 TEMP akışı, 144 tam program ve 78 ek ifade aynı. Native mmap 240/250 eşit; dört D144 offset ve altı D142 mapped-reader farkı açık. nFetchOut/gerçek harita yaşamı sıradaki doğruluk işidir; mmap tamamlandı sayılmaz. Yeni F10–F12 test beklentileri C VFS gözlemcisiyle sınıflandırıldı, değiştirilmedi. [Kanıt](karar_esligi_v6b_32.md).
+
+## V6b.33 — VFS fetch/unfetch yaşamı
+
+Unix VFS'de gerçek read-only mmap, fetch lease sayısı, EOF256 ve aktif ref sırasında limit guardı eklendi. 10.051 C/model/Rust işlemi ve dosya hashleri aynı. Pager bağlantısı yapılmadığından D142 altı örnekte açık; D144 dört örnek de sürüyor. Native mmap240/250, TEMP270/270, tam program144/144, elle CLI16/16. Dört kapıdaki eski fark kümeleri korundu; OFF(1131, 4, 337), ON(1117, 18, 337); hız Rust1.100 tabanına 1.210x ve14 digest farkı0. Mremap, mmap hata günlüğü ve hata enjeksiyonu tamamlandı sayılmaz. [Kanıt](karar_esligi_v6b_33.md). Kullanıcının sohbet devri için [devam belgesi](devir_v6b_33.md); sıradaki iş V6b.34/D142 sayfalayıcı bağlantısı.
