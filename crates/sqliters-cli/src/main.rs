@@ -14,6 +14,7 @@
     clippy::while_let_loop
 )]
 
+mod collations;
 mod dotcmd;
 mod help;
 mod import;
@@ -629,6 +630,9 @@ impl ShellState {
             }
             let testmode_on = self.has_flag(SHFLG_TESTING_MODE);
             if let Some(db) = &self.db {
+                // shell.c.in:5236–5238: these collations belong to each shell DB.
+                let _ = db.register_collation("uint", collations::uint);
+                let _ = db.register_collation("decimal", collations::decimal);
                 let _ = db.set_trusted_schema(testmode_on);
                 let _ = db.db_config_defensive(Some(!testmode_on));
                 if self.busy_timeout > 0 {

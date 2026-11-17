@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
@@ -503,9 +503,23 @@ pub type CollationCallback = Arc<dyn Fn(&str, &str) -> Ordering + Send + Sync>;
 pub type FallibleCollationCallback = Arc<dyn Fn(&str, &str) -> Result<Ordering> + Send + Sync>;
 
 /// Connection-level registry for built-in and custom collation sequences.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct CollationRegistry {
     custom: BTreeMap<String, CustomCollation>,
+    /// findCollSeqEntry never removes a hash entry when xCmp becomes NULL.
+    c_entries: Vec<String>,
+    /// UTF-8 builtin xCmp slots cleared through this registry's remove API.
+    removed_builtin_comparators: BTreeSet<String>,
+}
+
+impl Default for CollationRegistry {
+    fn default() -> Self {
+        Self {
+            custom: BTreeMap::new(),
+            c_entries: vec!["BINARY".to_owned(), "NOCASE".to_owned(), "RTRIM".to_owned()],
+            removed_builtin_comparators: BTreeSet::new(),
+        }
+    }
 }
 
 impl std::fmt::Debug for CollationRegistry {
@@ -517,6 +531,13 @@ impl std::fmt::Debug for CollationRegistry {
 }
 
 impl CollationRegistry {
+    pub(crate) fn note_entry(&mut self, name: &str) -> String {
+        if let Some(first) = self.c_entries.iter().find(|n| n.eq_ignore_ascii_case(name)) {
+            return first.clone();
+        }
+        self.c_entries.push(name.to_owned());
+        name.to_owned()
+    }
     /// Creates a collation registry with built-in `BINARY`, `NOCASE`, and `RTRIM` support.
     #[inline]
     pub fn new() -> Self {
@@ -542,8 +563,9 @@ impl CollationRegistry {
     where
         F: Fn(&str, &str) -> Result<Ordering> + Send + Sync + 'static,
     {
-        let name_str = name.into();
+        let name_str = self.note_entry(&name.into());
         let key = name_str.to_ascii_uppercase();
+        self.removed_builtin_comparators.remove(&key);
         let label = format!("collation {name_str}");
         let cc = CustomCollation::new(name_str, move |a, b| {
             catch_callback_panic(&label, || callback(a, b))
@@ -553,7 +575,17 @@ impl CollationRegistry {
 
     /// Removes a custom collation by name, returning `true` if it was present.
     pub fn unregister_collation(&mut self, name: &str) -> bool {
+        self.note_entry(name);
+        if Collation::from_name(name).is_some() {
+            self.removed_builtin_comparators.insert(name.to_ascii_uppercase());
+        }
         self.custom.remove(&name.to_ascii_uppercase()).is_some()
+    }
+
+    pub(crate) fn has_registration_comparator(&self, name: &str) -> bool {
+        let key = name.to_ascii_uppercase();
+        self.custom.contains_key(&key)
+            || (Collation::from_name(name).is_some() && !self.removed_builtin_comparators.contains(&key))
     }
 
     /// Looks up a registered custom collation descriptor by name (ASCII case-insensitive).
@@ -663,15 +695,11 @@ impl CollationRegistry {
         ))
     }
 
-    /// Returns all active collation names (built-in `BINARY`, `NOCASE`, `RTRIM`, plus custom collations).
+    /// `pragma.c:1456`: names in aCollSeq order, including NULL comparators.
     pub fn all_collation_names(&self) -> Vec<String> {
-        let mut names = vec!["BINARY".to_owned(), "NOCASE".to_owned(), "RTRIM".to_owned()];
-        for cc in self.custom.values() {
-            if !names.iter().any(|n| n.eq_ignore_ascii_case(&cc.name)) {
-                names.push(cc.name.to_string());
-            }
-        }
-        names
+        let keys: Vec<&str> = self.c_entries.iter().map(String::as_str).collect();
+        crate::schema::c_hash_iteration_order(&keys).into_iter()
+            .map(|i| self.c_entries[i].clone()).collect()
     }
 }
 

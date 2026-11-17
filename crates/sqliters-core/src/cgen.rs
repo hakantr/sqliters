@@ -98,6 +98,9 @@ fn func_flags(flags: FunctionFlags) -> u32 {
 }
 
 impl Host for EngineHost<'_> {
+    fn pragma_collations(&self) -> Option<Vec<String>> {
+        Some(self.collations.all_collation_names())
+    }
     fn pragma_text(&self, i_db: usize, name: &str) -> Option<String> {
         if name != "filename" { return None; }
         let slot = self.db_set.slots().get(i_db)?;

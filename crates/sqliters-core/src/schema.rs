@@ -860,6 +860,8 @@ pub struct SchemaData {
     /// them, as last read by [`Schema::reload_stat1`]: C's code generator (the port) loads
     /// its statistics from them with C's `analysisLoader()`.
     pub stat1_rows: Vec<(String, Option<String>, String)>,
+    /// Column COLLATE names visited by sqlite3InitCallback, in catalog/token order.
+    pub(crate) c_collation_entries: Vec<String>,
 }
 
 /// Copy-on-write (`Arc`-backed) schema handle so `Schema::clone` and `snapshot_open_schemas`
@@ -1095,6 +1097,7 @@ impl Schema {
                 loaded: true,
                 had_pages: false,
                 stat1_rows: Vec::new(),
+                c_collation_entries: Vec::new(),
             }))
         } else {
             Self::load_inner(btree, db_schema_name)
@@ -1111,6 +1114,7 @@ impl Schema {
         let writable_schema = btree.writable_schema();
         let raw_rows = scan_table_incremental(btree, 1)?;
         let mut tables = Vec::new();
+        let mut c_collation_entries = Vec::new();
         let mut virtual_tables = Vec::new();
         let mut views = Vec::new();
         let mut pending_auto_by_table: Vec<(String, Vec<PendingAutoIndex>)> = Vec::new();
@@ -1157,6 +1161,13 @@ impl Schema {
                     if let Some(sql_text) = sql_opt {
                         match parse_one(&sql_text) {
                             Ok((Some(Stmt::CreateTable(ct)), tail)) if tail.trim().is_empty() => {
+                                for col in &ct.columns {
+                                    for constraint in &col.constraints {
+                                        if let ColumnConstraint::Collate(name) = constraint {
+                                            c_collation_entries.push(name.clone());
+                                        }
+                                    }
+                                }
                                 let (mut tbl, autos) = build_table_schema_from_ast(&ct, rootpage)?;
                                 tbl.schema_rowid = rowid;
                                 tbl.name = name.clone();
@@ -1506,6 +1517,7 @@ impl Schema {
             loaded: true,
             had_pages: true,
             stat1_rows: Vec::new(),
+            c_collation_entries,
         });
         let _ = schema.reload_stat1(btree);
         Ok(schema)

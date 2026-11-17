@@ -1714,6 +1714,18 @@ impl ConnectionInner {
         }
     }
 
+    /// main.c:2940–2952: only replacing/removing an existing xCmp expires VMs.
+    fn prepare_collation_change(&mut self, name: &str) -> Result<()> {
+        if self.collations.has_registration_comparator(name) {
+            if !self.activity.leases.is_empty() {
+                return Err(SqliteError::new(ErrorCode::Busy,
+                    "unable to delete/modify collation sequence due to active statements"));
+            }
+            self.db_set.c_expire_all();
+        }
+        Ok(())
+    }
+
     fn restore_main_schema_encoding(&mut self) {
         let header = self.db_set.main_btree().pager().header();
         if !header.text_encoding_unset {
@@ -1943,6 +1955,9 @@ impl ConnectionInner {
                     any_changed = true;
                 }
             }
+            for name in &self.db_set.slots()[idx].schema.c_collation_entries {
+                self.collations.note_entry(name);
+            }
         }
         if any_changed {
             self.db_set.rebind_all_collations(&self.collations);
@@ -1974,6 +1989,9 @@ impl ConnectionInner {
                 slot.schema.ensure_fresh_in_tx_for_schema(bt, &slot.name)?;
                 if idx == 0 && has_pages {
                     self.connection_encoding = bt.encoding();
+                }
+                for name in &slot.schema.c_collation_entries {
+                    self.collations.note_entry(name);
                 }
                 any_changed = true;
             }
@@ -4532,6 +4550,7 @@ impl Connection {
         let mut session = self.shared.enter()?;
         let inner = session.inner_mut();
         inner.ensure_usable()?;
+        inner.prepare_collation_change(name)?;
         inner.collations.register_collation(name, cmp);
         inner.db_set.rebind_all_collations(&inner.collations);
         inner.schema_generation += 1;
@@ -4557,6 +4576,7 @@ impl Connection {
         let mut session = self.shared.enter()?;
         let inner = session.inner_mut();
         inner.ensure_usable()?;
+        inner.prepare_collation_change(name)?;
         inner.collations.register_fallible_collation(name, cmp);
         inner.db_set.rebind_all_collations(&inner.collations);
         inner.schema_generation += 1;
@@ -4578,6 +4598,7 @@ impl Connection {
         let mut session = self.shared.enter()?;
         let inner = session.inner_mut();
         inner.ensure_usable()?;
+        inner.prepare_collation_change(name)?;
         let removed = inner.collations.unregister_collation(name);
         if removed {
             inner.db_set.rebind_all_collations(&inner.collations);
@@ -6015,7 +6036,7 @@ fn prepare_default_cache_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>
 fn prepare_row_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str)
     -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>>
 {
-    if !matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("database_list")) {
+    if !matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("database_list") || name.eq_ignore_ascii_case("collation_list")) {
         return Ok(None);
     }
     let Some(program) = prepare_pragma_program(inner, sql)? else { return Ok(None); };
@@ -9500,6 +9521,16 @@ impl Statement {
                     },
                 );
                 inner.runtime.stmt_timestamp_ms = prev_ts;
+                if res.is_ok() && matches!(stmt_clone, Stmt::AttachDatabase { .. }) {
+                    // attach.c:271 -> sqlite3Init: the newly attached catalog's
+                    // column CollSeq entries survive a later DETACH.
+                    let n = inner.db_set.slot_count();
+                    for i in std::iter::once(0).chain((1..n).rev()) {
+                        for name in &inner.db_set.slots()[i].schema.c_collation_entries {
+                            inner.collations.note_entry(name);
+                        }
+                    }
+                }
                 if expires_all && res.is_ok() {
                     inner.advisory_expire_generation += 1;
                 }

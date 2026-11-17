@@ -1128,6 +1128,8 @@ pub trait Host {
     }
     /// A lossless UTF-8 prepare-time pager string. None leaves the handler unsupported.
     fn pragma_text(&self, _i_db: usize, _name: &str) -> Option<String> { None }
+    /// C's live aCollSeq hash order, including entries whose comparator was removed.
+    fn pragma_collations(&self) -> Option<Vec<String>> { None }
     /// pragma.c changes these values during prepare, including under EXPLAIN.
     fn note_pragma_effect(&self, _effect: crate::pragma::PrepareEffect) {}
     /// `sqlite3ReadSchema()` -> `sqlite3Init()` did work: C's connection has its schemas loaded

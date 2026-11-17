@@ -448,6 +448,17 @@ pub fn sqlite3_pragma(
                 p.v.add_op2(OP_ResultRow, 1, 1);
             }
         }
+        9 => {
+            // pragma.c:1456–1463: snapshot the live hash, without sorting names.
+            let Some(names) = p.db.host.pragma_collations() else {
+                p.not_supported("PRAGMA collation_list registry (V6b)");
+                return;
+            };
+            p.n_mem = 2;
+            for (i, name) in names.into_iter().enumerate() {
+                row(p, vec![PragmaCell::Int(i as i32), name.into()]);
+            }
+        }
         12 => {
             // pragma.c:1442–1453: names, membership and filenames freeze at prepare.
             p.n_mem = 3;

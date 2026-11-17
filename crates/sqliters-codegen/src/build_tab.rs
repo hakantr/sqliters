@@ -579,7 +579,7 @@ pub fn sqlite3_add_collate_type(p: &mut Parse, tok: &Token) {
     let z_coll = sqlite3_dequote(p.tok_str(tok));
     // sqlite3LocateCollSeq(): while the schema is loaded (initbusy) sqlite3FindCollSeq() is
     // called with create==1, so the collation always "exists"
-    if p.db.init_busy || sqlite3_locate_coll_seq(p, &z_coll).is_some() {
+    if sqlite3_locate_coll_seq(p, &z_coll).is_some() {
         {
             // sqlite3ColumnSetColl(db, &p->aCol[i], zColl)
             let c = &mut p.tabm(tab).a_col[i];

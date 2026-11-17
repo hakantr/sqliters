@@ -53,6 +53,10 @@ pub fn sqlite3_get_coll_seq(p: &mut Parse, z_name: &str) -> Option<Arc<CollSeq>>
 
 /// `sqlite3LocateCollSeq(pParse, zName)`
 pub fn sqlite3_locate_coll_seq(p: &mut Parse, z_name: &str) -> Option<Arc<CollSeq>> {
+    if p.db.init_busy {
+        // callback.c:262 -> findCollSeqEntry(create=1), including missing xCmp.
+        return Some(sqlite3_find_coll_seq(p, z_name).unwrap_or_else(|| intern_coll(p, z_name)));
+    }
     let c = sqlite3_find_coll_seq(p, z_name);
     if !p.db.init_busy && c.is_none() {
         return sqlite3_get_coll_seq(p, z_name);
