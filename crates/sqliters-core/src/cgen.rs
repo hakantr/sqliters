@@ -107,6 +107,9 @@ impl Host for EngineHost<'_> {
     fn pragma_collations(&self) -> Option<Vec<String>> {
         Some(self.collations.all_collation_names())
     }
+    fn pragma_module_names(&self) -> Option<Vec<String>> {
+        Some(self.db_set.vtab_registry().module_names_in_hash_order())
+    }
     fn pragma_mmap_size(&self, i_db: usize, request: Option<i64>) -> Option<sqliters_types::Result<Option<i64>>> {
         let slot = self.db_set.slots().get(i_db)?;
         if i_db == 1 && slot.btree.is_none() { return Some(Ok(None)); }
@@ -290,11 +293,9 @@ impl Host for EngineHost<'_> {
         let reg = self.db_set.vtab_registry();
         let (module, reg_name) = match reg.get_module(name) {
             Some(m) => (m, reg.registered_module_name(name).unwrap_or(name).to_owned()),
-            // sqlite3PragmaVtabRegister(db, zName): registered under the name of this use
             None if lazy => {
-                let m = crate::vtab::PragmaVTabModule::try_for_module_name(name)?;
-                let arc: Arc<dyn sqliters_types::VirtualTableModule> = Arc::new(m);
-                (arc, name.to_owned())
+                let (reg_name, m) = crate::vtab::VTabRegistry::lazy_module(name)?;
+                (m, reg_name)
             }
             None => return None,
         };

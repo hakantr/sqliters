@@ -17,6 +17,9 @@ fn render(v: &Value) -> String {
 /// Runs every statement list; a failing statement ends its list with `ERR: message`.
 fn run(pre: Option<&str>, stmts: &[&str]) -> Vec<String> {
     let conn = Connection::open_in_memory().unwrap();
+    // These expected results come from the reference CLI with the series extension.
+    conn.register_module(std::sync::Arc::new(crate::GenerateSeriesModule))
+        .unwrap();
     if let Some(p) = pre {
         conn.execute(p).unwrap();
     }

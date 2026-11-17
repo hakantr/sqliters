@@ -633,6 +633,7 @@ impl ShellState {
                 // shell.c.in:5236–5238: these collations belong to each shell DB.
                 let _ = db.register_collation("uint", collations::uint);
                 let _ = db.register_collation("decimal", collations::decimal);
+                let _ = db.register_module(std::sync::Arc::new(sqliters::ext::GenerateSeriesModule));
                 let _ = db.set_trusted_schema(testmode_on);
                 let _ = db.db_config_defensive(Some(!testmode_on));
                 if self.busy_timeout > 0 {

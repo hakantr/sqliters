@@ -155,6 +155,7 @@ fn m3c_returning_changes_counted_at_halt() {
 #[test]
 fn m3c_virtual_table_reads_take_c_plans() {
     let conn = Connection::open_in_memory().unwrap();
+    conn.register_module(std::sync::Arc::new(crate::GenerateSeriesModule)).unwrap();
     let _on = crate::vdbe_host::ForceMachine::on();
     let out = run(
         &conn,

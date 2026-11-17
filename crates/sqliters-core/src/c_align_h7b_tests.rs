@@ -67,6 +67,7 @@ fn assert_rows_and_errors_are_what_c_returns(
 ) {
     let db = TempDb::new(name);
     let conn = Connection::open(&db.0).unwrap();
+    conn.register_module(std::sync::Arc::new(crate::GenerateSeriesModule)).unwrap();
     let mut out = String::new();
     let mut errors: Vec<String> = Vec::new();
     for sql in stmts {

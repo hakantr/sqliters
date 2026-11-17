@@ -144,3 +144,32 @@ fn locking_mode_tvf_rechecks_the_hidden_schema_constraint() {
         .expect("the inner PRAGMA should reject the schema");
     assert_eq!(err.message, "unknown database 'missing'");
 }
+
+#[test]
+fn module_list_reflects_the_registration_of_used_sources() {
+    let db = Connection::open_in_memory().unwrap();
+    let names = || {
+        db.query("PRAGMA module_list", &[])
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.values()[0].to_text_lossy())
+            .collect::<Vec<_>>()
+    };
+    let initial = names();
+    assert_eq!(initial, ["dbstat", "fts5", "fts5vocab", "rtree", "rtree_i32"]);
+    assert!(db.prepare("SELECT * FROM generate_series(1, 2)").is_err());
+    db.prepare("WITH unused AS (SELECT * FROM json_each('[1]')) SELECT 1")
+        .unwrap();
+    assert_eq!(names(), initial);
+
+    let mut snapshot = db.prepare("PRAGMA module_list").unwrap();
+    db.prepare("WITH used AS (SELECT * FROM json_each('[1]')) SELECT * FROM used")
+        .unwrap();
+    assert!(names().contains(&"json_each".to_owned()));
+    let mut prepared_names = Vec::new();
+    while let StepResult::Row(row) = snapshot.step().unwrap() {
+        prepared_names.push(row.values()[0].to_text_lossy());
+    }
+    assert_eq!(prepared_names, initial);
+}

@@ -5847,7 +5847,9 @@ fn cmd_load_static_extension(
             .to_ascii_lowercase();
         let res: sqliters_types::Result<()> = match base.as_str() {
             "wholenumber" => conn.register_module(Arc::new(crate::vtab_helpers::WholenumberModule)),
-            "series" | "generate_series" => Ok(()),
+            "series" | "generate_series" => {
+                conn.register_module(Arc::new(sqliters_core::GenerateSeriesModule))
+            }
             "strdup" => crate::vtab_helpers::register_strdup_extension(&conn),
             "randomjson" => crate::vtab_helpers::register_randomjson_extension(&conn),
             "eval" => crate::vtab_helpers::register_eval_extension(&conn, db_cmd_name.clone()),

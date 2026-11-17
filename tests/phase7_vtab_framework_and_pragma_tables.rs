@@ -1193,8 +1193,7 @@ fn test_lazy_xconnect_and_raw_module_args_and_risk_flags() {
 #[test]
 fn test_generate_series_differential_parity_with_c_sqlite() {
     let conn = Connection::open_in_memory().unwrap();
-    // Verify `GenerateSeriesModule` is also directly constructible from `sqliters::ext`
-    let _ext_mod = GenerateSeriesModule;
+    conn.register_module(Arc::new(GenerateSeriesModule)).unwrap();
 
     let queries = [
         "SELECT value FROM generate_series(1, 5);",
@@ -1243,6 +1242,8 @@ fn test_eponymous_pragma_virtual_tables_differential_parity() {
     ";
 
     let conn = Connection::open(&db_path).unwrap();
+    // The reference CLI loads the series extension when it opens the connection.
+    conn.register_module(Arc::new(GenerateSeriesModule)).unwrap();
     conn.execute_batch(setup_sql).unwrap();
 
     let queries = [

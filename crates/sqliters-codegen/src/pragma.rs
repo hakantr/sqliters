@@ -274,6 +274,17 @@ pub fn sqlite3_pragma(
         None
     };
     match pragma.typ {
+        29 => {
+            // pragma.c:1489–1497, Hash iteration order at prepare time.
+            let Some(names) = p.db.host.pragma_module_names() else {
+                p.not_supported("PRAGMA module_list registry (V6b)");
+                return;
+            };
+            p.n_mem = 1;
+            for name in names {
+                row(p, vec![name.into()]);
+            }
+        }
         28 => {
             // pragma.c:951–987: conversion status is deliberately ignored.
             let request = right.map(|z| sqlite3_dec_or_hex_to_i64(z).0.max(0));

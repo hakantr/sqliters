@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use sqliters_ext::{
-    Fts5AuxRegistry, Fts5Module, Fts5VocabModule, GenerateSeriesModule, JsonEachModule,
+    Fts5AuxRegistry, Fts5Module, Fts5VocabModule, JsonEachModule,
     JsonTreeModule, JsonbEachModule, JsonbTreeModule, RTreeModule,
 };
 use sqliters_syntax::{
@@ -204,6 +204,7 @@ struct RegisteredModule {
 /// Per-connection registry of virtual table modules and connected virtual table instances.
 pub struct VTabRegistry {
     modules: BTreeMap<String, RegisteredModule>,
+    module_order: sqliters_codegen::trigger::CHash<()>,
     connected: HashMap<String, Vec<ConnectedVTabEntry>>,
     sub_sql_cache: HashMap<String, Arc<Stmt>>,
     fts5_aux: Arc<Fts5AuxRegistry>,
@@ -240,12 +241,12 @@ impl Default for VTabRegistry {
 }
 
 impl VTabRegistry {
-    /// Creates a new `VTabRegistry` pre-populated with built-in modules (`generate_series`, `dbstat`,
-    /// `json_each`, `json_tree`, `jsonb_each`, `jsonb_tree`, `fts5`, `fts5vocab`, `rtree`, `rtree_i32`).
+    /// Registers the virtual tables from SQLite's built-in extension initializers.
     pub fn new() -> Self {
         let fts5_aux = Arc::new(Fts5AuxRegistry::new());
         let mut reg = Self {
             modules: BTreeMap::new(),
+            module_order: Default::default(),
             connected: HashMap::new(),
             sub_sql_cache: HashMap::new(),
             fts5_aux: Arc::clone(&fts5_aux),
@@ -257,16 +258,11 @@ impl VTabRegistry {
             internal_sql_depth: 0,
             shadow_scratch: Vec::new(),
         };
-        reg.register_module(Arc::new(GenerateSeriesModule));
-        reg.register_module(Arc::new(DbStatModule));
-        reg.register_module(Arc::new(JsonEachModule));
-        reg.register_module(Arc::new(JsonTreeModule));
-        reg.register_module(Arc::new(JsonbEachModule));
-        reg.register_module(Arc::new(JsonbTreeModule));
-        reg.register_module(Arc::new(Fts5VocabModule::new(Arc::clone(&fts5_aux))));
-        reg.register_module(Arc::new(Fts5Module::new(fts5_aux)));
+        reg.register_module(Arc::new(Fts5Module::new(Arc::clone(&fts5_aux))));
+        reg.register_module(Arc::new(Fts5VocabModule::new(fts5_aux)));
         reg.register_module(Arc::new(RTreeModule::new_f32()));
         reg.register_module(Arc::new(RTreeModule::new_i32()));
+        reg.register_module(Arc::new(DbStatModule));
         reg
     }
 
@@ -278,40 +274,60 @@ impl VTabRegistry {
 
     /// Registers a virtual table module on the connection.
     pub fn register_module(&mut self, module: Arc<dyn VirtualTableModule>) {
-        let orig_name = module.name().to_owned();
-        let key = orig_name.to_ascii_lowercase();
-        self.modules.insert(key, RegisteredModule {
-            name: orig_name,
+        let name = module.name().to_owned();
+        self.register_module_named(name, module, false);
+    }
+
+    fn register_module_named(
+        &mut self,
+        name: String,
+        module: Arc<dyn VirtualTableModule>,
+        automatic_pragma: bool,
+    ) {
+        self.module_order.insert(&name, ());
+        self.modules.insert(name.to_ascii_lowercase(), RegisteredModule {
+            name,
             implementation: module,
-            automatic_pragma: false,
+            automatic_pragma,
         });
     }
 
     /// Unregisters a virtual table module by name (`sqlite3_create_module_v2` with `pModule == NULL`).
     pub fn unregister_module(&mut self, name: &str) -> bool {
-        let key = name.to_ascii_lowercase();
-        self.modules.remove(&key).is_some()
+        self.module_order.remove(name);
+        self.modules.remove(&name.to_ascii_lowercase()).is_some()
     }
 
-    /// Looks up a registered module by name (case-insensitive), lazily registering `pragma_<name>`
-    /// eponymous modules when requested (`sqlite3PragmaVtabRegister` parity).
+    /// The eponymous module that sqlite3LocateTable can register by name.
+    pub(crate) fn lazy_module(name: &str) -> Option<(String, Arc<dyn VirtualTableModule>)> {
+        let module: Arc<dyn VirtualTableModule> = match name.to_ascii_lowercase().as_str() {
+            "json_each" => Arc::new(JsonEachModule),
+            "json_tree" => Arc::new(JsonTreeModule),
+            "jsonb_each" => Arc::new(JsonbEachModule),
+            "jsonb_tree" => Arc::new(JsonbTreeModule),
+            _ => {
+                let pragma = PragmaVTabModule::try_for_module_name(name)?;
+                return Some((name.to_owned(), Arc::new(pragma)));
+            }
+        };
+        Some((module.name().to_owned(), module))
+    }
+
+    /// sqlite3LocateTable may register a built-in eponymous module on first resolution.
     pub fn get_or_register_module(&mut self, name: &str) -> Option<Arc<dyn VirtualTableModule>> {
-        let key = name.to_ascii_lowercase();
-        if let Some(module) = self.modules.get(&key) {
-            return Some(Arc::clone(&module.implementation));
+        if let Some(module) = self.get_module(name) {
+            return Some(module);
         }
-        if let Some(pragma_mod) = PragmaVTabModule::try_for_module_name(name) {
-            let arc: Arc<dyn VirtualTableModule> = Arc::new(pragma_mod);
-            // sqlite3PragmaVtabRegister(db, zName): the module keeps the spelling of its first
-            // use (PRAGMA module_list, the eponymous table's name)
-            self.modules.insert(key, RegisteredModule {
-                name: name.to_owned(),
-                implementation: Arc::clone(&arc),
-                automatic_pragma: true,
-            });
-            return Some(arc);
-        }
-        None
+        let (name, module) = Self::lazy_module(name)?;
+        let automatic_pragma = name.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("pragma_"));
+        self.register_module_named(name, Arc::clone(&module), automatic_pragma);
+        Some(module)
+    }
+
+    pub(crate) fn module_names_in_hash_order(&self) -> Vec<String> {
+        self.module_order.keys().iter()
+            .filter_map(|key| self.registered_module_name(key).map(str::to_owned))
+            .collect()
     }
 
     /// The name module `name` was registered with (`Module.zName`), if it is registered.
@@ -1189,8 +1205,8 @@ pub fn ensure_vtab_connected(
     if let Some(vt_def) = vt_def_opt {
         let module = ctx
             .db_set
-            .vtab_registry_mut()
-            .get_or_register_module(&vt_def.module_name)
+            .vtab_registry()
+            .get_module(&vt_def.module_name)
             .ok_or_else(|| {
                 SqliteError::new(
                     ErrorCode::Error,
@@ -1512,13 +1528,29 @@ pub fn ensure_stmt_vtabs_connected(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
     }
 
     let mut visited_views = Vec::new();
-    ensure_stmt_vtabs_connected_inner(ctx, stmt, &[], false, &mut visited_views)
+    ensure_stmt_vtabs_connected_inner(ctx, stmt, None, false, &mut visited_views)
+}
+
+struct CteScope<'a> {
+    parent: Option<&'a CteScope<'a>>,
+    definitions: &'a [sqliters_syntax::CommonTableExpr],
+    visited: std::cell::RefCell<Vec<bool>>,
+}
+
+impl<'a> CteScope<'a> {
+    fn new(parent: Option<&'a Self>, definitions: &'a [sqliters_syntax::CommonTableExpr]) -> Option<Self> {
+        (!definitions.is_empty()).then(|| Self {
+            parent,
+            definitions,
+            visited: std::cell::RefCell::new(vec![false; definitions.len()]),
+        })
+    }
 }
 
 fn ensure_stmt_vtabs_connected_inner(
     ctx: &mut ExecContext<'_>,
     stmt: &Stmt,
-    cte_names: &[String],
+    cte_names: Option<&CteScope<'_>>,
     in_view_or_trigger: bool,
     visited_views: &mut Vec<(DatabaseId, String)>,
 ) -> Result<()> {
@@ -1545,32 +1577,16 @@ fn ensure_stmt_vtabs_connected_inner(
         } => {
             let q = QualifiedName::unqualified("pragma_quick_check");
             let _ =
-                ensure_qname_vtab_connected(ctx, &q, &[], true, in_view_or_trigger, visited_views);
+                ensure_qname_vtab_connected(ctx, &q, None, true, in_view_or_trigger, visited_views);
             Ok(())
         }
         Stmt::Insert(ins) => {
-            let mut local_ctes_buf: Vec<String>;
-            let active_ctes: &[String] = if ins.ctes.is_empty() {
-                cte_names
-            } else {
-                local_ctes_buf = Vec::with_capacity(cte_names.len() + ins.ctes.len());
-                local_ctes_buf.extend_from_slice(cte_names);
-                for cte in &ins.ctes {
-                    local_ctes_buf.push(cte.name.to_ascii_lowercase());
-                    ensure_select_vtabs_connected(
-                        ctx,
-                        &cte.query,
-                        &local_ctes_buf,
-                        in_view_or_trigger,
-                        visited_views,
-                    )?;
-                }
-                &local_ctes_buf
-            };
+            let scope = CteScope::new(cte_names, &ins.ctes);
+            let active_ctes = scope.as_ref().or(cte_names);
             ensure_qname_vtab_connected(
                 ctx,
                 &ins.table,
-                active_ctes,
+                None,
                 true,
                 in_view_or_trigger,
                 visited_views,
@@ -1655,28 +1671,12 @@ fn ensure_stmt_vtabs_connected_inner(
             Ok(())
         }
         Stmt::Update(upd) => {
-            let mut local_ctes_buf: Vec<String>;
-            let active_ctes: &[String] = if upd.ctes.is_empty() {
-                cte_names
-            } else {
-                local_ctes_buf = Vec::with_capacity(cte_names.len() + upd.ctes.len());
-                local_ctes_buf.extend_from_slice(cte_names);
-                for cte in &upd.ctes {
-                    local_ctes_buf.push(cte.name.to_ascii_lowercase());
-                    ensure_select_vtabs_connected(
-                        ctx,
-                        &cte.query,
-                        &local_ctes_buf,
-                        in_view_or_trigger,
-                        visited_views,
-                    )?;
-                }
-                &local_ctes_buf
-            };
+            let scope = CteScope::new(cte_names, &upd.ctes);
+            let active_ctes = scope.as_ref().or(cte_names);
             ensure_qname_vtab_connected(
                 ctx,
                 &upd.table,
-                active_ctes,
+                None,
                 true,
                 in_view_or_trigger,
                 visited_views,
@@ -1728,28 +1728,12 @@ fn ensure_stmt_vtabs_connected_inner(
             Ok(())
         }
         Stmt::Delete(del) => {
-            let mut local_ctes_buf: Vec<String>;
-            let active_ctes: &[String] = if del.ctes.is_empty() {
-                cte_names
-            } else {
-                local_ctes_buf = Vec::with_capacity(cte_names.len() + del.ctes.len());
-                local_ctes_buf.extend_from_slice(cte_names);
-                for cte in &del.ctes {
-                    local_ctes_buf.push(cte.name.to_ascii_lowercase());
-                    ensure_select_vtabs_connected(
-                        ctx,
-                        &cte.query,
-                        &local_ctes_buf,
-                        in_view_or_trigger,
-                        visited_views,
-                    )?;
-                }
-                &local_ctes_buf
-            };
+            let scope = CteScope::new(cte_names, &del.ctes);
+            let active_ctes = scope.as_ref().or(cte_names);
             ensure_qname_vtab_connected(
                 ctx,
                 &del.table,
-                active_ctes,
+                None,
                 true,
                 in_view_or_trigger,
                 visited_views,
@@ -1862,7 +1846,7 @@ fn ensure_dml_triggers_vtabs_connected(
         }
         visited_views.push(trig_visit_key);
         if let Some(ref w) = tr.when_clause {
-            ensure_expr_vtabs_connected(ctx, w, &[], true, visited_views)?;
+            ensure_expr_vtabs_connected(ctx, w, None, true, visited_views)?;
         }
         for step in &tr.body {
             let step_stmt = match step {
@@ -1871,7 +1855,7 @@ fn ensure_dml_triggers_vtabs_connected(
                 TriggerStep::Update(u) => Stmt::Update(u.clone()),
                 TriggerStep::Delete(d) => Stmt::Delete(d.clone()),
             };
-            ensure_stmt_vtabs_connected_inner(ctx, &step_stmt, &[], true, visited_views)?;
+            ensure_stmt_vtabs_connected_inner(ctx, &step_stmt, None, true, visited_views)?;
         }
     }
     Ok(())
@@ -1880,18 +1864,25 @@ fn ensure_dml_triggers_vtabs_connected(
 fn ensure_qname_vtab_connected(
     ctx: &mut ExecContext<'_>,
     qname: &QualifiedName,
-    cte_names: &[String],
+    cte_names: Option<&CteScope<'_>>,
     allow_eponymous: bool,
     in_view_or_trigger: bool,
     visited_views: &mut Vec<(DatabaseId, String)>,
 ) -> Result<()> {
-    if qname.schema.is_none()
-        && !cte_names.is_empty()
-        && cte_names
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(&qname.name))
-    {
-        return Ok(());
+    if qname.schema.is_none() {
+        for scope in std::iter::successors(cte_names, |scope| scope.parent) {
+            if let Some((index, definition)) = scope.definitions.iter().enumerate()
+                .find(|(_, definition)| definition.name.eq_ignore_ascii_case(&qname.name))
+            {
+                // A recursive reference is already being resolved in its lexical scope.
+                if std::mem::replace(&mut scope.visited.borrow_mut()[index], true) {
+                    return Ok(());
+                }
+                return ensure_select_vtabs_connected(
+                    ctx, &definition.query, Some(scope), in_view_or_trigger, visited_views,
+                );
+            }
+        }
     }
     if let Ok(Some((db_id, rel))) = ctx.db_set.find_relation_ref_in_set(qname) {
         match rel {
@@ -1910,7 +1901,7 @@ fn ensure_qname_vtab_connected(
                     let v_select = v.select.clone();
                     visited_views.push(v_key.clone());
                     let res =
-                        ensure_select_vtabs_connected(ctx, &v_select, &[], true, visited_views);
+                        ensure_select_vtabs_connected(ctx, &v_select, None, true, visited_views);
                     if let Some(pos) = visited_views.iter().rposition(|k| k == &v_key) {
                         visited_views.remove(pos);
                     }
@@ -1968,28 +1959,12 @@ fn ensure_qname_vtab_connected(
 fn ensure_select_vtabs_connected(
     ctx: &mut ExecContext<'_>,
     sel: &SelectStmt,
-    cte_names: &[String],
+    cte_names: Option<&CteScope<'_>>,
     in_view_or_trigger: bool,
     visited_views: &mut Vec<(DatabaseId, String)>,
 ) -> Result<()> {
-    let mut local_ctes_buf: Vec<String>;
-    let active_ctes: &[String] = if sel.ctes.is_empty() {
-        cte_names
-    } else {
-        local_ctes_buf = Vec::with_capacity(cte_names.len() + sel.ctes.len());
-        local_ctes_buf.extend_from_slice(cte_names);
-        for cte in &sel.ctes {
-            local_ctes_buf.push(cte.name.to_ascii_lowercase());
-            ensure_select_vtabs_connected(
-                ctx,
-                &cte.query,
-                &local_ctes_buf,
-                in_view_or_trigger,
-                visited_views,
-            )?;
-        }
-        &local_ctes_buf
-    };
+    let scope = CteScope::new(cte_names, &sel.ctes);
+    let active_ctes = scope.as_ref().or(cte_names);
     ensure_select_core_vtabs_connected(
         ctx,
         &sel.body.head,
@@ -2033,7 +2008,7 @@ fn ensure_select_vtabs_connected(
 fn ensure_select_core_vtabs_connected(
     ctx: &mut ExecContext<'_>,
     core: &SelectCore,
-    cte_names: &[String],
+    cte_names: Option<&CteScope<'_>>,
     in_view_or_trigger: bool,
     visited_views: &mut Vec<(DatabaseId, String)>,
 ) -> Result<()> {
@@ -2112,7 +2087,7 @@ fn ensure_select_core_vtabs_connected(
 fn ensure_from_vtabs_connected(
     ctx: &mut ExecContext<'_>,
     from: &FromClause,
-    cte_names: &[String],
+    cte_names: Option<&CteScope<'_>>,
     in_view_or_trigger: bool,
     visited_views: &mut Vec<(DatabaseId, String)>,
 ) -> Result<()> {
@@ -2147,7 +2122,7 @@ fn ensure_from_vtabs_connected(
 fn ensure_tos_vtabs_connected(
     ctx: &mut ExecContext<'_>,
     tos: &TableOrSubquery,
-    cte_names: &[String],
+    cte_names: Option<&CteScope<'_>>,
     in_view_or_trigger: bool,
     visited_views: &mut Vec<(DatabaseId, String)>,
 ) -> Result<()> {
@@ -2205,7 +2180,7 @@ fn ensure_tos_vtabs_connected(
 fn ensure_expr_vtabs_connected(
     ctx: &mut ExecContext<'_>,
     expr: &Expr,
-    cte_names: &[String],
+    cte_names: Option<&CteScope<'_>>,
     in_view_or_trigger: bool,
     visited_views: &mut Vec<(DatabaseId, String)>,
 ) -> Result<()> {
@@ -3561,6 +3536,7 @@ impl PragmaVTabModule {
             "temp_store" => ("CREATE TABLE x(temp_store)", 1, false, false, false),
             "threads" => ("CREATE TABLE x(threads)", 1, false, false, false),
             "encoding" => ("CREATE TABLE x(encoding)", 1, false, false, false),
+            "cache_size" => ("CREATE TABLE x(cache_size,schema hidden)", 1, false, true, false),
             "locking_mode" => (
                 "CREATE TABLE x(locking_mode,schema hidden)",
                 1,

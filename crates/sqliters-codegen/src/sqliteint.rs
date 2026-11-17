@@ -1147,6 +1147,7 @@ pub trait Host {
     /// A lossless UTF-8 prepare-time pager string. None leaves the handler unsupported.
     fn pragma_text(&self, _i_db: usize, _name: &str) -> Option<String> { None }
     /// C's live aCollSeq hash order, including entries whose comparator was removed.
+    fn pragma_module_names(&self) -> Option<Vec<String>> { None }
     fn pragma_collations(&self) -> Option<Vec<String>> { None }
     /// A read-only prediction of the MMAP_SIZE file-control result. The outer
     /// None leaves the handler unsupported; inner None is SQLITE_NOTFOUND.

@@ -23752,7 +23752,6 @@ fn resolve_dml_target_in_set(
             .get(..7)
             .is_some_and(|p| p.eq_ignore_ascii_case(b"pragma_"))
             || qn.name.eq_ignore_ascii_case("dbstat")
-            || qn.name.eq_ignore_ascii_case("generate_series")
             || db_set
                 .vtab_registry()
                 .get_module(&qn.name)
@@ -31508,8 +31507,8 @@ fn exec_create_virtual_table(
 
     let Some(module) = ctx
         .db_set
-        .vtab_registry_mut()
-        .get_or_register_module(module_name)
+        .vtab_registry()
+        .get_module(module_name)
     else {
         return Err(SqliteError::new(
             ErrorCode::Error,
@@ -43475,7 +43474,7 @@ fn exec_pragma(
             let rows = ctx
                 .db_set
                 .vtab_registry()
-                .module_names_sorted()
+                .module_names_in_hash_order()
                 .into_iter()
                 .map(|m| vec![Value::Text(m)])
                 .collect();

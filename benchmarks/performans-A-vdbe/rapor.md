@@ -531,3 +531,7 @@ Boş veritabanında ilk sayfanın tahsisi çerez ve şema biçimi değişmedikç
 ## V6b.38 — D103 gizli şema sütunu
 
 Tek kaynaklı `pragma_locking_mode` sorgusunda C programı kullanılmayan gizli sütun koşulunu denetliyor. 488 eski bağlantı akışındaki kayıtlı D103 kapandı. Yeni native matris 176/184 ve kabuk 18/18. Sekiz V1 iç hata ofseti açık. Gcov 46 dal ve alınmayan 10 çıkış sınıflı. OFF 1139/4/337, ON 1125/18/337. DML ve ayrışma bulucu aynı. Rust 1.100 tabanına süre oranı 1,228 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_38.md).
+
+## V6b.39 — D143 native modül kaydı
+
+Beş yerleşik modül, ilk başvuruda JSON/PRAGMA kaydı, C hash sırası ve hazırlamada donan liste 46/46 native akışta eşleşti. 96 modüllü geçmişte liste sırası eşit. Bağlı modül değiştirme ve kabukta fsdir/completion açık. Kabuk denetimi 4/12. Gcov 64 dal ve alınmayan 13 çıkış sınıflı. OFF 1140/4/337, ON 1126/18/337. DML ve ayrışma bulucu aynı. Rust 1.100 tabanına süre oranı 1,224 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_39.md).

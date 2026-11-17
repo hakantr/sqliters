@@ -6209,7 +6209,7 @@ fn prepare_row_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &st
 {
     let defer_query = matches!(stmt, Some(Stmt::Pragma { name, value: None, .. })
         if name.eq_ignore_ascii_case("defer_foreign_keys"));
-    if !defer_query && !matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("database_list") || name.eq_ignore_ascii_case("collation_list") || name.eq_ignore_ascii_case("compile_options") || name.eq_ignore_ascii_case("case_sensitive_like") || name.eq_ignore_ascii_case("mmap_size")) {
+    if !defer_query && !matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("database_list") || name.eq_ignore_ascii_case("collation_list") || name.eq_ignore_ascii_case("module_list") || name.eq_ignore_ascii_case("compile_options") || name.eq_ignore_ascii_case("case_sensitive_like") || name.eq_ignore_ascii_case("mmap_size")) {
         return Ok(None);
     }
     let Some(program) = prepare_pragma_program(inner, sql)? else { return Ok(None); };
