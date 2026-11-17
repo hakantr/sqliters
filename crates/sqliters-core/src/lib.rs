@@ -3577,11 +3577,13 @@ impl Connection {
         }
 
         inner.state = ConnectionState::Closing;
+        let mut notify_rollback = !inner.is_autocommit();
         let mut any_in_tx = false;
         for slot in inner.db_set.slots_mut().iter_mut().rev() {
             if let Some(ref mut bt) = slot.btree {
                 bt.close_all_cursors();
                 if bt.transaction_state() != TransactionState::Open {
+                    notify_rollback |= bt.transaction_state() == TransactionState::Write;
                     any_in_tx = true;
                     let _ = bt.rollback_with_trip(extended::SQLITE_ABORT_ROLLBACK, false, false);
                 }
@@ -3592,6 +3594,11 @@ impl Connection {
                 crate::vtab::vtab_rollback_all(ctx)
             });
             inner.rollback_count += 1;
+        }
+        if notify_rollback {
+            // sqlite3LeaveMutexAndCloseZombie calls sqlite3RollbackAll before
+            // resetting the connection's autocommit state.
+            let _ = inner.commit_hooks.invoke_rollback_hook();
         }
         inner.explicit_tx = false;
         inner.implicit_savepoint_tx = false;

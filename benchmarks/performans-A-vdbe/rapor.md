@@ -539,3 +539,7 @@ Beş yerleşik modül, ilk başvuruda JSON/PRAGMA kaydı, C hash sırası ve haz
 ## V6b.40 — POSIX kabuk modülleri
 
 Kabuk gerçek fsdir ve completion hizmetlerini kaydediyor. Normal ve güvenli kip dahil 36 completion, 42 fsdir ve 12 kabuk profili akışı C ile aynı. Native modül, D103, DDL ve mmap kayıtları aynı kaldı. Gcov 214 dal ve alınmayan 43 çıkış sınıflı. OFF 1141/4/337, ON 1127/18/337. DML ve ayrışma bulucu aynı. Rust 1.100 tabanına süre oranı 1,227 ve 14 digest eşit. E28 güncel çekirdekte DELETE ve WAL yazım/senkronizasyon hatalarında yeniden üretildi. [Karar ve doğrulama](karar_esligi_v6b_40.md).
+
+## V6b.41 — E28 ve Pager ERROR
+
+IOERR/FULL spill, faz iki ve rollback hataları pager ERROR durumunu kuruyor. DELETE sıcak journal kurtarması, WAL hata sonrasında kilitlerin bırakılması ve COMMIT rollback akışı doğrulandı. C ile iki Rust kipinde 33/34 native akış ve eski beş E28 COMMIT akışı eşit. Altı DELETE data_version akışı da eşit. EXCLUSIVE DELETE sonlandırması ve sekiz WAL VFS yazım izi farkı açık. Gcov 272 dal, alınmayan 97 çıkış ayrı sınıflı. OFF 1140/7/337, ON 1126/21/337. Önceki başarısızlıklar ile F13–F15 kayıtlı. DML ve ayrışma bulucu V6b.40 ile aynı. Rust 1.100 süre oranı 1,239 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_41.md).

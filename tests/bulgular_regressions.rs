@@ -886,6 +886,7 @@ struct FaultState {
     main_writes_seen: usize,
     fail_on_main_write_nth: Option<usize>,
     fail_all_main_writes: bool,
+    persist_main_write_fault: bool,
     fail_next_truncate: bool,
     fail_next_main_sync: bool,
     fail_next_journal_delete: bool,
@@ -932,6 +933,7 @@ impl VfsFile for FaultFile {
             st.main_writes_seen += 1;
             if st.fail_on_main_write_nth == Some(st.main_writes_seen) {
                 st.fail_on_main_write_nth = None;
+                st.fail_all_main_writes = st.persist_main_write_fault;
                 return Err(SqliteError::new(
                     ErrorCode::IoErr,
                     "injected one-shot main DB write_at error",
@@ -1265,9 +1267,9 @@ fn test_bulgu_y2_multi_header_spilled_journal_and_bidirectional_c_recovery() {
             st.main_writes_seen = 0;
             // Let Page 1 write succeed, fail on Page 2 write AND block rollback writes so finalized Rust journal stays on disk!
             st.fail_on_main_write_nth = Some(2);
+            st.persist_main_write_fault = true;
         }
         assert!(conn.execute("COMMIT;").is_err());
-        fault.lock().unwrap().fail_all_main_writes = true;
         drop(conn);
     }
     assert!(tmp_r_crash.journal_path().exists());

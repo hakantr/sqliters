@@ -48,6 +48,8 @@ pub use shm::{
 pub const IOCAP_SEQUENTIAL: u32 = 0x0000_0400;
 /// Device characteristic bit indicating power-safe overwrites (`SQLITE_IOCAP_POWERSAFE_OVERWRITE`).
 pub const IOCAP_POWERSAFE_OVERWRITE: u32 = 0x0000_1000;
+/// Device characteristic bit for files that cannot be unlinked while open.
+pub const IOCAP_UNDELETABLE_WHEN_OPEN: u32 = 0x0000_0800;
 
 /// SQLite Julian Day millisecond offset for `1970-01-01 00:00:00 UTC`.
 pub const UNIX_EPOCH_JD_MS: i64 = 210_866_760_000_000;

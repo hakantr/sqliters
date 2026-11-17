@@ -1371,14 +1371,39 @@ pub(crate) fn rollback_all_databases(
     }
 }
 
-/// Outcome of [`commit_all_databases`] when an error occurs, indicating whether `commit_hook` or
-/// phase-1 I/O already rolled back the transaction (`RolledBack`) vs leaving it open for retry (`RetryableOrOpen`).
+/// Whether the commit error leaves the transaction open or already caused a rollback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommitFailureDisposition {
     /// Transaction remains open (e.g. `FK` constraint failure or `Busy` on `acquire_exclusive_lock`).
     LeaveOpen,
     /// Transaction was rolled back across all slots (e.g. `SQLITE_CONSTRAINT_COMMITHOOK` or Phase 1 I/O error).
     RolledBack,
+}
+
+/// Roll back across all b-trees and expose the autocommit state to the hook.
+fn rollback_failed_commit(ctx: &mut ExecContext<'_>) -> Result<()> {
+    *ctx.explicit_tx = false;
+    *ctx.implicit_savepoint_tx = false;
+    *ctx.in_user_btree_tx = false;
+    let _ = rollback_all_databases(ctx, true);
+    *ctx.schema_changed_in_tx = false;
+    ctx.savepoints.clear();
+    *ctx.rollback_count += 1;
+    ctx.publish();
+    ctx.commit_hooks.invoke_rollback_hook()
+}
+
+fn pager_commit_failure(
+    ctx: &mut ExecContext<'_>,
+    error: SqliteError,
+) -> (SqliteError, CommitFailureDisposition) {
+    if matches!(error.code, ErrorCode::IoErr | ErrorCode::Full) {
+        // Keep the commit error if rollback also encounters an error.
+        let _ = rollback_failed_commit(ctx);
+        (error, CommitFailureDisposition::RolledBack)
+    } else {
+        (error, CommitFailureDisposition::LeaveOpen)
+    }
 }
 
 /// Full 6-step multi-database commit coordinator (`vdbeCommit` in `sqlite/src/vdbeaux.c:2940-3190`).
@@ -1412,16 +1437,7 @@ pub(crate) fn commit_all_databases(
             return Err((e, CommitFailureDisposition::LeaveOpen));
         }
         if let Err(e) = crate::vtab::vtab_sync_all(ctx) {
-            *ctx.explicit_tx = false;
-            *ctx.implicit_savepoint_tx = false;
-            *ctx.in_user_btree_tx = false;
-            let _ = rollback_all_databases(ctx, true);
-            *ctx.schema_changed_in_tx = false;
-            ctx.savepoints.clear();
-            ctx.deferred_fk_suspects.clear();
-            *ctx.rollback_count += 1;
-            ctx.publish();
-            let _ = ctx.commit_hooks.invoke_rollback_hook();
+            let _ = rollback_failed_commit(ctx);
             return Err((e, CommitFailureDisposition::RolledBack));
         }
     }
@@ -1437,7 +1453,7 @@ pub(crate) fn commit_all_databases(
                     .busy_policy
                     .retry_btree(bt, Btree::acquire_exclusive_lock)
             {
-                return Err((e, CommitFailureDisposition::LeaveOpen));
+                return Err(pager_commit_failure(ctx, e));
             }
         }
     }
@@ -1460,16 +1476,7 @@ pub(crate) fn commit_all_databases(
             exec_svc.invoke_commit_hook(ctx.commit_hooks)
         };
         if let Err(e) = hook_res {
-            *ctx.explicit_tx = false;
-            *ctx.implicit_savepoint_tx = false;
-            *ctx.in_user_btree_tx = false;
-            let _ = rollback_all_databases(ctx, true);
-            *ctx.schema_changed_in_tx = false;
-            ctx.savepoints.clear();
-            ctx.deferred_fk_suspects.clear();
-            *ctx.rollback_count += 1;
-            ctx.publish();
-            let rb_hook_res = ctx.commit_hooks.invoke_rollback_hook();
+            let rb_hook_res = rollback_failed_commit(ctx);
             if e.code == ErrorCode::Constraint
                 && let Err(rb_err) = rb_hook_res
             {
@@ -1511,7 +1518,7 @@ pub(crate) fn commit_all_databases(
     };
 
     if let Err(e) = two_phase_res {
-        return Err((e, CommitFailureDisposition::LeaveOpen));
+        return Err(pager_commit_failure(ctx, e));
     }
 
     // Step 6: Virtual table post-commit notification (`sqlite3VtabCommit`).
