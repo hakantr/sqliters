@@ -199,6 +199,50 @@ pub(crate) fn schema_free_read_program(
     read_machine_program(inner, stmt, raw_sql, n_param, true, false, None)
 }
 
+/// The C planner orders explicit WHERE terms before implicit table-function
+/// constraints. A duplicate constraint on the hidden schema column can leave
+/// one of the terms for the VM to evaluate after VFilter.
+#[allow(non_upper_case_globals)]
+pub(crate) fn locking_mode_table_read_program(
+    inner: &ConnectionInner,
+    stmt: Option<&Stmt>,
+    sql: &str,
+    n_param: usize,
+) -> Result<Option<Arc<Program>>> {
+    use sqliters_syntax::{SelectCore, TableOrSubquery};
+
+    let Some(Stmt::Select(select)) = stmt else {
+        return Ok(None);
+    };
+    let SelectCore::Select { from: Some(from), .. } = &select.body.head else {
+        return Ok(None);
+    };
+    if !select.ctes.is_empty() || !select.body.compounds.is_empty() || !from.joins.is_empty() {
+        return Ok(None);
+    }
+    let TableOrSubquery::TableFunction { schema: None, name, args, .. } = &from.head else {
+        return Ok(None);
+    };
+    if args.len() != 1
+        || !name.eq_ignore_ascii_case("pragma_locking_mode")
+        || !inner.db_set.vtab_registry().has_automatic_pragma_module(name)
+    {
+        return Ok(None);
+    }
+    Ok(read_machine_program(inner, stmt, sql, n_param, false, false, None)?.filter(|program| {
+        use sqliters_vdbe::opcodes::{OP_OpenRead, OP_ReopenIdx, OP_VOpen};
+
+        !program.a_op.iter().any(|op| {
+            matches!(op.opcode, OP_OpenRead | OP_ReopenIdx)
+                || (op.opcode == OP_VOpen
+                    && !matches!(&op.p4, P4::Vtab(table)
+                        if table.name.eq_ignore_ascii_case("pragma_locking_mode")))
+        }) && program.a_op.iter().any(|op| {
+            matches!(&op.p4, P4::Vtab(vtab) if vtab.name.eq_ignore_ascii_case("pragma_locking_mode"))
+        })
+    }))
+}
+
 fn read_machine_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, schema_free: bool, like_only: bool, bound_values: Option<&[Value]>,
 ) -> Result<Option<Arc<Program>>> {

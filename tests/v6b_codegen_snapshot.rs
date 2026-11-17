@@ -120,3 +120,27 @@ fn first_schema_page_does_not_expire_a_v1_create() {
         2
     );
 }
+
+#[test]
+fn locking_mode_tvf_rechecks_the_hidden_schema_constraint() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch("ATTACH ':memory:' AS aux").unwrap();
+
+    let implicit = db
+        .query("SELECT schema FROM pragma_locking_mode('aux')", &[])
+        .unwrap();
+    assert_eq!(implicit.rows[0].values(), &[Value::Null]);
+    let contradictory = db
+        .query(
+            "SELECT locking_mode FROM pragma_locking_mode('aux') WHERE schema = 'main'",
+            &[],
+        )
+        .unwrap();
+    assert!(contradictory.rows.is_empty());
+
+    let err = db
+        .query("SELECT * FROM pragma_locking_mode('missing')", &[])
+        .err()
+        .expect("the inner PRAGMA should reject the schema");
+    assert_eq!(err.message, "unknown database 'missing'");
+}

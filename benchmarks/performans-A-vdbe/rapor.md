@@ -527,3 +527,7 @@ Tablo ve görünüm adı çakışmaları ham SQL token'ı ve bayt ofsetiyle haz�
 ## V6b.37 — İlk şema sayfası ve V1 yürütme
 
 Boş veritabanında ilk sayfanın tahsisi çerez ve şema biçimi değişmedikçe hazırlanmış ifadeyi eskitmiyor. 468 native akışta 330 yerine 402 aynı. V6b.36 üretilen sütun matrisi 244/244 oldu. Gerçek eskime matrisi önceki sonuçla aynı. Gcov 44 dal ve alınmayan 13 çıkış sınıflı. OFF 1138/4/337, ON 1124/18/337. DML ve ayrışma bulucu aynı. Rust 1.100 tabanına süre oranı 1,228 ve 14 digest eşit. WAL, savepoint dosya baytları, V1 eskime hata maskelemesi ve diğer açık işler sürüyor. [Karar ve doğrulama](karar_esligi_v6b_37.md).
+
+## V6b.38 — D103 gizli şema sütunu
+
+Tek kaynaklı `pragma_locking_mode` sorgusunda C programı kullanılmayan gizli sütun koşulunu denetliyor. 488 eski bağlantı akışındaki kayıtlı D103 kapandı. Yeni native matris 176/184 ve kabuk 18/18. Sekiz V1 iç hata ofseti açık. Gcov 46 dal ve alınmayan 10 çıkış sınıflı. OFF 1139/4/337, ON 1125/18/337. DML ve ayrışma bulucu aynı. Rust 1.100 tabanına süre oranı 1,228 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_38.md).

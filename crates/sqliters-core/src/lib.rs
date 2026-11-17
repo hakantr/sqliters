@@ -7707,13 +7707,17 @@ impl Statement {
         has_like: bool,
         bound_values: Option<&[Value]>,
     ) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
-        if (!vdbe_host::exec_switch_on() && !has_like) || is_explain || artifacts.category != Some(StmtCategory::Read) {
+        if is_explain || artifacts.category != Some(StmtCategory::Read) {
             return Ok(None);
         }
         let result = if has_like {
             vdbe_host::like_machine_program(inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param, bound_values)
-        } else {
+        } else if vdbe_host::exec_switch_on() {
             vdbe_host::machine_program(inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param)
+        } else {
+            vdbe_host::locking_mode_table_read_program(
+                inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param,
+            )
         };
         let Some(prog) = result? else {
             return Ok(None);

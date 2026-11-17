@@ -195,9 +195,15 @@ pub enum CachedSubSql {
     Multi,
 }
 
+struct RegisteredModule {
+    name: String,
+    implementation: Arc<dyn VirtualTableModule>,
+    automatic_pragma: bool,
+}
+
 /// Per-connection registry of virtual table modules and connected virtual table instances.
 pub struct VTabRegistry {
-    modules: BTreeMap<String, (String, Arc<dyn VirtualTableModule>)>,
+    modules: BTreeMap<String, RegisteredModule>,
     connected: HashMap<String, Vec<ConnectedVTabEntry>>,
     sub_sql_cache: HashMap<String, Arc<Stmt>>,
     fts5_aux: Arc<Fts5AuxRegistry>,
@@ -274,7 +280,11 @@ impl VTabRegistry {
     pub fn register_module(&mut self, module: Arc<dyn VirtualTableModule>) {
         let orig_name = module.name().to_owned();
         let key = orig_name.to_ascii_lowercase();
-        self.modules.insert(key, (orig_name, module));
+        self.modules.insert(key, RegisteredModule {
+            name: orig_name,
+            implementation: module,
+            automatic_pragma: false,
+        });
     }
 
     /// Unregisters a virtual table module by name (`sqlite3_create_module_v2` with `pModule == NULL`).
@@ -287,14 +297,18 @@ impl VTabRegistry {
     /// eponymous modules when requested (`sqlite3PragmaVtabRegister` parity).
     pub fn get_or_register_module(&mut self, name: &str) -> Option<Arc<dyn VirtualTableModule>> {
         let key = name.to_ascii_lowercase();
-        if let Some((_, m)) = self.modules.get(&key) {
-            return Some(Arc::clone(m));
+        if let Some(module) = self.modules.get(&key) {
+            return Some(Arc::clone(&module.implementation));
         }
         if let Some(pragma_mod) = PragmaVTabModule::try_for_module_name(name) {
             let arc: Arc<dyn VirtualTableModule> = Arc::new(pragma_mod);
             // sqlite3PragmaVtabRegister(db, zName): the module keeps the spelling of its first
             // use (PRAGMA module_list, the eponymous table's name)
-            self.modules.insert(key, (name.to_owned(), Arc::clone(&arc)));
+            self.modules.insert(key, RegisteredModule {
+                name: name.to_owned(),
+                implementation: Arc::clone(&arc),
+                automatic_pragma: true,
+            });
             return Some(arc);
         }
         None
@@ -302,21 +316,26 @@ impl VTabRegistry {
 
     /// The name module `name` was registered with (`Module.zName`), if it is registered.
     pub fn registered_module_name(&self, name: &str) -> Option<&str> {
-        self.modules.get(&name.to_ascii_lowercase()).map(|(n, _)| n.as_str())
+        self.modules.get(&name.to_ascii_lowercase()).map(|module| module.name.as_str())
     }
 
     /// Looks up an already-registered module without lazy `pragma_*` registration.
     pub fn get_module(&self, name: &str) -> Option<Arc<dyn VirtualTableModule>> {
         if !name.bytes().any(|b| b.is_ascii_uppercase()) {
-            return self.modules.get(name).map(|(_, m)| Arc::clone(m));
+            return self.modules.get(name).map(|module| Arc::clone(&module.implementation));
         }
         let key = name.to_ascii_lowercase();
-        self.modules.get(&key).map(|(_, m)| Arc::clone(m))
+        self.modules.get(&key).map(|module| Arc::clone(&module.implementation))
+    }
+
+    pub(crate) fn has_automatic_pragma_module(&self, name: &str) -> bool {
+        self.modules.get(&name.to_ascii_lowercase())
+            .is_some_and(|module| module.automatic_pragma)
     }
 
     /// Returns the sorted list of currently registered module names (`PRAGMA module_list`).
     pub fn module_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.modules.values().map(|(n, _)| n.clone()).collect();
+        let mut names: Vec<String> = self.modules.values().map(|module| module.name.clone()).collect();
         names.sort();
         names
     }
@@ -3821,11 +3840,10 @@ impl VirtualCursor for PragmaVTabCursor {
             return Ok(());
         }
 
-        let schema_prefix = if !self.schema_val.is_null() {
-            format!("{}.", quote_ident(&self.schema_val.to_text_lossy()))
-        } else {
-            String::new()
-        };
+        let schema = (!self.schema_val.is_null()).then(|| self.schema_val.to_text_lossy());
+        let schema_prefix = schema.as_deref()
+            .map(|name| format!("{}.", quote_string_literal(name)))
+            .unwrap_or_default();
 
         let pragma_sql = if !self.arg_val.is_null() {
             format!(
@@ -3837,7 +3855,17 @@ impl VirtualCursor for PragmaVTabCursor {
             format!("PRAGMA {schema_prefix}{}", self.spec.pragma_name)
         };
 
-        self.rows = ctx.query_sql(&pragma_sql, &[])?;
+        self.rows = ctx.query_sql(&pragma_sql, &[]).map_err(|mut error| {
+            // pragmaVtabFilter constructs the qualifier with %Q. Preserve that token
+            // in the sqlite3TwoPartName diagnostic from the nested PRAGMA.
+            if let Some(name) = schema.as_deref()
+                && error.code == ErrorCode::Error
+                && error.message.strip_prefix("unknown database ") == Some(name)
+            {
+                error.message = format!("unknown database {}", quote_string_literal(name));
+            }
+            error
+        })?;
         Ok(())
     }
 
