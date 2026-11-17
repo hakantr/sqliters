@@ -2279,6 +2279,15 @@ pub(crate) fn commit_transaction(ctx: &mut ExecContext<'_>) -> Result<()> {
         ));
     }
 
+    // vdbe.c:4192–4195: check FK before changing autoCommit, then make
+    // autoCommit=1 visible during Halt's xSync/commit/rollback callbacks.
+    check_deferred_fks(ctx)?;
+    let saved_explicit = *ctx.explicit_tx;
+    let saved_implicit = *ctx.implicit_savepoint_tx;
+    *ctx.explicit_tx = false;
+    *ctx.implicit_savepoint_tx = false;
+    ctx.publish();
+
     // vdbeaux.c `sqlite3VdbeHalt`: `else if( db->flags & SQLITE_CorruptRdOnly ){ rc =
     // SQLITE_CORRUPT; db->flags &= ~SQLITE_CorruptRdOnly; }` — the commit is not attempted
     // and the transaction is rolled back (`sqlite3RollbackAll`).
@@ -2311,7 +2320,12 @@ pub(crate) fn commit_transaction(ctx: &mut ExecContext<'_>) -> Result<()> {
             ctx.publish();
             Ok(())
         }
-        Err((err, CommitFailureDisposition::LeaveOpen)) => Err(err),
+        Err((err, CommitFailureDisposition::LeaveOpen)) => {
+            *ctx.explicit_tx = saved_explicit;
+            *ctx.implicit_savepoint_tx = saved_implicit;
+            ctx.publish();
+            Err(err)
+        }
         Err((err, CommitFailureDisposition::RolledBack)) => {
             *ctx.explicit_tx = false;
             *ctx.implicit_savepoint_tx = false;
@@ -2346,6 +2360,16 @@ pub(crate) fn release_savepoint_op(ctx: &mut ExecContext<'_>, sp_name: &str) -> 
 
     let is_tx_sp = pos == 0 && ctx.savepoints[0].is_transaction_savepoint;
     if is_tx_sp {
+        // vdbe.c:4074–4089: a transaction RELEASE temporarily enters
+        // autocommit. A failed Halt restores autoCommit=0 and leaves the
+        // SQL savepoint chain in place even if the Btrees rolled back.
+        check_deferred_fks(ctx)?;
+        let saved_explicit = *ctx.explicit_tx;
+        let saved_implicit = *ctx.implicit_savepoint_tx;
+        let saved_savepoints = ctx.savepoints.clone();
+        *ctx.explicit_tx = false;
+        *ctx.implicit_savepoint_tx = false;
+        ctx.publish();
         match commit_all_databases(ctx) {
             Ok(()) => {
                 *ctx.implicit_savepoint_tx = false;
@@ -2357,12 +2381,17 @@ pub(crate) fn release_savepoint_op(ctx: &mut ExecContext<'_>, sp_name: &str) -> 
                 ctx.publish();
                 Ok(())
             }
-            Err((err, CommitFailureDisposition::LeaveOpen)) => Err(err),
+            Err((err, CommitFailureDisposition::LeaveOpen)) => {
+                *ctx.explicit_tx = saved_explicit;
+                *ctx.implicit_savepoint_tx = saved_implicit;
+                ctx.publish();
+                Err(err)
+            }
             Err((err, CommitFailureDisposition::RolledBack)) => {
-                *ctx.explicit_tx = false;
-                *ctx.implicit_savepoint_tx = false;
+                *ctx.explicit_tx = saved_explicit;
+                *ctx.implicit_savepoint_tx = saved_implicit;
                 *ctx.in_user_btree_tx = false;
-                ctx.savepoints.clear();
+                *ctx.savepoints = saved_savepoints;
                 *ctx.schema_changed_in_tx = false;
                 ctx.deferred_fk_suspects.clear();
                 ctx.mutation_pipeline.clear();

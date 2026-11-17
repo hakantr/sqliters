@@ -45,6 +45,7 @@
 | V6b.25 — defer_foreign_keys; D131 açık | bu commit | Prepare/live bayrak, normal FK/işlem sonu, RESTRICT yazım sırası | 13414 tam program; 1624/1644 native aynı (20 D52); bütün dosyalar aynı; D131 6 fark açık | 1,050× taban; W14 1,358× | kapalı 1118/0; açık 1103/15 bilinen; 337 yok sayıldı |
 | V6b.26 — EXPLAIN yazıcı ömrü | bu commit | RUN/EOF/reset/finalize, changeCntOn, bekleyen işlem kapanışı | 72+408 native aynı; 120/192 kapanış tam aynı, 72 D132; eski altı D131 aynı | 1.060x taban; W14 1.369x | kapalı 1119/0; açık 1104/15 bilinen; 337 yok sayıldı |
 | V6b.27 — commit hook hata metni | bu commit | D132 varsayılan 531 metni | 192/192 EXPLAIN; 26/36 doğrudan aynı, 10 D133; önceki 72+408 aynı | 1.051x taban; W14 1.367x | kapalı 1120/0; açık 1105/15 bilinen; 337 yok sayıldı |
+| V6b.28 — savepoint ve callback autocommit | bu commit | D133/D134 kontrol bayrağı ve SQL savepoint ömrü | 144+72+96 ve eski 36 akış tam aynı | 1.058x taban; W14 1.369x | kapalı 1121/0; açık 1106/15 bilinen; 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -485,3 +486,7 @@ EXPLAIN, açıkladığı programın yazıcı sayımına katılır ve EOF sonras�
 ## V6b.27 — D132 commit hook hata metni
 
 531 hook reddi C’nin constraint failed iletisini döndürür. 192/192 EXPLAIN ve 26/36 doğru yazmalı doğrudan işlem akışı tamamen aynı; eski 72+36 hata metni farkı giderildi. 10 D133 legacy autocommit farkı sıradaki iş. D52/D103/E28 ve kalan PRAGMA/M4 açıktır. D133 sonrasında case_sensitive_like hazırlama etkisine dönülecek. Kanıt [karar_esligi_v6b_27.md](karar_esligi_v6b_27.md) içinde.
+
+## V6b.28 — D133/D134 savepoint ve callback autocommit
+
+Legacy COMMIT/transaction RELEASE, callback sırasında C gibi autocommit 1 gösterir; reddedilmiş RELEASE savepoint zincirini ve autocommit 0 durumunu korur. 144 callback + 72 kilit + 96 FK ve eski 36 doğrudan hook akışı tamamen aynı. D52/D103/E28 ve kalan PRAGMA/M4 açıktır. Sırada case_sensitive_like var. Kanıt [karar_esligi_v6b_28.md](karar_esligi_v6b_28.md) içinde.
