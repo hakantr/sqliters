@@ -5839,6 +5839,13 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) -> Result<()> {
         match effect {
             PrepareEffect::AnalysisLimit(n) => inner.db_set.set_analysis_limit(n),
             PrepareEffect::WorkerThreads(n) => inner.db_set.worker_threads_limit = n,
+            PrepareEffect::ShrinkMemory => {
+                // main.c:922–928: release every open pager, including TEMP and
+                // attached databases, regardless of the PRAGMA's schema name.
+                for slot in inner.db_set.slots_mut() {
+                    if let Some(bt) = slot.btree.as_mut() { bt.shrink_memory(); }
+                }
+            }
             PrepareEffect::BusyTimeout(n) => {
                 inner.busy_policy = if n > 0 { BusyPolicy::TimeoutMs(n as u64) } else { BusyPolicy::None };
             }
@@ -14329,6 +14336,38 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn shrink_memory_releases_all_file_caches_during_prepare_only() {
+        fn cached(conn: &Connection) -> Vec<u32> {
+            conn.shared.lock_inner().db_set.slots().iter().filter_map(|slot| {
+                slot.btree.as_ref().map(|bt| bt.pager().cache_page_count())
+            }).collect()
+        }
+        for sql in ["PRAGMA shrink_memory", "PRAGMA aux.shrink_memory='ignored'",
+                    "EXPLAIN PRAGMA shrink_memory", "EXPLAIN QUERY PLAN PRAGMA shrink_memory"] {
+            let vfs = Arc::new(MemoryVfs::new());
+            let conn = Connection::open_with_vfs(
+                vfs, Some(Path::new("/shrink.db")),
+                OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB,
+            ).unwrap();
+            conn.execute_batch("CREATE TABLE t(a); INSERT INTO t VALUES(1),(2);
+                ATTACH '/shrink_aux.db' AS aux; CREATE TABLE aux.u(a);
+                INSERT INTO aux.u VALUES(3),(4);").unwrap();
+            assert!(cached(&conn).iter().all(|&n| n > 0), "{sql}: before");
+            let mut stmt = conn.prepare(sql).unwrap();
+            assert!(cached(&conn).iter().all(|&n| n == 0), "{sql}: prepare");
+            conn.query("SELECT * FROM t UNION ALL SELECT * FROM aux.u", &[]).unwrap();
+            assert!(cached(&conn).iter().all(|&n| n > 0), "{sql}: refill");
+            while matches!(stmt.step().unwrap(), StepResult::Row(_)) {}
+            assert!(cached(&conn).iter().all(|&n| n > 0), "{sql}: step");
+            // Normal execution expires this runOnlyOnce PRAGMA. EXPLAIN only
+            // lists instructions, so its reset does not repeat preparation.
+            stmt.reset().unwrap();
+            while matches!(stmt.step().unwrap(), StepResult::Row(_)) {}
+            assert!(cached(&conn).iter().all(|&n| (n == 0) == !sql.starts_with("EXPLAIN")), "{sql}: reset");
         }
     }
 

@@ -52,6 +52,7 @@ pub enum PrepareEffect {
     TempStore(u8),
     Encoding(u8),
     WorkerThreads(i32),
+    ShrinkMemory,
 }
 
 /// Names of the pragmas enabled in the C reference build, in pragma.h order.
@@ -85,6 +86,7 @@ pub fn prepare_constant(name: &str) -> bool {
             "temp_store",
             "encoding",
             "threads",
+            "shrink_memory",
         ]
         .iter()
         .any(|n| name.eq_ignore_ascii_case(n))
@@ -577,6 +579,10 @@ pub fn sqlite3_pragma(
             if let Some(n) = mode {
                 return_int(p, n);
             }
+        }
+        34 => {
+            // pragma.c:2444–2446: sqlite3_db_release_memory runs while preparing.
+            p.db.host.note_pragma_effect(PrepareEffect::ShrinkMemory);
         }
         36 => {
             // pragma.c:1132–1153: pDb->safety_level is one greater than the result.
