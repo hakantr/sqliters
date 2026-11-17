@@ -6536,15 +6536,22 @@ impl Pager {
 
         let mut need_cache_reset = true;
         let playback_res: Result<()> = (|| {
-            // Truncate main DB back to its pre-transaction size (`pager.c:2959`).
-            self.db_file()?
-                .truncate(u64::from(orig_pages) * u64::from(page_size))?;
-
             let ps = page_size as usize;
+            let mut page = vec![0u8; ps];
+            let db = self.db_file()?;
+            let original_size = u64::from(orig_pages) * u64::from(page_size);
+            let size_on_disk = db.file_size()?;
+            // pager_truncate (pager.c:2726): leave equal sizes alone and
+            // extend by writing a zero page when a whole page is missing.
+            if size_on_disk > original_size {
+                db.truncate(original_size)?;
+            } else if original_size - size_on_disk >= u64::from(page_size) {
+                let _ = db.size_hint(original_size);
+                db.write_at(&page, original_size - u64::from(page_size))?;
+            }
             let rec_size = (4 + ps + 4) as u64;
             let sj_pgno = self.lock_geometry.sj_pgno(page_size);
-            let mut replayed_pages = Bitvec::new(orig_pages.max(1));
-            let mut rec_buf = vec![0u8; rec_size as usize];
+            let mut word = [0u8; 4];
             let mut journal_off: u64 = 0;
 
             // Multi-section playback loop (`pager.c:2913-3003`):
@@ -6587,33 +6594,30 @@ impl Pager {
                 }
 
                 for _ in 0..nrec {
-                    if journal_off.saturating_add(rec_size) > jsize {
-                        // Truncated record at tail (`SQLITE_IOERR_SHORT_READ` in `pager.c:2985`): stop playback cleanly.
+                    // pager_playback_one_page reads pgno, page data, then
+                    // checksum. A short read in any part ends hot replay.
+                    if !Self::read_hot_record_part(jfile.as_ref(), &mut word, journal_off)?
+                        || !Self::read_hot_record_part(jfile.as_ref(), &mut page, journal_off + 4)?
+                    {
                         break 'sections;
                     }
-                    jfile.read_at(&mut rec_buf, journal_off)?;
                     journal_off += rec_size;
-
-                    let pgno = u32::from_be_bytes([rec_buf[0], rec_buf[1], rec_buf[2], rec_buf[3]]);
+                    let pgno = u32::from_be_bytes(word);
                     if pgno == 0 || pgno == sj_pgno {
                         break 'sections;
                     }
-                    if pgno > orig_pages || replayed_pages.test(pgno) {
+                    // The hot replay path passes a null pDone bitvec. A later
+                    // valid record for the same page replaces the earlier one.
+                    if pgno > orig_pages {
                         continue;
                     }
-                    let data = &rec_buf[4..4 + ps];
-                    let stored_cksum = u32::from_be_bytes([
-                        rec_buf[4 + ps],
-                        rec_buf[4 + ps + 1],
-                        rec_buf[4 + ps + 2],
-                        rec_buf[4 + ps + 3],
-                    ]);
-                    if Self::journal_checksum(nonce, data) != stored_cksum {
+                    if !Self::read_hot_record_part(jfile.as_ref(), &mut word, journal_off - 4)?
+                        || Self::journal_checksum(nonce, &page) != u32::from_be_bytes(word)
+                    {
                         break 'sections;
                     }
                     let db_off = u64::from(pgno - 1) * u64::from(page_size);
-                    self.db_file()?.write_at(data, db_off)?;
-                    replayed_pages.set(pgno)?;
+                    self.db_file()?.write_at(&page, db_off)?;
                 }
 
                 if raw_nrec == 0xffff_ffff {
@@ -6651,6 +6655,14 @@ impl Pager {
             self.unlock_db_file(LockLevel::Shared)?;
         }
         Ok(true)
+    }
+
+    fn read_hot_record_part(journal: &dyn VfsFile, bytes: &mut [u8], offset: u64) -> Result<bool> {
+        match journal.read_at(bytes, offset) {
+            Ok(read) => Ok(read == bytes.len()),
+            Err(error) if error.extended_code == extended::SQLITE_IOERR_SHORT_READ => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     fn sync_hot_journal(&self, journal: &dyn VfsFile) -> Result<u64> {
@@ -8228,6 +8240,48 @@ mod tests {
         fresh.close().unwrap();
         let db = vfs.open(Some(path), OpenFlags::READONLY).unwrap();
         assert_eq!(db.file_size().unwrap(), 0);
+    }
+
+    #[test]
+    fn hot_journal_replays_duplicate_valid_records_in_order() {
+        let vfs = Arc::new(MemoryVfs::new());
+        let path = Path::new("duplicate.db");
+        let journal_path = Path::new("duplicate.db-journal");
+        let flags = OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB;
+        let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+        pager.begin_write().unwrap();
+        let pgno = pager.allocate_raw_page().unwrap();
+        pager.write_page(pgno).unwrap()[0] = 3;
+        pager.commit().unwrap();
+        let page_size = pager.page_size();
+        let n_page = pager.page_count();
+        pager.close().unwrap();
+
+        let nonce = 17u32;
+        let sector = 512u32;
+        let mut journal = Vec::from(JOURNAL_MAGIC);
+        for word in [2u32, nonce, n_page, sector, page_size] {
+            journal.extend(word.to_be_bytes());
+        }
+        journal.resize(sector as usize, 0);
+        for tag in [1, 2] {
+            let mut page = vec![0u8; page_size as usize];
+            page[0] = tag;
+            let check = Pager::journal_checksum(nonce, &page);
+            journal.extend(pgno.to_be_bytes());
+            journal.extend(page);
+            journal.extend(check.to_be_bytes());
+        }
+        let file = vfs.open(Some(journal_path), OpenFlags::READWRITE | OpenFlags::CREATE).unwrap();
+        file.write_at(&journal, 0).unwrap();
+        drop(file);
+
+        let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+        pager.begin_read().unwrap();
+        assert_eq!(pager.read_page(pgno).unwrap()[0], 2);
+        pager.end_read_if_unused().unwrap();
+        pager.close().unwrap();
+        assert!(!vfs.exists(journal_path).unwrap());
     }
 
     #[test]

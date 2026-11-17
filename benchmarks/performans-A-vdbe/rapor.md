@@ -551,3 +551,7 @@ EXCLUSIVE DELETE journal başlığı ve tanıtıcı ömrü ile WAL header/payloa
 ## V6b.43 — D146 sıcak journal seçimi
 
 Sıfır baytlık DB'nin yanındaki eski journal artık RESERVED kilidi altında temizleniyor. İlk CANTOPEN, ilk kısa xRead ve RO açılış hatası C ile aynı. 16 dosya, dört gerçek çöküş imajı ve 20 native akış eşit. V6b.42'nin 88 native ve 147 kurtarma sonucu korundu. Boş WAL ile BUSY kip değişikliğinde alınan geçici SHARED kilidi bırakılıyor. Gcov 88 dal, alınmayan 35 çıkış sınıflı. OFF 1143/7/337, ON 1129/21/337. DML ve ayrışma bulucu V6b.42 ile aynı. Rust 1.100 süre oranı 1,238 ve 14 digest eşit. Sıcak kayıt sırası ve okuma sınırı D147 olarak açık. [Karar ve doğrulama](karar_esligi_v6b_43.md).
+
+## V6b.44 — D147/D148 sıcak journal playback
+
+Sıcak journal kayıtları ayrı numara, sayfa ve checksum okumalarıyla sırayla uygulanıyor. Kısa kayıt okuması playback'i sonlandırıyor ve diğer IOERR kodları korunuyor. Ana dosya uzunluğu eşitse bırakılıyor, küçültme xTruncate, tam sayfalık büyütme sıfır sayfa xWrite ile yapılıyor. 28 native akış, 12 dosya imajı, dört gerçek C çöküşü ve önceki 147 kurtarma vakası eşit. Gcov 56 dal, alınmayan 20 çıkış sınıflı. OFF 1144/7/337, ON 1130/21/337. DML ve ayrışma bulucu V6b.43 ile aynı. Rust 1.100 süre oranı 1,229 ve 14 digest eşit. D149 journal bölüm başlığındaki xRead sınırları açık. [Karar ve doğrulama](karar_esligi_v6b_44.md).
