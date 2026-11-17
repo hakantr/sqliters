@@ -40,7 +40,8 @@
 | V6b.20 — sayfa1 cache ve bozuk kayıt | `6a56a70` | D120/D121/D122; SharedLock aşaması | 640+128 native aynı; bütün dosyalar aynı; 13181 program | 1,064× taban; W14 1,361× | kapalı 1113/0; açık 1098/15 bilinen; 337 yok sayıldı |
 | V6b.21 — database_list | `711360d` | Hazırlama anı, self/advisory Expire, veri okumayan liste, geçerli UTF-16 metin | 13192 tam program; 12+210+12 native aynı; bütün dosyalar aynı | 1,059× taban; W14 1,363× | kapalı 1114/0; açık 1099/15 bilinen; 337 yok sayıldı |
 | V6b.22 — collation_list ve kabuk karşılaştırıcıları | `12494d3` | C Hash geçmişi, UTF-8 BUSY/expire, uint/decimal | 13314 tam program +1362 geçmiş programı; 426/438 native (D128 açık); 7536 comparator; 36 shell; bütün dosyalar aynı | 1,051× taban; W14 1,362× | kapalı 1115/0; açık 1100/15 bilinen; 337 yok sayıldı |
-| V6b.23 — D128 hazırlama ve hata kodu | bu commit | Parse.rc, atılan COLLATE, dar tamsayı makine yolu | 13344 tam program; 636+438 native aynı; bütün dosyalar aynı | 1,047× taban; W14 1,364× | kapalı 1116/0; açık 1101/15 bilinen; 337 yok sayıldı |
+| V6b.23 — D128 hazırlama ve hata kodu | `92b69eb` | Parse.rc, atılan COLLATE, dar tamsayı makine yolu | 13344 tam program; 636+438 native aynı; bütün dosyalar aynı | 1,047× taban; W14 1,364× | kapalı 1116/0; açık 1101/15 bilinen; 337 yok sayıldı |
+| V6b.24 — compile_options | bu commit | 42 seçenek, get/used, Reusable ve hata konumu | 13372 tam program; 3990 native aynı; bütün dosyalar aynı | 1,052× taban; W14 1,369× | kapalı 1117/0; açık 1102/15 bilinen; 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -465,3 +466,7 @@ C hash sırası/kayıt geçmişi ile UTF-8 BUSY/expire hizalandı. Kabuk uint/de
 ## V6b.23 — D128
 
 Eksik karşılaştırıcının C 257 hazırlama hatası korundu; C’nin sabit koşulla attığı karşılaştırma çalışma anında denetlenmez. 636 yeni ve 438 önceki akış sonuç/hata/konum/sekiz sayaç/dosya baytlarında aynı. Kalan PRAGMA’lar ve genel collation/legacy yolları açık. Kanıt [karar_esligi_v6b_23.md](karar_esligi_v6b_23.md) içinde.
+
+## V6b.24 — compile_options
+
+Sabit C başvuru derlemesinin 42 seçenekli tanı profili gerçek üreticide; get/used SQL işlevleri makinede çalışır. 3.990 native akış sonuç/hata/konum/sayaç/dosya baytlarında aynı. COMPILER satırı uyumluluk hedefini anlatır; genel özellik eşliği iddiası değildir. Kalan PRAGMA’lar sürer. Kanıt [karar_esligi_v6b_24.md](karar_esligi_v6b_24.md) içinde.

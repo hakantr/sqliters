@@ -43415,11 +43415,8 @@ fn exec_pragma(
         "COMPILE_OPTIONS" => {
             return Ok(QueryOutput {
                 column_names: vec!["compile_options".to_owned()],
-                rows: vec![
-                    vec![Value::Text("PURE_SAFE_RUST".to_owned())],
-                    vec![Value::Text("SQLITE_FORMAT_3".to_owned())],
-                    vec![Value::Text("THREADSAFE=1".to_owned())],
-                ],
+                rows: sqliters_types::SQLITE_REFERENCE_COMPILE_OPTIONS.iter()
+                    .map(|&s| vec![Value::Text(s.to_owned())]).collect(),
             });
         }
         "THREADS" => {

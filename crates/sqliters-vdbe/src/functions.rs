@@ -186,7 +186,8 @@ fn builtin_scalar_flags_upper(upper: &str, enable_test_functions: bool) -> Optio
             Some(FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS)
         }
         "RANDSTR" | "TEST_ERROR" if enable_test_functions => Some(FunctionFlags::INNOCUOUS),
-        "RANDOM" | "RANDOMBLOB" | "LAST_INSERT_ROWID" | "CHANGES" | "TOTAL_CHANGES" => {
+        "RANDOM" | "RANDOMBLOB" | "LAST_INSERT_ROWID" | "CHANGES" | "TOTAL_CHANGES"
+        | "SQLITE_COMPILEOPTION_GET" | "SQLITE_COMPILEOPTION_USED" => {
             Some(FunctionFlags::INNOCUOUS)
         }
         "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" | "DATE" | "TIME" | "DATETIME"
@@ -473,7 +474,8 @@ fn eval_scalar_function_plain(
         return r;
     }
     match upper {
-        "CONCAT" | "CONCAT_WS" | "UNISTR" | "UNISTR_QUOTE" => Err(SqliteError::new(
+        "CONCAT" | "CONCAT_WS" | "UNISTR" | "UNISTR_QUOTE"
+        | "SQLITE_COMPILEOPTION_GET" | "SQLITE_COMPILEOPTION_USED" => Err(SqliteError::new(
             ErrorCode::Error,
             format!("wrong number of arguments to function {name}()"),
         )),
@@ -1107,6 +1109,8 @@ fn scalar_function_arity_with_flag(
 ) -> Option<(usize, usize)> {
     match upper {
         "TYPEOF"
+        | "SQLITE_COMPILEOPTION_GET"
+        | "SQLITE_COMPILEOPTION_USED"
         | "SUBTYPE"
         | "ABS"
         | "SIGN"

@@ -5360,16 +5360,18 @@ fn select_schema_use_of(inner: &ConnectionInner, stmt: &Stmt, sql: &str) -> Opti
     matches!(body, Stmt::Select(_)).then(|| cgen::select_schema_use(inner, sql)).flatten()
 }
 
-/// callback.c:216–232: a missing collation is a prepare error even when a
-/// legacy constant ORDER BY path would never compare values at execution.
-fn check_missing_collation_on_prepare(
+/// Preserve the C errors that legacy validation can defer or lose: missing
+/// collations and the diagnostic functions' argument-count error locations.
+fn check_c_prepare_error(
     inner: &mut ConnectionInner, usage: Option<&cgen::SelectSchemaUse>, sql: &str,
 ) -> Result<()> {
     if !usage.is_some_and(|u| u.btree_mask.is_none()) { return Ok(()); }
     let (result, _, _) = cgen::c_prepare_quiet(inner, sql);
     apply_codegen_pragma_effects(inner)?;
     if let sqliters_codegen::PrepareResult::Error { code, message, offset } = result
-        && code == sqliters_types::extended::SQLITE_ERROR_MISSING_COLLSEQ
+        && (code == sqliters_types::extended::SQLITE_ERROR_MISSING_COLLSEQ
+            || message.eq_ignore_ascii_case("wrong number of arguments to function sqlite_compileoption_get()")
+            || message.eq_ignore_ascii_case("wrong number of arguments to function sqlite_compileoption_used()"))
     {
         return Err(SqliteError::with_extended(code, message)
             .with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }));
@@ -6053,7 +6055,7 @@ fn prepare_default_cache_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>
 fn prepare_row_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str)
     -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>>
 {
-    if !matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("database_list") || name.eq_ignore_ascii_case("collation_list")) {
+    if !matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("database_list") || name.eq_ignore_ascii_case("collation_list") || name.eq_ignore_ascii_case("compile_options")) {
         return Ok(None);
     }
     let Some(program) = prepare_pragma_program(inner, sql)? else { return Ok(None); };
@@ -7780,7 +7782,7 @@ impl Statement {
             }
         }
 
-        check_missing_collation_on_prepare(inner, select_schema_use.as_ref(), &raw_sql)?;
+        check_c_prepare_error(inner, select_schema_use.as_ref(), &raw_sql)?;
 
         if c_first_load {
             // sqlite3Init() -> sqlite3AnalysisLoad() on fresh schema objects
@@ -8634,7 +8636,7 @@ impl Statement {
                     let _ = inner.ensure_schemas_loaded_for_prepare(false)?;
                 }
             }
-            check_missing_collation_on_prepare(inner, select_schema_use.as_ref(), &self.raw_sql)?;
+            check_c_prepare_error(inner, select_schema_use.as_ref(), &self.raw_sql)?;
             let (parsed_stmt, c_explain) = match parsed_stmt {
                 None if cgen::is_explain(&self.raw_sql) => match cgen::c_explain(inner, &self.raw_sql) {
                     cgen::CExplain::Program(prog) => {

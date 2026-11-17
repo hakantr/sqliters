@@ -33,6 +33,7 @@ pub fn dtrace_enabled() -> bool {
 }
 
 pub mod bitvec;
+pub mod compile_options;
 pub mod error;
 pub mod fp;
 pub mod json;
@@ -44,6 +45,7 @@ pub mod varint;
 pub mod vtab_api;
 
 pub use bitvec::Bitvec;
+pub use compile_options::{SQLITE_REFERENCE_COMPILE_OPTIONS, sqlite_compileoption_get, sqlite_compileoption_used};
 pub use error::{ConflictResolutionEffect, ErrorCode, Result, SqliteError, extended};
 pub use fp::{FpDecode, fp_decode, real_to_text, sqlite_atof, sqlite_atoi64, write_real_text};
 pub use json::{

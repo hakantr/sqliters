@@ -459,6 +459,14 @@ pub fn sqlite3_pragma(
                 row(p, vec![PragmaCell::Int(i as i32), name.into()]);
             }
         }
+        10 => {
+            // pragma.c:2379–2387: this constant list is explicitly reusable.
+            p.n_mem = 1;
+            for &option in sqliters_types::SQLITE_REFERENCE_COMPILE_OPTIONS {
+                row(p, vec![option.into()]);
+            }
+            p.v.reusable();
+        }
         12 => {
             // pragma.c:1442–1453: names, membership and filenames freeze at prepare.
             p.n_mem = 3;

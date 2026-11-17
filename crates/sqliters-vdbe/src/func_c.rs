@@ -158,6 +158,22 @@ fn quote_value(v: &Value, escape: bool, enc: TextEncoding) -> Result<Vec<u8>> {
 #[allow(clippy::too_many_lines)]
 pub(crate) fn eval(upper: &str, args: &[Value], ctx: &VmRuntimeContext) -> Option<Result<Value>> {
     let enc = ctx.text_encoding;
+    if args.len() == 1 && upper == "SQLITE_COMPILEOPTION_GET" {
+        // sqlite3_value_int: signed i64 conversion, then C's 32-bit truncation.
+        let integer = match &args[0] {
+            Value::Blob(b) if enc != TextEncoding::Utf8 =>
+                sqliters_types::sqlite_atoi64(enc.decode_bytes(b).as_bytes()).0,
+            v => crate::vdbemem::Mem::from_value(v).int_value(),
+        };
+        return Some(Ok(sqliters_types::sqlite_compileoption_get(integer as i32)
+            .map_or(Value::Null, |s| Value::Text(s.to_owned()))));
+    }
+    if args.len() == 1 && upper == "SQLITE_COMPILEOPTION_USED" {
+        if matches!(&args[0], Value::Real(r) if r.is_nan()) { return Some(Ok(Value::Null)); }
+        return Some(Ok(value_text(&args[0], enc).map_or(Value::Null,
+            |z| Value::Integer(i64::from(sqliters_types::sqlite_compileoption_used(&z))))));
+    }
+
     Some(match upper {
         "OCTET_LENGTH" if args.len() == 1 => Ok(match &args[0] {
             Value::Null => Value::Null,
