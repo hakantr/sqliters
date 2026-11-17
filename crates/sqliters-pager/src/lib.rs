@@ -379,6 +379,11 @@ pub struct Pager {
     /// itself. A commit stamps `db_file_vers_cc + 1` (`pager_write_changecounter`); a WAL commit
     /// does not advance it, so the stamp stays constant while page 1 stays cached.
     db_file_vers_cc: u32,
+    /// Full Pager.dbFileVers image, including size and freelist fields. It
+    /// records storage reads/writes, rather than the mutable in-memory header.
+    db_file_vers: [u8; 16],
+    /// Pager.hasHeldSharedLock: the first acquisition needs no version probe.
+    has_held_shared_lock: bool,
     /// True once `commit` has started writing/truncating the main database file (`PAGER_WRITER_DBMOD`).
     db_file_modified: bool,
     /// True once `write_super_journal` has recorded a super-journal pointer in this tx (`pPager->setSuper`).
@@ -649,6 +654,8 @@ impl Pager {
             change_counter_bumped: false,
             change_count_done: is_memdb_backing || db_kind == DatabaseKind::PrivateTemporary || options.immutable,
             db_file_vers_cc: 0,
+            db_file_vers: [0; 16],
+            has_held_shared_lock: false,
             db_file_modified: false,
             set_super: false,
             commit_phase_one_done: false,
@@ -1581,6 +1588,7 @@ impl Pager {
                 // brings the change counter of the file / WAL snapshot back with it.
                 let d = self.cache.entry_data(slot);
                 self.db_file_vers_cc = u32::from_be_bytes([d[24], d[25], d[26], d[27]]);
+                self.db_file_vers.copy_from_slice(&d[24..40]);
             }
         }
         Ok(slot)
@@ -1595,20 +1603,34 @@ impl Pager {
             None => None,
         };
         let buf = self.cache.entries[slot as usize].data.as_mut_slice();
-        if let Some(fno) = wal_frame {
-            self.wal.as_ref().unwrap().read_frame(fno, buf)?;
+        let result = if let Some(fno) = wal_frame {
+            self.wal.as_ref().unwrap().read_frame(fno, buf)
         } else {
             let offset = u64::from(pgno - 1) * (ps as u64);
             let file = self
                 .file
                 .as_deref()
                 .ok_or_else(|| SqliteError::misuse("database file is not open"))?;
-            let n = file.read_at(buf, offset)?;
-            if n < ps {
-                buf[n..].fill(0);
+            match file.read_at(buf, offset) {
+                Ok(n) => {
+                    if n < ps { buf[n..].fill(0); }
+                    Ok(())
+                }
+                Err(e) if e.extended_code == extended::SQLITE_IOERR_SHORT_READ => Ok(()),
+                Err(e) => Err(e),
             }
+        };
+        if pgno == 1 {
+            if result.is_ok() {
+                self.db_file_vers.copy_from_slice(&buf[24..40]);
+            } else {
+                // readDbPage, pager.c:3102–3118: a failed page 1 read must
+                // never look like the file version of a valid cached page.
+                self.db_file_vers.fill(0xff);
+            }
+            self.db_file_vers_cc = u32::from_be_bytes(self.db_file_vers[..4].try_into().unwrap());
         }
-        Ok(())
+        result
     }
 
     /// `sqlite3PcacheFetchStress`: the cache is nearly full of pages it cannot recycle. "Find
@@ -1997,6 +2019,7 @@ impl Pager {
                 if pgno == 1 {
                     let data = self.cache.entry_data(slot);
                     self.db_file_vers_cc = u32::from_be_bytes(data[24..28].try_into().unwrap());
+                    self.db_file_vers.copy_from_slice(&data[24..40]);
                 }
                 self.a_stat[PAGER_STAT_WRITE] += 1;
             } else {
@@ -2803,7 +2826,10 @@ impl Pager {
         };
 
         self.lock_db_file(LockLevel::Shared)?;
-        if let Err(e) = self.begin_read_under_shared_lock() {
+        // Changing locking_mode during prepare does not release the reader
+        // already retained by exclusive mode (C remains PAGER_READER).
+        let retained_reader = prev_lock >= LockLevel::Shared;
+        if let Err(e) = self.begin_read_under_shared_lock(retained_reader) {
             if had_wal_before {
                 if let Some(ref mut wal) = self.wal {
                     let _ = wal.end_read_transaction();
@@ -2823,7 +2849,7 @@ impl Pager {
         Ok(())
     }
 
-    fn begin_read_under_shared_lock(&mut self) -> Result<()> {
+    fn begin_read_under_shared_lock(&mut self, retained_reader: bool) -> Result<()> {
         if (self.is_memdb_backing && self.header_loaded)
             || (self.db_kind == DatabaseKind::PrivateTemporary && self.file.is_none())
         {
@@ -2856,12 +2882,51 @@ impl Pager {
         }
 
         if self.wal.is_none() {
-            let recovered = if self.immutable || self.is_memdb_backing {
+            let recovered = if retained_reader || self.immutable || self.is_memdb_backing {
                 false
             } else {
                 self.recover_hot_journal_under_shared_lock()?
             };
+            // pager.c:5452–5488: warm rollback readers compare only these
+            // sixteen bytes. Reading the complete header here introduces I/O
+            // failures in regions C never touches (D117).
+            let version_changed = if !retained_reader
+                && !self.uses_temp_file_semantics()
+                && self.has_held_shared_lock
+            {
+                let mut version = [0u8; 16];
+                match self.db_file()?.read_at(&mut version, 24) {
+                    Ok(16) => {}
+                    Ok(_) => version.fill(0),
+                    Err(e) if e.extended_code == sqliters_types::error::extended::SQLITE_IOERR_SHORT_READ => version.fill(0),
+                    Err(e) => return Err(e),
+                }
+                version != self.db_file_vers
+            } else { false };
+            if version_changed {
+                self.notify_backup_restart();
+                self.bump_data_version();
+                self.pcache_reset();
+            }
+            let cached_header = !recovered && !version_changed && self.header_loaded && self.page_size_fixed
+                && self.cache.slot_of(1).is_some()
+                && (self.suppress_auto_wal
+                    || (!self.header.is_wal() && self.journal_mode != JournalMode::Wal));
+            if cached_header && (retained_reader || self.uses_temp_file_semantics()) {
+                self.has_held_shared_lock = true;
+                // lockBtree, btree.c:3451–3454, refreshes live auto-vacuum
+                // flags even when page 1 remains cached and unchanged.
+                self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
+                return Ok(());
+            }
             let file_len = self.db_file()?.file_size()?;
+            self.has_held_shared_lock = true;
+            // SharedLock still calls pagerPagecount for a newly acquired
+            // normal reader. Keep its xFileSize failure even on a cache hit.
+            if cached_header && file_len / u64::from(self.header.page_size) == u64::from(self.page_count) {
+                self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
+                return Ok(());
+            }
             if file_len == 0 {
                 if !self.suppress_auto_wal && self.journal_mode == JournalMode::Wal {
                     self.open_wal_under_shared_lock()?;
@@ -2932,7 +2997,7 @@ impl Pager {
                     };
                     disk_hdr.database_size_pages = effective_pages;
 
-                    let invalidate_cache = recovered
+                    let invalidate_cache = version_changed || recovered
                         || !self.header_loaded
                         || !self.page_size_fixed
                         || disk_hdr.page_size != self.header.page_size
@@ -2940,7 +3005,7 @@ impl Pager {
                         || disk_hdr.schema_cookie != self.header.schema_cookie
                         || effective_pages != self.page_count;
                     if invalidate_cache {
-                        if self.header_loaded {
+                        if self.header_loaded && !version_changed {
                             self.notify_backup_restart();
                             // `sqlite3PagerSharedLock`: the 16 bytes at offset 24 differ from
                             // what this pager last saw → `pager_reset()`.
@@ -2956,6 +3021,7 @@ impl Pager {
                     self.configured_auto_vacuum = AutoVacuumMode::from_header(&disk_hdr);
                     // `sqlite3PagerSharedLock` reads bytes 24..39 of the file into `dbFileVers`.
                     self.db_file_vers_cc = disk_hdr.change_counter;
+                    self.db_file_vers.copy_from_slice(&hdr_bytes[24..40]);
                     self.adopt_loaded_header(disk_hdr);
                     self.page_count = effective_pages;
                     self.page_size_fixed = true;
@@ -2974,6 +3040,7 @@ impl Pager {
                 .ok_or_else(|| SqliteError::misuse("NamedDisk database missing file"))?;
             self.wal.as_mut().unwrap().begin_read_transaction(db_f)?
         };
+        self.has_held_shared_lock = true;
         if self.wal.as_ref().unwrap().is_readonly() {
             self.readonly = true;
         }
@@ -3088,6 +3155,7 @@ impl Pager {
             // `readDbPage(1)`: page 1 is (re-)read from the WAL snapshot or the database file
             // only when it is not cached; a cached page 1 keeps the older `dbFileVers`.
             self.db_file_vers_cc = snap_hdr.change_counter;
+            self.db_file_vers.copy_from_slice(&hdr_bytes[24..40]);
         }
         self.adopt_loaded_header(snap_hdr);
         self.page_count = effective_pages;
@@ -3415,6 +3483,7 @@ impl Pager {
         self.header.change_counter = 0;
         self.header.version_valid_for = 0;
         self.db_file_vers_cc = 0;
+        self.db_file_vers = [0; 16];
         // `newDatabase` (`btree.c`): schema format and text encoding stay 0 in the file until
         // the first table is created.
         if self.header.text_encoding == 0 {
@@ -5105,6 +5174,10 @@ impl Pager {
                 // and cuts the cache back to the database size.
                 self.release_transient();
                 for (pgno, orig_data) in self.tx_preimages.drain() {
+                    if pgno == 1 && pgno <= orig_count {
+                        self.db_file_vers.copy_from_slice(&orig_data[24..40]);
+                        self.db_file_vers_cc = u32::from_be_bytes(orig_data[24..28].try_into().unwrap());
+                    }
                     if pgno <= orig_count
                         && let Some(d) = self.cache.get_data_mut(pgno)
                         && d.len() == orig_data.len()
@@ -5205,7 +5278,7 @@ impl Pager {
                 self.unlock_db_file(LockLevel::Shared)?;
             }
             if !self.header_loaded
-                && let Err(e) = self.begin_read_under_shared_lock()
+                && let Err(e) = self.begin_read_under_shared_lock(true)
             {
                 if self.locking_mode == LockingMode::Normal {
                     let _ = self.unlock_db_file(LockLevel::NoLock);
@@ -5487,6 +5560,7 @@ impl Pager {
                     // one the next commit counts on from.
                     let d = self.cache.entry_data(slot);
                     self.db_file_vers_cc = u32::from_be_bytes([d[24], d[25], d[26], d[27]]);
+                    self.db_file_vers.copy_from_slice(&d[24..40]);
                 }
             } else {
                 self.cache.entry_data_mut(slot).fill(0);
@@ -5607,6 +5681,9 @@ impl Pager {
                     d.copy_from_slice(img);
                 }
                 self.cache.release(s);
+            }
+            if pgno == 1 {
+                self.db_file_vers.copy_from_slice(&img[24..40]);
             }
         }
 
@@ -6074,6 +6151,10 @@ impl Pager {
                     }
                     let db_off = u64::from(pgno - 1) * u64::from(page_size);
                     self.db_file()?.write_at(data, db_off)?;
+                    if pgno == 1 {
+                        self.db_file_vers.copy_from_slice(&data[24..40]);
+                        self.db_file_vers_cc = u32::from_be_bytes(data[24..28].try_into().unwrap());
+                    }
                     replayed_pages.set(pgno)?;
                 }
 
@@ -7219,6 +7300,10 @@ mod tests {
     /// What a [`FaultVfs`] injects and observes.
     #[derive(Default)]
     struct FaultCtl {
+        /// Fail reads that touch the file prefix outside C's version probe.
+        fail_db_prefix_read: std::sync::atomic::AtomicBool,
+        fail_db_file_size: std::sync::atomic::AtomicBool,
+        db_reads: Mutex<Vec<(u64, usize)>>,
         /// `xFileSize` of `<db>-wal` fails.
         fail_wal_file_size: std::sync::atomic::AtomicBool,
         /// `xTruncate` of `<db>-wal` fails.
@@ -7285,6 +7370,12 @@ mod tests {
 
     impl VfsFile for FaultFile {
         fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+            if self.is_db {
+                self.ctl.db_reads.lock().unwrap().push((offset, buf.len()));
+                if offset < 24 && self.ctl.fail_db_prefix_read.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(SqliteError::with_extended(extended::SQLITE_IOERR_READ, "disk I/O error"));
+                }
+            }
             self.inner.read_at(buf, offset)
         }
         fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
@@ -7316,6 +7407,9 @@ mod tests {
             self.inner.sync(flags)
         }
         fn file_size(&self) -> Result<u64> {
+            if self.is_db && self.ctl.fail_db_file_size.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(SqliteError::with_extended(extended::SQLITE_IOERR_FSTAT, "disk I/O error"));
+            }
             if self.is_wal
                 && self
                     .ctl
@@ -7362,6 +7456,88 @@ mod tests {
         fn is_readonly(&self) -> bool {
             self.inner.is_readonly()
         }
+    }
+
+    #[test]
+    fn warm_read_probes_only_file_version_and_retained_reader_skips_probe() {
+        for (mode, prepared_mode) in [
+            (LockingMode::Normal, LockingMode::Normal),
+            (LockingMode::Exclusive, LockingMode::Exclusive),
+            (LockingMode::Exclusive, LockingMode::Normal),
+        ] {
+            let ctl = Arc::new(FaultCtl::default());
+            let vfs = Arc::new(FaultVfs { inner: Arc::new(MemoryVfs::new()), ctl: ctl.clone() });
+            let mut pager = Pager::open_with_vfs(vfs, Some(Path::new("warm.db")),
+                OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB).unwrap();
+            pager.set_locking_mode(mode);
+            pager.begin_write().unwrap();
+            pager.commit().unwrap();
+            pager.set_locking_mode(prepared_mode);
+            ctl.db_reads.lock().unwrap().clear();
+            ctl.fail_db_prefix_read.store(true, std::sync::atomic::Ordering::Relaxed);
+            pager.begin_read().unwrap();
+            pager.read_page(1).unwrap();
+            let expected = if mode == LockingMode::Normal { vec![(24, 16)] } else { vec![] };
+            assert_eq!(*ctl.db_reads.lock().unwrap(), expected, "{mode:?} -> {prepared_mode:?}");
+            ctl.fail_db_prefix_read.store(false, std::sync::atomic::Ordering::Relaxed);
+            pager.end_read_if_unused().unwrap();
+            ctl.fail_db_file_size.store(true, std::sync::atomic::Ordering::Relaxed);
+            let result = pager.begin_read();
+            if prepared_mode == LockingMode::Normal {
+                assert_eq!(result.unwrap_err().extended_code, extended::SQLITE_IOERR_FSTAT);
+            } else {
+                result.unwrap();
+            }
+            ctl.fail_db_file_size.store(false, std::sync::atomic::Ordering::Relaxed);
+            pager.end_read_if_unused().unwrap();
+            pager.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn warm_cached_header_still_opens_pending_wal() {
+        let inner = Arc::new(MemoryVfs::new());
+        let mut pager = Pager::open_with_vfs(inner, Some(Path::new("pending_wal.db")),
+            OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB).unwrap();
+        pager.begin_write().unwrap();
+        pager.commit().unwrap();
+        assert_eq!(pager.set_journal_mode(JournalMode::Wal).unwrap(), JournalMode::Wal);
+        pager.begin_read().unwrap();
+        assert!(pager.use_wal());
+        pager.end_read_if_unused().unwrap();
+        pager.close().unwrap();
+    }
+
+    #[test]
+    fn warm_read_compares_all_sixteen_raw_version_bytes() {
+        let ctl = Arc::new(FaultCtl::default());
+        let inner = Arc::new(MemoryVfs::new());
+        let vfs = Arc::new(FaultVfs { inner: inner.clone(), ctl: ctl.clone() });
+        let path = Path::new("version.db");
+        let mut pager = Pager::open_with_vfs(vfs, Some(path),
+            OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB).unwrap();
+        pager.begin_write().unwrap();
+        pager.commit().unwrap();
+        let version = pager.data_version();
+        let counter = pager.db_file_vers_cc;
+        // A legacy zero page-count field is valid and normalizes back to the
+        // physical size. It must still invalidate the cache without a changed
+        // counter, and its raw zero bytes must remain the comparison image.
+        let file = inner.open(Some(path), OpenFlags::READWRITE | OpenFlags::MAIN_DB).unwrap();
+        file.write_at(&[0; 4], 28).unwrap();
+        ctl.db_reads.lock().unwrap().clear();
+        pager.begin_read().unwrap();
+        assert_eq!(pager.db_file_vers_cc, counter);
+        assert_eq!(pager.db_file_vers[4..8], [0; 4]);
+        assert_eq!(pager.page_count(), 1);
+        assert_eq!(pager.data_version(), version.wrapping_add(1));
+        assert_eq!(ctl.db_reads.lock().unwrap()[0], (24, 16));
+        pager.read_page(1).unwrap();
+        pager.end_read_if_unused().unwrap();
+        pager.begin_read().unwrap();
+        assert_eq!(pager.data_version(), version.wrapping_add(1));
+        pager.end_read_if_unused().unwrap();
+        pager.close().unwrap();
     }
 
     /// An 8-page database in WAL mode on a [`FaultVfs`], with `synchronous = FULL`.

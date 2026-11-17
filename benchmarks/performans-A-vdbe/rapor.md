@@ -33,7 +33,8 @@
 | V6b.13 — SELECT şema/Btree kararı; D115 açık | `c56c2cb` | D112/D114 UTF-8, bekleyen ifadeler ve VALUES | 13957 EXPLAIN/EQP; 11534 tam program; API2913/2914 aynı; bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1097/0; açık 1082/15 bilinen; 337 yok sayıldı |
 | V6b.14 — UTF-16 boş yürütme yolu ve sayaçlar | `801d13a` | D115/D116; parametre, reset/expire, ilerleme ve sayaçlar | 14077 EXPLAIN/EQP; 11654 tam program; API3075/3076 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1100/0; açık 1085/15 bilinen; 337 yok sayıldı |
 | V6b.15 — threads hazırlama ve sınır | `f539575` | C sayı kabulü, maske, 8 sınırı, donmuş satır, pragma_threads | 15456 EXPLAIN/EQP; 13009 tam program; API3995/3996 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1103/0; açık 1088/15 bilinen; 337 yok sayıldı |
-| V6b.16 — shrink_memory hazırlama etkisi | bu commit | Bütün açık pager’lar, reset/EXPLAIN ayrımı; D117 açık hata farkı | 15632 EXPLAIN/EQP; 13181 program; API4157/4158 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1104/0; açık 1089/15 bilinen; 337 yok sayıldı |
+| V6b.16 — shrink_memory hazırlama etkisi | `1c0e7e8` | Bütün açık pager’lar, reset/EXPLAIN ayrımı; D117 açık hata farkı | 15632 EXPLAIN/EQP; 13181 program; API4157/4158 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1104/0; açık 1089/15 bilinen; 337 yok sayıldı |
+| V6b.17 — D117 sıcak başlık kontrolü | bu commit | 16 byte sürüm, retained reader ve pending WAL; D118 açık | 13181 program; API4157/4158 aynı, bütün dosyalar aynı; 30 hata yoklaması | Yeniden ölçülmedi | kapalı 1107/0; açık 1092/15 bilinen; 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -430,3 +431,7 @@ threads hazırlama etkisi, bağlantı sınırı ve pragma_threads eklendi; başv
 ## V6b.16 — shrink_memory ve D117
 
 shrink_memory hazırlama etkisi taşındı; bütün 4.158 API akışının dosya baytları aynı. VFS hata enjeksiyonu D117 başlık okuma farkını gösterdi; sonraki adım bu farkın düzeltilmesidir. TEMP/journal gözlemleri de açık. Kanıt ve dört kapı [karar_esligi_v6b_16.md](karar_esligi_v6b_16.md) içinde.
+
+## V6b.17 — D117, D118 ve D119
+
+Sıcak okumanın D117 IOERR_READ farkı yoklanan 30 akışta giderildi; pending WAL guard’ı 896/896 dosyayla doğrulandı. D119 hata aktarımı ve D118 kısa okuma/sayfa1 yükleme farkları sonraki adım. Genel hot-journal/E28 ve TEMP/journal zamanlama gözlemleri açık. Kanıt [karar_esligi_v6b_17.md](karar_esligi_v6b_17.md) içinde.
