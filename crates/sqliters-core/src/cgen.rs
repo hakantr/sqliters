@@ -728,6 +728,33 @@ pub(crate) fn c_explain_tail(inner: &ConnectionInner, sql: &str) -> (CExplain, u
     (r, tail, loaded)
 }
 
+/// CREATE [TEMP] TABLE can load the schema in the name reduction, before the
+/// tokenizer yields a later syntax error in the column list.
+pub(crate) fn starts_create_table(sql: &str) -> bool {
+    use sqliters_codegen::tk::{TK_COMMENT, TK_CREATE, TK_SEMI, TK_SPACE, TK_TABLE, TK_TEMP};
+    use sqliters_codegen::tokenize::sqlite3_get_token;
+
+    let mut rest = sql.as_bytes();
+    let mut tokens = std::iter::from_fn(|| {
+        let (n, token) = sqlite3_get_token(rest);
+        if n == 0 {
+            return None;
+        }
+        rest = &rest[n..];
+        Some(token)
+    })
+    .filter(|token| !matches!(*token, TK_COMMENT | TK_SPACE))
+    .skip_while(|token| *token == TK_SEMI);
+    if tokens.next() != Some(TK_CREATE) {
+        return false;
+    }
+    match tokens.next() {
+        Some(TK_TABLE) => true,
+        Some(TK_TEMP) => tokens.next() == Some(TK_TABLE),
+        _ => false,
+    }
+}
+
 /// True if the statement text starts with `EXPLAIN` (also `EXPLAIN QUERY PLAN`).
 pub(crate) fn is_explain(sql: &str) -> bool {
     use sqliters_codegen::tk::{TK_COMMENT, TK_EXPLAIN, TK_SPACE};

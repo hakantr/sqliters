@@ -6102,6 +6102,37 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) -> Result<()> {
 }
 
 #[allow(non_upper_case_globals)]
+/// sqlite3StartTable uses the input token for an existing table or view, including
+/// its quote characters and byte offset. Reuse that parser diagnostic after schema refresh.
+fn c_create_name_error(
+    inner: &mut ConnectionInner,
+    stmt: Option<&Stmt>,
+    sql: &str,
+    error: SqliteError,
+) -> SqliteError {
+    if !matches!(stmt, Some(Stmt::CreateTable(_) | Stmt::CreateTableAs { .. } | Stmt::CreateView(_)))
+        || inner.authorizer.is_some()
+        || error.code != ErrorCode::Error
+        || !(error.message.starts_with("unknown database ")
+            || (error.message.ends_with(" already exists")
+                && (error.message.starts_with("table ") || error.message.starts_with("view "))))
+    {
+        return error;
+    }
+    let (result, _, loaded) = cgen::c_prepare_quiet(inner, sql);
+    if let Err(e) = apply_codegen_pragma_effects(inner) {
+        return e;
+    }
+    let sqliters_codegen::PrepareResult::Error { code, message, offset } = result else {
+        return error;
+    };
+    if loaded {
+        inner.db_set.c_mark_schemas_loaded();
+    }
+    SqliteError::with_extended(code, message)
+        .with_offset(usize::try_from(offset).unwrap_or(SqliteError::NO_OFFSET))
+}
+
 fn prepare_pragma_program(inner: &mut ConnectionInner, sql: &str) -> Result<Option<Box<sqliters_vdbe::vdbeaux::Program>>> {
     let (result, _, _) = cgen::c_prepare_quiet(inner, sql);
     apply_codegen_pragma_effects(inner)?;
@@ -7780,8 +7811,13 @@ impl Statement {
                     // rejects it too, the message and the byte offset are C's (e.g. the
                     // first `SELECT` of a connection loses the offset of an error that
                     // `sqlite3Init()` clears, see `Db.encoding_fixed`).
-                    let result = cgen::c_explain_tail(inner, sql);
+                    let mut result = cgen::c_explain_tail(inner, sql);
                     apply_codegen_pragma_effects(inner)?;
+                    if c_unloaded && result.2 && !inner.authorizer.is_some() && cgen::starts_create_table(sql) {
+                        inner.ensure_schemas_loaded_for_prepare(false)?;
+                        result = cgen::c_explain_tail(inner, sql);
+                        apply_codegen_pragma_effects(inner)?;
+                    }
                     if let (cgen::CExplain::Error { code, message, offset }, _, loaded) = result {
                         if loaded {
                             // C's sqlite3ReadSchema() loaded the schemas before the error
@@ -8002,7 +8038,7 @@ impl Statement {
                 return Ok(artifacts);
             }
             if !vdbe_host::exec_switch_on() || !matches!(stmt, Some(Stmt::Select(_))) {
-                return Err(err);
+                return Err(c_create_name_error(inner, stmt.as_ref(), &raw_sql, err));
             }
             let probe = read_artifacts(stmt.clone(), Vec::new());
             match vdbe_host::machine_program(inner, stmt.as_ref(), &raw_sql, probe.max_param) {
@@ -8811,12 +8847,13 @@ impl Statement {
                         }) =>
                 {
                     if inner.ensure_schemas_loaded_for_prepare(true)? {
-                        try_compile(inner, &parsed_stmt)?
+                        try_compile(inner, &parsed_stmt)
+                            .map_err(|e| c_create_name_error(inner, parsed_stmt.as_ref(), &self.raw_sql, e))?
                     } else {
-                        return Err(err);
+                        return Err(c_create_name_error(inner, parsed_stmt.as_ref(), &self.raw_sql, err));
                     }
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(c_create_name_error(inner, parsed_stmt.as_ref(), &self.raw_sql, err)),
             };
             apply_prepare_auto_vacuum_pragma(inner, &mut artifacts, c_prepared_auto_vacuum);
             if let Some(out) = &c_prepared_pragma {

@@ -515,3 +515,7 @@ Unix VFS'de gerçek read-only mmap, fetch lease sayısı, EOF256 ve aktif ref s�
 ## V6b.34 — D142 sayfalayıcı bağlantısı
 
 B-tree imleçleri Unix xFetch lease'lerini PCache'den ayrı tutuyor. Etkin okuyucunun mmap sınırını koruduğu altı önceki D142 akışı artık eşit. Dosya büyümesinden doğan 36 yeni fark SIZE_HINT ile kapandı ve büyüme/geometri 52/52 oldu. Önceki native mmap 246/250, genişletilmiş native 433/440. Kalıcı dosya hashleri eşit. Kalan çıktılar önceki dört D144 ve yedi hata/bozuk dosya farkıyla aynı. Gcov 150 dal kaydetti ve alınmayan 47 çıkış tek tek sınıflandırıldı. OFF 1135/4/337, ON 1121/18/337. DML ve ayrışma bulucu V6b.33 ile aynı. Rust 1.100 tabanına süre oranı 1,225 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_34.md).
+
+## V6b.35 — D144 DDL adı hazırlama tanısı
+
+Tablo ve görünüm adı çakışmaları ham SQL token'ı ve bayt ofsetiyle hazırlanıyor. V2 ve V1 için 464'er native akış, 14 kabuk denetimi ve önceki 250 mmap akışı C ile eşit. Genişletilmiş mmap 433/440 ve önceki yedi ham fark sürüyor. 64 C dalının alınmayan 18 çıkışı ayrı sınıflandırıldı. OFF 1136/4/337, ON 1122/18/337. DML ve ayrışma bulucu V6b.34 ile aynı. Rust 1.100 tabanına süre oranı 1,235 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_35.md).
