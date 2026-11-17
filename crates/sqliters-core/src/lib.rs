@@ -7218,13 +7218,25 @@ impl Statement {
     }
 
     /// `sqlite3_stmt_status(pStmt, op, resetFlg)` of a statement run by the port of C's
-    /// virtual machine (diagnostic switch `SQLITERS_VDBE_EXEC`); 0 otherwise.
+    /// virtual machine; 0 otherwise.
     #[doc(hidden)]
     pub fn machine_stmt_status(&mut self, op: usize, reset: bool) -> u32 {
         if let StatementLifecycle::Running(RunningExec::Machine { vm, .. }) = &mut self.lifecycle {
             return vm.stmt_status(op, reset);
         }
         self.c_machine_vm.as_mut().map_or(0, |vm| vm.stmt_status(op, reset))
+    }
+
+    fn reprepare_machine_vm(&mut self, counters: [u32; 9]) {
+        // vdbeaux.c:152–153: sqlite3VdbeSwap preserves aCounter and counts
+        // the successful reprepare, including one before the first step.
+        self.c_machine_vm = self.c_machine.as_ref().map(|program| {
+            let mut vm = Box::new(sqliters_vdbe::vdbe::Vdbe::new(Arc::clone(program)));
+            vm.a_counter = counters;
+            let count = &mut vm.a_counter[sqliters_vdbe::vdbe::SQLITE_STMTSTATUS_REPREPARE];
+            *count = count.wrapping_add(1);
+            vm
+        });
     }
 
     /// The first `sqlite3_step` of an execution on the machine.
@@ -7287,6 +7299,7 @@ impl Statement {
             Err(e) if e.code == ErrorCode::Schema => {
                 // SQLITE_SCHEMA from OP_Transaction (the schema cookie or generation is not the
                 // one the program was generated for): sqlite3Reprepare, then run again — once.
+                let counters = vm.a_counter;
                 drop(vm);
                 if self.c_machine_fixed {
                     let _ = inner.finish_activity(
@@ -7306,6 +7319,7 @@ impl Statement {
                     && let Ok(Some(prog)) = vdbe_host::machine_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len())
                 {
                     self.c_machine = Some(prog);
+                    self.reprepare_machine_vm(counters);
                     return self.machine_start_inner(hid, shared, inner, lease_cursors, read_instances, true);
                 }
                 MachineStart::Fallback(lease_cursors, read_instances)
@@ -8591,7 +8605,8 @@ impl Statement {
                 self.c_machine = c_machine;
                 self.c_machine_write = c_write;
             }
-            self.c_machine_vm = None;
+            let counters = self.c_machine_vm.take().map_or([0; 9], |vm| vm.a_counter);
+            self.reprepare_machine_vm(counters);
             self.column_names = artifacts.column_names;
             self.params = transferred;
             self.named_params = artifacts.named_params;

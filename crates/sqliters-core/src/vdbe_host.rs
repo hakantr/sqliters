@@ -103,7 +103,8 @@ pub(crate) fn machine_program(
 
 /// A read rejected by legacy validation despite C eliminating its table source.
 /// This entry also works with the diagnostic switch off; it accepts only a
-/// checked program with no Btree use and retains the machine's other guards.
+/// checked program with no Btree use. An empty path containing only control
+/// flow and integer initialization also works in UTF-16 without text operations.
 pub(crate) fn schema_free_read_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize,
 ) -> Result<Option<Arc<Program>>> {
@@ -134,11 +135,22 @@ fn read_machine_program(
         trace("fallback: schema with an application-defined collation", raw_sql);
         return Ok(None);
     }
+    let prepared = if schema_free {
+        match crate::cgen::c_prepare(inner, raw_sql).0 {
+            PrepareResult::Program(p) if p.n_var as usize == n_param && empty_program_path(&p) => {
+                trace("machine: empty schema-free path", raw_sql);
+                return Ok(Some(Arc::new(*p)));
+            }
+            result => Some(result),
+        }
+    } else {
+        None
+    };
     if inner.effective_encoding() != TextEncoding::Utf8 {
         trace("fallback: UTF-16 database", raw_sql);
         return Ok(None);
     }
-    match crate::cgen::c_prepare(inner, raw_sql).0 {
+    match prepared.unwrap_or_else(|| crate::cgen::c_prepare(inner, raw_sql).0) {
         PrepareResult::Program(p) => {
             if schema_free && p.btree_mask != 0 { return Ok(None); }
             if p.explain != 0 {
@@ -180,6 +192,30 @@ fn read_machine_program(
             Ok(None)
         }
     }
+}
+
+/// Follow unconditional control flow and encoding-independent integer setup.
+/// Any text, cursor, function, error
+/// halt, invalid jump, or cycle leaves the ordinary machine guards in force.
+#[allow(non_upper_case_globals)]
+fn empty_program_path(program: &Program) -> bool {
+    use sqliters_vdbe::opcodes::{OP_Goto, OP_Halt, OP_Init, OP_Integer};
+    if program.explain != 0 || program.btree_mask != 0 { return false; }
+    let mut pc = 0usize;
+    for _ in 0..program.a_op.len() {
+        let Some(op) = program.a_op.get(pc) else { return false; };
+        match op.opcode {
+            OP_Init | OP_Goto => {
+                if (op.opcode == OP_Init && pc != 0) || op.p5 != 0 { return false; }
+                let Ok(next) = usize::try_from(op.p2) else { return false; };
+                pc = next;
+            }
+            OP_Halt => return op.p1 == 0,
+            OP_Integer => pc += 1,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// What C's compile result decides for a statement that writes, with the switch on.

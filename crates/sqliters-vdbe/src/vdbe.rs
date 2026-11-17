@@ -81,6 +81,7 @@ pub const SQLITE_STMTSTATUS_FULLSCAN_STEP: usize = 1;
 pub const SQLITE_STMTSTATUS_SORT: usize = 2;
 pub const SQLITE_STMTSTATUS_AUTOINDEX: usize = 3;
 pub const SQLITE_STMTSTATUS_VM_STEP: usize = 4;
+pub const SQLITE_STMTSTATUS_REPREPARE: usize = 5;
 pub const SQLITE_STMTSTATUS_RUN: usize = 6;
 pub const SQLITE_STMTSTATUS_FILTER_MISS: usize = 7;
 pub const SQLITE_STMTSTATUS_FILTER_HIT: usize = 8;
@@ -1884,7 +1885,7 @@ impl Vdbe {
     }
 
     /// `sqlite3_stmt_status(pStmt, op, resetFlag)` for the counters the machine keeps
-    /// (`SQLITE_STMTSTATUS_FULLSCAN_STEP` 1, `SORT` 2, `AUTOINDEX` 3, `VM_STEP` 4, `RUN` 6,
+    /// (`SQLITE_STMTSTATUS_FULLSCAN_STEP` 1, `SORT` 2, `AUTOINDEX` 3, `VM_STEP` 4, `REPREPARE` 5, `RUN` 6,
     /// `FILTER_MISS` 7, `FILTER_HIT` 8).
     pub fn stmt_status(&mut self, op: usize, reset: bool) -> u32 {
         let Some(c) = self.a_counter.get_mut(op) else {
