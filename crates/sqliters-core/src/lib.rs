@@ -6133,6 +6133,45 @@ fn c_create_name_error(
         .with_offset(usize::try_from(offset).unwrap_or(SqliteError::NO_OFFSET))
 }
 
+/// The parser actions for generated columns reject constraints in SQL order,
+/// before name resolution of the generated expression or any statement writes.
+fn check_create_generated_column_errors(
+    inner: &mut ConnectionInner,
+    stmt: Option<&Stmt>,
+    sql: &str,
+) -> Result<()> {
+    use sqliters_syntax::ColumnConstraint;
+
+    let Some(Stmt::CreateTable(table)) = stmt else {
+        return Ok(());
+    };
+    if inner.authorizer.is_some()
+        || !table.columns.iter().any(|column| {
+            column.constraints.iter().any(|constraint| {
+                matches!(constraint, ColumnConstraint::Generated { .. })
+            })
+        })
+    {
+        return Ok(());
+    }
+    let (result, _, loaded) = cgen::c_prepare_quiet(inner, sql);
+    let opened_temp = cgen::take_c_temp_opened();
+    let sqliters_codegen::PrepareResult::Error { code, message, offset } = result else {
+        let _ = cgen::take_c_pragma_effects();
+        return Ok(());
+    };
+    apply_codegen_pragma_effects(inner)?;
+    if opened_temp && !inner.db_set.is_temp_open() {
+        let encoding = inner.effective_encoding();
+        inner.db_set.ensure_temp_open(encoding, inner.writable_schema)?;
+    }
+    if loaded {
+        inner.db_set.c_mark_schemas_loaded();
+    }
+    Err(SqliteError::with_extended(code, message)
+        .with_offset(usize::try_from(offset).unwrap_or(SqliteError::NO_OFFSET)))
+}
+
 fn prepare_pragma_program(inner: &mut ConnectionInner, sql: &str) -> Result<Option<Box<sqliters_vdbe::vdbeaux::Program>>> {
     let (result, _, _) = cgen::c_prepare_quiet(inner, sql);
     apply_codegen_pragma_effects(inner)?;
@@ -7980,6 +8019,7 @@ impl Statement {
 
         let try_compile =
             |inner: &mut ConnectionInner, stmt_opt: Option<Stmt>| -> Result<CompiledArtifacts> {
+                check_create_generated_column_errors(inner, stmt_opt.as_ref(), &raw_sql)?;
                 if let Some(ref st) = stmt_opt {
                     inner.with_default_exec_ctx(shared, ActivitySummary::default(), |ctx| {
                         crate::vtab::ensure_stmt_vtabs_connected(ctx, st)
@@ -8799,6 +8839,7 @@ impl Statement {
             let try_compile = |inner: &mut ConnectionInner,
                                parsed_stmt: &Option<Stmt>|
              -> Result<CompiledArtifacts> {
+                check_create_generated_column_errors(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
                 if let Some(st) = parsed_stmt {
                     inner.with_default_exec_ctx(&shared, ActivitySummary::default(), |ctx| {
                         crate::vtab::ensure_stmt_vtabs_connected(ctx, st)

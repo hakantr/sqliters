@@ -65,3 +65,40 @@ fn create_name_collisions_keep_the_input_token_and_byte_offset() {
     }
     db.execute_batch("CREATE TABLE IF NOT EXISTS main.[Tç](a);").unwrap();
 }
+
+#[test]
+fn generated_column_constraints_fail_at_prepare_in_parser_order() {
+    let db = Connection::open_in_memory().unwrap();
+    for (sql, message) in [
+        (
+            "CREATE TABLE t(a, g AS (missing) PRIMARY KEY, a)",
+            "generated columns cannot be part of the PRIMARY KEY",
+        ),
+        (
+            "CREATE TABLE t(a, g INTEGER PRIMARY KEY AS (a + 1) STORED)",
+            "generated columns cannot be part of the PRIMARY KEY",
+        ),
+        (
+            "CREATE TABLE t(a, g AS (a) DEFAULT 0 PRIMARY KEY)",
+            "cannot use DEFAULT on a generated column",
+        ),
+        (
+            "CREATE TABLE t(a, g AS (a) STORED, PRIMARY KEY (a, g))",
+            "generated columns cannot be part of the PRIMARY KEY",
+        ),
+    ] {
+        let err = db.prepare(sql).err().expect("prepare should fail");
+        assert_eq!(err.message, message);
+        assert_eq!(err.c_offset(), -1);
+    }
+    db.execute_batch("CREATE TABLE t(a); INSERT INTO t VALUES (9);")
+        .unwrap();
+    let mut noop = db
+        .prepare("CREATE TABLE IF NOT EXISTS t(a, g AS (a) PRIMARY KEY)")
+        .unwrap();
+    assert!(matches!(noop.step().unwrap(), StepResult::Done));
+    assert_eq!(
+        db.query("SELECT a FROM t", &[]).unwrap().rows[0].values(),
+        &[Value::Integer(9)]
+    );
+}

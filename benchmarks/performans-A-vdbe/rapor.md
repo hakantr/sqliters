@@ -519,3 +519,7 @@ B-tree imleçleri Unix xFetch lease'lerini PCache'den ayrı tutuyor. Etkin okuyu
 ## V6b.35 — D144 DDL adı hazırlama tanısı
 
 Tablo ve görünüm adı çakışmaları ham SQL token'ı ve bayt ofsetiyle hazırlanıyor. V2 ve V1 için 464'er native akış, 14 kabuk denetimi ve önceki 250 mmap akışı C ile eşit. Genişletilmiş mmap 433/440 ve önceki yedi ham fark sürüyor. 64 C dalının alınmayan 18 çıkışı ayrı sınıflandırıldı. OFF 1136/4/337, ON 1122/18/337. DML ve ayrışma bulucu V6b.34 ile aynı. Rust 1.100 tabanına süre oranı 1,235 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_35.md).
+
+## V6b.36 — Üretilen sütun kısıtlarının hazırlama sırası
+
+Üretilen sütunun PK ve DEFAULT tanıları gerçek hazırlamada C'nin hata sırasını kullanıyor. Mevcut tabloya ya da görünüme yönelik IF NOT EXISTS, gövdeyi işlemeden şemayı okuma işlemiyle doğruluyor. 234/244 native ve 22/22 kabuk akışı eşit. Kalan 10 native fark önceki boş dosya V1 yürütme sorunu. DML OFF 380/400, ON 400/400. Çalışma alanı OFF 1137/4/337, ON 1123/18/337. Gcov 64 dal ve alınmayan 8 çıkış sınıflı. Rust 1.100 tabanına süre oranı 1,237 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_36.md).

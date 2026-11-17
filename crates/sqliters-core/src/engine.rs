@@ -31284,6 +31284,21 @@ fn exec_create_table_started(
         let enc = ctx.encoding();
         ctx.db_set.ensure_temp_open(enc, *ctx.writable_schema)?;
     }
+    // sqlite3StartTable verifies the schema and leaves pNewTable unset for an
+    // existing IF NOT EXISTS target, so none of the column actions run.
+    let has_existing_target = |db_set: &DatabaseSet| {
+        db_set.slot(db_id).is_some_and(|slot| {
+            slot.schema.find_user_table(&ct.name.name).is_some()
+                || slot.schema.find_virtual_table(&ct.name.name).is_some()
+                || slot.schema.find_view(&ct.name.name).is_some()
+        })
+    };
+    if ct.if_not_exists && has_existing_target(ctx.db_set) {
+        ctx.ensure_read_db(db_id, true)?;
+        if has_existing_target(ctx.db_set) {
+            return Ok(());
+        }
+    }
     // Validate AST & inline autoindexes before opening write tx or allocating pages
     let (tbl_preview, pending_autos) = build_table_schema_from_ast(ct, 2)?;
     validate_table_collations(&tbl_preview, &pending_autos, ctx.collations)?;
