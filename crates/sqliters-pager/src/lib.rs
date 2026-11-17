@@ -336,7 +336,8 @@ pub struct Pager {
     header_probe: bool,
     /// See [`Pager::pcache_epoch`].
     pcache_epoch: u32,
-    /// `Pager.dbSize` where it differs from `page_count` (which is the b-tree layer's
+    /// `Pager.dbSize`: the physical snapshot count established by SharedLock,
+    /// then the pager image size during a write. It differs from `page_count` (the b-tree layer's
     /// `BtShared.nPage`): an incremental-vacuum step inside a transaction shortens only the
     /// b-tree's image; the pager's stays until `sqlite3PagerTruncateImage` at commit. A dirty
     /// page up to this size is still written when the cache lets it go, and a page up to
@@ -384,6 +385,10 @@ pub struct Pager {
     db_file_vers: [u8; 16],
     /// Pager.hasHeldSharedLock: the first acquisition needs no version probe.
     has_held_shared_lock: bool,
+    /// A pager reader survives the end of an EXCLUSIVE Btree transaction.
+    /// A WAL connection can keep its physical SHARED lock while its pager is
+    /// OPEN, so the physical lock alone cannot identify a retained reader.
+    reader_snapshot_held: bool,
     /// True once `commit` has started writing/truncating the main database file (`PAGER_WRITER_DBMOD`).
     db_file_modified: bool,
     /// True once `write_super_journal` has recorded a super-journal pointer in this tx (`pPager->setSuper`).
@@ -656,6 +661,7 @@ impl Pager {
             db_file_vers_cc: 0,
             db_file_vers: [0; 16],
             has_held_shared_lock: false,
+            reader_snapshot_held: false,
             db_file_modified: false,
             set_super: false,
             commit_phase_one_done: false,
@@ -1376,6 +1382,11 @@ impl Pager {
     fn set_state(&mut self, st: TransactionState) {
         let was_open = self.state == TransactionState::Open;
         self.state = st;
+        if st != TransactionState::Open {
+            self.reader_snapshot_held = true;
+        } else if self.locking_mode == LockingMode::Normal {
+            self.reader_snapshot_held = false;
+        }
         if st == TransactionState::Open {
             self.release_transient();
             if self.page1_ref {
@@ -1624,6 +1635,19 @@ impl Pager {
             self.db_file_vers_cc = u32::from_be_bytes(self.db_file_vers[..4].try_into().unwrap());
         }
         result
+    }
+
+    /// lockBtree fetches page 1 through the pager before validating its header.
+    /// Keep that reference on success; an invalid header still leaves its image
+    /// in pcache after the caller releases the reference (notably in EXCLUSIVE).
+    fn read_cached_page1_header(&mut self) -> Result<[u8; DB_HEADER_SIZE]> {
+        // SharedLock has established Pager.dbSize independently of the
+        // logical count that lockBtree is about to validate.
+        let slot = self.pager_get(1, false)?;
+        self.page1_ref = true;
+        let mut bytes = [0u8; DB_HEADER_SIZE];
+        bytes.copy_from_slice(&self.cache.entry_data(slot)[..DB_HEADER_SIZE]);
+        Ok(bytes)
     }
 
     /// readDbPage / sqlite3PagerReadFileheader accept a database short read:
@@ -2834,9 +2858,21 @@ impl Pager {
         self.lock_db_file(LockLevel::Shared)?;
         // Changing locking_mode during prepare does not release the reader
         // already retained by exclusive mode (C remains PAGER_READER).
-        let retained_reader = prev_lock >= LockLevel::Shared;
-        if let Err(e) = self.begin_read_under_shared_lock(retained_reader) {
-            if had_wal_before {
+        let retained_reader = self.reader_snapshot_held;
+        let mut snapshot_established = false;
+        if let Err(e) = self.begin_read_under_shared_lock(retained_reader, &mut snapshot_established) {
+            if !snapshot_established { self.reader_snapshot_held = false; }
+            self.set_state(TransactionState::Open);
+            if snapshot_established {
+                // SharedLock succeeded before lockBtree fetched/validated page
+                // 1. EXCLUSIVE retains even a newly acquired reader here.
+                if let Some(ref mut wal) = self.wal {
+                    let _ = wal.end_read_transaction();
+                }
+                if self.locking_mode == LockingMode::Normal {
+                    let _ = self.unlock_db_file(LockLevel::NoLock);
+                }
+            } else if had_wal_before {
                 if let Some(ref mut wal) = self.wal {
                     let _ = wal.end_read_transaction();
                 }
@@ -2854,6 +2890,7 @@ impl Pager {
         // lockBtree (btree.c:3322–3323): a failed page 1 acquisition
         // must abort the read instead of being reduced to page1_ref=false.
         self.state = TransactionState::Read;
+        self.reader_snapshot_held = true;
         if !self.page1_ref && !self.header_probe {
             match self.pager_get(1, false) {
                 Ok(_) => self.page1_ref = true,
@@ -2868,7 +2905,7 @@ impl Pager {
         Ok(())
     }
 
-    fn begin_read_under_shared_lock(&mut self, retained_reader: bool) -> Result<()> {
+    fn begin_read_under_shared_lock(&mut self, retained_reader: bool, snapshot_established: &mut bool) -> Result<()> {
         if (self.is_memdb_backing && self.header_loaded)
             || (self.db_kind == DatabaseKind::PrivateTemporary && self.file.is_none())
         {
@@ -2938,8 +2975,14 @@ impl Pager {
                 self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
                 return Ok(());
             }
-            let file_len = self.db_file()?.file_size()?;
+            let file_len = if retained_reader {
+                // An EXCLUSIVE reader keeps SharedLock's existing Pager.dbSize.
+                u64::from(self.db_size) * u64::from(self.header.page_size)
+            } else { self.db_file()?.file_size()? };
+            self.db_size = file_len.div_ceil(u64::from(self.header.page_size)) as Pgno;
             self.has_held_shared_lock = true;
+            self.reader_snapshot_held = true;
+            *snapshot_established = true;
             // SharedLock still calls pagerPagecount for a newly acquired
             // normal reader. Keep its xFileSize failure even on a cache hit.
             if cached_header && file_len / u64::from(self.header.page_size) == u64::from(self.page_count) {
@@ -2962,17 +3005,32 @@ impl Pager {
                     return Ok(());
                 }
             } else {
-                if file_len < DB_HEADER_SIZE as u64 {
-                    return Err(SqliteError::new(
-                        ErrorCode::NotADb,
-                        "file is not a database",
-                    ));
-                }
-
-                let mut hdr_bytes = [0u8; DB_HEADER_SIZE];
-                Self::read_database_bytes(self.db_file()?, &mut hdr_bytes, 0)?;
-
-                let mut disk_hdr = DatabaseHeader::parse(&hdr_bytes)?;
+                let (hdr_bytes, mut disk_hdr) = loop {
+                    let bytes = if self.header_probe {
+                        let mut bytes = [0u8; DB_HEADER_SIZE];
+                        Self::read_database_bytes(self.db_file()?, &mut bytes, 0)?;
+                        bytes
+                    } else { self.read_cached_page1_header()? };
+                    let parsed = match DatabaseHeader::parse(&bytes) {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            self.header_loaded = false;
+                            return Err(error);
+                        }
+                    };
+                    if parsed.page_size != self.header.page_size {
+                        // lockBtree releases the old page, changes the pager's
+                        // size, then fetches page 1 again at the actual size.
+                        let bytes = self.db_file()?.file_size()?;
+                        self.db_size = bytes.div_ceil(u64::from(parsed.page_size)) as Pgno;
+                        self.header.page_size = parsed.page_size;
+                        self.header.reserved_bytes = parsed.reserved_bytes;
+                        self.bump_data_version();
+                        self.pcache_sync_page_size();
+                        continue;
+                    }
+                    break (bytes, parsed);
+                };
                 if disk_hdr.forces_readonly() {
                     self.readonly = true;
                 }
@@ -2987,7 +3045,7 @@ impl Pager {
                     self.open_wal_under_shared_lock()?;
                 } else {
                     let ps = u64::from(disk_hdr.page_size);
-                    let file_pages = (file_len / ps) as Pgno;
+                    let file_pages = file_len.div_ceil(ps) as Pgno;
 
                     // Per btree.c:3330 & 3435-3442: if header page count is 0 or change_counter != version_valid_for
                     // (e.g. modified by pre-3.7.0 SQLite), fall back to physical file size in pages;
@@ -3010,27 +3068,9 @@ impl Pager {
                     };
                     disk_hdr.database_size_pages = effective_pages;
 
-                    let invalidate_cache = version_changed || recovered
-                        || !self.header_loaded
-                        || !self.page_size_fixed
-                        || disk_hdr.page_size != self.header.page_size
-                        || disk_hdr.change_counter != self.header.change_counter
-                        || disk_hdr.schema_cookie != self.header.schema_cookie
-                        || effective_pages != self.page_count;
-                    if invalidate_cache {
-                        if self.header_loaded && !version_changed {
-                            self.notify_backup_restart();
-                            // `sqlite3PagerSharedLock`: the 16 bytes at offset 24 differ from
-                            // what this pager last saw → `pager_reset()`.
-                            self.bump_data_version();
-                        }
-                        self.pcache_reset();
-                    }
-                    if disk_hdr.page_size != self.header.page_size {
-                        // `lockBtree` → `sqlite3PagerSetPagesize` → `pager_reset()`.
-                        self.bump_data_version();
-                    }
-
+                    // SharedLock already invalidates the snapshot on a version
+                    // change or hot-journal recovery. Header metadata alone is
+                    // not a second reason to discard its freshly fetched page.
                     self.configured_auto_vacuum = AutoVacuumMode::from_header(&disk_hdr);
                     // `sqlite3PagerSharedLock` reads bytes 24..39 of the file into `dbFileVers`.
                     self.db_file_vers_cc = disk_hdr.change_counter;
@@ -3073,6 +3113,7 @@ impl Pager {
         }
 
         let wal_pages = self.wal.as_ref().unwrap().db_size();
+        if wal_pages > 0 { self.db_size = wal_pages; }
         if !changed
             && self.header_loaded
             && self.page_size_fixed
@@ -3082,6 +3123,11 @@ impl Pager {
             return Ok(());
         }
         let file_len = self.db_file()?.file_size()?;
+        if wal_pages == 0 {
+            self.db_size = file_len.div_ceil(u64::from(self.header.page_size)) as Pgno;
+        }
+        self.reader_snapshot_held = true;
+        *snapshot_established = true;
         if wal_pages == 0 && file_len == 0 {
             if self.page_count != 0 {
                 self.pcache_reset();
@@ -5285,7 +5331,7 @@ impl Pager {
                 self.unlock_db_file(LockLevel::Shared)?;
             }
             if !self.header_loaded
-                && let Err(e) = self.begin_read_under_shared_lock(true)
+                && let Err(e) = self.begin_read_under_shared_lock(true, &mut false)
             {
                 if self.locking_mode == LockingMode::Normal {
                     let _ = self.unlock_db_file(LockLevel::NoLock);
@@ -7567,6 +7613,41 @@ mod tests {
     }
 
     #[test]
+    fn invalid_page1_stays_cached_by_an_exclusive_reader_until_shrink() {
+        for mode in [LockingMode::Normal, LockingMode::Exclusive] {
+            for prefix in [0, 8, 16, 20] {
+                let ctl = Arc::new(FaultCtl::default());
+                let vfs = Arc::new(FaultVfs { inner: Arc::new(MemoryVfs::new()), ctl: ctl.clone() });
+                let mut pager = Pager::open_with_vfs(vfs, Some(Path::new("invalid_header.db")),
+                    OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB).unwrap();
+                pager.begin_write().unwrap();
+                pager.commit().unwrap();
+                pager.set_locking_mode(mode);
+                pager.shrink_memory();
+                *ctl.short_page1.lock().unwrap() = Some((prefix, false));
+                assert_eq!(pager.begin_read().unwrap_err().code, ErrorCode::NotADb);
+                assert_eq!(pager.page_refcount(1), 0);
+                assert!(!pager.page1_ref);
+                *ctl.short_page1.lock().unwrap() = None;
+                if mode == LockingMode::Exclusive {
+                    // SharedLock is still held: no fresh xFileSize or disk
+                    // page read may replace the cached invalid header.
+                    ctl.fail_db_file_size.store(true, std::sync::atomic::Ordering::Relaxed);
+                    assert_eq!(pager.begin_read().unwrap_err().code, ErrorCode::NotADb);
+                    ctl.fail_db_file_size.store(false, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    pager.begin_read().unwrap();
+                    pager.end_read_if_unused().unwrap();
+                }
+                pager.shrink_memory();
+                pager.begin_read().unwrap();
+                pager.end_read_if_unused().unwrap();
+                pager.close().unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn database_short_read_preserves_prefix_and_retries_after_invalid_header() {
         for as_count in [false, true] {
             for prefix in [0, 8, DB_HEADER_SIZE, 512] {
@@ -7631,7 +7712,13 @@ mod tests {
                     OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB).unwrap();
                 pager.begin_write().unwrap();
                 pager.commit().unwrap();
-                if wal { pager.set_journal_mode(JournalMode::Wal).unwrap(); }
+                if wal {
+                    pager.set_journal_mode(JournalMode::Wal).unwrap();
+                    // Test failure of an already-open WAL snapshot, not the
+                    // earlier disk page read that discovers its WAL header.
+                    pager.begin_read().unwrap();
+                    pager.end_read_if_unused().unwrap();
+                }
                 pager.set_locking_mode(mode);
                 pager.shrink_memory();
                 ctl.fail_page1_payload_read.store(true, std::sync::atomic::Ordering::Relaxed);

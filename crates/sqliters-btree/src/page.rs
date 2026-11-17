@@ -290,9 +290,7 @@ impl ParsedPage {
             let p = ptr_base + 2 * idx;
             let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
             if off < ptr_end || off >= usable {
-                return Err(SqliteError::corrupt(format!(
-                    "invalid cell offset {off} on page {pgno}"
-                )));
+                return Err(SqliteError::corrupt("database disk image is malformed"));
             }
             Ok(off)
         };
@@ -704,9 +702,7 @@ pub fn last_table_leaf_rowid(pgno: Pgno, usable_size: u32, raw: &[u8]) -> Result
     let p = ptr_base + 2 * (n_cell - 1);
     let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
     if off < ptr_end || off >= usable {
-        return Err(SqliteError::corrupt(format!(
-            "invalid cell offset {off} on page {pgno}"
-        )));
+        return Err(SqliteError::corrupt("database disk image is malformed"));
     }
     let (_, n1) = get_varint(&raw[off..usable])?;
     let (rowid, _) = get_varint_i64(&raw[off + n1..usable])?;
@@ -741,9 +737,7 @@ pub fn seek_table_leaf_cell(
         let p = ptr_base + 2 * mid;
         let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
         if off < ptr_end || off >= usable {
-            return Err(SqliteError::corrupt(format!(
-                "invalid cell offset {off} on page {pgno}"
-            )));
+            return Err(SqliteError::corrupt("database disk image is malformed"));
         }
         let slice = &raw[off..usable];
         let (payload_u64, n1) = get_varint(slice)?;
@@ -1825,9 +1819,7 @@ pub fn raw_cell_offset(
     let p = ptr_base + 2 * cell_idx;
     let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
     if off < ptr_end || off >= usable {
-        return Err(SqliteError::corrupt(format!(
-            "invalid cell offset {off} on page {pgno}"
-        )));
+        return Err(SqliteError::corrupt("database disk image is malformed"));
     }
     Ok(off)
 }
@@ -2114,9 +2106,7 @@ pub fn binary_search_table_leaf(
         let p = ptr_base + 2 * mid;
         let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
         if off < ptr_end || off >= usable {
-            return Err(SqliteError::corrupt(format!(
-                "invalid cell offset {off} on page {pgno}"
-            )));
+            return Err(SqliteError::corrupt("database disk image is malformed"));
         }
         let slice = &raw[off..usable];
         let (_, n1) = get_varint(slice)?;
@@ -2161,9 +2151,7 @@ pub fn binary_search_table_leaf_with_span(
         let p = ptr_base + 2 * mid;
         let off = u16::from_be_bytes([raw[p], raw[p + 1]]) as usize;
         if off < ptr_end || off >= usable {
-            return Err(SqliteError::corrupt(format!(
-                "invalid cell offset {off} on page {pgno}"
-            )));
+            return Err(SqliteError::corrupt("database disk image is malformed"));
         }
         let slice = &raw[off..usable];
         let (payload_u64, n1) = get_varint(slice)?;

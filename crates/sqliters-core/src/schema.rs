@@ -1133,8 +1133,13 @@ impl Schema {
 
         for (rowid, payload) in raw_rows {
             let cols = decode_record_with_encoding(&payload, enc)?;
-            if cols.len() < 5 {
-                continue;
+            // sqlite3InitCallback (prepare.c:114): the SQL query supplies
+            // NULL for a missing rootpage, and a NULL rootpage is a corrupt
+            // schema row even when every record column is absent.
+            if cols.get(3).is_none_or(|v| matches!(v, Value::Null)) {
+                if writable_schema { continue; }
+                let name = cols.get(1).and_then(Value::as_str).unwrap_or("?");
+                return Err(SqliteError::corrupt(format!("malformed database schema ({name})")));
             }
             let obj_type = cols[0].as_str().unwrap_or("");
             let name = cols[1].as_str().unwrap_or("").to_owned();
@@ -1145,7 +1150,7 @@ impl Schema {
                 Value::Text(t) => t.trim().parse::<u32>().unwrap_or(0),
                 other => other.as_i64().unwrap_or(0) as Pgno,
             };
-            let sql_opt = cols[4].as_str().map(str::to_owned);
+            let sql_opt = cols.get(4).and_then(Value::as_str).map(str::to_owned);
 
             match obj_type {
                 "table" => {
