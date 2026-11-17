@@ -1992,6 +1992,14 @@ impl ConnectionInner {
             if bt.transaction_state() == TransactionState::Open {
                 continue;
             }
+            // A write lock on an empty database allocates page 1 before OP_Transaction
+            // reads the schema cookie. The new empty catalog has the same schema generation.
+            if slot.schema.loaded
+                && !slot.schema.had_pages
+                && bt.pager().has_uncommitted_empty_schema_page()
+            {
+                continue;
+            }
             let has_pages = bt.pager().page_count() > 0;
             let cur_cookie = bt.pager().header().schema_cookie;
             if !slot.schema.loaded

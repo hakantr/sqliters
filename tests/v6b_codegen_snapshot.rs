@@ -102,3 +102,21 @@ fn generated_column_constraints_fail_at_prepare_in_parser_order() {
         &[Value::Integer(9)]
     );
 }
+
+#[test]
+fn first_schema_page_does_not_expire_a_v1_create() {
+    let db = Connection::open_in_memory().unwrap();
+    let mut create = db.prepare_v1("CREATE TABLE fresh(a)").unwrap();
+    assert!(matches!(create.step().unwrap(), StepResult::Done));
+
+    let mut stale = db.prepare_v1("SELECT name FROM sqlite_schema").unwrap();
+    db.execute_batch("CREATE TABLE later(a)").unwrap();
+    assert!(stale.step().is_err());
+    assert_eq!(
+        db.query("SELECT name FROM sqlite_schema ORDER BY name", &[])
+            .unwrap()
+            .rows
+            .len(),
+        2
+    );
+}

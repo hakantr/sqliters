@@ -3685,6 +3685,16 @@ impl Pager {
         }
     }
 
+    /// True while the write transaction has allocated the initial empty schema page and
+    /// neither created a schema object nor changed the schema cookie.
+    pub fn has_uncommitted_empty_schema_page(&self) -> bool {
+        self.state == TransactionState::Write
+            && self.tx_orig_page_count == 0
+            && self.page_count == 1
+            && self.header.schema_format == 0
+            && self.header.schema_cookie == self.tx_orig_header.schema_cookie
+    }
+
     fn initialize_empty_database(&mut self) -> Result<()> {
         let ps = self.header.page_size as usize;
         let usable = self.header.usable_size();

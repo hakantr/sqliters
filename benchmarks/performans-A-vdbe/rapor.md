@@ -523,3 +523,7 @@ Tablo ve görünüm adı çakışmaları ham SQL token'ı ve bayt ofsetiyle haz�
 ## V6b.36 — Üretilen sütun kısıtlarının hazırlama sırası
 
 Üretilen sütunun PK ve DEFAULT tanıları gerçek hazırlamada C'nin hata sırasını kullanıyor. Mevcut tabloya ya da görünüme yönelik IF NOT EXISTS, gövdeyi işlemeden şemayı okuma işlemiyle doğruluyor. 234/244 native ve 22/22 kabuk akışı eşit. Kalan 10 native fark önceki boş dosya V1 yürütme sorunu. DML OFF 380/400, ON 400/400. Çalışma alanı OFF 1137/4/337, ON 1123/18/337. Gcov 64 dal ve alınmayan 8 çıkış sınıflı. Rust 1.100 tabanına süre oranı 1,237 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_36.md).
+
+## V6b.37 — İlk şema sayfası ve V1 yürütme
+
+Boş veritabanında ilk sayfanın tahsisi çerez ve şema biçimi değişmedikçe hazırlanmış ifadeyi eskitmiyor. 468 native akışta 330 yerine 402 aynı. V6b.36 üretilen sütun matrisi 244/244 oldu. Gerçek eskime matrisi önceki sonuçla aynı. Gcov 44 dal ve alınmayan 13 çıkış sınıflı. OFF 1138/4/337, ON 1124/18/337. DML ve ayrışma bulucu aynı. Rust 1.100 tabanına süre oranı 1,228 ve 14 digest eşit. WAL, savepoint dosya baytları, V1 eskime hata maskelemesi ve diğer açık işler sürüyor. [Karar ve doğrulama](karar_esligi_v6b_37.md).
