@@ -1371,6 +1371,19 @@ pub(crate) fn rollback_all_databases(
     }
 }
 
+/// OP_AutoCommit ROLLBACK (vdbe.c:4181). SQLite runs the rollback hook
+/// while autocommit is still off, then the caller ends the SQL transaction.
+pub(crate) fn rollback_before_autocommit(ctx: &mut ExecContext<'_>) -> Result<()> {
+    let _ = rollback_all_databases(ctx, true);
+    *ctx.rollback_count += 1;
+    *ctx.in_user_btree_tx = false;
+    *ctx.schema_changed_in_tx = false;
+    ctx.deferred_fk_suspects.clear();
+    ctx.mutation_pipeline.clear();
+    ctx.publish();
+    ctx.commit_hooks.invoke_rollback_hook()
+}
+
 /// Whether the commit error leaves the transaction open or already caused a rollback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommitFailureDisposition {
@@ -2575,19 +2588,12 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                         "cannot rollback - no transaction is active",
                     ));
                 }
-                let rollback_res = rollback_all_databases(ctx, true);
-                *ctx.rollback_count += 1;
+                let hook_result = rollback_before_autocommit(ctx);
                 *ctx.explicit_tx = false;
                 *ctx.implicit_savepoint_tx = false;
-                *ctx.in_user_btree_tx = false;
                 ctx.savepoints.clear();
-                *ctx.schema_changed_in_tx = false;
-                ctx.deferred_fk_suspects.clear();
-                ctx.mutation_pipeline.clear();
                 ctx.publish();
-                rollback_res?;
-                ctx.commit_hooks.invoke_rollback_hook()?;
-                Ok(())
+                hook_result
             }
         }
         Stmt::Savepoint(name) => {

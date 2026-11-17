@@ -236,10 +236,6 @@ const fn cksum_endian(big_end_cksum: bool) -> WalChecksumEndian {
     }
 }
 
-/// Upper bound on the bytes of consecutive appended WAL frames staged for one positioned write
-/// in [`Wal::write_frames`] (a single frame larger than this is still written in one piece).
-const WAL_APPEND_BATCH_BYTES: usize = 64 * 1024;
-
 /// Computes the byte offset in `-wal` of 1-based `frame_no` (`walFrameOffset`, `wal.c:556`).
 #[inline]
 pub const fn wal_frame_offset(frame_no: u32, page_size: u32) -> u64 {
@@ -1555,17 +1551,6 @@ impl Wal {
         let mut i_offset = wal_frame_offset(i_frame + 1, page_size);
         let mut appended_pgnos: Vec<Pgno> = Vec::with_capacity(frames.len());
         let mut last_idx: Option<usize> = None;
-        // Appended frames are laid out back to back in `-wal`, so consecutive
-        // `[24-byte frame header | page image]` records are staged in one contiguous buffer and
-        // written with a single positioned write per run (bounded by `WAL_APPEND_BATCH_BYTES`)
-        // instead of a header write plus a page write per frame. The bytes and file offsets are
-        // identical and the WAL only becomes durable at the sync below, so this is
-        // durability-neutral; the buffer is always flushed before any other `-wal` I/O.
-        let batch_cap = WAL_APPEND_BATCH_BYTES.max(sz_frame as usize);
-        let mut frame_buf: Vec<u8> =
-            Vec::with_capacity((frames.len().saturating_mul(sz_frame as usize)).min(batch_cap));
-        let mut frame_buf_off = i_offset;
-
         for (idx, frame) in frames.iter().enumerate() {
             if frame.data.len() != page_size as usize {
                 return Err(SqliteError::misuse("WAL frame data length != page_size"));
@@ -1585,10 +1570,6 @@ impl Wal {
                     self.i_re_cksum = i_write;
                 }
                 let wal_fd = self.wal_file.as_ref().expect("checked Some");
-                if !frame_buf.is_empty() {
-                    wal_fd.write_at(&frame_buf, frame_buf_off)?;
-                    frame_buf.clear();
-                }
                 wal_fd.write_at(frame.data, data_off)?;
                 continue;
             }
@@ -1617,27 +1598,16 @@ impl Wal {
                     self.hdr.frame_cksum,
                 )
             };
-            if frame_buf.is_empty() {
-                frame_buf_off = i_offset;
-            }
-            frame_buf.extend_from_slice(&fhdr);
-            frame_buf.extend_from_slice(frame.data);
-            if frame_buf.len() + (sz_frame as usize) > batch_cap {
-                let wal_fd = self.wal_file.as_ref().expect("checked Some");
-                wal_fd.write_at(&frame_buf, frame_buf_off)?;
-                frame_buf.clear();
-            }
             self.hdr.frame_cksum = next_cksum;
+            let wal_fd = self.wal_file.as_deref().expect("checked Some");
+            // walWriteOneFrame: the header and page are two VFS writes.
+            // Failure writing the header must leave the page write unissued.
+            wal_fd.write_at(&fhdr, i_offset)?;
+            wal_fd.write_at(frame.data, i_offset + WAL_FRAME_HDRSIZE as u64)?;
             i_offset += sz_frame;
             appended_pgnos.push(frame.pgno);
             last_idx = Some(idx);
         }
-        if !frame_buf.is_empty() {
-            let wal_fd = self.wal_file.as_ref().expect("checked Some");
-            wal_fd.write_at(&frame_buf, frame_buf_off)?;
-        }
-        drop(frame_buf);
-
         // Recompute checksum chain if any earlier uncommitted frame was overwritten (`wal.c:4262-4265`).
         if is_commit && self.i_re_cksum > 0 {
             self.wal_rewrite_checksums(i_frame)?;
@@ -1646,6 +1616,7 @@ impl Wal {
         // Pad to sector boundary (unless `IOCAP_POWERSAFE_OVERWRITE`) and sync WAL BEFORE publishing
         // `WalIndexHdr` (`wal.c:4281-4300`).
         let mut n_extra = 0u32;
+        let mut sync_result = Ok(());
         if is_commit && let Some(w_sync) = wal_sync_flags {
             let wal_fd = self.wal_file.as_ref().expect("checked Some");
             let mut b_sync = true;
@@ -1664,6 +1635,7 @@ impl Wal {
                             self.hdr.frame_cksum,
                             last_frame.data,
                         )?;
+                        self.hdr.frame_cksum = next_cksum;
                         Self::write_with_sync_point(
                             wal_fd.as_ref(),
                             &fhdr,
@@ -1678,14 +1650,13 @@ impl Wal {
                             i_sync_point,
                             w_sync,
                         )?;
-                        self.hdr.frame_cksum = next_cksum;
                         i_offset += sz_frame;
                         n_extra += 1;
                     }
                 }
             }
             if b_sync {
-                wal_fd.sync(w_sync)?;
+                sync_result = wal_fd.sync(w_sync);
             }
         }
 
@@ -1702,6 +1673,10 @@ impl Wal {
             }
             self.truncate_on_commit = false;
         }
+
+        // walFrames attempts the optional size limit even after xSync
+        // fails, but publishes no WAL-index entries in that case.
+        sync_result?;
 
         // Append newly written frames (plus any sector-padding frames) into the WAL-index (`wal.c:4320-4331`).
         let mut idx_frame = self.hdr.mx_frame;
@@ -1780,32 +1755,28 @@ impl Wal {
 
         let i_start = self.i_re_cksum;
         self.i_re_cksum = 0;
-        let mut frame_hdr = [0u8; WAL_FRAME_HDRSIZE];
-        let mut page_buf = vec![0u8; sz_page as usize];
+        let mut frame = vec![0u8; WAL_FRAME_HDRSIZE + sz_page as usize];
 
         for i_read in i_start..=i_last {
             let off = wal_frame_offset(i_read, sz_page);
-            let n1 = wal_fd.read_at(&mut frame_hdr, off)?;
-            let n2 = wal_fd.read_at(&mut page_buf, off + (WAL_FRAME_HDRSIZE as u64))?;
-            if n1 < WAL_FRAME_HDRSIZE || n2 < page_buf.len() {
+            if wal_fd.read_at(&mut frame, off)? < frame.len() {
                 return Err(SqliteError::with_extended(
                     extended::SQLITE_IOERR_SHORT_READ,
                     "short read rewriting WAL frame checksum",
                 ));
             }
-            let pgno = u32::from_be_bytes([frame_hdr[0], frame_hdr[1], frame_hdr[2], frame_hdr[3]]);
-            let n_db_size =
-                u32::from_be_bytes([frame_hdr[4], frame_hdr[5], frame_hdr[6], frame_hdr[7]]);
+            let pgno = u32::from_be_bytes(frame[0..4].try_into().unwrap());
+            let n_db_size = u32::from_be_bytes(frame[4..8].try_into().unwrap());
             let (new_hdr, next_cksum) = wal_encode_frame_header(
                 pgno,
                 n_db_size,
                 self.hdr.salt,
                 self.hdr.big_end_cksum != 0,
                 self.hdr.frame_cksum,
-                &page_buf,
+                &frame[WAL_FRAME_HDRSIZE..],
             )?;
-            wal_fd.write_at(&new_hdr, off)?;
             self.hdr.frame_cksum = next_cksum;
+            wal_fd.write_at(&new_hdr, off)?;
         }
         Ok(())
     }

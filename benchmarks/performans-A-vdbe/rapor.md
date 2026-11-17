@@ -543,3 +543,7 @@ Kabuk gerçek fsdir ve completion hizmetlerini kaydediyor. Normal ve güvenli ki
 ## V6b.41 — E28 ve Pager ERROR
 
 IOERR/FULL spill, faz iki ve rollback hataları pager ERROR durumunu kuruyor. DELETE sıcak journal kurtarması, WAL hata sonrasında kilitlerin bırakılması ve COMMIT rollback akışı doğrulandı. C ile iki Rust kipinde 33/34 native akış ve eski beş E28 COMMIT akışı eşit. Altı DELETE data_version akışı da eşit. EXCLUSIVE DELETE sonlandırması ve sekiz WAL VFS yazım izi farkı açık. Gcov 272 dal, alınmayan 97 çıkış ayrı sınıflı. OFF 1140/7/337, ON 1126/21/337. Önceki başarısızlıklar ile F13–F15 kayıtlı. DML ve ayrışma bulucu V6b.40 ile aynı. Rust 1.100 süre oranı 1,239 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_41.md).
+
+## V6b.42 — D145 EXCLUSIVE DELETE ve WAL yazma sınırları
+
+EXCLUSIVE DELETE journal başlığı ve tanıtıcı ömrü ile WAL header/payload yazma boyutları ve ofsetleri C ile hizalandı. SQL ROLLBACK pager hatası ve sıcak nRec sıfır kurtarma davranışı düzeldi. 88 native akış, sekiz WAL checksum zinciri yeniden yazımı ve 147 kesinti/kurtarma imajı eşit. Gcov 168 dal ve alınmayan 36 çıkış sınıflı. OFF 1142/7/337, ON 1128/21/337. DML ve ayrışma bulucu V6b.41 ile aynı. Rust 1.100 süre oranı 1,247 ve 14 digest eşit. Sıfır baytlık ana DB yanında kalan sıcak journal seçimi D146 olarak açık. [Karar ve doğrulama](karar_esligi_v6b_42.md).

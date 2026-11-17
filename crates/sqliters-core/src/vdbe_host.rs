@@ -1120,18 +1120,7 @@ impl VdbeHost for WriteHost<'_, '_> {
     }
 
     fn rollback_all(&mut self) -> Result<()> {
-        // sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK): the b-trees, the virtual tables, the
-        // schemas when DBFLAG_SchemaChange; "db->nDeferredCons = 0; db->nDeferredImmCons = 0;";
-        // the rollback hook "if( db->xRollbackCallback && (inTrans || !db->autoCommit) )" (here
-        // autoCommit is still 0). The result of sqlite3BtreeRollback is not looked at.
-        let _ = crate::engine::rollback_all_databases(self.ctx, true);
-        *self.ctx.rollback_count += 1;
-        *self.ctx.in_user_btree_tx = false;
-        *self.ctx.schema_changed_in_tx = false;
-        self.ctx.deferred_fk_suspects.clear();
-        self.ctx.mutation_pipeline.clear();
-        self.ctx.publish();
-        self.ctx.commit_hooks.invoke_rollback_hook()
+        crate::engine::rollback_before_autocommit(self.ctx)
     }
 
     fn halt_transaction(&mut self, read_only: bool) -> Result<Option<SqliteError>> {

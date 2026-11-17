@@ -2613,7 +2613,7 @@ impl Pager {
                 JournalMode::Delete | JournalMode::Memory | JournalMode::Off
             );
 
-        if leaving_persistent {
+        if leaving_persistent && self.locking_mode == LockingMode::Normal {
             if let Some(mut jfd) = self.journal_file.take() {
                 jfd.close()?;
             }
@@ -3632,7 +3632,7 @@ impl Pager {
                 .and_then(|()| self.initialize_empty_database())
         {
             if !self.use_wal() {
-                let _ = self.finalize_journal_after_tx(false);
+                let _ = self.finalize_journal_after_tx();
             }
             self.cache_drop(1);
             self.page_count = 0;
@@ -4881,6 +4881,7 @@ impl Pager {
                 self.unlock_db_file(LockLevel::Shared)?;
                 self.set_state(TransactionState::Read);
             } else {
+                self.release_retained_delete_journal(false);
                 self.unlock_db_file(LockLevel::NoLock)?;
                 self.set_state(TransactionState::Open);
             }
@@ -5337,7 +5338,7 @@ impl Pager {
                     return self.finish_tx_to_read_or_open(retain_read);
                 }
 
-                self.finalize_journal_after_tx(true)?;
+                self.finalize_journal_after_tx()?;
 
                 if self.pending_byte_copy.is_none() {
                     // `pager_end_transaction`: "else if( rc==SQLITE_OK && bCommit &&
@@ -5583,10 +5584,9 @@ impl Pager {
                 // restarted. The pages of this transaction are still in the trackers' dirty
                 // sets, so the next step copies their restored content again.
 
-                // Finalize journal file (`Delete` unlinks even if `journal_file` was already closed
-                // by a failed `commit()`, `Truncate` truncates to 0, `Persist` zeroes 28B) BEFORE
-                // clearing `self.journal_started_in_tx`!
-                self.finalize_journal_after_tx(false)?;
+                // Preserve the journal on a playback error. Finalize only
+                // after the original pages have been restored.
+                self.finalize_journal_after_tx()?;
                 self.set_super = false;
                 self.journal_started_in_tx = false;
 
@@ -5647,7 +5647,7 @@ impl Pager {
         self.tx_journaled.clear_all();
         self.subsavepoints.clear();
         self.notify_backup_restart();
-        self.finalize_journal_after_tx(false)?;
+        self.finalize_journal_after_tx()?;
         self.set_super = false;
         self.journal_started_in_tx = false;
 
@@ -5674,88 +5674,102 @@ impl Pager {
         Ok(())
     }
 
-    /// Finalizes `self.journal_file` at the end of commit or rollback (`pager_end_transaction`,
-    /// `sqlite/src/pager.c:2117-2161` and `zeroJournalHdr`, `pager.c:1436-1468`).
-    fn finalize_journal_after_tx(&mut self, is_commit: bool) -> Result<()> {
-        if self.journal_mode == JournalMode::Wal {
-            return Ok(());
-        }
-        if matches!(
-            self.journal_mode,
-            JournalMode::Delete | JournalMode::Memory | JournalMode::Off
-        ) {
-            if let Some(mut jfd) = self.journal_file.take() {
-                let close_res = jfd.close();
-                self.journal_off = 0;
-                close_res?;
-            } else {
-                self.journal_off = 0;
-            }
+    fn keeps_delete_journal(&self) -> bool {
+        self.journal_mode == JournalMode::Delete && self.locking_mode == LockingMode::Exclusive
+    }
 
-            if self.journal_started_in_tx
-                && self.journal_mode == JournalMode::Delete
-                && self.db_kind == DatabaseKind::NamedDisk
-                && let Some(ref jpath) = self.journal_path
+    /// The last reader after EXCLUSIVE -> NORMAL and pager close end the
+    /// retained READER transaction (pager.c:2099, 2248). An ERROR pager
+    /// can also hold an open journal, so require a retained reader snapshot.
+    fn release_retained_delete_journal(&mut self, closing: bool) {
+        if self.journal_mode != JournalMode::Delete
+            || !self.reader_snapshot_held
+            || self.journal_started_in_tx
+            || self.pager_error.is_some()
+            || !self.file.as_deref().is_some_and(|file| file.lock_level() >= LockLevel::Reserved)
+        {
+            return;
+        }
+        if closing && let Some(journal) = self.journal_file.as_deref() {
+            // sqlite3PagerClose syncs an open journal before ending the
+            // transaction. It leaves the journal in place on error.
+            if self.sync_hot_journal(journal).is_err() {
+                return;
+            }
+        }
+        // SQLite does not return errors from this reader/close cleanup.
+        let _ = self.remove_delete_journal();
+    }
+
+    fn remove_delete_journal(&mut self) -> Result<()> {
+        self.journal_off = 0;
+        if let Some(mut journal) = self.journal_file.take() {
+            let _ = journal.close();
+            if self.db_kind == DatabaseKind::NamedDisk
+                && let Some(path) = &self.journal_path
             {
-                let sync_dir = is_commit && self.synchronous == 3;
-                self.vfs.delete(jpath, sync_dir)?;
+                self.vfs.delete(path, self.synchronous == 3)?;
             }
-            return Ok(());
         }
+        Ok(())
+    }
 
-        let Some(ref jfd_check) = self.journal_file else {
+    /// pager_end_transaction (pager.c:2117–2161).
+    fn finalize_journal_after_tx(&mut self) -> Result<()> {
+        if self.keeps_delete_journal() || self.journal_mode == JournalMode::Persist {
+            let result = self.zero_journal_header(self.set_super);
             self.journal_off = 0;
-            return Ok(());
-        };
-        let _ = jfd_check;
-
+            return result;
+        }
         match self.journal_mode {
-            JournalMode::Truncate => {
-                if self.journal_off > 0 {
-                    let jfd = self.journal_file.as_deref().expect("checked Some");
-                    jfd.truncate(0)?;
-                    if self.synchronous >= 2 {
-                        let sflags = self.file_sync_flags();
-                        jfd.sync(sflags)?;
-                    }
-                }
+            JournalMode::Wal => Ok(()),
+            JournalMode::Delete => self.remove_delete_journal(),
+            JournalMode::Memory | JournalMode::Off => {
                 self.journal_off = 0;
+                if let Some(mut journal) = self.journal_file.take() {
+                    journal.close()?;
+                }
                 Ok(())
             }
-            JournalMode::Persist => {
-                if self.journal_off > 0 {
-                    let is_temp_file = self.db_kind == DatabaseKind::PrivateTemporary;
-                    let has_super = self.set_super;
-                    let limit = self.journal_size_limit;
-                    let jfd = self.journal_file.as_deref().expect("checked Some");
-
-                    if is_temp_file || has_super || limit == 0 {
-                        jfd.truncate(0)?;
-                    } else {
-                        // Zero ONLY the first 28 bytes (`zeroJournalHdr` in `pager.c:1447`),
-                        // leaving bytes 28..sector_size untouched!
-                        let zero_hdr = [0u8; JOURNAL_HEADER_CORE_BYTES];
-                        jfd.write_at(&zero_hdr, 0)?;
-                    }
-
-                    if self.synchronous > 0 {
-                        jfd.sync(self.data_sync_flags())?;
-                    }
-
-                    if limit > 0 {
-                        let limit_u64 = limit as u64;
-                        if jfd.file_size()? > limit_u64 {
-                            jfd.truncate(limit_u64)?;
+            JournalMode::Truncate => {
+                let result = (|| {
+                    if self.journal_off != 0 && let Some(journal) = self.journal_file.as_deref() {
+                        journal.truncate(0)?;
+                        if self.synchronous >= 2 {
+                            journal.sync(self.file_sync_flags())?;
                         }
                     }
-                }
+                    Ok(())
+                })();
                 self.journal_off = 0;
-                Ok(())
+                result
             }
-            JournalMode::Delete | JournalMode::Memory | JournalMode::Off | JournalMode::Wal => {
-                unreachable!("handled above")
-            }
+            JournalMode::Persist => unreachable!("handled above"),
         }
+    }
+
+    /// zeroJournalHdr (pager.c:1436–1468). The journal is cold once its
+    /// header is invalidated, including when the following xSync fails.
+    fn zero_journal_header(&self, has_super: bool) -> Result<()> {
+        let Some(journal) = self.journal_file.as_deref() else {
+            return Ok(());
+        };
+        if self.journal_off == 0 {
+            return Ok(());
+        }
+        let limit = self.journal_size_limit;
+        if self.uses_temp_file_semantics() || has_super || limit == 0 {
+            journal.truncate(0)?;
+        } else {
+            journal.write_at(&[0; JOURNAL_HEADER_CORE_BYTES], 0)?;
+        }
+        if !self.pager_no_sync() {
+            journal.sync(self.data_sync_flags())?;
+        }
+        if limit > 0 && journal.file_size()? > limit as u64 {
+            journal.truncate(limit as u64)?;
+        }
+        Ok(())
     }
 
     // ========================================================================
@@ -6197,6 +6211,7 @@ impl Pager {
             }
         }
 
+        self.release_retained_delete_journal(true);
         if let Some(mut jfd) = self.journal_file.take()
             && let Err(e) = jfd.close()
             && first_err.is_none()
@@ -6355,27 +6370,34 @@ impl Pager {
     }
 
     fn play_hot_journal(&mut self, jpath: &Path) -> Result<bool> {
-        if !self.vfs.exists(jpath)? {
+        let reuse = self.keeps_delete_journal() && self.journal_file.is_some();
+        if !reuse && !self.vfs.exists(jpath)? {
             if self.locking_mode == LockingMode::Normal {
                 self.unlock_db_file(LockLevel::Shared)?;
             }
             return Ok(false);
         }
 
-        // Close any cached persistent handle before modifying/unlinking jpath.
-        if let Some(mut cached_jf) = self.journal_file.take() {
-            let _ = cached_jf.close();
-            self.journal_off = 0;
-        }
-        let mut jfile = self.vfs.open(Some(jpath), OpenFlags::READWRITE | OpenFlags::MAIN_JOURNAL)?;
-        // pagerSyncHotJournal: make the source durable before updating .db.
-        if !self.pager_no_sync() {
-            jfile.sync(SyncFlags::Normal)?;
-        }
-        let jsize = jfile.file_size()?;
+        let mut jfile = if reuse {
+            self.journal_file.take().expect("checked Some")
+        } else {
+            if let Some(mut journal) = self.journal_file.take() {
+                let _ = journal.close();
+                self.journal_off = 0;
+            }
+            self.vfs.open(Some(jpath), OpenFlags::READWRITE | OpenFlags::MAIN_JOURNAL)?
+        };
+        let jsize = match self.sync_hot_journal(jfile.as_ref()) {
+            Ok(size) => size,
+            Err(error) => {
+                if self.keeps_delete_journal() {
+                    self.journal_file = Some(jfile);
+                }
+                return Err(error);
+            }
+        };
         if jsize < JOURNAL_HEADER_CORE_BYTES as u64 {
-            let _ = jfile.close();
-            self.vfs.delete(jpath, true)?;
+            self.finish_hot_journal(jpath, jfile, false, false)?;
             if self.locking_mode == LockingMode::Normal {
                 self.unlock_db_file(LockLevel::Shared)?;
             }
@@ -6388,8 +6410,7 @@ impl Pager {
             return Err(e);
         }
         if hdr0[0..8] != JOURNAL_MAGIC {
-            let _ = jfile.close();
-            self.vfs.delete(jpath, true)?;
+            self.finish_hot_journal(jpath, jfile, false, false)?;
             if self.locking_mode == LockingMode::Normal {
                 self.unlock_db_file(LockLevel::Shared)?;
             }
@@ -6419,8 +6440,7 @@ impl Pager {
             && raw_sector_size.is_power_of_two();
         let hdr_sz = u64::from(raw_sector_size);
         if !DatabaseHeader::is_valid_page_size(page_size) || !valid_sector || jsize < hdr_sz {
-            let _ = jfile.close();
-            self.vfs.delete(jpath, true)?;
+            self.finish_hot_journal(jpath, jfile, false, false)?;
             if self.locking_mode == LockingMode::Normal {
                 self.unlock_db_file(LockLevel::Shared)?;
             }
@@ -6459,9 +6479,7 @@ impl Pager {
             if !super_exists {
                 // Super-journal was already unlinked: the multi-DB transaction COMMITTED!
                 // Do NOT play back `.db` (`pager.c:2895-2905`).
-                let close_res = jfile.close();
-                close_res?;
-                self.finalize_recovered_journal_file(jpath, true)?;
+                self.finish_hot_journal(jpath, jfile, true, false)?;
                 self.pcache_reset();
                 self.page_size_fixed = false;
                 self.header_loaded = false;
@@ -6507,7 +6525,9 @@ impl Pager {
                     u32::from_be_bytes([sec_hdr[12], sec_hdr[13], sec_hdr[14], sec_hdr[15]]);
                 journal_off += hdr_sz;
 
-                let nrec: u64 = if raw_nrec == 0xffff_ffff || raw_nrec == 0 {
+                // A zero nRec in a hot journal is an unsynced section.
+                // Its bytes can include records left in a reused journal.
+                let nrec: u64 = if raw_nrec == 0xffff_ffff {
                     (jsize.saturating_sub(journal_off)) / rec_size
                 } else {
                     u64::from(raw_nrec)
@@ -6552,8 +6572,7 @@ impl Pager {
                     replayed_pages.set(pgno)?;
                 }
 
-                // Both `0xffffffff` (no-sync mode) and `0` (active un-spilled tail section) consume up to EOF.
-                if raw_nrec == 0xffff_ffff || raw_nrec == 0 {
+                if raw_nrec == 0xffff_ffff {
                     break;
                 }
             }
@@ -6564,13 +6583,17 @@ impl Pager {
             Ok(())
         })();
 
-        let close_res = jfile.close();
-        playback_res?;
-        close_res?;
+        if let Err(error) = playback_res {
+            if self.keeps_delete_journal() {
+                self.journal_file = Some(jfile);
+            } else {
+                let _ = jfile.close();
+            }
+            return Err(error);
+        }
 
-        // Finalize `&jpath` BEFORE calling `pager_delsuper` (`pager.c:3036-3046`) so sibling
-        // journal inspection sees this database's journal already deleted or truncated to 0 bytes!
-        self.finalize_recovered_journal_file(jpath, z_super.is_some())?;
+        // Finalize before inspecting sibling journals (pager.c:3036–3046).
+        self.finish_hot_journal(jpath, jfile, z_super.is_some(), true)?;
         if let Some(ref super_name) = z_super {
             self.pager_delsuper(super_name)?;
         }
@@ -6584,6 +6607,34 @@ impl Pager {
             self.unlock_db_file(LockLevel::Shared)?;
         }
         Ok(true)
+    }
+
+    fn sync_hot_journal(&self, journal: &dyn VfsFile) -> Result<u64> {
+        if !self.pager_no_sync() {
+            journal.sync(SyncFlags::Normal)?;
+        }
+        journal.file_size()
+    }
+
+    fn finish_hot_journal(
+        &mut self,
+        jpath: &Path,
+        mut journal: Box<dyn VfsFile>,
+        has_super: bool,
+        read_header: bool,
+    ) -> Result<()> {
+        if self.keeps_delete_journal() {
+            self.journal_file = Some(journal);
+            if read_header {
+                self.journal_off = self.journal_sector_size as u64;
+            }
+            let result = self.zero_journal_header(has_super);
+            self.journal_off = 0;
+            result
+        } else {
+            journal.close()?;
+            self.finalize_recovered_journal_file(jpath, has_super)
+        }
     }
 
     fn finalize_recovered_journal_file(&mut self, jpath: &Path, has_super: bool) -> Result<()> {
@@ -6767,14 +6818,13 @@ mod tests {
         pager2.close().unwrap();
     }
 
-    /// A WAL commit larger than one append batch must put exactly the same bytes in `-wal` as
-    /// frame-by-frame writes: every frame decodes with the running checksum chain, page numbers
-    /// ascend, only the final frame carries the commit size, and a second connection reads back
-    /// every page through the WAL-index.
+    /// All frames of a large commit decode with the running checksum chain.
+    /// Page numbers ascend, only the final frame carries the commit size, and
+    /// a second connection reads back every page through the WAL-index.
     #[test]
-    fn test_wal_commit_spanning_multiple_append_batches_is_byte_exact() {
+    fn test_large_wal_commit_is_byte_exact() {
         let vfs = Arc::new(MemoryVfs::new());
-        let db_path = Path::new("wal_batch.db");
+        let db_path = Path::new("wal_large.db");
         let mut pager = Pager::open_with_vfs(
             vfs.clone(),
             Some(db_path),
@@ -6790,8 +6840,7 @@ mod tests {
             JournalMode::Wal
         );
 
-        // 1 small commit, then one commit of 49 frames (3 full 15-frame batches + a 4-frame tail
-        // at 4096-byte pages), then a 2-frame commit.
+        // One small commit, one 49-frame commit, then a two-frame commit.
         let page_size = pager.page_size() as usize;
         let stamp = |pgno: Pgno, round: u8, buf: &mut [u8]| {
             for (i, b) in buf.iter_mut().enumerate().skip(16) {
@@ -6874,7 +6923,7 @@ mod tests {
         let big_idx = commits
             .iter()
             .position(|(pgnos, _)| pgnos.len() >= 48)
-            .expect("one commit spanning several append batches");
+            .expect("one large commit");
         // (Commits may be followed by sector-padding frames that repeat the commit frame.)
         assert!(big_idx + 1 < commits.len());
         for (i, (pgnos, n_truncate)) in commits.iter().enumerate() {
@@ -7209,6 +7258,31 @@ mod tests {
             (valid, last_n_truncate)
         }
 
+        fn committed_prefix<'a>(&self, image: &'a [u8]) -> &'a [u8] {
+            let Some(header_bytes) = image.first_chunk::<WAL_HDRSIZE>() else {
+                return &image[..0];
+            };
+            let Some(header) = WalFileHeader::decode_for_recovery(header_bytes).unwrap() else {
+                return &image[..0];
+            };
+            assert_eq!(header.page_size as usize, self.page_size);
+            let mut checksum = header.cksum;
+            let mut committed = 0;
+            for (index, frame) in image[WAL_HDRSIZE..].chunks_exact(self.sz_frame()).enumerate() {
+                let frame_header = frame.first_chunk::<WAL_FRAME_HDRSIZE>().unwrap();
+                let Some((_, n_truncate, next)) = wal_decode_frame(
+                    frame_header, &frame[WAL_FRAME_HDRSIZE..], header.salt, header.big_end_cksum, checksum,
+                ).unwrap() else {
+                    break;
+                };
+                if n_truncate != 0 {
+                    committed = WAL_HDRSIZE + (index + 1) * self.sz_frame();
+                }
+                checksum = next;
+            }
+            &image[..committed]
+        }
+
         /// Crash model: everything issued before a sync is durable; of the writes issued since
         /// the last sync ANY subset may have reached the disk (unordered writeback). Recovers
         /// every such image and requires the pre-transaction state or the complete transaction.
@@ -7216,6 +7290,8 @@ mod tests {
         fn assert_every_crash_state_is_atomic(&self) -> (usize, usize) {
             let mut durable = self.base_wal.clone();
             let mut epoch: Vec<(usize, &WalOp)> = Vec::new();
+            let mut recovered_prefixes = HashMap::<Vec<u8>, bool>::new();
+            let mut image = Vec::new();
             let (mut n_before, mut n_after) = (0usize, 0usize);
             let end_marker = WalOp::Sync;
             let numbered = self.ops.iter().enumerate();
@@ -7225,25 +7301,47 @@ mod tests {
                     continue;
                 }
                 assert!(
-                    epoch.len() <= 14,
+                    epoch.len() <= 22,
                     "scenario too large to enumerate: {} unsynced operations",
                     epoch.len()
                 );
                 for mask in 0u32..(1u32 << epoch.len()) {
-                    let mut image = durable.clone();
-                    let mut kept = Vec::new();
-                    for (bit, (idx, pending)) in epoch.iter().enumerate() {
+                    image.clear();
+                    image.extend_from_slice(&durable);
+                    for (bit, (_, pending)) in epoch.iter().enumerate() {
                         if mask & (1 << bit) != 0 {
                             apply_wal_op(&mut image, pending);
-                            kept.push(*idx);
                         }
                     }
-                    let got = recovered_state(&self.db_image, &image);
-                    if got == self.before {
-                        n_before += 1;
-                    } else if got == self.after {
-                        n_after += 1;
+                    let prefix = self.committed_prefix(&image);
+                    let recovered_after = match recovered_prefixes.get(prefix) {
+                        Some(&after) => Some(after),
+                        None => {
+                            let got = recovered_state(&self.db_image, &image);
+                            let after = if got == self.before {
+                                Some(false)
+                            } else if got == self.after {
+                                Some(true)
+                            } else {
+                                None
+                            };
+                            if let Some(after) = after {
+                                recovered_prefixes.insert(prefix.to_vec(), after);
+                            }
+                            after
+                        }
+                    };
+                    if let Some(after) = recovered_after {
+                        if after {
+                            n_after += 1;
+                        } else {
+                            n_before += 1;
+                        }
                     } else {
+                        let kept: Vec<_> = epoch.iter().enumerate()
+                            .filter(|(bit, _)| mask & (1 << bit) != 0)
+                            .map(|(_, (idx, _))| *idx).collect();
+                        let got = recovered_state(&self.db_image, &image);
                         let lost: Vec<usize> = epoch
                             .iter()
                             .map(|(idx, _)| *idx)
@@ -7370,22 +7468,21 @@ mod tests {
             stamp_page(pager, 6, 3);
             stamp_page(pager, 8, 3);
         });
-        // Crash safety first: all 2^10 subsets of the transaction's 10 unsynced writes (plus
-        // the state after the final sync) recover to "before" or "after".
+        // Enumerate all 2^16 subsets of the 16 writes before xSync and
+        // check the durable state after xSync.
         let (n_before, n_after) = run.assert_every_crash_state_is_atomic();
-        assert_eq!(n_before + n_after, (1 << 10) + 1);
+        assert_eq!(n_before + n_after, (1 << 16) + 1);
         assert!(n_before > 0 && n_after > 0);
 
         // Then the bytes, write by write, against what C puts on disk.
         let ps = run.page_size;
-        let szf = run.sz_frame();
         let m = run.base_frames();
         assert!(m >= 3, "two earlier WAL commits precede the transaction");
         let wal_hdr = run.wal_header();
         let salt_bytes: Vec<u8> = wal_hdr.salt.iter().flat_map(|s| s.to_be_bytes()).collect();
 
         // Spill: three appended frames with the real salt and a valid (uncommitted) chain.
-        assert_eq!(run.commit_start, 3);
+        assert_eq!(run.commit_start, 6);
         let spilled = run.image_after(run.commit_start);
         assert_eq!(run.valid_chain(&spilled), (m + 3, 0));
 
@@ -7393,8 +7490,8 @@ mod tests {
         let writes = run.commit_writes();
         assert_eq!(
             writes.len(),
-            7,
-            "2 in-place + 1 append run + 4 header rewrites"
+            10,
+            "2 in-place + 2 header/page pairs + 4 header rewrites"
         );
         // 1-2: page images of pages 3 and 4 over frames m+2 and m+3 (frame headers untouched).
         for (i, frame_no) in [m + 2, m + 3].into_iter().enumerate() {
@@ -7403,29 +7500,28 @@ mod tests {
             assert_eq!(data.len(), ps);
             assert_eq!(&data[0..4], &(3 + i as u32).to_be_bytes());
         }
-        // 3: frames m+4 (page 6) and m+5 (page 8, commit) in one positioned write, both with
-        //    salt and checksum zeroed exactly as `memset(&aFrame[8], 0, 16)` leaves them.
-        let (off, data) = writes[2];
-        assert_eq!(off, run.frame_offset(m + 4));
-        assert_eq!(data.len(), 2 * szf);
+        // Two appended frames carry zero salt and checksum until
+        // walRewriteChecksums re-chains them.
         for (i, (pgno, n_truncate)) in [(6u32, 0u32), (8, 8)].into_iter().enumerate() {
-            let fhdr = &data[i * szf..i * szf + WAL_FRAME_HDRSIZE];
-            assert_eq!(&fhdr[0..4], &pgno.to_be_bytes());
-            assert_eq!(&fhdr[4..8], &n_truncate.to_be_bytes());
-            assert_eq!(
-                &fhdr[8..24],
-                &[0u8; 16],
-                "frame appended while a checksum rewrite is pending must not carry a salt or \
-                 checksum (C writes zeroes)"
-            );
+            let frame_offset = run.frame_offset(m + 4 + i as u32);
+            let (offset, header) = writes[2 + 2 * i];
+            let (page_offset, page) = writes[3 + 2 * i];
+            assert_eq!(offset, frame_offset);
+            assert_eq!(header.len(), WAL_FRAME_HDRSIZE);
+            assert_eq!(page_offset, frame_offset + WAL_FRAME_HDRSIZE as u64);
+            assert_eq!(page.len(), ps);
+            assert_eq!(&page[..4], &pgno.to_be_bytes());
+            assert_eq!(&header[0..4], &pgno.to_be_bytes());
+            assert_eq!(&header[4..8], &n_truncate.to_be_bytes());
+            assert_eq!(&header[8..], &[0u8; 16]);
         }
         // Before `walRewriteChecksums` the log holds no valid frame past the first overwritten
         // one, whatever happened to the in-place writes.
-        let pre_rewrite = run.image_after(run.commit_start + 3);
+        let pre_rewrite = run.image_after(run.commit_start + 6);
         assert_eq!(run.valid_chain(&pre_rewrite), (m + 1, 0));
-        // 4-7: one 24-byte header per frame m+2 ..= m+5, ascending, now with the real salt.
+        // One 24-byte header per frame m+2 ..= m+5, ascending, now with the real salt.
         for (i, frame_no) in (m + 2..=m + 5).enumerate() {
-            let (off, data) = writes[3 + i];
+            let (off, data) = writes[6 + i];
             assert_eq!(off, run.frame_offset(frame_no));
             assert_eq!(data.len(), WAL_FRAME_HDRSIZE);
             assert_eq!(&data[8..16], salt_bytes.as_slice());
@@ -7439,7 +7535,9 @@ mod tests {
         // The W1 hole: spilled frames and the appended commit frame durable, both in-place
         // overwrites (and the header rewrites) lost.
         let mut hole = spilled.clone();
-        apply_wal_op(&mut hole, &run.ops[run.commit_start + 2]);
+        for op in &run.ops[run.commit_start + 2..run.commit_start + 6] {
+            apply_wal_op(&mut hole, op);
+        }
         assert_eq!(
             run.valid_chain(&hole),
             (m + 3, 0),
@@ -7477,26 +7575,26 @@ mod tests {
 
             let m = run.base_frames();
             // Second spill: page 3 over frame m+2 in place, then page 6 appended unchained.
-            let WalOp::Write { off, data } = &run.ops[3] else {
+            let WalOp::Write { off, data } = &run.ops[6] else {
                 panic!("in-place overwrite expected")
             };
             assert_eq!(*off, run.frame_offset(m + 2) + WAL_FRAME_HDRSIZE as u64);
             assert_eq!(data.len(), run.page_size);
-            let WalOp::Write { off, data } = &run.ops[4] else {
+            let WalOp::Write { off, data } = &run.ops[7] else {
                 panic!("appended spill frame expected")
             };
             assert_eq!(*off, run.frame_offset(m + 4));
             assert_eq!(&data[0..4], &6u32.to_be_bytes());
             assert_eq!(&data[4..24], &[0u8; 20], "spill frame written unchained");
-            assert_eq!(run.commit_start, 5);
+            assert_eq!(run.commit_start, 9);
             // COMMIT: page 8 appended as an unchained commit frame, then 4 header rewrites.
             let writes = run.commit_writes();
-            assert_eq!(writes.len(), 5);
+            assert_eq!(writes.len(), 6);
             assert_eq!(writes[0].0, run.frame_offset(m + 5));
             assert_eq!(&writes[0].1[0..4], &8u32.to_be_bytes());
             assert_eq!(&writes[0].1[4..8], &8u32.to_be_bytes());
             assert_eq!(&writes[0].1[8..24], &[0u8; 16]);
-            let pre_rewrite = run.image_after(run.commit_start + 1);
+            let pre_rewrite = run.image_after(run.commit_start + 2);
             assert_eq!(run.valid_chain(&pre_rewrite), (m + 1, 0));
             assert_eq!(run.valid_chain(&run.final_wal), (m + 5, 8));
         }
@@ -7526,32 +7624,32 @@ mod tests {
         );
         assert!(matches!(run.ops[1], WalOp::Sync), "WAL header is synced");
         // Second spill: frame 1 (page 2) overwritten in place, page 5 appended unchained.
-        let WalOp::Write { off, data } = &run.ops[4] else {
+        let WalOp::Write { off, data } = &run.ops[6] else {
             panic!("in-place overwrite expected")
         };
         assert_eq!(*off, run.frame_offset(1) + WAL_FRAME_HDRSIZE as u64);
         assert_eq!(data.len(), run.page_size);
-        let WalOp::Write { off, data } = &run.ops[5] else {
+        let WalOp::Write { off, data } = &run.ops[7] else {
             panic!("appended spill frame expected")
         };
         assert_eq!(*off, run.frame_offset(3));
         assert_eq!(&data[4..24], &[0u8; 20]);
-        assert_eq!(run.commit_start, 6);
+        assert_eq!(run.commit_start, 9);
         // COMMIT appends page 8 as an unchained commit frame at frame 4 ...
         let writes = run.commit_writes();
         assert_eq!(writes[0].0, run.frame_offset(4));
-        assert_eq!(writes[0].1.len(), run.sz_frame());
+        assert_eq!(writes[0].1.len(), WAL_FRAME_HDRSIZE);
         assert_eq!(&writes[0].1[0..4], &8u32.to_be_bytes());
         assert_eq!(&writes[0].1[4..8], &8u32.to_be_bytes());
         assert_eq!(&writes[0].1[8..24], &[0u8; 16]);
-        let pre_rewrite = run.image_after(run.commit_start + 1);
+        let pre_rewrite = run.image_after(run.commit_start + 2);
         assert_eq!(run.valid_chain(&pre_rewrite), (0, 0));
         // ... rewrites the headers of frames 1..=4 starting from the WAL-header checksum ...
         for (i, frame_no) in (1u32..=4).enumerate() {
-            assert_eq!(writes[1 + i].0, run.frame_offset(frame_no));
-            assert_eq!(writes[1 + i].1.len(), WAL_FRAME_HDRSIZE);
+            assert_eq!(writes[2 + i].0, run.frame_offset(frame_no));
+            assert_eq!(writes[2 + i].1.len(), WAL_FRAME_HDRSIZE);
         }
-        let rewritten = run.image_after(run.commit_start + 5);
+        let rewritten = run.image_after(run.commit_start + 6);
         assert_eq!(run.valid_chain(&rewritten), (4, 8));
         // ... and pads to the sector boundary with valid copies of the commit frame.
         let (valid, n_truncate) = run.valid_chain(&run.final_wal);
@@ -7590,8 +7688,8 @@ mod tests {
         let m = run.base_frames();
         // Spills: m+1 (page 2), m+2 (page 3); page 3 in place over m+2, m+3 (page 6) unchained;
         // under the savepoint m+4 (page 4) and m+5 (page 7), both unchained.
-        assert_eq!(run.commit_start, 6);
-        for (op, frame_no) in [(3usize, m + 3), (4, m + 4), (5, m + 5)] {
+        assert_eq!(run.commit_start, 11);
+        for (op, frame_no) in [(5usize, m + 3), (7, m + 4), (9, m + 5)] {
             let WalOp::Write { off, data } = &run.ops[op] else {
                 panic!("appended spill frame expected")
             };
@@ -7605,23 +7703,28 @@ mod tests {
         // COMMIT appends from frame m+4 again (the savepoint rollback dropped m+4 and m+5),
         // every frame unchained, the last one carrying the commit size.
         let writes = run.commit_writes();
-        let (off, data) = writes[0];
-        assert_eq!(off, run.frame_offset(m + 4));
-        let n_appended = data.len() / run.sz_frame();
-        assert_eq!(data.len(), n_appended * run.sz_frame());
-        for i in 0..n_appended {
-            let fhdr = &data[i * run.sz_frame()..i * run.sz_frame() + WAL_FRAME_HDRSIZE];
+        let n_appended = writes.chunks_exact(2).enumerate()
+            .take_while(|(index, pair)| {
+                let offset = run.frame_offset(m + 4 + *index as u32);
+                pair[0].0 == offset && pair[1].0 == offset + WAL_FRAME_HDRSIZE as u64
+            }).count();
+        assert!(n_appended > 0);
+        for (i, pair) in writes[..2 * n_appended].chunks_exact(2).enumerate() {
+            let fhdr = pair[0].1;
+            assert_eq!(fhdr.len(), WAL_FRAME_HDRSIZE);
+            assert_eq!(pair[1].1.len(), run.page_size);
             let n_truncate = if i + 1 == n_appended { 8u32 } else { 0 };
             assert_eq!(&fhdr[4..8], &n_truncate.to_be_bytes());
             assert_eq!(&fhdr[8..24], &[0u8; 16]);
         }
         let last = m + 3 + n_appended as u32;
-        let pre_rewrite = run.image_after(run.commit_start + 1);
+        let rewrite_start = 2 * n_appended;
+        let pre_rewrite = run.image_after(run.commit_start + rewrite_start);
         assert_eq!(run.valid_chain(&pre_rewrite), (m + 1, 0));
-        assert_eq!(writes.len(), 1 + (last - (m + 1)) as usize);
+        assert_eq!(writes.len(), rewrite_start + (last - (m + 1)) as usize);
         for (i, frame_no) in (m + 2..=last).enumerate() {
-            assert_eq!(writes[1 + i].0, run.frame_offset(frame_no));
-            assert_eq!(writes[1 + i].1.len(), WAL_FRAME_HDRSIZE);
+            assert_eq!(writes[rewrite_start + i].0, run.frame_offset(frame_no));
+            assert_eq!(writes[rewrite_start + i].1.len(), WAL_FRAME_HDRSIZE);
         }
         assert_eq!(run.valid_chain(&run.final_wal), (last, 8));
         // The rolled-back images of pages 4 and 7 are not part of the committed state.
@@ -7711,6 +7814,7 @@ mod tests {
         page_write_error: Mutex<Option<(&'static str, i32)>>,
         // true injects the error after successfully removing the journal.
         journal_delete_error: Mutex<Option<bool>>,
+        fail_journal_zero: AtomicBool,
         fail_hot_journal_sync: AtomicBool,
         fail_db_unlock: AtomicBool,
         /// Ordered trace of the operations that matter for durability.
@@ -7809,6 +7913,11 @@ mod tests {
             self.inner.read_at(buf, offset)
         }
         fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
+            if self.is_journal && offset == 0 && buf == [0; JOURNAL_HEADER_CORE_BYTES]
+                && self.ctl.fail_journal_zero.swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(SqliteError::with_extended(extended::SQLITE_IOERR_WRITE, "disk I/O error"));
+            }
             let mut fault = self.ctl.page_write_error.lock().unwrap();
             if let Some((kind, code)) = *fault
                 && ((kind == "db" && self.is_db) || (kind == "wal" && self.is_wal))
@@ -7929,9 +8038,15 @@ mod tests {
             pager.write_page(pgno).unwrap()[0] = 2;
             pager.page_ref(pgno).unwrap();
             pager.commit_phase_one(None).unwrap();
-            *ctl.journal_delete_error.lock().unwrap() = Some(after_delete);
+            let expected_code = if locking_mode == LockingMode::Exclusive {
+                ctl.fail_journal_zero.store(true, Relaxed);
+                extended::SQLITE_IOERR_WRITE
+            } else {
+                *ctl.journal_delete_error.lock().unwrap() = Some(after_delete);
+                extended::SQLITE_IOERR_DELETE
+            };
             let error = pager.commit_phase_two(false, false).unwrap_err();
-            assert_eq!(error.extended_code, extended::SQLITE_IOERR_DELETE);
+            assert_eq!(error.extended_code, expected_code);
             assert_eq!(pager.page_ref(pgno).unwrap_err(), error);
             assert_eq!(pager.write_page(pgno).unwrap_err(), error);
             let epoch = pager.pcache_epoch();
@@ -7955,10 +8070,86 @@ mod tests {
             }
             pager.begin_read().unwrap();
             assert_eq!(pager.read_page(pgno).unwrap()[0], if after_delete { 2 } else { 1 });
-            assert!(!vfs.exists(journal).unwrap());
+            if locking_mode == LockingMode::Exclusive {
+                let cold = vfs_file_image(vfs.as_ref(), journal);
+                assert_eq!(&cold[..JOURNAL_HEADER_CORE_BYTES], &[0; JOURNAL_HEADER_CORE_BYTES]);
+            } else {
+                assert!(!vfs.exists(journal).unwrap());
+            }
             pager.end_read_if_unused().unwrap();
             pager.close().unwrap();
+            assert!(!vfs.exists(journal).unwrap());
         }
+    }
+
+    #[test]
+    fn exclusive_delete_reuses_cold_journal_until_normal_reader_or_close() {
+        let vfs = Arc::new(MemoryVfs::new());
+        let path = Path::new("retained.db");
+        let journal = Path::new("retained.db-journal");
+        let flags = OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB;
+        let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+        pager.set_locking_mode(LockingMode::Exclusive);
+        pager.begin_write().unwrap();
+        let page = pager.allocate_raw_page().unwrap();
+        pager.write_page(page).unwrap()[0] = 1;
+        pager.commit().unwrap();
+        assert_eq!(pager.journal_mode(), JournalMode::Delete);
+        let cold = vfs_file_image(vfs.as_ref(), journal);
+        assert_eq!(&cold[..JOURNAL_HEADER_CORE_BYTES], &[0; JOURNAL_HEADER_CORE_BYTES]);
+
+        pager.begin_write().unwrap();
+        pager.write_page(page).unwrap()[0] = 2;
+        pager.rollback().unwrap();
+        let cold = vfs_file_image(vfs.as_ref(), journal);
+        assert_eq!(&cold[..JOURNAL_HEADER_CORE_BYTES], &[0; JOURNAL_HEADER_CORE_BYTES]);
+
+        pager.set_locking_mode(LockingMode::Normal);
+        assert!(vfs.exists(journal).unwrap());
+        pager.begin_read().unwrap();
+        assert_eq!(pager.read_page(page).unwrap()[0], 1);
+        pager.end_read_if_unused().unwrap();
+        assert!(!vfs.exists(journal).unwrap());
+
+        pager.set_locking_mode(LockingMode::Exclusive);
+        pager.set_journal_size_limit(0);
+        pager.begin_write().unwrap();
+        pager.write_page(page).unwrap()[0] = 3;
+        pager.commit().unwrap();
+        assert!(vfs.exists(journal).unwrap());
+        assert!(vfs_file_image(vfs.as_ref(), journal).is_empty());
+        pager.close().unwrap();
+        assert!(!vfs.exists(journal).unwrap());
+    }
+
+    #[test]
+    fn hot_zero_record_count_does_not_replay_retained_bytes() {
+        let ctl = Arc::new(FaultCtl::default());
+        let vfs = Arc::new(FaultVfs { inner: Arc::new(MemoryVfs::new()), ctl: ctl.clone() });
+        let path = Path::new("tail.db");
+        let journal = Path::new("tail.db-journal");
+        let flags = OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB;
+        let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+        pager.begin_write().unwrap();
+        let page = pager.allocate_raw_page().unwrap();
+        pager.write_page(page).unwrap()[0] = 1;
+        pager.commit().unwrap();
+        pager.begin_write().unwrap();
+        pager.write_page(page).unwrap()[0] = 2;
+        pager.commit_phase_one(None).unwrap();
+        *ctl.journal_delete_error.lock().unwrap() = Some(false);
+        assert_eq!(pager.commit_phase_two(false, false).unwrap_err().extended_code, extended::SQLITE_IOERR_DELETE);
+        assert!(pager.rollback().is_err());
+
+        // Keep the payload and its checksums intact, as with a reused
+        // journal, but mark the section as an unsynced zero-record tail.
+        let mut journal_fd = vfs.open(Some(journal), OpenFlags::READWRITE).unwrap();
+        journal_fd.write_at(&0u32.to_be_bytes(), 8).unwrap();
+        journal_fd.close().unwrap();
+        pager.begin_read().unwrap();
+        assert_eq!(pager.read_page(page).unwrap()[0], 2);
+        pager.end_read_if_unused().unwrap();
+        assert!(!vfs.exists(journal).unwrap());
     }
 
     #[test]
