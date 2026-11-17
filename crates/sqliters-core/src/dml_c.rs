@@ -1322,7 +1322,7 @@ impl Analyzer<'_> {
                     }
                 }
                 let action = if update.is_some() { fk.on_update } else { fk.on_delete };
-                if !(fk.deferred || self.defer_fks)
+                if !fk.deferred
                     && action != FkAction::Cascade
                     && action != FkAction::SetNull
                 {
@@ -1357,7 +1357,7 @@ impl Analyzer<'_> {
             {
                 continue;
             }
-            if !(fk.deferred || self.defer_fks) {
+            if !fk.deferred {
                 self.may_abort();
             }
         }
@@ -1397,8 +1397,10 @@ impl Analyzer<'_> {
         for (ctbl, fk) in work {
             let is_update = update.is_some();
             let action = if is_update { fk.on_update } else { fk.on_delete };
-            if action == FkAction::NoAction {
-                continue; // fkActionTrigger returns 0 for OE_None... (no program)
+            if action == FkAction::NoAction
+                || (action == FkAction::Restrict && self.defer_fks)
+            {
+                continue; // fkey.c:1230: no action trigger for deferred RESTRICT.
             }
             let key = (ctbl.name.to_ascii_lowercase(), fk.id, is_update);
             if self.coded_fk_actions.contains(&key) {
@@ -1943,7 +1945,7 @@ impl Analyzer<'_> {
     /// mayAbort.
     fn fk_check_insert(&mut self, tbl: &TableSchema) {
         for fk in &tbl.foreign_keys {
-            if !(fk.deferred || self.defer_fks) {
+            if !fk.deferred {
                 self.may_abort();
             }
         }
@@ -2282,7 +2284,7 @@ pub(crate) fn compiled_dml_flags(db_set: &DatabaseSet, stmt: CompiledDml<'_>) ->
         db_set,
         fk_on: false,
         rec_triggers: false,
-        defer_fks: false,
+        defer_fks: db_set.c_defer_foreign_keys(),
         f: StmtFlags::default(),
         coded_triggers: Vec::new(),
         coded_fk_actions: Vec::new(),
@@ -2306,11 +2308,17 @@ pub(crate) fn dml_insert_flags(
     fk_on: bool,
     rec_triggers: bool,
 ) -> StmtFlags {
+    dml_insert_flags_with_defer(db_set, ins, fk_on, rec_triggers, db_set.c_defer_foreign_keys())
+}
+
+pub(crate) fn dml_insert_flags_with_defer(
+    db_set: &DatabaseSet, ins: &InsertStmt, fk_on: bool, rec_triggers: bool, defer_fks: bool,
+) -> StmtFlags {
     let mut a = Analyzer {
         db_set,
         fk_on,
         rec_triggers,
-        defer_fks: false,
+        defer_fks,
         f: StmtFlags::default(),
         coded_triggers: Vec::new(),
         coded_fk_actions: Vec::new(),
@@ -2339,6 +2347,7 @@ pub(crate) fn dml_stmt_flags(
     stmt: &Stmt,
     fk_on: bool,
     rec_triggers: bool,
+    defer_fks: bool,
 ) -> (StmtFlags, Vec<(DatabaseId, String)>) {
     // A virtual-table target (or a name that does not resolve) reports both flags whatever else
     // the statement contains; answer that before the analysis copies the table definition.
@@ -2359,7 +2368,7 @@ pub(crate) fn dml_stmt_flags(
         db_set,
         fk_on,
         rec_triggers,
-        defer_fks: false,
+        defer_fks,
         f: StmtFlags::default(),
         coded_triggers: Vec::new(),
         coded_fk_actions: Vec::new(),

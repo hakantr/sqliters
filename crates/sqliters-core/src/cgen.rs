@@ -475,6 +475,7 @@ pub(crate) fn c_prepare(inner: &ConnectionInner, sql: &str) -> (PrepareResult, u
 pub(crate) struct SelectSchemaUse {
     pub reads_schema: bool,
     pub btree_mask: Option<u32>,
+    pub is_reader: Option<bool>,
 }
 
 pub(crate) fn select_schema_use(inner: &ConnectionInner, sql: &str) -> Option<SelectSchemaUse> {
@@ -488,8 +489,8 @@ pub(crate) fn select_schema_use(inner: &ConnectionInner, sql: &str) -> Option<Se
     C_TEMP_OPENED.with(|c| c.set(temp));
     C_ROWEST.with(|c| *c.borrow_mut() = rowest);
     match result {
-        PrepareResult::Program(p) => Some(SelectSchemaUse { reads_schema, btree_mask: Some(p.btree_mask) }),
-        PrepareResult::Error { .. } => Some(SelectSchemaUse { reads_schema, btree_mask: None }),
+        PrepareResult::Program(p) => Some(SelectSchemaUse { reads_schema, btree_mask: Some(p.btree_mask), is_reader: Some(p.b_is_reader) }),
+        PrepareResult::Error { .. } => Some(SelectSchemaUse { reads_schema, btree_mask: None, is_reader: None }),
         PrepareResult::Unsupported(_) => None,
     }
 }

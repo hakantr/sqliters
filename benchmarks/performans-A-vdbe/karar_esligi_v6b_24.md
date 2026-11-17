@@ -84,7 +84,7 @@ Genel derlemde 13372 tam program aynı; 93 Unsupported başarı sayılmadı. EXP
 
 ## C kapsamı
 
-Birikimli kapsam sqlite3_compileoption_get/used, iki SQL sarmalayıcısı, sqlite3CompileOptions ve sqlite3VdbeReusable yordamlarıyla genişletildi. Değer-int/metin sarmalayıcıları, Mem int/real dönüşümü, tanımlayıcı karakteri ve strlen30 yardımcıları da ölçüldü. OP_Noop sekizinci seçili opcode bloğudur; tüm sqlite3VdbeExec sayılmadı. C kapsam matrisinde de 3.990 native akış tekrar çalışır.
+Birikimli kapsam sqlite3_compileoption_get/used, iki SQL sarmalayıcısı, sqlite3CompileOptions ve sqlite3VdbeReusable yordamlarıyla genişletildi. Değer-int/metin sarmalayıcıları, Mem int/real dönüşümü, tanımlayıcı karakteri ve strlen30 yardımcıları da ölçüldü. OP_Noop ölçüm listesine eklendi; C bunu adlandırılmış case yerine ortak default bloğunda yürüttüğü için V6b.24 tablosunda yalnız yedi opcode bölgesi ölçüldü. Bu ölçüm eksikliği V6b.25’te default bloğu eklenerek düzeltildi; tüm sqlite3VdbeExec sayılmadı. C kapsam matrisinde de 3.990 native akış tekrar çalışır.
 
 ### Seçili C işlevlerinin birikimli kapsamı (gcov, -O0 başvuru derlemi)
 
@@ -248,7 +248,7 @@ Corpus: the 15987 statements the port accepts, each run as EXPLAIN and as EXPLAI
 
 Kuralda toplam 4/4 dal alındı. Üstteki işlev toplamına eklenmedi.
 
-## Yürütülen sekiz işlem kodunun C blokları (sqlite3VdbeExec bütünü sayılmadı)
+## V6b.24’te ölçülen yedi işlem kodunun C blokları (sqlite3VdbeExec bütünü sayılmadı)
 
 | İşlem kodu | Alınan dallar |
 |---|---|

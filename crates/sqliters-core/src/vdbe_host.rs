@@ -744,6 +744,10 @@ impl VdbeHost for WriteHost<'_, '_> {
         self.ctx.db_set.trigger_depth_limit()
     }
 
+    fn defer_fks(&self) -> bool {
+        self.ctx.db_set.c_defer_foreign_keys()
+    }
+
     fn deferred_cons(&self) -> (i64, i64) {
         (self.ctx.deferred_fk_suspects.n_deferred_cons, self.ctx.deferred_fk_suspects.n_deferred_imm_cons)
     }

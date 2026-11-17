@@ -735,6 +735,11 @@ impl DatabaseSet {
         self.c_flags_toggled
     }
 
+    /// `db->flags & SQLITE_DeferFKs` (the reference default is off).
+    pub const fn c_defer_foreign_keys(&self) -> bool {
+        self.c_flags_toggled & sqliters_codegen::consts::SQLITE_DeferFKs != 0
+    }
+
     /// `sqlite3ExpirePreparedStatements(db, 0)`.
     pub fn c_expire_all(&mut self) {
         self.c_expire_seq += 1;

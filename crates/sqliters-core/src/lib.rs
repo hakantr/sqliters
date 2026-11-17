@@ -1928,14 +1928,22 @@ impl ConnectionInner {
                 } else {
                     Ok(())
                 };
+                let reloaded = !prev_loaded
+                    || prev_cookie != slot.schema.schema_cookie
+                    || prev_had_pages != slot.schema.had_pages;
+                // prepare.c sqlite3InitOne executes a schema SELECT. Its successful
+                // autocommit reader halt clears DeferFKs even during outer prepare.
+                let schema_select_finished = load_res.is_ok() || load_res.as_ref().is_err_and(|e|
+                    e.code == ErrorCode::Corrupt && e.message.starts_with("malformed database schema ("));
+                if schema_select_finished && reloaded && self.is_autocommit()
+                    && !self.activity.leases.iter().any(|(_, l)| l.is_writer)
+                {
+                    self.db_set.set_c_pragma_flags_at_prepare(0, sqliters_codegen::consts::SQLITE_DeferFKs);
+                    self.deferred_fk_suspects.clear();
+                }
                 load_res?;
                 end_res?;
-                if !prev_loaded
-                    || prev_cookie != slot.schema.schema_cookie
-                    || prev_had_pages != slot.schema.had_pages
-                {
-                    any_changed = true;
-                }
+                if reloaded { any_changed = true; }
             } else {
                 if sets_text_encoding { self.restore_main_schema_encoding(); }
                 let slot = &mut self.db_set.slots_mut()[idx];
@@ -2097,6 +2105,15 @@ impl ConnectionInner {
         self.runtime.total_changes += n;
     }
 
+    /// vdbeaux.c:3359,3416–3449: an autocommit reader with no other writer
+    /// completes the transaction, even if other read-only statements remain.
+    fn finish_deferred_fk_reader(&mut self, reader: bool, summary: ActivitySummary) {
+        if reader && self.is_autocommit() && summary.other_writers == 0 {
+            self.db_set.set_c_pragma_flags_at_prepare(0, sqliters_codegen::consts::SQLITE_DeferFKs);
+            self.deferred_fk_suspects.clear();
+        }
+    }
+
     fn finish_activity(
         &mut self,
         hid: HandleId,
@@ -2133,7 +2150,11 @@ impl ConnectionInner {
         }
 
         match outcome {
-            ActivityFinish::NoLock | ActivityFinish::PendingCommitAborted => Ok(()),
+            ActivityFinish::NoLock => {
+                self.finish_deferred_fk_reader(_removed.is_some_and(|l| l.is_reader), summary);
+                Ok(())
+            }
+            ActivityFinish::PendingCommitAborted => Ok(()),
 
             ActivityFinish::ReadDone {
                 lease_cursors,
@@ -2185,6 +2206,7 @@ impl ConnectionInner {
                         }
                     }
                 }
+                self.finish_deferred_fk_reader(_removed.is_some_and(|l| l.is_reader), summary);
                 Ok(())
             }
 
@@ -5181,6 +5203,9 @@ pub struct Statement {
     requires_schema: bool,
     /// A failed reprepare never entered VdbeExec and must not run its IOERR halt rollback.
     read_io_during_prepare: bool,
+    /// C bIsReader, independently of the selected execution strategy.
+    c_is_reader: bool,
+    compiled_defer_fks: bool,
     category: Option<StmtCategory>,
     compiled_vdbe: Option<Arc<VdbeProgram>>,
     compiled_fast_read: Option<Arc<fast_read::FastReadPlan>>,
@@ -6055,7 +6080,9 @@ fn prepare_default_cache_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>
 fn prepare_row_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str)
     -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>>
 {
-    if !matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("database_list") || name.eq_ignore_ascii_case("collation_list") || name.eq_ignore_ascii_case("compile_options")) {
+    let defer_query = matches!(stmt, Some(Stmt::Pragma { name, value: None, .. })
+        if name.eq_ignore_ascii_case("defer_foreign_keys"));
+    if !defer_query && !matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("database_list") || name.eq_ignore_ascii_case("collation_list") || name.eq_ignore_ascii_case("compile_options")) {
         return Ok(None);
     }
     let Some(program) = prepare_pragma_program(inner, sql)? else { return Ok(None); };
@@ -8033,6 +8060,9 @@ impl Statement {
 
         let hid = inner.register_handle(HandleKind::Statement);
         apply_select_schema_use(&mut artifacts, select_schema_use.as_ref());
+        let c_is_reader = c_explain.as_ref().or(c_machine.as_ref()).or(c_write.as_ref())
+            .map(|p| p.b_is_reader).or_else(|| select_schema_use.as_ref().and_then(|u| u.is_reader))
+            .unwrap_or(artifacts.category.is_some_and(|c| c != StmtCategory::NoLockPragma));
         Ok(Self {
             shared: Arc::clone(shared),
             handle_id: Some(hid),
@@ -8041,6 +8071,8 @@ impl Statement {
             stmt: artifacts.stmt,
             requires_schema: artifacts.requires_schema,
             read_io_during_prepare: false,
+            c_is_reader,
+            compiled_defer_fks: inner.db_set.c_defer_foreign_keys(),
             category: artifacts.category,
             compiled_vdbe: artifacts.compiled_vdbe,
             compiled_fast_read: artifacts.compiled_fast_read,
@@ -8743,6 +8775,10 @@ impl Statement {
             let copy_len = self.params.len().min(artifacts.max_param);
             transferred[..copy_len].clone_from_slice(&self.params[..copy_len]);
 
+            self.compiled_defer_fks = inner.db_set.c_defer_foreign_keys();
+            self.c_is_reader = c_explain.as_ref().or(c_machine.as_ref()).or(c_write.as_ref())
+                .map(|p| p.b_is_reader).or_else(|| select_schema_use.as_ref().and_then(|u| u.is_reader))
+                .unwrap_or(artifacts.category.is_some_and(|c| c != StmtCategory::NoLockPragma));
             self.stmt = artifacts.stmt;
             self.requires_schema = artifacts.requires_schema;
             self.category = artifacts.category;
@@ -8847,6 +8883,7 @@ impl Statement {
                     || inner.trace_hook.is_some()
                     || inner.authorizer.is_some()
                     || inner.progress.is_enabled()
+                    || inner.db_set.c_defer_foreign_keys()
                     || inner.simulated_cleanup_io_error.is_some()
                     || inner.db_set.vtab_registry().has_any_in_tx()
                 {
@@ -9265,6 +9302,7 @@ impl Statement {
     ) -> Option<Result<StepResult>> {
         if self.category != Some(StmtCategory::Read)
             || self.expired
+            || inner.db_set.c_defer_foreign_keys()
             || self.compiled_advisory_expire_generation != inner.advisory_expire_generation
             || self.compiled_schema_generation != inner.schema_generation
             || self.compiled_v1_expire_generation != inner.v1_expire_generation
@@ -9395,6 +9433,7 @@ impl Statement {
                     inner.with_default_exec_ctx(shared, summary, |ctx| vdbe_host::halt_control(ctx, vm));
                 }
                 inner.activity.remove(hid);
+                inner.finish_deferred_fk_reader(vm.prog.b_is_reader, summary);
                 self.lifecycle = StatementLifecycle::Halted { last_error: Some(e.clone()) };
                 Err(e)
             }
@@ -9507,6 +9546,7 @@ impl Statement {
                     }
                     Err(e) => {
                         inner.activity.remove(hid);
+                        inner.finish_deferred_fk_reader(self.c_is_reader, summary);
                         self.lifecycle = StatementLifecycle::Halted {
                             last_error: Some(e.clone()),
                         };
@@ -9520,7 +9560,7 @@ impl Statement {
                 let expires_all = self.c_prepared_pragma.is_some()
                     && matches!(&stmt_clone, Stmt::Pragma { name, value: Some(_), .. }
                         if sqliters_codegen::pragma::flag_mask(name).is_some());
-                inner.activity.start(hid, false, false);
+                inner.activity.start(hid, self.c_is_reader, false);
                 let summary = inner.activity.summary_excluding(hid, &inner.db_set);
                 let prev_ts = inner.runtime.stmt_timestamp_ms;
                 if prev_ts.is_none() && self.c_explain.is_none() {
@@ -9865,7 +9905,7 @@ impl Statement {
                         }
                         inner.activity.start_with_instances(
                             hid,
-                            true,
+                            self.c_is_reader,
                             false,
                             read_instances.clone(),
                             SmallInstVec::new(),
@@ -10063,7 +10103,7 @@ impl Statement {
                 }
                 inner.activity.start_with_instances(
                     hid,
-                    self.c_machine.as_ref().is_none_or(|program| program.b_is_reader),
+                    self.c_is_reader,
                     false,
                     read_instances.clone(),
                     Vec::new(),
@@ -10677,6 +10717,7 @@ impl Statement {
                     .then_some(inner.savepoints.len());
                 let top_level_sql = inner.trace_hook.is_some().then(|| self.raw_sql.clone());
                 let mut stmt_tx = StmtTxTracker {
+                    prepared_defer_fks: Some(self.compiled_defer_fks),
                     stmt_sp_slot,
                     top_level_sql,
                     ignored_fk_parent_tables: self.ignored_fk_parent_tables.clone(),
@@ -12057,6 +12098,7 @@ fn try_fast_read_plan_fields(
 ) -> Option<Result<StepResult>> {
     if category != Some(StmtCategory::Read)
         || expired
+        || inner.db_set.c_defer_foreign_keys()
         || compiled_advisory_expire_generation != inner.advisory_expire_generation
         || compiled_schema_generation != inner.schema_generation
         || compiled_v1_expire_generation != inner.v1_expire_generation

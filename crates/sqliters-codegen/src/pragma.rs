@@ -260,10 +260,6 @@ pub fn sqlite3_pragma(
     let Some(pragma) = locate(&name) else {
         return;
     };
-    if pragma.name == "defer_foreign_keys" {
-        p.not_supported("PRAGMA defer_foreign_keys transaction lifetime (V6b)");
-        return;
-    }
     if pragma.flags & 1 != 0 {
         sqlite3_read_schema(p);
     }

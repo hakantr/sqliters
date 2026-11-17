@@ -115,6 +115,8 @@ pub struct ActivitySummary {
 #[doc(hidden)]
 #[derive(Debug, Clone, Default)]
 pub struct StmtTxTracker {
+    /// Compile-time DeferFKs for legacy FK code decisions; counters use the live flag.
+    pub prepared_defer_fks: Option<bool>,
     /// Bitmask of `DatabaseId` slots whose `Read` transaction was started from `Open` by this statement.
     pub started_read_mask: u16,
     /// Bitmask of `DatabaseId` slots whose `Write` transaction (and optional `stmt_sp_slot`) was entered in this statement.
@@ -475,6 +477,11 @@ pub struct ExecContext<'a> {
 }
 
 impl ExecContext<'_> {
+    #[inline]
+    fn prepared_defer_fks(&self) -> bool {
+        self.stmt_tx.prepared_defer_fks.unwrap_or_else(|| self.db_set.c_defer_foreign_keys())
+    }
+
     #[inline]
     pub(crate) fn in_trigger_program(&self) -> bool {
         self.stmt_tx.subprogram_stack.iter().any(Option::is_some)
@@ -1353,6 +1360,9 @@ pub(crate) fn rollback_all_databases(
     }
 
     crate::vtab::vtab_rollback_all(ctx);
+    // main.c:1551–1553, after xRollback and before the rollback hook.
+    ctx.deferred_fk_suspects.clear();
+    ctx.db_set.set_c_pragma_flags_at_prepare(0, sqliters_codegen::consts::SQLITE_DeferFKs);
 
     if let Some(e) = first_err {
         Err(e)
@@ -1522,6 +1532,9 @@ pub(crate) fn commit_all_databases(
         let _ = crate::vtab::vtab_commit_all(ctx);
     }
 
+    // vdbeaux.c:3447–3449: clear only after the full commit succeeds.
+    ctx.deferred_fk_suspects.clear();
+    ctx.db_set.set_c_pragma_flags_at_prepare(0, sqliters_codegen::consts::SQLITE_DeferFKs);
     Ok(())
 }
 
@@ -2885,6 +2898,7 @@ pub(crate) fn apply_stmt_journal_policy(ctx: &mut ExecContext<'_>, stmt: &Stmt) 
             stmt,
             *ctx.foreign_keys,
             *ctx.recursive_triggers,
+            ctx.prepared_defer_fks(),
         ),
     };
     ctx.stmt_tx.autoinc_coded = autoinc;
@@ -21016,9 +21030,6 @@ fn replace_conflict_delete_row(
             cvals
         };
 
-        if *ctx.foreign_keys {
-            check_parent_delete_restrict(ctx, db_id, tbl, &cvals2, params)?;
-        }
         // `insert.c`, rowid constraint, `case OE_Replace`: with DELETE triggers (and
         // recursive triggers on) or foreign keys the conflicting row is deleted
         // (`sqlite3GenerateRowDelete`); otherwise only its index entries are
@@ -21533,7 +21544,7 @@ fn validate_and_write_row_inner(
     }
 
     // 7. If updating an existing row, re-verify `old_key` still exists (`update.c:1050-1057`),
-    // check parent UPDATE RESTRICT before mutating, and remove the old row + index entries!
+    // and remove the old row + index entries. FK actions run after the write.
     let mut update_in_place = false;
     let old_logical_vals_opt = if let Some(old_key) = existing_self_key {
         let Some(op) = seek_table_raw_entry(ctx, db_id, tbl, old_key)? else {
@@ -21550,9 +21561,6 @@ fn validate_and_write_row_inner(
         };
         if key_changes {
             c_write_cursor_to_row(ctx, db_id, tbl, old_key)?;
-        }
-        if *ctx.foreign_keys {
-            check_parent_update_restrict(ctx, db_id, tbl, &old_vals, &raw_vals, params)?;
         }
         // update.c: only the entries of the indexes the statement rewrites are deleted; the
         // table row itself is deleted only when its rowid changes (otherwise the new record
@@ -22825,7 +22833,7 @@ fn register_child_fk_checks(
             written_vals,
             &fk.from_cols,
         )? {
-            if fk.deferred {
+            if fk.deferred || ctx.db_set.c_defer_foreign_keys() {
                 ctx.deferred_fk_suspects
                     .push((inst_id, tbl.name.clone(), rkey.clone(), fk.id));
             } else {
@@ -22860,7 +22868,7 @@ fn check_insert_fk_immediately(
     };
     let (enc, _) = slot_encoding_and_name(ctx, db_id);
     for fk in &tbl.foreign_keys {
-        if fk.deferred {
+        if fk.deferred || ctx.prepared_defer_fks() {
             continue;
         }
         // (A constraint whose parent key cannot be located is reported when the statement is
@@ -22950,57 +22958,6 @@ fn find_referencing_fks(
     out
 }
 
-fn check_parent_delete_restrict(
-    ctx: &mut ExecContext<'_>,
-    db_id: DatabaseId,
-    ptbl: &TableSchema,
-    old_parent_vals: &[Value],
-    params: &[Value],
-) -> Result<()> {
-    let Some((schema_name, slot_schema, refs)) = ctx.db_set.slot(db_id).map(|s| {
-        (
-            s.name.clone(),
-            s.schema.clone(),
-            find_referencing_fks(&s.schema, &ptbl.name),
-        )
-    }) else {
-        return Ok(());
-    };
-    let (enc, _) = slot_encoding_and_name(ctx, db_id);
-    for (ctbl, fk) in refs {
-        // (reported at prepare time where C reports it; skipped here)
-        let Ok((_, parent_col_idxs)) =
-            resolve_fk_parent_cols(&slot_schema, &schema_name, &ctbl.name, &fk)
-        else {
-            continue;
-        };
-        if fk.on_delete != FkAction::Restrict {
-            continue;
-        }
-        if parent_col_idxs
-            .iter()
-            .any(|&pi| old_parent_vals[pi].is_null())
-        {
-            continue;
-        }
-        let crows = scan_table_raw_entries(ctx, db_id, &ctbl)?;
-        for (ckey, cpayload) in crows {
-            let cvals = decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload, params)?;
-            if child_row_matches_parent_key(
-                ptbl,
-                &parent_col_idxs,
-                old_parent_vals,
-                &cvals,
-                &fk.from_cols,
-                enc,
-            ) {
-                return Err(fk_restrict_err());
-            }
-        }
-    }
-    Ok(())
-}
-
 fn parent_key_changed(
     ptbl: &TableSchema,
     parent_col_idxs: &[usize],
@@ -23019,67 +22976,6 @@ fn parent_key_changed(
         .truthiness()
             != Some(true)
     })
-}
-
-fn check_parent_update_restrict(
-    ctx: &mut ExecContext<'_>,
-    db_id: DatabaseId,
-    ptbl: &TableSchema,
-    old_parent_vals: &[Value],
-    new_parent_vals: &[Value],
-    params: &[Value],
-) -> Result<()> {
-    let Some((schema_name, slot_schema, refs)) = ctx.db_set.slot(db_id).map(|s| {
-        (
-            s.name.clone(),
-            s.schema.clone(),
-            find_referencing_fks(&s.schema, &ptbl.name),
-        )
-    }) else {
-        return Ok(());
-    };
-    let (enc, _) = slot_encoding_and_name(ctx, db_id);
-    for (ctbl, fk) in refs {
-        // (reported at prepare time where C reports it; skipped here)
-        let Ok((_, parent_col_idxs)) =
-            resolve_fk_parent_cols(&slot_schema, &schema_name, &ctbl.name, &fk)
-        else {
-            continue;
-        };
-        if !parent_key_changed(
-            ptbl,
-            &parent_col_idxs,
-            old_parent_vals,
-            new_parent_vals,
-            enc,
-        ) {
-            continue;
-        }
-        if fk.on_update != FkAction::Restrict {
-            continue;
-        }
-        if parent_col_idxs
-            .iter()
-            .any(|&pi| old_parent_vals[pi].is_null())
-        {
-            continue;
-        }
-        let crows = scan_table_raw_entries(ctx, db_id, &ctbl)?;
-        for (ckey, cpayload) in crows {
-            let cvals = decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload, params)?;
-            if child_row_matches_parent_key(
-                ptbl,
-                &parent_col_idxs,
-                old_parent_vals,
-                &cvals,
-                &fk.from_cols,
-                enc,
-            ) {
-                return Err(fk_restrict_err());
-            }
-        }
-    }
-    Ok(())
 }
 
 fn run_in_fk_subprogram<F>(ctx: &mut ExecContext<'_>, f: F) -> Result<()>
@@ -23182,15 +23078,15 @@ fn apply_parent_delete_fk_actions(
             continue;
         }
 
-        if fk.on_delete == FkAction::Restrict {
-            return Err(fk_constraint_err());
+        if fk.on_delete == FkAction::Restrict && !ctx.prepared_defer_fks() {
+            return Err(fk_restrict_err());
         }
 
         // Register all matching child rows as FK suspects BEFORE running the action (`fkey.c`
         // `OP_FkCounter`), so if a child `BEFORE` trigger suppresses the delete/update via
         // `RAISE(IGNORE)`, statement-end / commit-time FK verification catches the remaining child!
         for ckey in &matching_children {
-            if fk.deferred {
+            if fk.deferred || ctx.db_set.c_defer_foreign_keys() {
                 ctx.deferred_fk_suspects
                     .push((inst_id, ctbl.name.clone(), ckey.clone(), fk.id));
             } else {
@@ -23204,7 +23100,7 @@ fn apply_parent_delete_fk_actions(
         }
 
         match fk.on_delete {
-            FkAction::Restrict => unreachable!(),
+            FkAction::Restrict => { debug_assert!(ctx.prepared_defer_fks()); }
             FkAction::NoAction => {}
             FkAction::Cascade => {
                 let cindexes = slot_schema.indexes_for_table(&ctbl.name);
@@ -23240,7 +23136,6 @@ fn apply_parent_delete_fk_actions(
                         };
                         let cur_cvals2 =
                             decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload2, params)?;
-                        check_parent_delete_restrict(ctx, db_id, &ctbl, &cur_cvals2, params)?;
                         if delete_row_via_pipeline(
                             ctx,
                             db_id,
@@ -23460,12 +23355,12 @@ fn apply_parent_update_fk_actions(
             continue;
         }
 
-        if fk.on_update == FkAction::Restrict {
-            return Err(fk_constraint_err());
+        if fk.on_update == FkAction::Restrict && !ctx.prepared_defer_fks() {
+            return Err(fk_restrict_err());
         }
 
         for ckey in &matching_children {
-            if fk.deferred {
+            if fk.deferred || ctx.db_set.c_defer_foreign_keys() {
                 ctx.deferred_fk_suspects
                     .push((inst_id, ctbl.name.clone(), ckey.clone(), fk.id));
             } else {
@@ -23479,7 +23374,7 @@ fn apply_parent_update_fk_actions(
         }
 
         match fk.on_update {
-            FkAction::Restrict => unreachable!(),
+            FkAction::Restrict => { debug_assert!(ctx.prepared_defer_fks()); }
             FkAction::NoAction => {}
             FkAction::Cascade => {
                 let cindexes = slot_schema.indexes_for_table(&ctbl.name);
@@ -28548,7 +28443,8 @@ fn try_exec_fast_vtab_insert(
 /// recurse through `exec_insert_internal`, whose frame must stay small.)
 #[inline(never)]
 fn decide_insert_fk_halts_immediately(ctx: &mut ExecContext<'_>, ins: &InsertStmt) {
-    if matches!(&ins.source, InsertSource::Values(rows) if rows.len() == 1)
+    if !ctx.prepared_defer_fks()
+        && matches!(&ins.source, InsertSource::Values(rows) if rows.len() == 1)
         && ins.returning.is_empty()
         && ctx
             .db_set
@@ -28557,11 +28453,12 @@ fn decide_insert_fk_halts_immediately(ctx: &mut ExecContext<'_>, ins: &InsertStm
             .flatten()
             .is_some_and(|(_, t)| t.foreign_keys.iter().any(|fk| !fk.deferred))
     {
-        let flags = crate::dml_c::dml_insert_flags(
+        let flags = crate::dml_c::dml_insert_flags_with_defer(
             ctx.db_set,
             ins,
             *ctx.foreign_keys,
             *ctx.recursive_triggers,
+            ctx.prepared_defer_fks(),
         );
         ctx.stmt_tx.insert_fk_halts_immediately = !flags.multi_write;
     }
@@ -30951,9 +30848,6 @@ fn delete_table_row_and_build_after_scope(
         return Ok(None);
     };
     let cur_old_vals = decode_table_logical_row(ctx, p.db_id, &p.tbl, rkey, &payload2, params)?;
-    if *ctx.foreign_keys {
-        check_parent_delete_restrict(ctx, p.db_id, &p.tbl, &cur_old_vals, params)?;
-    }
     ctx.stmt_tx.delete_idx_no_seek = p.scan_index_root;
     let deleted = delete_row_via_pipeline(
         ctx,
@@ -32464,7 +32358,6 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
                     continue;
                 }
                 let old_vals = decode_table_logical_row(ctx, db_id, &tbl, &rkey, &payload, &[])?;
-                check_parent_delete_restrict(ctx, db_id, &tbl, &old_vals, &[])?;
                 if delete_row_via_pipeline(
                     ctx,
                     db_id,
@@ -47209,7 +47102,7 @@ fn validate_fk_check_static(
                     continue;
                 }
             }
-            if insert_one_row && !fk.deferred {
+            if insert_one_row && !fk.deferred && !db_set.c_defer_foreign_keys() {
                 continue;
             }
             resolve_fk_parent_cols(&slot.schema, &slot.name, &ctbl.name, fk)?;
