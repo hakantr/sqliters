@@ -37,7 +37,8 @@
 | V6b.17 — D117 sıcak başlık kontrolü | `565ab23` | 16 byte sürüm, retained reader ve pending WAL; D118 açık | 13181 program; API 4157/4158 aynı, bütün dosyalar aynı; 30 hata yoklaması | Yeniden ölçülmedi | kapalı 1107/0; açık 1092/15 bilinen; 337 yok sayıldı |
 | V6b.18 — D119 sayfa1 hata aktarımı | `a7a7cbd` | Okuyucu IOERR rollback, reprepare ayrımı ve callback/sayaçlar | 13181 program; API 4157/4158 aynı, bütün dosyalar aynı; 56/16/64 native | 1,063× taban; W14 1,362× | kapalı 1110/0; açık 1095/15 bilinen; 337 yok sayıldı |
 | V6b.19 — D118 kısa okuma | `09bbf9b` | DB/WAL SHORT_READ ayrımı, hata metinleri | 640 akış: 624 aynı, 16 açık; bütün dosyalar aynı | 1,069× taban; W14 1,379× | kapalı 1112/0; açık 1097/15 bilinen; 337 yok sayıldı |
-| V6b.20 — sayfa1 cache ve bozuk kayıt | bu commit | D120/D121/D122; SharedLock aşaması | 640+128 native aynı; bütün dosyalar aynı; 13181 program | 1,064× taban; W14 1,361× | kapalı 1113/0; açık 1098/15 bilinen; 337 yok sayıldı |
+| V6b.20 — sayfa1 cache ve bozuk kayıt | `6a56a70` | D120/D121/D122; SharedLock aşaması | 640+128 native aynı; bütün dosyalar aynı; 13181 program | 1,064× taban; W14 1,361× | kapalı 1113/0; açık 1098/15 bilinen; 337 yok sayıldı |
+| V6b.21 — database_list | bu commit | Hazırlama anı, self/advisory Expire, veri okumayan liste, geçerli UTF-16 metin | 13192 tam program; 12+210+12 native aynı; bütün dosyalar aynı | 1,059× taban; W14 1,363× | kapalı 1114/0; açık 1099/15 bilinen; 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -450,3 +451,7 @@ Başlık kısa okuma düzeltildi; genişletilmiş matris 640 akışın 624’ün
 ## V6b.20 — sayfa1 önbelleği ve bozuk kayıt
 
 D118’in kaydedilen akışları ve D120/D121/D122 giderildi; 640+128 native senaryo eşleşti. Ham G/Ç izinde 52/72 aynı; dirty/TEMP farkları açık. Sırada kalan PRAGMA işleyicileri var. Kanıt [karar_esligi_v6b_20.md](karar_esligi_v6b_20.md) içinde.
+
+## V6b.21 — database_list
+
+Liste hazırlamada sabitlendi; reset/DETACH expire, aktif satırken DDL ve geçerli UTF-16 sonuçlar C ile eşleştirildi. 12 eski/yeni, 210 genişletilmiş ve 12 dosyaya bağlı aux akışı sonuç/hata/dosya baytlarında aynı. 13192 tam program eşleşti; 573 alınmayan dal ayrı sınıflandırıldı. Kalan PRAGMA’lar ve M4 açık; sırada collation_list var. Kanıt [karar_esligi_v6b_21.md](karar_esligi_v6b_21.md) içinde.

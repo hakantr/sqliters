@@ -569,6 +569,7 @@ macro_rules! host_common {
 }
 
 impl VdbeHost for MachineHost<'_> {
+    fn text_encoding(&self) -> TextEncoding { self.encoding }
     fn btree(&mut self, i_db: usize) -> Option<&mut Btree> {
         self.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut())
     }
@@ -667,6 +668,7 @@ impl WriteHost<'_, '_> {
 }
 
 impl VdbeHost for WriteHost<'_, '_> {
+    fn text_encoding(&self) -> TextEncoding { self.encoding }
     fn btree(&mut self, i_db: usize) -> Option<&mut Btree> {
         self.ctx.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut())
     }

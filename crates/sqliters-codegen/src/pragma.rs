@@ -448,6 +448,19 @@ pub fn sqlite3_pragma(
                 p.v.add_op2(OP_ResultRow, 1, 1);
             }
         }
+        12 => {
+            // pragma.c:1442–1453: names, membership and filenames freeze at prepare.
+            p.n_mem = 3;
+            for i in 0..p.db.a_db.len() {
+                if !p.db.a_db[i].has_bt { continue; }
+                let name = p.db.a_db[i].z_db_s_name.clone();
+                let Some(filename) = p.db.host.pragma_text(i, "filename") else {
+                    p.not_supported("PRAGMA database_list filename (V6b)");
+                    return;
+                };
+                row(p, vec![PragmaCell::Int(i as i32), name.into(), filename.into()]);
+            }
+        }
         15 => foreign_key_check(p, i_db, right, z_db.as_deref()),
         16 => foreign_key_list(p, right, z_db.as_deref()),
         19 => {

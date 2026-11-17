@@ -518,9 +518,13 @@ impl Mem {
                     Value::Real(self.i as f64)
                 }
             }
-            3 => Value::Text(match std::str::from_utf8(&self.z) {
-                Ok(s) => s.to_owned(),
-                Err(_) => String::from_utf8_lossy(&self.z).into_owned(),
+            3 => Value::Text(match self.enc {
+                2 => sqliters_types::TextEncoding::Utf16Le.decode_bytes(&self.z),
+                3 => sqliters_types::TextEncoding::Utf16Be.decode_bytes(&self.z),
+                _ => match std::str::from_utf8(&self.z) {
+                    Ok(s) => s.to_owned(),
+                    Err(_) => String::from_utf8_lossy(&self.z).into_owned(),
+                },
             }),
             _ => {
                 if self.flags & MEM_ZERO != 0 {

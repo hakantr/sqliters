@@ -5183,6 +5183,7 @@ pub struct Statement {
     compiled_schema_generation: u64,
     compiled_v1_expire_generation: u64,
     compiled_advisory_expire_generation: u64,
+    compiled_c_expire_seq: u64,
     compiled_slot_cookies: Vec<(SchemaInstanceId, u32, bool)>,
     expired: bool,
     column_names: Vec<String>,
@@ -6007,6 +6008,29 @@ fn prepare_default_cache_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>
     }
     Ok(prepare_pragma_program(inner, sql)?.and_then(|p| p.a_op.iter()
         .find(|op| op.opcode == sqliters_vdbe::opcodes::OP_SetCookie && op.p2 == 3).map(|op| op.p3)))
+}
+
+/// A data-free PRAGMA with multiple frozen rows runs on the C machine in both
+/// diagnostic switch states; execution owns progress and runOnlyOnce expiry.
+fn prepare_row_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str)
+    -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>>
+{
+    if !matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("database_list")) {
+        return Ok(None);
+    }
+    let Some(program) = prepare_pragma_program(inner, sql)? else { return Ok(None); };
+    if program.btree_mask != 0 || sqliters_vdbe::vdbe::unsupported_reason(&program).is_some() {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(*program)))
+}
+
+fn apply_row_pragma(artifacts: &mut CompiledArtifacts, program: &sqliters_vdbe::vdbeaux::Program) {
+    artifacts.category = Some(StmtCategory::Read);
+    artifacts.requires_schema = false;
+    artifacts.compiled_vdbe = None;
+    artifacts.compiled_fast_read = None;
+    artifacts.column_names = vdbe_host::column_names(program).unwrap_or_default();
 }
 
 #[derive(Clone, Copy)]
@@ -7308,7 +7332,9 @@ impl Statement {
             None => Box::new(sqliters_vdbe::vdbe::Vdbe::new(prog)),
         };
 
-        match vdbe_host::step(inner, shared, hid, &mut vm, &self.params, true, &self.raw_sql) {
+        let result = vdbe_host::step(inner, shared, hid, &mut vm, &self.params, true, &self.raw_sql);
+        if vm.expired_on_reset { self.expired = true; }
+        match result {
             Ok(Some(row)) => {
                 if vm.prog.uses_vtab() {
                     let keys = vdbe_host::positioned_vtab_keys(inner, &vm);
@@ -7393,6 +7419,7 @@ impl Statement {
             unreachable!("machine_advance requires a statement suspended on the machine");
         };
         let res = vdbe_host::step(inner, shared, hid, vm, &self.params, false, &self.raw_sql);
+        if vm.expired_on_reset { self.expired = true; }
         if let Ok(Some(row)) = res {
             if vm.prog.uses_vtab() {
                 let keys = vdbe_host::positioned_vtab_keys(inner, vm);
@@ -7717,6 +7744,7 @@ impl Statement {
             }
         };
         let c_prepared_pragma = prepare_constant_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
+        let c_row_pragma = prepare_row_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
         let c_prepared_default_cache = prepare_default_cache_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
         let c_prepared_auto_vacuum = prepare_auto_vacuum_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
         // C's ALTER TABLE (RENAME TO, RENAME COLUMN, DROP COLUMN of a non-TEMP table) reads
@@ -7917,8 +7945,13 @@ impl Statement {
             }
         }
 
-        let c_machine = Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some())?
-            .or_else(|| schema_free_fallback.into_inner());
+        let c_machine = if let Some(program) = c_row_pragma {
+            apply_row_pragma(&mut artifacts, &program);
+            Some(program)
+        } else {
+            Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some())?
+                .or_else(|| schema_free_fallback.into_inner())
+        };
         if let Some(out) = &c_prepared_pragma {
             artifacts.category = Some(StmtCategory::NoLockPragma);
             artifacts.column_names = out.column_names.clone();
@@ -7952,6 +7985,7 @@ impl Statement {
             compiled_schema_generation: inner.schema_generation,
             compiled_v1_expire_generation: inner.v1_expire_generation,
             compiled_advisory_expire_generation: inner.advisory_expire_generation,
+            compiled_c_expire_seq: inner.db_set.c_expire_seq(),
             compiled_slot_cookies: inner.snapshot_slot_cookies(),
             expired: false,
             column_names: artifacts.column_names,
@@ -8474,6 +8508,7 @@ impl Statement {
     fn needs_reprepare(&self, inner: &ConnectionInner) -> bool {
         if self.expired
             || self.compiled_advisory_expire_generation != inner.advisory_expire_generation
+            || self.compiled_c_expire_seq != inner.db_set.c_expire_seq()
         {
             return true;
         }
@@ -8546,6 +8581,7 @@ impl Statement {
             };
             apply_codegen_pragma_effects(inner)?;
             let c_prepared_pragma = prepare_constant_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
+            let c_row_pragma = prepare_row_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
             self.c_prepared_default_cache = prepare_default_cache_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
             let c_prepared_auto_vacuum = prepare_auto_vacuum_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
             self.c_prepared_auto_vacuum = c_prepared_auto_vacuum;
@@ -8619,8 +8655,13 @@ impl Statement {
                 artifacts.requires_schema = false;
                 artifacts.column_names = explain_column_names(prog.explain);
             }
-            let c_machine = Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some())?
-                .or(schema_free_fallback);
+            let c_machine = if let Some(program) = c_row_pragma {
+                apply_row_pragma(&mut artifacts, &program);
+                Some(program)
+            } else {
+                Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some())?
+                    .or(schema_free_fallback)
+            };
             if let Some(prog) = &c_write
                 && artifacts.category != Some(StmtCategory::Control)
             {
@@ -8655,6 +8696,7 @@ impl Statement {
             self.compiled_schema_generation = inner.schema_generation;
             self.compiled_v1_expire_generation = inner.v1_expire_generation;
             self.compiled_advisory_expire_generation = inner.advisory_expire_generation;
+            self.compiled_c_expire_seq = inner.db_set.c_expire_seq();
             self.compiled_slot_cookies = inner.snapshot_slot_cookies();
             self.expired = false;
             if !self.needs_reprepare(inner) {
@@ -9940,7 +9982,7 @@ impl Statement {
                 }
                 inner.activity.start_with_instances(
                     hid,
-                    true,
+                    self.c_machine.as_ref().is_none_or(|program| program.b_is_reader),
                     false,
                     read_instances.clone(),
                     Vec::new(),

@@ -1126,6 +1126,8 @@ pub trait Host {
     fn pragma_int(&self, _i_db: usize, _name: &str) -> Option<i64> {
         None
     }
+    /// A lossless UTF-8 prepare-time pager string. None leaves the handler unsupported.
+    fn pragma_text(&self, _i_db: usize, _name: &str) -> Option<String> { None }
     /// pragma.c changes these values during prepare, including under EXPLAIN.
     fn note_pragma_effect(&self, _effect: crate::pragma::PrepareEffect) {}
     /// `sqlite3ReadSchema()` -> `sqlite3Init()` did work: C's connection has its schemas loaded

@@ -88,6 +88,8 @@ pub const SQLITE_STMTSTATUS_FILTER_HIT: usize = 8;
 
 /// What the machine needs of the connection (`sqlite3 *db`).
 pub trait VdbeHost {
+    /// `ENC(db)` used by OP_String8's conversion before its length check.
+    fn text_encoding(&self) -> sqliters_types::TextEncoding { sqliters_types::TextEncoding::Utf8 }
     /// `db->aDb[iDb].pBt`
     fn btree(&mut self, i_db: usize) -> Option<&mut Btree>;
     /// `OP_Transaction` on a read statement: `sqlite3BtreeBeginTrans(pBt, 0, &iMeta)`;
@@ -847,6 +849,8 @@ pub struct Vdbe {
     /// `expired==1`: `sqlite3ExpirePreparedStatements(db, 0)` ran while the statement was
     /// running.
     pub expired: bool,
+    /// `expired==2` set by the current statement's OP_Expire P2=1.
+    pub expired_on_reset: bool,
     /// For the host: its expiry sequence number when the execution started.
     pub expire_seq: u64,
     /// Executed instructions (`nVmStep`)
@@ -952,7 +956,7 @@ fn unsupported(prog: &Program, write: bool) -> Option<String> {
     }
     let subs = prog.p_program.iter().flat_map(|s| s.a_op.iter());
     for op in prog.a_op.iter().chain(subs) {
-        let ok = matches!(
+        let ok = (op.opcode == OP_Expire && op.p1 != 0 && op.p2 == 1) || matches!(
             op.opcode,
             OP_Init
                 | OP_Goto
@@ -1454,6 +1458,7 @@ impl Vdbe {
             min_write_file_format: mwf,
             halted: false,
             expired: false,
+            expired_on_reset: false,
             expire_seq: 0,
             n_vm_step: 0,
             call_steps: 0,
@@ -1875,6 +1880,7 @@ impl Vdbe {
         }
         self.halted = false;
         self.expired = false;
+        self.expired_on_reset = false;
         self.n_change = 0;
         // sqlite3VdbeRewind: "p->nFkConstraint = 0"
         self.n_fk_constraint = 0;
@@ -2092,6 +2098,10 @@ impl Vdbe {
             match op.opcode {
                 OP_Goto => jump_check!(op.p2),
 
+                // vdbe.c:8386–8393. Global/immediate expiration remains outside
+                // the supported subset; runOnlyOnce PRAGMAs use this self/advisory form.
+                OP_Expire if op.p1 != 0 && op.p2 == 1 => self.expired_on_reset = true,
+
                 OP_Gosub => {
                     let m = &mut self.a_mem[op.p1 as usize];
                     m.flags = MEM_INT;
@@ -2237,10 +2247,20 @@ impl Vdbe {
                         return Err(too_big());
                     }
                     let is_blob = op.p3 > 0 && self.a_mem[op.p3 as usize].i == i64::from(op.p5);
+                    let encoding = host.text_encoding();
                     let m = &mut self.a_mem[op.p2 as usize];
                     m.z.clear();
-                    m.z.extend_from_slice(&z[..n]);
-                    m.enc = 1;
+                    if op.opcode == OP_String8 && encoding != sqliters_types::TextEncoding::Utf8 {
+                        // Generated database_list strings are lossless UTF-8.
+                        // General invalid UTF-8 translation remains unported.
+                        let text = std::str::from_utf8(&z[..n])
+                            .map_err(|_| internal("unsupported UTF-16 String8 with invalid UTF-8"))?;
+                        encoding.encode_into(text, &mut m.z);
+                        if m.z.len() as i64 > i64::from(limit_length) { return Err(too_big()); }
+                    } else {
+                        m.z.extend_from_slice(&z[..n]);
+                    }
+                    m.enc = encoding as u8;
                     m.flags = if is_blob { MEM_BLOB | MEM_TERM } else { MEM_STR | MEM_TERM };
                 }
 

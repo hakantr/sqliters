@@ -98,6 +98,17 @@ fn func_flags(flags: FunctionFlags) -> u32 {
 }
 
 impl Host for EngineHost<'_> {
+    fn pragma_text(&self, i_db: usize, name: &str) -> Option<String> {
+        if name != "filename" { return None; }
+        let slot = self.db_set.slots().get(i_db)?;
+        // The generator can predict opening an unnamed TEMP Btree before the
+        // real prepare effects are applied to the connection.
+        if i_db == 1 && slot.btree.is_none() { return Some(String::new()); }
+        match slot.btree.as_ref()?.db_path() {
+            Some(path) => path.to_str().map(str::to_owned),
+            None => Some(String::new()),
+        }
+    }
     fn note_pragma_effect(&self, effect: sqliters_codegen::pragma::PrepareEffect) {
         C_PRAGMA_EFFECTS.with(|effects| effects.borrow_mut().push(effect));
     }
