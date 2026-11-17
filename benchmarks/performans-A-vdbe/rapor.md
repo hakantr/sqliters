@@ -502,3 +502,7 @@ Bağlı değer, maskeli bind/clear ve dummy Variable üretimi C ile hizalandı; 
 ## V6b.31 — UTF-16 LIKE ve ham kodlama kararları
 
 D139 kalan UTF-16 NOCASE, D140 NUL karşılaştırma/gruplama ve D141 ham Unicode aralık örnekleri eşitlendi. Açılan UTF-16 yolda bulunan TEXT/BLOB CAST ve sayısal dönüşüm farkları giderildi. 528 tam program, 72 ek SQL, 489145 ham dönüşüm/karşılaştırma ve 1587945 sayısal hücre gözleminde fark yok. İki anahtar testi ve dört kapı denetlendi; eski kusur/beklenti kümeleri korundu. Genel geçersiz TEXT API temsili, NOMEM, GLOB, kalan PRAGMA/M4 ve E28 açıktır. [Karar eşliği](karar_esligi_v6b_31.md).
+
+## V6b.32 — mmap hazırlama etkisi ve TEMP dosya ömrü
+
+MMAP_SIZE hazırlama etkisi ve VFS sınırı üreticiye taşındı; TEMP dosyası ilk yazma yerine ilk dirty spill’de açılır, küçük commit dirty sayfaları önbellekte bırakır. 270 TEMP akışı, 144 tam program ve 78 ek ifade aynı. Native mmap 240/250 eşit; dört D144 offset ve altı D142 mapped-reader farkı açık. nFetchOut/gerçek harita yaşamı sıradaki doğruluk işidir; mmap tamamlandı sayılmaz. Yeni F10–F12 test beklentileri C VFS gözlemcisiyle sınıflandırıldı, değiştirilmedi. [Kanıt](karar_esligi_v6b_32.md).

@@ -273,7 +273,7 @@ pub struct Pager {
     wal_path: Option<PathBuf>,
     shm_path: Option<PathBuf>,
 
-    /// Backing `.db` handle (`None` for lazy file-backed `PrivateTemporary` prior to first write,
+    /// Backing `.db` handle (`None` for lazy file-backed `PrivateTemporary` prior to first spill,
     /// or after [`Pager::close`]).
     file: Option<Box<dyn VfsFile>>,
     journal_file: Option<Box<dyn VfsFile>>,
@@ -414,6 +414,8 @@ pub struct Pager {
     /// PAGER_FULLFSYNC / PAGER_CKPT_FULLFSYNC, independent of the safety level.
     full_fsync: bool,
     checkpoint_full_fsync: bool,
+    /// Pager.szMmap. pagerOpentemp does not apply a pending request to the VFS.
+    mmap_limit: i64,
 }
 
 impl Pager {
@@ -674,6 +676,7 @@ impl Pager {
             backup_raw_staging: None,
             full_fsync: false,
             checkpoint_full_fsync: false,
+            mmap_limit: 0,
         })
     }
 
@@ -1728,7 +1731,7 @@ impl Pager {
         let fl = self.cache.flags(slot);
         if self.pending_byte_copy.is_some()
             || self.staged_raw_copy
-            || self.state != TransactionState::Write
+            || (self.state != TransactionState::Write && self.db_kind != DatabaseKind::PrivateTemporary)
         {
             // (an image staged in another page geometry is written as a whole at commit)
             return Ok(());
@@ -1995,6 +1998,14 @@ impl Pager {
     /// than Pager.dbSize, this means sqlite3PagerTruncateImage() was called to make the file
     /// smaller" — those are skipped, as is a page marked `PGHDR_DONT_WRITE`.
     fn pager_write_pagelist(&mut self, pgnos: &[Pgno]) -> Result<()> {
+        if !pgnos.is_empty() && self.db_kind == DatabaseKind::PrivateTemporary
+            && !self.is_memdb_backing && self.file.is_none()
+        {
+            // pager.c:4493–4502: open only when a dirty list reaches the file.
+            let file = self.vfs.open(None, OpenFlags::READWRITE | OpenFlags::CREATE
+                | OpenFlags::EXCLUSIVE | OpenFlags::TEMP_DB | OpenFlags::DELETEONCLOSE)?;
+            self.file = Some(file);
+        }
         let ps = u64::from(self.header.page_size);
         let lock_byte_pgno = self.lock_byte_page();
         // (`Pager.dbSize`; never below the b-tree's image)
@@ -2589,6 +2600,32 @@ impl Pager {
     #[inline]
     pub fn db_path(&self) -> Option<&Path> {
         self.db_path.as_deref()
+    }
+
+    /// sqlite3_file_control(..., SQLITE_FCNTL_MMAP_SIZE, -1).
+    pub fn mmap_size(&self) -> Result<Option<i64>> {
+        match self.file.as_ref() {
+            Some(file) => file.mmap_size(-1),
+            None => Ok(None),
+        }
+    }
+
+    /// sqlite3PagerSetMmapLimit / pagerFixMaplimit: file-control hint errors
+    /// are ignored; the following PRAGMA query is a separate operation.
+    pub fn set_mmap_limit(&mut self, limit: i64) {
+        self.mmap_limit = limit;
+        self.fix_mmap_limit();
+    }
+
+    fn fix_mmap_limit(&self) {
+        if let Some(file) = self.file.as_ref() {
+            let _ = file.mmap_size(self.mmap_limit);
+        }
+    }
+
+    /// Read-only generator inspection of the built-in VFS limit contract.
+    pub fn predict_mmap_size(&self, request: Option<i64>) -> Result<Option<i64>> {
+        self.mmap_size().map(|current| current.map(|n| request.map_or(n, |limit| limit.min(0x7fff0000))))
     }
 
     #[inline]
@@ -3294,26 +3331,6 @@ impl Pager {
         }
 
         let acquired_read_here = self.state == TransactionState::Open;
-
-        // Materialize lazy temporary `.db` file on first write transaction
-        if self.db_kind == DatabaseKind::PrivateTemporary
-            && !self.is_memdb_backing
-            && self.file.is_none()
-        {
-            let opened = self.vfs.open(
-                None,
-                OpenFlags::READWRITE
-                    | OpenFlags::CREATE
-                    | OpenFlags::EXCLUSIVE
-                    | OpenFlags::TEMP_DB
-                    | OpenFlags::DELETEONCLOSE,
-            )?;
-            self.file = Some(opened);
-            // If we were logically in `Read` on an unopened temp DB, acquire `Shared` on the new handle now.
-            if !acquired_read_here && let Err(e) = self.lock_db_file(LockLevel::Shared) {
-                return Err(e);
-            }
-        }
 
         if acquired_read_here {
             self.begin_read()?;
@@ -4843,6 +4860,15 @@ impl Pager {
         // (`sqlite3BtreeCommitPhaseOne`: "if( pBt->bDoTruncate ) sqlite3PagerTruncateImage(..)")
         self.db_size = self.page_count;
         let lock_byte_pgno = self.lock_byte_page();
+        if self.db_kind == DatabaseKind::PrivateTemporary && !self.is_memdb_backing
+            && (!self.cache_modified || self.file.is_none() || self.cache.percent_dirty() < 25)
+        {
+            // pagerFlushOnCommit / CommitPhaseOne: dirty TEMP pages remain in
+            // cache until spill; a later transaction must journal them anew.
+            if self.cache_modified { self.notify_backup_restart(); }
+            self.commit_phase_one_done = true;
+            return Ok(());
+        }
         let has_dirty_pages = self.cache.any_dirty_upto(self.page_count, lock_byte_pgno);
         let needs_db_flush = self.cache_modified
             || has_dirty_pages
@@ -5064,6 +5090,9 @@ impl Pager {
                     self.cache.clean_all();
                     self.cache.truncate(self.page_count);
                 }
+                if self.db_kind == DatabaseKind::PrivateTemporary && !self.is_memdb_backing {
+                    self.cache.clear_writable();
+                }
                 self.set_super = false;
                 self.staged_raw_copy = false;
                 self.backup_raw_staging = None;
@@ -5184,7 +5213,12 @@ impl Pager {
 
                 // pager_playback resets this; an empty WRITER_LOCKED rollback
                 // only ends the transaction and keeps the retained-lock flag.
-                if self.journal_started_in_tx { self.change_count_done = self.uses_temp_file_semantics(); }
+                if self.journal_started_in_tx {
+                    self.change_count_done = self.uses_temp_file_semantics();
+                    // readJournalHdr / end_playback restore page geometry via
+                    // sqlite3PagerSetPagesize, which also runs pagerFixMaplimit.
+                    self.fix_mmap_limit();
+                }
                 let orig_count = self.tx_orig_page_count;
 
                 // If `commit` already started modifying `.db` (`db_file_modified`), restore all
@@ -5238,7 +5272,11 @@ impl Pager {
                         d.copy_from_slice(&orig_data);
                     }
                 }
-                self.cache.clean_all();
+                if self.db_kind == DatabaseKind::PrivateTemporary && !self.is_memdb_backing {
+                    self.cache.clear_writable();
+                } else {
+                    self.cache.clean_all();
+                }
                 self.cache.truncate(orig_count);
 
                 self.page_count = orig_count;
@@ -5512,6 +5550,11 @@ impl Pager {
             return Ok(());
         }
         self.change_count_done = self.uses_temp_file_semantics();
+        if self.transaction_savepoint && index == 0 && !self.use_wal() && self.journal_started_in_tx {
+            // Transaction savepoint rollback uses pSavepoint=NULL, starts at
+            // journal offset zero and reads the main-journal header.
+            self.fix_mmap_limit();
+        }
         self.release_transient();
         // `sqlite3BtreeSavepoint(SAVEPOINT_ROLLBACK)` → `saveAllCursors(pBt, 0, 0)`: no cursor
         // keeps a page across the rollback (only the b-tree's reference on page 1 stays).

@@ -107,6 +107,11 @@ impl Host for EngineHost<'_> {
     fn pragma_collations(&self) -> Option<Vec<String>> {
         Some(self.collations.all_collation_names())
     }
+    fn pragma_mmap_size(&self, i_db: usize, request: Option<i64>) -> Option<sqliters_types::Result<Option<i64>>> {
+        let slot = self.db_set.slots().get(i_db)?;
+        if i_db == 1 && slot.btree.is_none() { return Some(Ok(None)); }
+        Some(slot.btree.as_ref()?.pager().predict_mmap_size(request))
+    }
     fn pragma_text(&self, i_db: usize, name: &str) -> Option<String> {
         if name != "filename" { return None; }
         let slot = self.db_set.slots().get(i_db)?;

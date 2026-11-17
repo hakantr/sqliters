@@ -5968,6 +5968,14 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) -> Result<()> {
     for effect in cgen::take_c_pragma_effects() {
         match effect {
             PrepareEffect::AnalysisLimit(n) => inner.db_set.set_analysis_limit(n),
+            PrepareEffect::MmapSize { i_db, limit } => {
+                if i_db.is_none() { inner.db_set.mmap_limit = limit; }
+                for (id, slot) in inner.db_set.slots_mut().iter_mut().enumerate().rev() {
+                    if i_db.is_none_or(|target| target == id)
+                        && let Some(bt) = slot.btree.as_mut()
+                    { bt.pager_mut().set_mmap_limit(limit); }
+                }
+            }
             PrepareEffect::LikeFunctions(case_sensitive) => {
                 let active = inner.activity.summary_excluding(HandleId(0), &inner.db_set).other_active != 0;
                 for arity in [2, 3] {
@@ -6123,7 +6131,7 @@ fn prepare_row_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &st
 {
     let defer_query = matches!(stmt, Some(Stmt::Pragma { name, value: None, .. })
         if name.eq_ignore_ascii_case("defer_foreign_keys"));
-    if !defer_query && !matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("database_list") || name.eq_ignore_ascii_case("collation_list") || name.eq_ignore_ascii_case("compile_options") || name.eq_ignore_ascii_case("case_sensitive_like")) {
+    if !defer_query && !matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("database_list") || name.eq_ignore_ascii_case("collation_list") || name.eq_ignore_ascii_case("compile_options") || name.eq_ignore_ascii_case("case_sensitive_like") || name.eq_ignore_ascii_case("mmap_size")) {
         return Ok(None);
     }
     let Some(program) = prepare_pragma_program(inner, sql)? else { return Ok(None); };

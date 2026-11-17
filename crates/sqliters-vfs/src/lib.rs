@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -199,6 +199,12 @@ pub trait VfsFile: Send + Sync {
     /// closed/faulted handles.
     fn lock_state_for_diagnostics(&self) -> Result<Option<LockLevel>> {
         Ok(Some(self.lock_level()))
+    }
+
+    /// SQLITE_FCNTL_MMAP_SIZE. Return the previous limit; a negative argument
+    /// only queries it. None means SQLITE_NOTFOUND for this VFS.
+    fn mmap_size(&self, _new_limit: i64) -> Result<Option<i64>> {
+        Ok(None)
     }
 
     /// Explicitly releases locks, closes (or defers closing under active POSIX locks) the
@@ -2089,6 +2095,7 @@ struct OsFile {
     delete_on_close: bool,
     readonly: bool,
     pending_dir_sync: AtomicBool,
+    mmap_size_max: AtomicI64,
     lock_geometry: LockGeometry,
     min_shm_granularity: usize,
     lock_level: Mutex<LockLevel>,
@@ -2118,6 +2125,18 @@ impl Drop for OsFile {
 }
 
 impl VfsFile for OsFile {
+    fn mmap_size(&self, new_limit: i64) -> Result<Option<i64>> {
+        self.file_ref()?;
+        // os_unix.c:4228–4244, the reference mxMmap is 0x7fff0000.
+        // This VFS has no outstanding xFetch pointers. Mapping is advisory;
+        // storing its limit does not require mapping pages.
+        let old = if new_limit >= 0 {
+            self.mmap_size_max.swap(new_limit.min(0x7fff0000), AtomicOrdering::Relaxed)
+        } else {
+            self.mmap_size_max.load(AtomicOrdering::Relaxed)
+        };
+        Ok(Some(old))
+    }
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
         let file = self.file_ref()?;
         #[cfg(unix)]
@@ -3506,6 +3525,7 @@ impl Vfs for OsVfs {
             delete_on_close,
             readonly,
             pending_dir_sync: AtomicBool::new(pending_dir_sync),
+            mmap_size_max: AtomicI64::new(0),
             lock_geometry: self.lock_geometry,
             min_shm_granularity: self.min_shm_granularity,
             lock_level: Mutex::new(LockLevel::NoLock),

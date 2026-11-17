@@ -38,6 +38,7 @@ pub enum PrepareEffect {
         i_db: usize,
         limit: i64,
     },
+    MmapSize { i_db: Option<usize>, limit: i64 },
     SecureDelete {
         i_db: Option<usize>,
         mode: u8,
@@ -273,6 +274,28 @@ pub fn sqlite3_pragma(
         None
     };
     match pragma.typ {
+        28 => {
+            // pragma.c:951–987: conversion status is deliberately ignored.
+            let request = right.map(|z| sqlite3_dec_or_hex_to_i64(z).0.max(0));
+            if let Some(limit) = request {
+                p.db.host.note_pragma_effect(PrepareEffect::MmapSize {
+                    i_db: z_db.as_ref().map(|_| i_db as usize),
+                    limit,
+                });
+            }
+            let Some(result) = p.db.host.pragma_mmap_size(i_db as usize, request) else {
+                p.not_supported("PRAGMA mmap_size file control (V6b)");
+                return;
+            };
+            match result {
+                Ok(Some(limit)) => return_int(p, limit),
+                Ok(None) => {},
+                Err(error) => {
+                    p.n_err += 1;
+                    p.rc = error.extended_code;
+                }
+            }
+        }
         1 => {
             // PragTyp_ANALYSIS_LIMIT, pragma.c:2733
             let n = right

@@ -977,6 +977,23 @@ impl PageCache {
         }
     }
 
+    /// sqlite3PcacheClearWritable: retain dirty pages across TEMP transactions.
+    pub(crate) fn clear_writable(&mut self) {
+        let mut id = self.p_dirty;
+        while id != NIL {
+            let slot = self.idents[id as usize].slot;
+            self.entries[slot as usize].flags &= !(PGHDR_NEED_SYNC | PGHDR_WRITEABLE);
+            id = self.idents[id as usize].d_next;
+        }
+        self.p_synced = self.p_dirty_tail;
+    }
+
+    /// sqlite3PCachePercentDirty, using numberOfCachePages rather than pagecount.
+    pub(crate) fn percent_dirty(&self) -> i32 {
+        let n = self.number_of_cache_pages();
+        if n == 0 { 0 } else { ((i64::from(self.n_dirty) * 100) / i64::from(n)) as i32 }
+    }
+
     /// `sqlite3PcacheClearSyncFlags`.
     pub(crate) fn clear_sync_flags(&mut self) {
         let mut id = self.p_dirty;

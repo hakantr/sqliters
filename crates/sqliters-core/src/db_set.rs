@@ -312,6 +312,8 @@ pub struct DatabaseSet {
     pub(crate) next_page_size: i32,
     /// sqlite3.nextAutovac: the last request, even if the Btree refused to change.
     pub(crate) next_auto_vacuum: Option<AutoVacuumMode>,
+    /// sqlite3.szMmap: inherited by subsequently attached/opened databases.
+    pub(crate) mmap_limit: i64,
 }
 
 impl std::fmt::Debug for DatabaseSet {
@@ -413,6 +415,7 @@ impl DatabaseSet {
             c_expire_seq: 0,
             next_page_size: 0,
             next_auto_vacuum: None,
+            mmap_limit: 0,
             xferopt_delta: std::sync::atomic::AtomicU64::new(0),
             open_blobs: std::collections::HashMap::new(),
             vtab_registry: crate::vtab::VTabRegistry::new(),
@@ -1395,6 +1398,9 @@ impl DatabaseSet {
                 ..PagerOpenOptions::default()
             };
             let mut bt = Btree::open_private_temporary(Arc::clone(&self.disk_vfs), opts)?;
+            // btree.c:2715 initializes Pager.szMmap even when its TEMP fd is
+            // unopened. pagerOpentemp does not later apply it to the new fd.
+            bt.pager_mut().set_mmap_limit(self.mmap_limit);
             bt.pager_mut().set_pragma_page_size(self.next_page_size);
             bt.set_interrupt_flag(Some(Arc::clone(&self.interrupt_flag)));
             bt.set_writable_schema(writable_schema);
@@ -1933,6 +1939,7 @@ impl DatabaseSet {
         // attach.c: "sqlite3BtreeSetPagerFlags(pNew->pBt, PAGER_SYNCHRONOUS_FULL | (db->flags &
         // PAGER_FLAGS_MASK))" — the new database takes the connection's `cache_spill` setting.
         btree.set_cache_spill(self.cache_spill);
+        btree.pager_mut().set_mmap_limit(self.mmap_limit);
         let instance_id = SchemaInstanceId(self.next_schema_instance_id);
         self.next_schema_instance_id += 1;
         let db_id = DatabaseId(self.slots.len());

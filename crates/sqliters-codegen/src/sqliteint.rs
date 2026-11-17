@@ -1148,6 +1148,9 @@ pub trait Host {
     fn pragma_text(&self, _i_db: usize, _name: &str) -> Option<String> { None }
     /// C's live aCollSeq hash order, including entries whose comparator was removed.
     fn pragma_collations(&self) -> Option<Vec<String>> { None }
+    /// A read-only prediction of the MMAP_SIZE file-control result. The outer
+    /// None leaves the handler unsupported; inner None is SQLITE_NOTFOUND.
+    fn pragma_mmap_size(&self, _i_db: usize, _request: Option<i64>) -> Option<sqliters_types::Result<Option<i64>>> { None }
     /// pragma.c changes these values during prepare, including under EXPLAIN.
     fn note_pragma_effect(&self, _effect: crate::pragma::PrepareEffect) {}
     /// `sqlite3ReadSchema()` -> `sqlite3Init()` did work: C's connection has its schemas loaded
