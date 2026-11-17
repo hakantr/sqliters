@@ -35,7 +35,8 @@
 | V6b.15 — threads hazırlama ve sınır | `f539575` | C sayı kabulü, maske, 8 sınırı, donmuş satır, pragma_threads | 15456 EXPLAIN/EQP; 13009 tam program; API3995/3996 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1103/0; açık 1088/15 bilinen; 337 yok sayıldı |
 | V6b.16 — shrink_memory hazırlama etkisi | `1c0e7e8` | Bütün açık pager’lar, reset/EXPLAIN ayrımı; D117 açık hata farkı | 15632 EXPLAIN/EQP; 13181 program; API 4157/4158 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1104/0; açık 1089/15 bilinen; 337 yok sayıldı |
 | V6b.17 — D117 sıcak başlık kontrolü | `565ab23` | 16 byte sürüm, retained reader ve pending WAL; D118 açık | 13181 program; API 4157/4158 aynı, bütün dosyalar aynı; 30 hata yoklaması | Yeniden ölçülmedi | kapalı 1107/0; açık 1092/15 bilinen; 337 yok sayıldı |
-| V6b.18 — D119 sayfa1 hata aktarımı | bu commit | Okuyucu IOERR rollback, reprepare ayrımı ve callback/sayaçlar | 13181 program; API 4157/4158 aynı, bütün dosyalar aynı;56/16/64 native | Yeniden ölçülmedi | kapalı 1110/0; açık 1095/15 bilinen;337 yok sayıldı |
+| V6b.18 — D119 sayfa1 hata aktarımı | `a7a7cbd` | Okuyucu IOERR rollback, reprepare ayrımı ve callback/sayaçlar | 13181 program; API 4157/4158 aynı, bütün dosyalar aynı; 56/16/64 native | 1,063× taban; W14 1,362× | kapalı 1110/0; açık 1095/15 bilinen; 337 yok sayıldı |
+| V6b.19 — D118 kısa okuma | bu commit | DB/WAL SHORT_READ ayrımı, hata metinleri | 640 akış: 624 aynı, 16 açık; bütün dosyalar aynı | 1,069× taban; W14 1,379× | kapalı 1112/0; açık 1097/15 bilinen; 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -440,3 +441,7 @@ Sıcak okumanın D117 IOERR_READ farkı yoklanan 30 akışta giderildi; pending 
 ## V6b.18 — D119
 
 Sayfa1 okuma hatası artık yutulmuyor. Yürütme ve hazırlama hata aşamaları farklı rollback kararlarını izliyor; 56 yürütme, 16 reprepare ve 64 callback/sayaç akışı doğrulandı. D118 kısa okuma sonraki adım; genel E28/M4/legacy hızlı yollar açık. Kanıt [karar_esligi_v6b_18.md](karar_esligi_v6b_18.md) içinde.
+
+## V6b.19 — D118 kısa okuma
+
+Başlık kısa okuma düzeltildi; genişletilmiş matris 640 akışın 624’ünde eşlik gösterdi. D120/D121/D122 toplam 16 kusur açık; bütün dosya baytları aynı. D118 tam kapanmadı; sırada sayfa1 yükleme/önbellek eşliği var. Kanıt [karar_esligi_v6b_19.md](karar_esligi_v6b_19.md) içinde.

@@ -185,7 +185,7 @@ impl DatabaseHeader {
         if buf.len() < DB_HEADER_SIZE {
             return Err(SqliteError::new(
                 ErrorCode::NotADb,
-                "file is shorter than 100-byte SQLite header",
+                "file is not a database",
             ));
         }
         if &buf[0..16] != SQLITE_FILE_HEADER {
@@ -204,7 +204,7 @@ impl DatabaseHeader {
         if !Self::is_valid_page_size(page_size) {
             return Err(SqliteError::new(
                 ErrorCode::NotADb,
-                format!("invalid SQLite page size: {page_size}"),
+                "file is not a database",
             ));
         }
 
@@ -213,9 +213,7 @@ impl DatabaseHeader {
         if write_version == 0 || read_version == 0 || read_version > 2 {
             return Err(SqliteError::new(
                 ErrorCode::NotADb,
-                format!(
-                    "unsupported SQLite format versions: write={write_version}, read={read_version}"
-                ),
+                "file is not a database",
             ));
         }
 
@@ -224,7 +222,7 @@ impl DatabaseHeader {
         if usable < 480 {
             return Err(SqliteError::new(
                 ErrorCode::NotADb,
-                "usable page size is less than 480 bytes",
+                "file is not a database",
             ));
         }
 
@@ -232,7 +230,7 @@ impl DatabaseHeader {
         if buf[21] != 64 || buf[22] != 32 || buf[23] != 32 {
             return Err(SqliteError::new(
                 ErrorCode::NotADb,
-                "invalid embedded payload fractions in SQLite header",
+                "file is not a database",
             ));
         }
 
@@ -247,7 +245,7 @@ impl DatabaseHeader {
         let Some(enc) = TextEncoding::from_header_u32(text_encoding) else {
             return Err(SqliteError::new(
                 ErrorCode::NotADb,
-                format!("invalid SQLite text encoding in header: {text_encoding}"),
+                "file is not a database",
             ));
         };
         let normalized_encoding = enc as u32;

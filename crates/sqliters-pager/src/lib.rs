@@ -1611,14 +1611,7 @@ impl Pager {
                 .file
                 .as_deref()
                 .ok_or_else(|| SqliteError::misuse("database file is not open"))?;
-            match file.read_at(buf, offset) {
-                Ok(n) => {
-                    if n < ps { buf[n..].fill(0); }
-                    Ok(())
-                }
-                Err(e) if e.extended_code == extended::SQLITE_IOERR_SHORT_READ => Ok(()),
-                Err(e) => Err(e),
-            }
+            Self::read_database_bytes(file, buf, offset)
         };
         if pgno == 1 {
             if result.is_ok() {
@@ -1631,6 +1624,19 @@ impl Pager {
             self.db_file_vers_cc = u32::from_be_bytes(self.db_file_vers[..4].try_into().unwrap());
         }
         result
+    }
+
+    /// readDbPage / sqlite3PagerReadFileheader accept a database short read:
+    /// the VFS has already zeroed the unread tail. WAL frame reads keep the error.
+    fn read_database_bytes(file: &dyn VfsFile, buf: &mut [u8], offset: u64) -> Result<()> {
+        match file.read_at(buf, offset) {
+            Ok(n) => {
+                if n < buf.len() { buf[n..].fill(0); }
+                Ok(())
+            }
+            Err(e) if e.extended_code == extended::SQLITE_IOERR_SHORT_READ => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// `sqlite3PcacheFetchStress`: the cache is nearly full of pages it cannot recycle. "Find
@@ -2707,7 +2713,7 @@ impl Pager {
     pub fn read_btree_header_at_open(&mut self) -> Result<()> {
         let mut bytes = [0u8; DB_HEADER_SIZE];
         if let Some(file) = self.file.as_deref() {
-            file.read_at(&mut bytes, 0)?;
+            Self::read_database_bytes(file, &mut bytes, 0)?;
         }
         let size = (u32::from(bytes[16]) << 8) | (u32::from(bytes[17]) << 16);
         if DatabaseHeader::is_valid_page_size(size) {
@@ -2964,13 +2970,7 @@ impl Pager {
                 }
 
                 let mut hdr_bytes = [0u8; DB_HEADER_SIZE];
-                let n = self.db_file()?.read_at(&mut hdr_bytes, 0)?;
-                if n < DB_HEADER_SIZE {
-                    return Err(SqliteError::new(
-                        ErrorCode::NotADb,
-                        "short read on database header",
-                    ));
-                }
+                Self::read_database_bytes(self.db_file()?, &mut hdr_bytes, 0)?;
 
                 let mut disk_hdr = DatabaseHeader::parse(&hdr_bytes)?;
                 if disk_hdr.forces_readonly() {
@@ -3108,13 +3108,7 @@ impl Pager {
                     "file is not a database",
                 ));
             }
-            let n = self.db_file()?.read_at(&mut hdr_bytes, 0)?;
-            if n < DB_HEADER_SIZE {
-                return Err(SqliteError::new(
-                    ErrorCode::NotADb,
-                    "short read on database header",
-                ));
-            }
+            Self::read_database_bytes(self.db_file()?, &mut hdr_bytes, 0)?;
         }
 
         let mut snap_hdr = DatabaseHeader::parse(&hdr_bytes)?;
@@ -7317,6 +7311,9 @@ mod tests {
         fail_db_prefix_read: std::sync::atomic::AtomicBool,
         fail_db_file_size: std::sync::atomic::AtomicBool,
         fail_page1_payload_read: std::sync::atomic::AtomicBool,
+        /// Prefix preserved by a database/WAL short read; bool selects Ok(n) vs IOERR_SHORT_READ.
+        short_page1: Mutex<Option<(usize, bool)>>,
+        short_wal_only: std::sync::atomic::AtomicBool,
         db_reads: Mutex<Vec<(u64, usize)>>,
         /// `xFileSize` of `<db>-wal` fails.
         fail_wal_file_size: std::sync::atomic::AtomicBool,
@@ -7384,6 +7381,16 @@ mod tests {
 
     impl VfsFile for FaultFile {
         fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+            if buf.len() >= DB_HEADER_SIZE
+                && ((self.is_db && offset == 0 && !self.ctl.short_wal_only.load(std::sync::atomic::Ordering::Relaxed)) || self.is_wal)
+                && let Some((prefix, as_count)) = *self.ctl.short_page1.lock().unwrap()
+            {
+                let n = self.inner.read_at(buf, offset)?.min(prefix);
+                buf[n..].fill(0);
+                return if as_count { Ok(n) } else {
+                    Err(SqliteError::with_extended(extended::SQLITE_IOERR_SHORT_READ, "disk I/O error"))
+                };
+            }
             if self.ctl.fail_page1_payload_read.load(std::sync::atomic::Ordering::Relaxed)
                 && buf.len() >= 512 && ((self.is_db && offset == 0) || self.is_wal)
             {
@@ -7555,6 +7562,61 @@ mod tests {
         pager.end_read_if_unused().unwrap();
         pager.begin_read().unwrap();
         assert_eq!(pager.data_version(), version.wrapping_add(1));
+        pager.end_read_if_unused().unwrap();
+        pager.close().unwrap();
+    }
+
+    #[test]
+    fn database_short_read_preserves_prefix_and_retries_after_invalid_header() {
+        for as_count in [false, true] {
+            for prefix in [0, 8, DB_HEADER_SIZE, 512] {
+                let ctl = Arc::new(FaultCtl::default());
+                let vfs = Arc::new(FaultVfs { inner: Arc::new(MemoryVfs::new()), ctl: ctl.clone() });
+                let mut pager = Pager::open_with_vfs(vfs, Some(Path::new("short.db")),
+                    OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB).unwrap();
+                pager.begin_write().unwrap();
+                pager.commit().unwrap();
+                pager.shrink_memory();
+                *ctl.short_page1.lock().unwrap() = Some((prefix, as_count));
+                // The unlocked open-time header hint also accepts SHORT_READ.
+                pager.read_btree_header_at_open().unwrap();
+                if prefix < 16 {
+                    assert_eq!(pager.begin_read().unwrap_err().code, ErrorCode::NotADb);
+                    assert_eq!(pager.transaction_state(), TransactionState::Open);
+                } else {
+                    pager.begin_read().unwrap();
+                    let p1 = pager.read_page(1).unwrap();
+                    assert_eq!(&p1[..16], b"SQLite format 3\0");
+                    assert!(p1[prefix..].iter().all(|b| *b == 0));
+                    pager.end_read_if_unused().unwrap();
+                }
+                *ctl.short_page1.lock().unwrap() = None;
+                pager.shrink_memory();
+                pager.begin_read().unwrap();
+                pager.end_read_if_unused().unwrap();
+                pager.close().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn wal_short_read_remains_an_io_error() {
+        let ctl = Arc::new(FaultCtl::default());
+        let vfs = Arc::new(FaultVfs { inner: Arc::new(MemoryVfs::new()), ctl: ctl.clone() });
+        let mut pager = Pager::open_with_vfs(vfs, Some(Path::new("short_wal.db")),
+            OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB).unwrap();
+        pager.begin_write().unwrap();
+        pager.commit().unwrap();
+        pager.set_journal_mode(JournalMode::Wal).unwrap();
+        pager.begin_write().unwrap();
+        pager.header_mut().unwrap().user_version = 1;
+        pager.commit().unwrap();
+        pager.shrink_memory();
+        ctl.short_wal_only.store(true, std::sync::atomic::Ordering::Relaxed);
+        *ctl.short_page1.lock().unwrap() = Some((0, false));
+        assert_eq!(pager.begin_read().unwrap_err().extended_code, extended::SQLITE_IOERR_SHORT_READ);
+        *ctl.short_page1.lock().unwrap() = None;
+        pager.begin_read().unwrap();
         pager.end_read_if_unused().unwrap();
         pager.close().unwrap();
     }

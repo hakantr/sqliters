@@ -28,9 +28,7 @@ impl BtreePageType {
             0x05 => Ok(Self::TableInterior),
             0x0a => Ok(Self::IndexLeaf),
             0x0d => Ok(Self::TableLeaf),
-            other => Err(SqliteError::corrupt(format!(
-                "invalid btree page flags byte: {other:#04x}"
-            ))),
+            _ => Err(SqliteError::corrupt("database disk image is malformed")),
         }
     }
 
