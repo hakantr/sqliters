@@ -35,6 +35,8 @@ struct EngineHost<'a> {
     default_locking_mode: i64,
     /// set by [`Host::note_schema_loaded`]
     schema_loaded: std::cell::Cell<bool>,
+    /// Inspect schema use without invoking application virtual-table callbacks.
+    schema_probe: bool,
     /// The virtual-table instances handed to the generator: id -> (database, table)
     vtabs: std::cell::RefCell<Vec<(u64, String, String)>>,
 }
@@ -259,6 +261,7 @@ impl Host for EngineHost<'_> {
     }
 
     fn vtab_module(&self, name: &str, lazy: bool) -> Option<VtabModule> {
+        if self.schema_probe { return None; }
         let reg = self.db_set.vtab_registry();
         let (module, reg_name) = match reg.get_module(name) {
             Some(m) => (m, reg.registered_module_name(name).unwrap_or(name).to_owned()),
@@ -278,6 +281,7 @@ impl Host for EngineHost<'_> {
     }
 
     fn vtab_connect(&self, i_db: usize, table: &str, _module: &str, _args: &[String], eponymous: bool) -> VtabConnect {
+        if self.schema_probe { return VtabConnect::Unsupported; }
         let Some(slot) = self.db_set.slots().get(i_db) else { return VtabConnect::Unsupported };
         let reg = self.db_set.vtab_registry();
         // (the engine connects the virtual tables a statement names before the generator runs,
@@ -448,6 +452,35 @@ pub(crate) fn c_prepare_quiet(inner: &ConnectionInner, sql: &str) -> (PrepareRes
 /// Run C's parser and code generator over one statement (`sqlite3Prepare`).
 /// The third value: C's `sqlite3Init()` loaded the schemas during this prepare.
 pub(crate) fn c_prepare(inner: &ConnectionInner, sql: &str) -> (PrepareResult, usize, bool) {
+    c_prepare_impl(inner, sql, false)
+}
+
+/// SELECT decisions made by C's compiler with the schema cache assumed unloaded.
+/// A false `reads_schema` proves this prepare does not need a schema load even
+/// after RESET. A returned program also describes execution's Btree use.
+pub(crate) struct SelectSchemaUse {
+    pub reads_schema: bool,
+    pub btree_mask: Option<u32>,
+}
+
+pub(crate) fn select_schema_use(inner: &ConnectionInner, sql: &str) -> Option<SelectSchemaUse> {
+    let effects = take_c_pragma_effects();
+    let temp = take_c_temp_opened();
+    let rowest = take_c_rowest_clamped();
+    let quiet = C_QUIET.with(|c| c.replace(true));
+    let (result, _, reads_schema) = c_prepare_impl(inner, sql, true);
+    C_QUIET.with(|c| c.set(quiet));
+    C_PRAGMA_EFFECTS.with(|c| *c.borrow_mut() = effects);
+    C_TEMP_OPENED.with(|c| c.set(temp));
+    C_ROWEST.with(|c| *c.borrow_mut() = rowest);
+    match result {
+        PrepareResult::Program(p) => Some(SelectSchemaUse { reads_schema, btree_mask: Some(p.btree_mask) }),
+        PrepareResult::Error { .. } => Some(SelectSchemaUse { reads_schema, btree_mask: None }),
+        PrepareResult::Unsupported(_) => None,
+    }
+}
+
+fn c_prepare_impl(inner: &ConnectionInner, sql: &str, schema_probe: bool) -> (PrepareResult, usize, bool) {
     let host = EngineHost {
         functions: &inner.functions,
         collations: &inner.collations,
@@ -456,15 +489,22 @@ pub(crate) fn c_prepare(inner: &ConnectionInner, sql: &str) -> (PrepareResult, u
         wal_autocheckpoint: inner.wal_autocheckpoint_threshold,
         default_locking_mode: i64::from(inner.default_locking_mode == sqliters_pager::LockingMode::Exclusive),
         schema_loaded: std::cell::Cell::new(false),
+        schema_probe,
         vtabs: std::cell::RefCell::new(Vec::new()),
     };
-    if schema_dump_on() && sql.contains("/*#schemadump*/") {
+    if schema_dump_on() && !C_QUIET.with(std::cell::Cell::get) && sql.contains("/*#schemadump*/") {
         // Verification aid: the schema objects as the generator loads them, on stderr.
         for l in sqliters_codegen::schema_dump(make_db(inner, &host)) {
             eprintln!("sd: {l}");
         }
     }
-    let db = make_db(inner, &host);
+    let mut db = make_db(inner, &host);
+    if schema_probe {
+        // Counterfactual cache state only; EncodingFixed remains the real
+        // connection's bit (parse.y:523). No connection metadata is changed.
+        db.schema_not_loaded = true;
+        db.m_db_flags &= !(sqliters_codegen::consts::DBFLAG_SchemaKnownOk as u32);
+    }
     if where_dump_on() && !C_QUIET.with(std::cell::Cell::get) {
         // Verification aid: the planner's term / loop / path dump on stderr, before the
         // `cg:` trace line of the statement.

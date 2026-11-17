@@ -3523,7 +3523,11 @@ impl Connection {
         // after a literal INSERT that bypassed prepare (prepare.c:104).
         session.inner_mut().db_set.c_note_encoding_fixed();
         if let Ok((Some(st), _)) = parse_one(sql) {
-            if stmt_loads_schema_on_prepare(&st) || crate::engine::c_pragma_reads_schema(&st) {
+            let schema_use = select_schema_use_of(session.inner(), &st, sql);
+            let needs_schema = schema_use.as_ref().map_or_else(
+                || stmt_loads_schema_on_prepare(&st), |usage| usage.reads_schema,
+            );
+            if needs_schema || crate::engine::c_pragma_reads_schema(&st) {
                 let inner = session.inner_mut();
                 let unloaded = inner.db_set.c_any_schema_unloaded();
                 inner.db_set.set_c_prepare_unloaded(unloaded);
@@ -5294,6 +5298,43 @@ struct CompiledArtifacts {
     max_param: usize,
     named_params: HashMap<String, usize>,
     ignored_fk_parent_tables: Vec<(DatabaseId, String)>,
+}
+
+fn select_schema_use_of(inner: &ConnectionInner, stmt: &Stmt, sql: &str) -> Option<cgen::SelectSchemaUse> {
+    let mut body = stmt;
+    while let Stmt::Explain { stmt: nested, .. } = body { body = nested; }
+    matches!(body, Stmt::Select(_)).then(|| cgen::select_schema_use(inner, sql)).flatten()
+}
+
+fn apply_select_schema_use(artifacts: &mut CompiledArtifacts, usage: Option<&cgen::SelectSchemaUse>) {
+    if usage.is_some_and(|usage| usage.btree_mask == Some(0)) {
+        artifacts.requires_schema = false;
+        // Legacy plans may retain a source C eliminated (e.g. an unused CTE).
+        if artifacts.compiled_vdbe.as_ref().is_some_and(|p| p.referenced_db_mask() != 0) {
+            artifacts.compiled_vdbe = None;
+        }
+        artifacts.compiled_fast_read = None;
+    }
+}
+
+fn schema_free_read_fallback(
+    inner: &ConnectionInner, stmt: Option<Stmt>, sql: &str,
+) -> Result<Option<(CompiledArtifacts, Arc<sqliters_vdbe::vdbeaux::Program>)>> {
+    let mut artifacts = read_artifacts(stmt, Vec::new());
+    let Some(program) = vdbe_host::schema_free_read_program(inner, artifacts.stmt.as_ref(), sql, artifacts.max_param)? else {
+        return Ok(None);
+    };
+    artifacts.column_names = vdbe_host::column_names(&program).unwrap_or_default();
+    artifacts.requires_schema = false;
+    Ok(Some((artifacts, program)))
+}
+
+fn prepared_read_roots(stmt: &Stmt, requires_schema: bool, db_set: &DatabaseSet) -> Vec<LeaseCursorSpec> {
+    if !requires_schema && matches!(stmt, Stmt::Select(_)) {
+        Vec::new()
+    } else {
+        collect_select_referenced_roots(stmt, db_set)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7539,7 +7580,10 @@ impl Statement {
         let raw_sql = sql[..consumed_len].to_owned();
         let unparsed_tail = tail.to_owned();
 
-        let needs_schema = stmt_opt.as_ref().is_some_and(stmt_loads_schema_on_prepare);
+        let select_schema_use = stmt_opt.as_ref().and_then(|st| select_schema_use_of(inner, st, &raw_sql));
+        let needs_schema = select_schema_use.as_ref().map_or_else(
+            || stmt_opt.as_ref().is_some_and(stmt_loads_schema_on_prepare), |usage| usage.reads_schema,
+        );
         // A statement that writes sqlite_stat1: C's in-memory statistics and the engine's may
         // differ until the next ANALYZE.
         {
@@ -7708,7 +7752,15 @@ impl Statement {
         // decided by C's compile result, as an INSERT / UPDATE / DELETE is (c_write_of): C's
         // error is the error of the prepare; a statement C compiles runs C's program on the
         // machine. `err` stays when the generator leaves the statement to the engine.
+        let schema_free_fallback = std::cell::RefCell::new(None);
         let c_read_decides = |inner: &mut ConnectionInner, stmt: Option<Stmt>, err: SqliteError| -> Result<CompiledArtifacts> {
+            if err.code == ErrorCode::Error && err.message.starts_with("no such table:")
+                && select_schema_use.as_ref().is_some_and(|usage| usage.btree_mask == Some(0))
+                && let Some((artifacts, program)) = schema_free_read_fallback(inner, stmt.clone(), &raw_sql)?
+            {
+                schema_free_fallback.replace(Some(program));
+                return Ok(artifacts);
+            }
             if !vdbe_host::exec_switch_on() || !matches!(stmt, Some(Stmt::Select(_))) {
                 return Err(err);
             }
@@ -7811,7 +7863,8 @@ impl Statement {
             }
         }
 
-        let c_machine = Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some())?;
+        let c_machine = Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some())?
+            .or_else(|| schema_free_fallback.into_inner());
         if let Some(out) = &c_prepared_pragma {
             artifacts.category = Some(StmtCategory::NoLockPragma);
             artifacts.column_names = out.column_names.clone();
@@ -7823,6 +7876,7 @@ impl Statement {
         }
 
         let hid = inner.register_handle(HandleKind::Statement);
+        apply_select_schema_use(&mut artifacts, select_schema_use.as_ref());
         Ok(Self {
             shared: Arc::clone(shared),
             handle_id: Some(hid),
@@ -8399,6 +8453,10 @@ impl Statement {
     fn recompile_in_open_tx(&mut self, inner: &mut ConnectionInner) -> Result<()> {
         for _ in 0..SQLITE_MAX_SCHEMA_RETRY {
             let parsed_stmt = parse_one(&self.raw_sql).ok().and_then(|(st, _)| st);
+            let select_schema_use = parsed_stmt.as_ref().and_then(|st| select_schema_use_of(inner, st, &self.raw_sql));
+            let needs_schema = select_schema_use.as_ref().map_or_else(
+                || parsed_stmt.as_ref().is_some_and(stmt_loads_schema_on_prepare), |usage| usage.reads_schema,
+            );
             if !inner.db_set.is_temp_open()
                 && let Some(ref st) = parsed_stmt
                 && stmt_references_temp_catalog(st, &inner.db_set)
@@ -8406,11 +8464,10 @@ impl Statement {
                 let enc = inner.effective_encoding();
                 inner.db_set.ensure_temp_open(enc, inner.writable_schema)?;
             }
-            inner.refresh_open_tx_schemas()?;
-            if parsed_stmt
-                .as_ref()
-                .is_some_and(stmt_loads_schema_on_prepare)
-            {
+            if needs_schema || select_schema_use.is_none() {
+                inner.refresh_open_tx_schemas()?;
+            }
+            if needs_schema {
                 let any_unloaded = inner
                     .db_set
                     .slots()
@@ -8464,12 +8521,22 @@ impl Statement {
             } else {
                 Self::c_write_of(&shared, inner, parsed_stmt.as_ref(), &self.raw_sql)?
             };
+            let mut schema_free_fallback = None;
             let mut artifacts = match try_compile(inner, &parsed_stmt) {
                 Ok(a) => a,
                 Err(err) if c_explain.is_some() && err.code == ErrorCode::Error => {
                     explain_artifacts(parsed_stmt.clone())
                 }
                 Err(_) if c_write.is_some() => write_artifacts(parsed_stmt.clone()),
+                Err(err) if err.code == ErrorCode::Error && err.message.starts_with("no such table:")
+                    && select_schema_use.as_ref().is_some_and(|usage| usage.btree_mask == Some(0)) =>
+                {
+                    let Some((artifacts, program)) = schema_free_read_fallback(inner, parsed_stmt.clone(), &self.raw_sql)? else {
+                        return Err(err);
+                    };
+                    schema_free_fallback = Some(program);
+                    artifacts
+                }
                 Err(err)
                     if err.code == ErrorCode::Error
                         && inner.db_set.slots().iter().any(|s| {
@@ -8497,13 +8564,15 @@ impl Statement {
                 artifacts.requires_schema = false;
                 artifacts.column_names = explain_column_names(prog.explain);
             }
-            let c_machine = Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some())?;
+            let c_machine = Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some())?
+                .or(schema_free_fallback);
             if let Some(prog) = &c_write
                 && artifacts.category != Some(StmtCategory::Control)
             {
                 Self::apply_c_write(&mut artifacts, prog);
             }
             let mut transferred = vec![Value::Null; artifacts.max_param];
+            apply_select_schema_use(&mut artifacts, select_schema_use.as_ref());
             let copy_len = self.params.len().min(artifacts.max_param);
             transferred[..copy_len].clone_from_slice(&self.params[..copy_len]);
 
@@ -9160,6 +9229,7 @@ impl Statement {
         let is_advisory_expired = self.expired
             || self.compiled_advisory_expire_generation != inner.advisory_expire_generation;
         if self.category != Some(StmtCategory::Control)
+            && (self.requires_schema || !matches!(self.stmt, Some(Stmt::Select(_))))
             && let Err(e) = inner.refresh_open_tx_schemas()
         {
             self.lifecycle = StatementLifecycle::Halted {
@@ -9652,8 +9722,9 @@ impl Statement {
                     }
                 }
 
-                let mut specs = collect_select_referenced_roots(
+                let mut specs = prepared_read_roots(
                     self.stmt.as_ref().expect("non-empty statement"),
+                    self.requires_schema,
                     &inner.db_set,
                 );
                 for spec in &specs {
@@ -9729,8 +9800,9 @@ impl Statement {
                             cleanup_started_reads(inner, &started_here);
                             return self.start_execution_in_session(hid, shared, inner);
                         }
-                        specs = collect_select_referenced_roots(
+                        specs = prepared_read_roots(
                             self.stmt.as_ref().expect("non-empty statement"),
+                            self.requires_schema,
                             &inner.db_set,
                         );
                         for spec in &specs {

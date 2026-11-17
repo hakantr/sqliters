@@ -98,6 +98,21 @@ pub(crate) fn machine_program(
     if !exec_switch_on() {
         return Ok(None);
     }
+    read_machine_program(inner, stmt, raw_sql, n_param, false)
+}
+
+/// A read rejected by legacy validation despite C eliminating its table source.
+/// This entry also works with the diagnostic switch off; it accepts only a
+/// checked program with no Btree use and retains the machine's other guards.
+pub(crate) fn schema_free_read_program(
+    inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize,
+) -> Result<Option<Arc<Program>>> {
+    read_machine_program(inner, stmt, raw_sql, n_param, true)
+}
+
+fn read_machine_program(
+    inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, schema_free: bool,
+) -> Result<Option<Arc<Program>>> {
     if !matches!(stmt, Some(Stmt::Select(_))) {
         return Ok(None);
     }
@@ -125,6 +140,7 @@ pub(crate) fn machine_program(
     }
     match crate::cgen::c_prepare(inner, raw_sql).0 {
         PrepareResult::Program(p) => {
+            if schema_free && p.btree_mask != 0 { return Ok(None); }
             if p.explain != 0 {
                 return Ok(None);
             }

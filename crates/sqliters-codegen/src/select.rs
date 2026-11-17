@@ -4964,7 +4964,10 @@ pub fn sqlite3_multi_values(p: &mut Parse, left: SelectId, row: ExprListId) -> S
                 0,
                 ExprId::NULL,
             );
-            // (sqlite3ReadSchema(pParse): the engine's schema is always loaded)
+            // insert.c:711–712: a VALUES co-routine needs the schema's encoding.
+            if (p.db.m_db_flags & DBFLAG_SchemaKnownOk as u32) == 0 {
+                crate::schema::sqlite3_read_schema(p);
+            }
             {
                 let (prior, op) = (p.s(left).p_prior, p.s(left).op);
                 let r = p.sm(ret);
