@@ -251,3 +251,34 @@ fn test_persistent_pipe_immediate_flush_and_bail() {
         "bail did not stop execution"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn shell_modules_return_file_data_and_sql_completions() {
+    let scratch = TempDirGuard::new("modules");
+    fs::create_dir(scratch.path("sample")).unwrap();
+    fs::write(scratch.path("sample/note"), b"hi").unwrap();
+    let output = Command::new(bin_path())
+        .current_dir(&scratch.dir)
+        .args([
+            ":memory:",
+            "SELECT candidate FROM completion('SEL'); \
+             SELECT name, hex(data), level FROM fsdir('sample') WHERE data IS NOT NULL;",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, b"SELECT\nsample/note|6869|2\n");
+
+    let safe = Command::new(bin_path())
+        .args([
+            "-safe",
+            ":memory:",
+            "SELECT name FROM pragma_module_list WHERE name IN ('completion','fsdir') ORDER BY name;",
+        ])
+        .output()
+        .unwrap();
+    assert!(safe.status.success(), "{:?}", safe.stderr);
+    assert_eq!(safe.stdout, b"completion\n");
+}

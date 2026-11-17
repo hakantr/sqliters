@@ -14,6 +14,9 @@
     clippy::while_let_loop
 )]
 
+mod completion;
+#[cfg(unix)]
+mod fsdir;
 mod collations;
 mod dotcmd;
 mod help;
@@ -287,6 +290,8 @@ pub struct ShellState {
     pub dbcfg_shadow: [i32; 22],
     /// Shell-side copies of `sqlite3_limit` values the engine has no setting for.
     pub limits: [i32; 15],
+    #[cfg(unix)]
+    pub fsdir_max_length: std::sync::Arc<std::sync::atomic::AtomicI32>,
     pub exit_code: Option<i32>,
 }
 
@@ -634,6 +639,11 @@ impl ShellState {
                 let _ = db.register_collation("uint", collations::uint);
                 let _ = db.register_collation("decimal", collations::decimal);
                 let _ = db.register_module(std::sync::Arc::new(sqliters::ext::GenerateSeriesModule));
+                #[cfg(unix)]
+                if !self.b_safe_mode {
+                    let _ = db.register_module(std::sync::Arc::new(fsdir::FsDirModule::new(std::sync::Arc::clone(&self.fsdir_max_length))));
+                }
+                let _ = db.register_module(std::sync::Arc::new(completion::CompletionModule));
                 let _ = db.set_trusted_schema(testmode_on);
                 let _ = db.db_config_defensive(Some(!testmode_on));
                 if self.busy_timeout > 0 {
@@ -642,6 +652,8 @@ impl ShellState {
             }
             self.dbcfg_shadow = dotcmd::DBCFG_DEFAULTS;
             self.limits = dotcmd::LIMIT_DEFAULTS;
+            #[cfg(unix)]
+            self.fsdir_max_length.store(self.limits[0], std::sync::atomic::Ordering::Relaxed);
         }
         true
     }
@@ -1959,6 +1971,8 @@ fn shell_main(argv: &[String]) -> i32 {
         busy_timeout: 0,
         dbcfg_shadow: dotcmd::DBCFG_DEFAULTS,
         limits: dotcmd::LIMIT_DEFAULTS,
+        #[cfg(unix)]
+        fsdir_max_length: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(dotcmd::LIMIT_DEFAULTS[0])),
         exit_code: None,
     };
     let mut z_init_file: Option<String> = None;

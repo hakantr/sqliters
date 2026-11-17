@@ -3345,6 +3345,10 @@ fn limit_access(p: &mut ShellState, i: usize, set: Option<i32>) -> i32 {
     let old = p.limits[i];
     if let Some(v) = new_val {
         p.limits[i] = v;
+        #[cfg(unix)]
+        if i == 0 {
+            p.fsdir_max_length.store(v, std::sync::atomic::Ordering::Relaxed);
+        }
         let db = p.db();
         match A_LIMIT[i] {
             "attached" => {

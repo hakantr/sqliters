@@ -535,3 +535,7 @@ Tek kaynaklı `pragma_locking_mode` sorgusunda C programı kullanılmayan gizli 
 ## V6b.39 — D143 native modül kaydı
 
 Beş yerleşik modül, ilk başvuruda JSON/PRAGMA kaydı, C hash sırası ve hazırlamada donan liste 46/46 native akışta eşleşti. 96 modüllü geçmişte liste sırası eşit. Bağlı modül değiştirme ve kabukta fsdir/completion açık. Kabuk denetimi 4/12. Gcov 64 dal ve alınmayan 13 çıkış sınıflı. OFF 1140/4/337, ON 1126/18/337. DML ve ayrışma bulucu aynı. Rust 1.100 tabanına süre oranı 1,224 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_39.md).
+
+## V6b.40 — POSIX kabuk modülleri
+
+Kabuk gerçek fsdir ve completion hizmetlerini kaydediyor. Normal ve güvenli kip dahil 36 completion, 42 fsdir ve 12 kabuk profili akışı C ile aynı. Native modül, D103, DDL ve mmap kayıtları aynı kaldı. Gcov 214 dal ve alınmayan 43 çıkış sınıflı. OFF 1141/4/337, ON 1127/18/337. DML ve ayrışma bulucu aynı. Rust 1.100 tabanına süre oranı 1,227 ve 14 digest eşit. E28 güncel çekirdekte DELETE ve WAL yazım/senkronizasyon hatalarında yeniden üretildi. [Karar ve doğrulama](karar_esligi_v6b_40.md).
