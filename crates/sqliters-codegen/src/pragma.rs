@@ -51,6 +51,7 @@ pub enum PrepareEffect {
     LockingMode { i_db: Option<usize>, mode: u8 },
     TempStore(u8),
     Encoding(u8),
+    WorkerThreads(i32),
 }
 
 /// Names of the pragmas enabled in the C reference build, in pragma.h order.
@@ -83,6 +84,7 @@ pub fn prepare_constant(name: &str) -> bool {
             "locking_mode",
             "temp_store",
             "encoding",
+            "threads",
         ]
         .iter()
         .any(|n| name.eq_ignore_ascii_case(n))
@@ -93,6 +95,12 @@ fn locate(name: &str) -> Option<&'static PragmaName> {
         .binary_search_by(|p| p.name.cmp(&name.to_ascii_lowercase()))
         .ok()
         .map(|i| &table::PRAGMAS[i])
+}
+
+/// pragma.c:2716–2722, then sqlite3_limit's reference-build hard limit.
+pub fn worker_threads_setting(value: &str) -> Option<i32> {
+    let (n, rc) = sqlite3_dec_or_hex_to_i64(value);
+    (rc == 0 && n >= 0).then(|| ((n & 0x7fff_ffff) as i32).min(SQLITE_MAX_WORKER_THREADS))
 }
 
 fn columns(p: &mut Parse, pragma: &PragmaName) {
@@ -602,6 +610,13 @@ pub fn sqlite3_pragma(
                     p.db.host.note_pragma_effect(PrepareEffect::TempStore(mode));
                 }
             } else { return_int(p, current); }
+        }
+        41 => {
+            if let Some(n) = right.and_then(worker_threads_setting) {
+                p.db.a_limit[SQLITE_LIMIT_WORKER_THREADS as usize] = n;
+                p.db.host.note_pragma_effect(PrepareEffect::WorkerThreads(n));
+            }
+            return_int(p, i64::from(p.db.a_limit[SQLITE_LIMIT_WORKER_THREADS as usize]));
         }
         42 => {
             // pragma.c:2428–2435: sqlite3Atoi failure disables the callback.

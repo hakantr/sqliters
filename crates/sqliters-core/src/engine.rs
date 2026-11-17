@@ -43422,6 +43422,14 @@ fn exec_pragma(
                 ],
             });
         }
+        "THREADS" => {
+            if let Some(value) = value
+                && let Some(n) = sqliters_codegen::pragma::worker_threads_setting(&pragma_to_string(value))
+            {
+                ctx.db_set.worker_threads_limit = n;
+            }
+            return Ok(single_col("threads", Value::Integer(i64::from(ctx.db_set.worker_threads_limit))));
+        }
         "ANALYSIS_LIMIT" => {
             // `PragTyp_ANALYSIS_LIMIT` (`pragma.c:2733`): a non-negative decimal or hex integer
             // is stored (masked to 31 bits), anything else is ignored; the current limit is
@@ -46673,6 +46681,7 @@ fn infer_pragma_columns(name: &str, value: Option<&PragmaValue>) -> Vec<String> 
         "JOURNAL_SIZE_LIMIT" => vec!["journal_size_limit".to_owned()],
         "SECURE_DELETE" => vec!["secure_delete".to_owned()],
         "ANALYSIS_LIMIT" => vec!["analysis_limit".to_owned()],
+        "THREADS" => vec!["threads".to_owned()],
         "DATA_VERSION" => vec!["data_version".to_owned()],
         "MMAP_SIZE" => vec!["mmap_size".to_owned()],
         "CELL_SIZE_CHECK" => {

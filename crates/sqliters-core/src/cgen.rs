@@ -597,6 +597,7 @@ fn make_db<'a>(inner: &ConnectionInner, host: &'a EngineHost<'a>) -> Db<'a> {
     }
     db.x_auth = inner.authorizer.is_some();
     db.n_analysis_limit = inner.db_set.analysis_limit();
+    db.a_limit[sqliters_codegen::consts::SQLITE_LIMIT_WORKER_THREADS as usize] = inner.db_set.worker_threads_limit;
     db.case_sensitive_like = inner.db_set.c_case_sensitive_like();
     db.schema_not_loaded = inner.db_set.c_prepare_unloaded();
     db.encoding_fixed = inner.db_set.c_encoding_fixed();

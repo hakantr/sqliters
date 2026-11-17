@@ -31,7 +31,8 @@
 | V6b.11 — doğrulama hazırlama durumu; D112/D113 açık | `ad50ddd` | D111, ilk sanal tablo ve şema çerezi önizlemesi | 11172 tam program aynı; yeni bozuk şema farkları açık | Yeniden ölçülmedi | kapalı 1087/0; açık 1072/15 bilinen; 337 yok sayıldı |
 | V6b.12 — şema başlatma sırası; D112 açık | `694b9c2` | D113: yeni yükleme ve açık işlemde main/bağlı/TEMP hata önceliği | 13621 EXPLAIN/EQP; 11240 tam program; API2235/2236 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1092/0; açık 1077/15 bilinen; 337 yok sayıldı |
 | V6b.13 — SELECT şema/Btree kararı; D115 açık | `c56c2cb` | D112/D114 UTF-8, bekleyen ifadeler ve VALUES | 13957 EXPLAIN/EQP; 11534 tam program; API2913/2914 aynı; bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1097/0; açık 1082/15 bilinen; 337 yok sayıldı |
-| V6b.14 — UTF-16 boş yürütme yolu ve sayaçlar | bu commit | D115/D116; parametre, reset/expire, ilerleme ve sayaçlar | 14077 EXPLAIN/EQP; 11654 tam program; API3075/3076 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1100/0; açık 1085/15 bilinen; 337 yok sayıldı |
+| V6b.14 — UTF-16 boş yürütme yolu ve sayaçlar | `801d13a` | D115/D116; parametre, reset/expire, ilerleme ve sayaçlar | 14077 EXPLAIN/EQP; 11654 tam program; API3075/3076 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1100/0; açık 1085/15 bilinen; 337 yok sayıldı |
+| V6b.15 — threads hazırlama ve sınır | bu commit | C sayı kabulü, maske, 8 sınırı, donmuş satır, pragma_threads | 15456 EXPLAIN/EQP; 13009 tam program; API3995/3996 aynı, bütün dosyalar aynı | Yeniden ölçülmedi | kapalı 1103/0; açık 1088/15 bilinen; 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -420,3 +421,7 @@ D113 hem yeni fiziksel şema yükleyicisinde hem açık işlemde önbellek yenil
 ## V6b.14 — UTF-16 boş yürütme yolu
 
 D115’in kaydedilen satırsız programı ve D116 yeniden hazırlama sayaç kaybı düzeltildi. 3.076 API akışının bütün dosya baytları aynı; tek çıktı farkı D103. Genel UTF-16 ve kalan işler açık. Kanıt ve dört kapı [karar_esligi_v6b_14.md](karar_esligi_v6b_14.md) içinde.
+
+## V6b.15 — threads
+
+threads hazırlama etkisi, bağlantı sınırı ve pragma_threads eklendi; başvuru işçi üst sınırı 8 ile hizalandı. 3.996 API akışının bütün dosyaları aynı; tek çıktı farkı D103. Sonraki adım shrink_memory hazırlamasıdır. Kanıt ve dört kapı [karar_esligi_v6b_15.md](karar_esligi_v6b_15.md) içinde.

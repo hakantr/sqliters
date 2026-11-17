@@ -285,6 +285,8 @@ pub struct DatabaseSet {
     /// `PRAGMA analysis_limit` (`sqlite3.nAnalysisLimit`): approximate number of index rows
     /// `ANALYZE` examines per index; `0` = no limit.
     analysis_limit: i32,
+    /// SQLITE_LIMIT_WORKER_THREADS; reference default 0 and hard limit 8.
+    pub(crate) worker_threads_limit: i32,
     /// `PRAGMA cell_size_check` (`SQLITE_CellSizeCk` in `sqlite3.flags`), applied to every
     /// database of the connection, including ones opened later.
     cell_size_check: bool,
@@ -399,6 +401,7 @@ impl DatabaseSet {
             interrupt_flag,
             temp_trigger_bindings: Vec::new(),
             analysis_limit: 0,
+            worker_threads_limit: 0,
             cell_size_check: false,
             c_flags_toggled: 0,
             c_case_sensitive_like: false,

@@ -9,7 +9,9 @@ pub const SQLITE_DIGIT_SEPARATOR: i32 = 95;
 pub const SQLITE_MAX_FILE_FORMAT: i32 = 4;
 pub const SQLITE_DEFAULT_FILE_FORMAT: i32 = 4;
 pub const SQLITE_DEFAULT_RECURSIVE_TRIGGERS: i32 = 0;
-pub const SQLITE_MAX_WORKER_THREADS: i32 = 0;
+// Reference build: MAX_WORKER_THREADS=8. The raw generator had selected the
+// disabled SQLITE_THREADSAFE==0 branch instead of the threaded default.
+pub const SQLITE_MAX_WORKER_THREADS: i32 = 8;
 pub const SQLITE_DEFAULT_WORKER_THREADS: i32 = 0;
 pub const SQLITE_DEFAULT_PCACHE_INITSZ: i32 = 20;
 pub const SQLITE_DEFAULT_SORTERREF_SIZE: i32 = 0x7fffffff;

@@ -5838,6 +5838,7 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) -> Result<()> {
     for effect in cgen::take_c_pragma_effects() {
         match effect {
             PrepareEffect::AnalysisLimit(n) => inner.db_set.set_analysis_limit(n),
+            PrepareEffect::WorkerThreads(n) => inner.db_set.worker_threads_limit = n,
             PrepareEffect::BusyTimeout(n) => {
                 inner.busy_policy = if n > 0 { BusyPolicy::TimeoutMs(n as u64) } else { BusyPolicy::None };
             }
