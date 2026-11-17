@@ -2382,6 +2382,7 @@ impl Pager {
     /// If `LockLevel::Exclusive` cannot be obtained due to active readers/writers, returns
     /// `ErrorCode::Busy` WITHOUT closing `self.wal`!
     fn close_wal_for_mode_switch(&mut self) -> Result<()> {
+        let acquired_shared = self.wal.is_none() && self.db_file()?.lock_level() == LockLevel::NoLock;
         if self.wal.is_none() {
             self.lock_db_file(LockLevel::Shared)?;
             let exists_res = match self.wal_path.as_deref() {
@@ -2419,8 +2420,13 @@ impl Pager {
                 }
                 return Err(e);
             }
-        } else {
-            self.acquire_exclusive_lock_or_restore()?;
+        } else if let Err(error) = self.acquire_exclusive_lock_or_restore() {
+            // The xAccess probe acquired SHARED without opening a B-tree
+            // reader. Release it so the other connection can close its WAL.
+            if acquired_shared && self.locking_mode == LockingMode::Normal {
+                let _ = self.unlock_db_file(LockLevel::NoLock);
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -6356,17 +6362,50 @@ impl Pager {
         result
     }
 
-    fn has_hot_journal(&self, path: &Path) -> Result<bool> {
-        if !self.vfs.exists(path)? || self.db_file()?.check_reserved_lock()? {
+    fn has_hot_journal(&mut self, path: &Path) -> Result<bool> {
+        let retained_journal = self.journal_file.as_deref().filter(|journal| {
+            journal.device_characteristics() & sqliters_vfs::IOCAP_UNDELETABLE_WHEN_OPEN != 0
+        });
+        let journal_open = retained_journal.is_some();
+        if (!journal_open && !self.vfs.exists(path)?) || self.db_file()?.check_reserved_lock()? {
             return Ok(false);
         }
-        let Ok(mut journal) = self.vfs.open(Some(path), OpenFlags::READONLY) else {
+
+        // hasHotJournal (pager.c:5234–5251): A journal next to an empty
+        // database cannot restore data from a previous database at this path.
+        // Take RESERVED before deleting it in case another writer appeared.
+        if !journal_open && self.db_file()?.file_size()? == 0 {
+            if self.lock_db_file(LockLevel::Reserved).is_ok() {
+                let _ = self.vfs.delete(path, false);
+                if self.locking_mode == LockingMode::Normal {
+                    let _ = self.unlock_db_file(LockLevel::Shared);
+                }
+            }
             return Ok(false);
+        }
+
+        if let Some(journal) = retained_journal {
+            return Self::journal_first_byte_is_nonzero(journal);
+        }
+        let mut journal = match self.vfs.open(Some(path), OpenFlags::READONLY | OpenFlags::MAIN_JOURNAL) {
+            Ok(journal) => journal,
+            // A concurrent commit may have removed the file between access
+            // and open. Recheck it under EXCLUSIVE before proceeding.
+            Err(error) if error.extended_code == ErrorCode::CantOpen as i32 => return Ok(true),
+            Err(error) => return Err(error),
         };
-        let mut first_byte = [0u8; 1];
-        let result = journal.read_at(&mut first_byte, 0);
+        let hot = Self::journal_first_byte_is_nonzero(journal.as_ref());
         let _ = journal.close();
-        Ok(result? != 0 && first_byte[0] != 0)
+        hot
+    }
+
+    fn journal_first_byte_is_nonzero(journal: &dyn VfsFile) -> Result<bool> {
+        let mut first = [0u8; 1];
+        match journal.read_at(&mut first, 0) {
+            Ok(_) => Ok(first[0] != 0),
+            Err(error) if error.extended_code == extended::SQLITE_IOERR_SHORT_READ => Ok(first[0] != 0),
+            Err(error) => Err(error),
+        }
     }
 
     fn play_hot_journal(&mut self, jpath: &Path) -> Result<bool> {
@@ -6385,7 +6424,12 @@ impl Pager {
                 let _ = journal.close();
                 self.journal_off = 0;
             }
-            self.vfs.open(Some(jpath), OpenFlags::READWRITE | OpenFlags::MAIN_JOURNAL)?
+            let mut journal = self.vfs.open(Some(jpath), OpenFlags::READWRITE | OpenFlags::MAIN_JOURNAL)?;
+            if journal.is_readonly() {
+                let _ = journal.close();
+                return Err(SqliteError::new(ErrorCode::CantOpen, "unable to open database file"));
+            }
+            journal
         };
         let jsize = match self.sync_hot_journal(jfile.as_ref()) {
             Ok(size) => size,
@@ -8150,6 +8194,40 @@ mod tests {
         assert_eq!(pager.read_page(page).unwrap()[0], 2);
         pager.end_read_if_unused().unwrap();
         assert!(!vfs.exists(journal).unwrap());
+    }
+
+    #[test]
+    fn an_empty_database_does_not_replay_a_journal_from_another_database() {
+        let ctl = Arc::new(FaultCtl::default());
+        let vfs = Arc::new(FaultVfs { inner: Arc::new(MemoryVfs::new()), ctl: ctl.clone() });
+        let path = Path::new("empty.db");
+        let journal = Path::new("empty.db-journal");
+        let flags = OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB;
+        let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+        pager.begin_write().unwrap();
+        let page = pager.allocate_raw_page().unwrap();
+        pager.write_page(page).unwrap()[0] = 1;
+        pager.commit().unwrap();
+        pager.begin_write().unwrap();
+        pager.write_page(page).unwrap()[0] = 2;
+        pager.commit_phase_one(None).unwrap();
+        *ctl.journal_delete_error.lock().unwrap() = Some(false);
+        assert_eq!(pager.commit_phase_two(false, false).unwrap_err().extended_code, extended::SQLITE_IOERR_DELETE);
+        assert!(pager.rollback().is_err());
+        pager.close().unwrap();
+        assert!(vfs.exists(journal).unwrap());
+
+        let mut db = vfs.open(Some(path), OpenFlags::READWRITE).unwrap();
+        db.truncate(0).unwrap();
+        db.close().unwrap();
+        let mut fresh = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+        fresh.begin_read().unwrap();
+        assert_eq!(fresh.page_count(), 0);
+        assert!(!vfs.exists(journal).unwrap());
+        fresh.end_read_if_unused().unwrap();
+        fresh.close().unwrap();
+        let db = vfs.open(Some(path), OpenFlags::READONLY).unwrap();
+        assert_eq!(db.file_size().unwrap(), 0);
     }
 
     #[test]

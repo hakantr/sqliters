@@ -3666,6 +3666,13 @@ impl Vfs for OsVfs {
     }
 
     fn exists(&self, path: &Path) -> Result<bool> {
+        #[cfg(unix)]
+        {
+            // unixAccess (os_unix.c:6899): xAccess treats an empty regular
+            // file as absent, even when its directory entry still exists.
+            Ok(fs::metadata(path).is_ok_and(|meta| !meta.is_file() || meta.len() != 0))
+        }
+        #[cfg(not(unix))]
         match fs::metadata(path) {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
