@@ -5968,6 +5968,15 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) -> Result<()> {
     for effect in cgen::take_c_pragma_effects() {
         match effect {
             PrepareEffect::AnalysisLimit(n) => inner.db_set.set_analysis_limit(n),
+            PrepareEffect::LikeFunctions(case_sensitive) => {
+                let active = inner.activity.summary_excluding(HandleId(0), &inner.db_set).other_active != 0;
+                for arity in [2, 3] {
+                    if inner.functions.register_c_like(arity, case_sensitive, active) {
+                        inner.db_set.c_expire_all();
+                    }
+                }
+                inner.db_set.set_c_case_sensitive_like(true);
+            }
             PrepareEffect::WorkerThreads(n) => inner.db_set.worker_threads_limit = n,
             PrepareEffect::ShrinkMemory => {
                 // main.c:922–928: release every open pager, including TEMP and
@@ -6114,7 +6123,7 @@ fn prepare_row_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &st
 {
     let defer_query = matches!(stmt, Some(Stmt::Pragma { name, value: None, .. })
         if name.eq_ignore_ascii_case("defer_foreign_keys"));
-    if !defer_query && !matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("database_list") || name.eq_ignore_ascii_case("collation_list") || name.eq_ignore_ascii_case("compile_options")) {
+    if !defer_query && !matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("database_list") || name.eq_ignore_ascii_case("collation_list") || name.eq_ignore_ascii_case("compile_options") || name.eq_ignore_ascii_case("case_sensitive_like")) {
         return Ok(None);
     }
     let Some(program) = prepare_pragma_program(inner, sql)? else { return Ok(None); };
@@ -7604,11 +7613,17 @@ impl Statement {
         artifacts: &mut CompiledArtifacts,
         raw_sql: &str,
         is_explain: bool,
+        has_like: bool,
     ) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
-        if !vdbe_host::exec_switch_on() || is_explain || artifacts.category != Some(StmtCategory::Read) {
+        if (!vdbe_host::exec_switch_on() && !has_like) || is_explain || artifacts.category != Some(StmtCategory::Read) {
             return Ok(None);
         }
-        let Some(prog) = vdbe_host::machine_program(inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param)? else {
+        let result = if has_like {
+            vdbe_host::like_machine_program(inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param)
+        } else {
+            vdbe_host::machine_program(inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param)
+        };
+        let Some(prog) = result? else {
             return Ok(None);
         };
         artifacts.compiled_vdbe = None;
@@ -8077,7 +8092,7 @@ impl Statement {
             apply_data_free_program(&mut artifacts, &program);
             Some(program)
         } else {
-            Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some())?
+            Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some(), select_schema_use.as_ref().is_some_and(|u| u.has_like))?
                 .or_else(|| schema_free_fallback.into_inner())
         };
         if let Some(out) = &c_prepared_pragma {
@@ -8794,7 +8809,7 @@ impl Statement {
                 apply_data_free_program(&mut artifacts, &program);
                 Some(program)
             } else {
-                Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some())?
+                Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some(), select_schema_use.as_ref().is_some_and(|u| u.has_like))?
                     .or(schema_free_fallback)
             };
             if let Some(prog) = &c_write

@@ -1,6 +1,7 @@
 //! `callback.c`: access to collating sequences and SQL functions.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use sqliters_vdbe::vdbeaux::{CollSeq, FuncDef};
 
@@ -10,6 +11,13 @@ use crate::sqliteint::*;
 
 /// The collating sequences every connection has (`sqlite3_open`: BINARY, NOCASE, RTRIM).
 const BUILTIN_COLLATIONS: [&str; 3] = ["BINARY", "NOCASE", "RTRIM"];
+
+// func.c:2377–2384: after SQLITE_BUSY, FindFunction may name the shared builtin.
+static LIKE_BUILTIN_FLAGS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+
+pub fn note_like_builtin_flags(arity: usize, flags: u32) {
+    LIKE_BUILTIN_FLAGS[arity - 2].fetch_or(flags, Ordering::SeqCst);
+}
 
 /// `SQLITE_ERROR_MISSING_COLLSEQ`
 pub const SQLITE_ERROR_MISSING_COLLSEQ: i32 = SQLITE_ERROR | (1 << 8);
@@ -98,12 +106,15 @@ fn match_quality(f_n_arg: i32, func_flags: u32, n_arg: i32, enc: u8) -> i32 {
 }
 
 fn intern_func(p: &mut Parse, b: &BuiltinFunc) -> Arc<FuncDef> {
-    if let Some(f) = p.a_func.iter().find(|f| f.n_arg == b.1 && f.func_flags == b.2 && f.name == b.0) {
+    let flags = b.2 | if b.0.eq_ignore_ascii_case("like") {
+        LIKE_BUILTIN_FLAGS[(b.1 - 2) as usize].load(Ordering::SeqCst)
+    } else { 0 };
+    if let Some(f) = p.a_func.iter().find(|f| f.n_arg == b.1 && f.func_flags == flags && f.name == b.0) {
         return f.clone();
     }
     let f = Arc::new(FuncDef {
         n_arg: b.1,
-        func_flags: b.2,
+        func_flags: flags,
         name: b.0.to_owned(),
         user_data: b.3,
         x_finalize: b.4,
@@ -118,11 +129,8 @@ fn intern_func(p: &mut Parse, b: &BuiltinFunc) -> Arc<FuncDef> {
 /// functions (`db->aFunc`) are preferred over built-in functions unless `DBFLAG_PreferBuiltin`
 /// is set.
 pub fn sqlite3_find_function(p: &mut Parse, z_name: &str, n_arg: i32, _create_flag: u8) -> Option<Arc<FuncDef>> {
-    if p.db.case_sensitive_like && z_name.eq_ignore_ascii_case("like") {
-        // sqlite3RegisterLikeFunctions(): like() is then a connection-level function with
-        // other flags and wildcard set; the engine does not implement the pragma yet.
-        p.not_supported("like() after PRAGMA case_sensitive_like");
-        return None;
+    if z_name.eq_ignore_ascii_case("like") {
+        p.v.references_like = true;
     }
     let enc = p.db.enc;
     let mut best: Option<Arc<FuncDef>> = None;

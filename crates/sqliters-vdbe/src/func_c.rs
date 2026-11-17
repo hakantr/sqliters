@@ -154,6 +154,114 @@ fn quote_value(v: &Value, escape: bool, enc: TextEncoding) -> Result<Vec<u8>> {
     })
 }
 
+/// The LIKE-only branches of `func.c:patternCompare`. UTF-8 decoding and the
+/// ASCII search after '%' retain C's treatment of malformed byte sequences.
+/// The most recent wildcard is the only retry point: exhausting its search
+/// returns SQLITE_NOWILDCARDMATCH through all earlier calls in C.
+fn like_pattern_compare(pat: &[u8], txt: &[u8], escape: u32, no_case: bool) -> bool {
+    fn next(z: &[u8], i: &mut usize) -> u32 {
+        let (c, n) = utf8_read(&z[*i..]);
+        *i += n;
+        c
+    }
+    fn find(z: &[u8], mut i: usize, anchor: u32, no_case: bool) -> Option<usize> {
+        if anchor < 0x80 {
+            while i < z.len() {
+                let c = z[i];
+                i += 1;
+                if u32::from(c) == anchor
+                    || (no_case && c.eq_ignore_ascii_case(&(anchor as u8)))
+                {
+                    return Some(i);
+                }
+            }
+        } else {
+            while i < z.len() {
+                if next(z, &mut i) == anchor { return Some(i); }
+            }
+        }
+        None
+    }
+    let all = if escape == u32::from(b'%') { 0 } else { u32::from(b'%') };
+    let one = if escape == u32::from(b'_') { 0 } else { u32::from(b'_') };
+    let (mut p, mut t) = (0, 0);
+    let mut retry = None;
+    'compare: loop {
+        let mut escaped = None;
+        loop {
+            let mut c = next(pat, &mut p);
+            if c == 0 {
+                if t == txt.len() { return true; }
+                break;
+            }
+            if c == all {
+                loop {
+                    c = next(pat, &mut p);
+                    if c != all && (c != one || one == 0) { break; }
+                    if c == one && next(txt, &mut t) == 0 { return false; }
+                }
+                if c == 0 { return true; }
+                if c == escape {
+                    c = next(pat, &mut p);
+                    if c == 0 { return false; }
+                }
+                let Some(found) = find(txt, t, c, no_case) else { return false; };
+                retry = Some((p, found, c));
+                t = found;
+                continue 'compare;
+            }
+            if c == escape {
+                c = next(pat, &mut p);
+                if c == 0 { break; }
+                escaped = Some(p);
+            }
+            let c2 = next(txt, &mut t);
+            if c == c2 { continue; }
+            if no_case && c < 0x80 && c2 < 0x80
+                && (c as u8).eq_ignore_ascii_case(&(c2 as u8)) { continue; }
+            if c == one && Some(p) != escaped && c2 != 0 { continue; }
+            break;
+        }
+        let Some((after, start, anchor)) = retry else { return false; };
+        let Some(found) = find(txt, start, anchor, no_case) else { return false; };
+        retry = Some((after, found, anchor));
+        p = after;
+        t = found;
+    }
+}
+
+/// `likeFunc` for the connection-local functions installed by the PRAGMA.
+/// The reference profile uses the default 50000-byte pattern limit.
+pub fn eval_registered_like(args: &[Value], ctx: &VmRuntimeContext, case_sensitive: bool) -> Result<Value> {
+    if args.len() != 2 && args.len() != 3 {
+        return Err(SqliteError::new(ErrorCode::Error, "wrong number of arguments to function like()"));
+    }
+    let pat_text = if matches!(&args[0], Value::Real(r) if r.is_nan()) {
+        None
+    } else { value_text(&args[0], ctx.text_encoding) };
+    let n_pat = match &args[0] {
+        Value::Blob(b) => b.len(),
+        _ => pat_text.as_ref().map_or(0, |s| s.len()),
+    };
+    if n_pat > 50_000 {
+        return Err(SqliteError::new(ErrorCode::Error, "LIKE or GLOB pattern too complex"));
+    }
+    let mut escape = 0;
+    if args.len() == 3 {
+        if matches!(&args[2], Value::Real(r) if r.is_nan()) { return Ok(Value::Null); }
+        let Some(e) = value_text(&args[2], ctx.text_encoding) else { return Ok(Value::Null); };
+        let e = cstr(&e);
+        if e.is_empty() || skip_utf8(e, 0) != e.len() {
+            return Err(SqliteError::new(ErrorCode::Error, "ESCAPE expression must be a single character"));
+        }
+        escape = utf8_read(e).0;
+    }
+    let Some(pat) = pat_text else { return Ok(Value::Null); };
+    if matches!(&args[1], Value::Real(r) if r.is_nan()) { return Ok(Value::Null); }
+    let Some(txt) = value_text(&args[1], ctx.text_encoding) else { return Ok(Value::Null); };
+    Ok(Value::Integer(i64::from(like_pattern_compare(cstr(&pat), cstr(&txt), escape, !case_sensitive))))
+}
+
 /// Evaluates the functions ported here; `None` when `upper` is not one of them.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn eval(upper: &str, args: &[Value], ctx: &VmRuntimeContext) -> Option<Result<Value>> {

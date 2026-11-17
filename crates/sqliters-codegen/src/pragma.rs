@@ -53,6 +53,7 @@ pub enum PrepareEffect {
     Encoding(u8),
     WorkerThreads(i32),
     ShrinkMemory,
+    LikeFunctions(bool),
 }
 
 /// Names of the pragmas enabled in the C reference build, in pragma.h order.
@@ -389,7 +390,11 @@ pub fn sqlite3_pragma(
                 return_int(p, 0);
             } else if let Some(n) = host_int(p, i_db, "cache_spill") { return_int(p, n); }
         }
-        8 if right.is_none() => {} // case_sensitive_like query is empty
+        8 => {
+            if let Some(z) = right {
+                p.db.host.note_pragma_effect(PrepareEffect::LikeFunctions(get_boolean(z, false)));
+            }
+        }
         13 => {
             // PragTyp_DEFAULT_CACHE_SIZE, pragma.c:553
             p.v.uses_btree(i_db, p.db.a_db[i_db as usize].sharable);

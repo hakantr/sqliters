@@ -175,6 +175,8 @@ pub struct FunctionRegistry {
     scalars: BTreeMap<String, Vec<ScalarFunctionDef>>,
     aggregates: BTreeMap<String, Vec<WindowFunctionDef>>,
     user_modified: bool,
+    c_like_flags: BTreeMap<Option<usize>, u32>,
+    c_like_modes: BTreeMap<Option<usize>, bool>,
 }
 
 impl FunctionRegistry {
@@ -211,8 +213,10 @@ impl FunctionRegistry {
     ) {
         self.user_modified = true;
         let key = name.to_ascii_uppercase();
+        let registered_name = if key == "LIKE" { "like".to_owned() } else { name.to_owned() };
+        self.clear_c_like_metadata(&key, arity);
         let def = ScalarFunctionDef {
-            name: name.to_owned(),
+            name: registered_name,
             arity,
             flags,
             callback,
@@ -220,6 +224,8 @@ impl FunctionRegistry {
         let overloads = self.scalars.entry(key).or_default();
         if let Some(existing) = overloads.iter_mut().find(|d| d.arity == arity) {
             *existing = def;
+        } else if def.name.eq_ignore_ascii_case("like") {
+            overloads.insert(0, def);
         } else {
             overloads.push(def);
         }
@@ -238,6 +244,8 @@ impl FunctionRegistry {
         self.user_modified = true;
         let name = name.into();
         let key = name.to_ascii_uppercase();
+        let name = if key == "LIKE" { "like".to_owned() } else { name };
+        self.clear_c_like_metadata(&key, arity);
         let def = ScalarFunctionDef {
             name,
             arity,
@@ -247,6 +255,8 @@ impl FunctionRegistry {
         let overloads = self.scalars.entry(key).or_default();
         if let Some(existing) = overloads.iter_mut().find(|d| d.arity == arity) {
             *existing = def;
+        } else if def.name.eq_ignore_ascii_case("like") {
+            overloads.insert(0, def);
         } else {
             overloads.push(def);
         }
@@ -256,6 +266,7 @@ impl FunctionRegistry {
     pub fn unregister_scalar(&mut self, name: &str, arity: Option<usize>) -> bool {
         self.user_modified = true;
         let key = name.to_ascii_uppercase();
+        self.clear_c_like_metadata(&key, arity);
         let Some(overloads) = self.scalars.get_mut(&key) else {
             return false;
         };
@@ -298,6 +309,88 @@ impl FunctionRegistry {
             .unwrap_or_default()
     }
 
+    fn clear_c_like_metadata(&mut self, name: &str, arity: Option<usize>) {
+        if name.eq_ignore_ascii_case("like") {
+            self.c_like_flags.remove(&arity);
+            self.c_like_modes.remove(&arity);
+            if let Some(v) = self.aggregates.get_mut("LIKE") { v.retain(|f| f.arity != arity); }
+        }
+    }
+
+    pub(crate) fn c_like_flags(&self, name: &str, arity: Option<usize>) -> Option<u32> {
+        name.eq_ignore_ascii_case("like").then(|| self.c_like_flags.get(&arity).copied()).flatten()
+    }
+
+    /// func.c:2363–2384. Returns whether sqlite3CreateFunc expires statements.
+    pub(crate) fn register_c_like(&mut self, arity: usize, case_sensitive: bool, active: bool) -> bool {
+        use sqliters_codegen::consts::{SQLITE_FUNC_CASE, SQLITE_FUNC_LIKE, SQLITE_FUNC_UNSAFE};
+        let scalar = self.find_scalar("like", arity).map(|f| f.arity);
+        let aggregate = self.find_aggregate("like", arity).map(|f| f.arity);
+        let current = if scalar == Some(Some(arity)) || aggregate == Some(Some(arity)) {
+            Some(Some(arity))
+        } else { scalar.or(aggregate) };
+        let exact = current.is_none_or(|n| n == Some(arity));
+        let added_flags = SQLITE_FUNC_LIKE | if case_sensitive { SQLITE_FUNC_CASE } else { 0 };
+        if active && exact {
+            if let Some(def) = self.scalars.get_mut("LIKE")
+                .and_then(|v| v.iter_mut().find(|f| f.arity == Some(arity)))
+            {
+                let flags = self.c_like_flags.get(&Some(arity)).copied()
+                    .unwrap_or_else(|| crate::cgen::func_flags(def.flags));
+                self.c_like_flags.insert(Some(arity), (flags | added_flags) & !SQLITE_FUNC_UNSAFE);
+                def.flags = def.flags | FunctionFlags::INNOCUOUS;
+            } else if let Some(def) = self.aggregates.get_mut("LIKE")
+                .and_then(|v| v.iter_mut().find(|f| f.arity == Some(arity)))
+            {
+                let flags = self.c_like_flags.get(&Some(arity)).copied()
+                    .unwrap_or_else(|| crate::cgen::func_flags(def.flags));
+                self.c_like_flags.insert(Some(arity), (flags | added_flags) & !SQLITE_FUNC_UNSAFE);
+                def.flags = def.flags | FunctionFlags::INNOCUOUS;
+            } else {
+                sqliters_codegen::callback::note_like_builtin_flags(arity, added_flags);
+            }
+            return false;
+        }
+        self.register_scalar("like", Some(arity), FunctionFlags::INNOCUOUS, move |args| {
+            let values: Vec<Value> = args.iter().map(|v| v.value.clone()).collect();
+            sqliters_vdbe::eval_registered_like(&values, &VmRuntimeContext::default(), case_sensitive)
+                .map(RuntimeValue::plain)
+        });
+        if let Some(v) = self.aggregates.get_mut("LIKE") { v.retain(|f| f.arity != Some(arity)); }
+        self.c_like_flags.insert(Some(arity), 1 | added_flags);
+        self.c_like_modes.insert(Some(arity), case_sensitive);
+        exact
+    }
+
+    fn call_scalar_definition(
+        &self, def: &ScalarFunctionDef, args: &[RuntimeValue], runtime_ctx: &VmRuntimeContext,
+        strict_subtype: bool,
+    ) -> Result<RuntimeValue> {
+        if def.name.eq_ignore_ascii_case("like")
+            && let Some(&mode) = self.c_like_modes.get(&def.arity)
+        {
+            let values: Vec<Value> = args.iter().map(|v| v.value.clone()).collect();
+            return sqliters_vdbe::eval_registered_like(&values, runtime_ctx, mode).map(RuntimeValue::plain);
+        }
+        let callback = Arc::clone(&def.callback);
+        let mut scratch = Vec::new();
+        let filtered = strip_unsubscribed_subtypes(def.flags, args, &mut scratch);
+        let result = catch_callback_panic(&def.name, || callback(filtered))?;
+        enforce_result_subtype_contract(&def.name, def.flags, strict_subtype, result)
+    }
+
+    pub(crate) fn call_scalar_bound(
+        &self, name: &str, arity: Option<usize>, args: &[RuntimeValue], runtime_ctx: &VmRuntimeContext,
+        strict_subtype: bool,
+    ) -> Result<RuntimeValue> {
+        if let Some(def) = with_ascii_upper_key(name, |k| self.scalars.get(k))
+            .and_then(|v| v.iter().find(|f| f.arity == arity))
+        {
+            return self.call_scalar_definition(def, args, runtime_ctx, strict_subtype);
+        }
+        self.call_scalar(name, args, runtime_ctx, strict_subtype)
+    }
+
     /// The (arity, flags, supports_window) of every aggregate or window function registered
     /// under `name` (any arity).
     pub fn aggregate_overloads(&self, name: &str) -> Vec<(Option<usize>, FunctionFlags, bool)> {
@@ -321,6 +414,11 @@ impl FunctionRegistry {
         self.user_modified = true;
         let name = name.into();
         let key = name.to_ascii_uppercase();
+        let name = if key == "LIKE" { "like".to_owned() } else { name };
+        if key == "LIKE" {
+            self.clear_c_like_metadata(&key, arity);
+            if let Some(v) = self.scalars.get_mut("LIKE") { v.retain(|f| f.arity != arity); }
+        }
         let def = WindowFunctionDef {
             name,
             arity,
@@ -332,6 +430,8 @@ impl FunctionRegistry {
         let overloads = self.aggregates.entry(key).or_default();
         if let Some(existing) = overloads.iter_mut().find(|d| d.arity == arity) {
             *existing = def;
+        } else if def.name.eq_ignore_ascii_case("like") {
+            overloads.insert(0, def);
         } else {
             overloads.push(def);
         }
@@ -440,13 +540,7 @@ impl FunctionRegistry {
         strict_subtype: bool,
     ) -> Result<RuntimeValue> {
         if let Some(def) = self.find_scalar(name, args.len()) {
-            let callback = Arc::clone(&def.callback);
-            let flags = def.flags;
-            let reg_name = def.name.clone();
-            let mut scratch = Vec::new();
-            let filtered = strip_unsubscribed_subtypes(flags, args, &mut scratch);
-            let result = catch_callback_panic(&reg_name, || callback(filtered))?;
-            return enforce_result_subtype_contract(&reg_name, flags, strict_subtype, result);
+            return self.call_scalar_definition(def, args, runtime_ctx, strict_subtype);
         }
         match eval_scalar_function_rt_with_strict(name, args, runtime_ctx, strict_subtype) {
             Ok(v) => Ok(v),

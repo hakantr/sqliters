@@ -1161,7 +1161,7 @@ fn unsupported(prog: &Program, write: bool) -> Option<String> {
             _ => {}
         }
         if let P4::KeyInfo(k) = &op.p4 {
-            if k.enc != 1 {
+            if k.enc != 1 && !(prog.references_like && k.a_coll.iter().flatten().all(|c| c.name.eq_ignore_ascii_case("binary"))) {
                 return Some("UTF-16 key".to_owned());
             }
             // An application-defined collation can fail in this engine (its callback returns a
@@ -2300,7 +2300,7 @@ impl Vdbe {
                             m.expand_blob();
                         }
                     }
-                    m.enc = 1;
+                    m.enc = host.text_encoding() as u8;
                 }
 
                 OP_Variable => {
@@ -2379,6 +2379,7 @@ impl Vdbe {
                 OP_Concat => {
                     let (p1, p2, p3) = (op.p1 as usize, op.p2 as usize, op.p3 as usize);
                     let flags1 = self.a_mem[p1].flags;
+                    let encoding = host.text_encoding();
                     if (flags1 | self.a_mem[p2].flags) & MEM_NULL != 0 {
                         self.a_mem[p3].set_null();
                     } else {
@@ -2387,12 +2388,24 @@ impl Vdbe {
                         let mut a = self.a_mem[p1].clone();
                         if a.flags & (MEM_STR | MEM_BLOB) == 0 {
                             a.stringify(false);
+                            if encoding != sqliters_types::TextEncoding::Utf8 {
+                                let text = String::from_utf8_lossy(&a.z).into_owned();
+                                a.z.clear();
+                                encoding.encode_into(&text, &mut a.z);
+                                a.enc = encoding as u8;
+                            }
                         } else if a.flags & MEM_ZERO != 0 {
                             a.expand_blob();
                         }
                         let mut b = self.a_mem[p2].clone();
                         if b.flags & (MEM_STR | MEM_BLOB) == 0 {
                             b.stringify(false);
+                            if encoding != sqliters_types::TextEncoding::Utf8 {
+                                let text = String::from_utf8_lossy(&b.z).into_owned();
+                                b.z.clear();
+                                encoding.encode_into(&text, &mut b.z);
+                                b.enc = encoding as u8;
+                            }
                         } else if b.flags & MEM_ZERO != 0 {
                             b.expand_blob();
                         }
@@ -2403,10 +2416,11 @@ impl Vdbe {
                         let out = &mut self.a_mem[p3];
                         let mut z = b.z;
                         z.extend_from_slice(&a.z);
+                        if encoding != sqliters_types::TextEncoding::Utf8 { z.truncate(z.len() & !1); }
                         out.z = z;
                         out.set_type_flag(MEM_STR);
                         out.flags |= MEM_TERM;
-                        out.enc = 1;
+                        out.enc = encoding as u8;
                     }
                 }
 
@@ -2923,6 +2937,7 @@ impl Vdbe {
                     let mut ci = op.p1 as usize;
                     let mut p2 = op.p2 as u32;
                     let p3 = op.p3 as usize;
+                    let encoding = host.text_encoding() as u8;
                     'col: loop {
                         // op_column_restart:
                         let pc_ = csr!(ci);
@@ -3083,12 +3098,14 @@ impl Vdbe {
                                 }
                                 dest.z.clear();
                                 dest.z.extend_from_slice(&pc_.a_row[off..off + len]);
-                                dest.enc = 1;
+                                dest.enc = encoding;
                                 dest.flags = if t & 1 != 0 { MEM_STR | MEM_TERM } else { MEM_BLOB };
                             } else {
                                 sqlite3_vdbe_serial_get(&pc_.a_row[off.min(pc_.a_row.len())..], t, dest);
                             }
                         } else {
+                            // vdbe.c:3353: overflow results carry the database encoding.
+                            self.a_mem[p3].enc = encoding;
                             let p5 = op.p5 & OPFLAG_BYTELENARG;
                             if (p5 != 0 && (p5 == OPFLAG_TYPEOFARG || (t >= 12 && (t & 1 == 0 || p5 == OPFLAG_BYTELENARG))))
                                 || sqlite3_vdbe_serial_type_len(t) == 0
@@ -3106,7 +3123,7 @@ impl Vdbe {
                                 } else {
                                     sqlite3_vdbe_serial_get(&[0u8; 8], t, dest);
                                 }
-                                dest.enc = 1;
+                                dest.enc = encoding;
                             } else {
                                 // vdbeColumnFromOverflow
                                 let len = sqlite3_vdbe_serial_type_len(t);
@@ -3141,11 +3158,11 @@ impl Vdbe {
                                     dest.z.clear();
                                     dest.z.extend_from_slice(c);
                                     dest.flags = if t & 1 != 0 { MEM_STR | MEM_TERM } else { MEM_BLOB };
-                                    dest.enc = 1;
+                                    dest.enc = encoding;
                                 } else {
                                     let buf = sqlite3_vdbe_mem_from_btree(bt, &mut pc_.cur, off as u32, len)?;
                                     sqlite3_vdbe_serial_get(&buf, t, dest);
-                                    dest.enc = 1;
+                                    dest.enc = encoding;
                                 }
                             }
                         }
@@ -5012,7 +5029,7 @@ impl Vdbe {
                     let argc = usize::from(ctx.argc);
                     let p2 = op.p2 as usize;
                     let func = &ctx.p_func;
-                    let out: Mem;
+                    let mut out: Mem;
                     if func.func_flags & SQLITE_FUNC_NEEDCOLL != 0 {
                         let coll = self.func_coll_seq(pc);
                         let argv = &self.a_mem[p2..p2 + argc];
@@ -5054,6 +5071,15 @@ impl Vdbe {
                         let args: Vec<RuntimeValue> = self.a_mem[p2..p2 + argc].iter().map(Mem::to_runtime_value).collect();
                         let rv = host.call_function(func, &args)?;
                         out = mem_from_runtime(&rv);
+                    }
+                    // vdbeapi.c:sqlite3_result_text/value stores text in pCtx->enc.
+                    let encoding = host.text_encoding();
+                    if out.flags & MEM_STR != 0 && out.enc != encoding as u8 {
+                        if let Value::Text(text) = out.to_value() {
+                            out.z.clear();
+                            encoding.encode_into(&text, &mut out.z);
+                            out.enc = encoding as u8;
+                        }
                     }
                     if out.too_big(limit_length) {
                         return Err(too_big());

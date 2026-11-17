@@ -338,6 +338,8 @@ pub struct Vdbe {
     pub prep_flags: u8,
     /// `changeCntOn`: set by `sqlite3VdbeCountChanges()` for top-level DML.
     pub change_cnt_on: bool,
+    /// Compiler routing hint: LIKE was resolved, including an omitted range residual.
+    pub references_like: bool,
     /// `Parse.nTempReg` / `Parse.nRangeReg` are reset by [`Vdbe::end_coroutine`]; the code
     /// generator reads this flag after the call and clears its pools (C does it through
     /// `v->pParse`).
@@ -753,6 +755,7 @@ impl Vdbe {
             expmask: self.expmask,
             prep_flags: self.prep_flags,
             change_cnt_on: self.change_cnt_on,
+            references_like: self.references_like,
         }
     }
 }
@@ -805,6 +808,8 @@ pub struct Program {
     pub b_is_reader: bool,
     /// `changeCntOn`: publish `nChange` when a reader halts, including EXPLAIN DML.
     pub change_cnt_on: bool,
+    /// Routing metadata from function resolution; not a C Vdbe field.
+    pub references_like: bool,
     /// `usesStmtJournal`
     pub uses_stmt_journal: bool,
     /// `explain`: 0 normal, 1 EXPLAIN, 2 EXPLAIN QUERY PLAN

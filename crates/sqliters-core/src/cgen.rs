@@ -85,7 +85,7 @@ impl VTabIndexInfoCalls for CallsAdapter<'_> {
 }
 
 /// `sqlite3CreateFunc()`: the `funcFlags` of an application-defined function.
-fn func_flags(flags: FunctionFlags) -> u32 {
+pub(crate) fn func_flags(flags: FunctionFlags) -> u32 {
     let extra = flags.0
         & (FunctionFlags::DETERMINISTIC.0
             | FunctionFlags::DIRECTONLY.0
@@ -176,7 +176,7 @@ impl Host for EngineHost<'_> {
         for (arity, flags) in self.functions.scalar_overloads(name) {
             out.push(Arc::new(FuncDef {
                 n_arg: arity.map_or(-1, |n| n as i16),
-                func_flags: func_flags(flags),
+                func_flags: self.functions.c_like_flags(name, arity).unwrap_or_else(|| func_flags(flags)),
                 name: name.to_ascii_lowercase(),
                 user_data: -1,
                 x_finalize: false,
@@ -186,7 +186,7 @@ impl Host for EngineHost<'_> {
         for (arity, flags, supports_window) in self.functions.aggregate_overloads(name) {
             out.push(Arc::new(FuncDef {
                 n_arg: arity.map_or(-1, |n| n as i16),
-                func_flags: func_flags(flags),
+                func_flags: self.functions.c_like_flags(name, arity).unwrap_or_else(|| func_flags(flags)),
                 name: name.to_ascii_lowercase(),
                 user_data: -1,
                 x_finalize: true,
@@ -476,6 +476,15 @@ pub(crate) struct SelectSchemaUse {
     pub reads_schema: bool,
     pub btree_mask: Option<u32>,
     pub is_reader: Option<bool>,
+    pub has_like: bool,
+}
+
+pub(crate) fn program_has_like(p: &sqliters_vdbe::vdbeaux::Program) -> bool {
+    p.references_like || p.a_op.iter().any(|op| match &op.p4 {
+        sqliters_vdbe::vdbeaux::P4::FuncDef(f) => f.name.eq_ignore_ascii_case("like"),
+        sqliters_vdbe::vdbeaux::P4::FuncCtx(c) => c.p_func.name.eq_ignore_ascii_case("like"),
+        _ => false,
+    })
 }
 
 pub(crate) fn select_schema_use(inner: &ConnectionInner, sql: &str) -> Option<SelectSchemaUse> {
@@ -489,8 +498,8 @@ pub(crate) fn select_schema_use(inner: &ConnectionInner, sql: &str) -> Option<Se
     C_TEMP_OPENED.with(|c| c.set(temp));
     C_ROWEST.with(|c| *c.borrow_mut() = rowest);
     match result {
-        PrepareResult::Program(p) => Some(SelectSchemaUse { reads_schema, btree_mask: Some(p.btree_mask), is_reader: Some(p.b_is_reader) }),
-        PrepareResult::Error { .. } => Some(SelectSchemaUse { reads_schema, btree_mask: None, is_reader: None }),
+        PrepareResult::Program(p) => Some(SelectSchemaUse { reads_schema, btree_mask: Some(p.btree_mask), is_reader: Some(p.b_is_reader), has_like: program_has_like(&p) }),
+        PrepareResult::Error { .. } => Some(SelectSchemaUse { reads_schema, btree_mask: None, is_reader: None, has_like: false }),
         PrepareResult::Unsupported(_) => None,
     }
 }

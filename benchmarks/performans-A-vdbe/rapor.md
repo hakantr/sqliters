@@ -490,3 +490,7 @@ EXPLAIN, açıkladığı programın yazıcı sayımına katılır ve EOF sonras�
 ## V6b.28 — D133/D134 savepoint ve callback autocommit
 
 Legacy COMMIT/transaction RELEASE, callback sırasında C gibi autocommit 1 gösterir; reddedilmiş RELEASE savepoint zincirini ve autocommit 0 durumunu korur. 144 callback + 72 kilit + 96 FK ve eski 36 doğrudan hook akışı tamamen aynı. D52/D103/E28 ve kalan PRAGMA/M4 açıktır. Sırada case_sensitive_like var. Kanıt [karar_esligi_v6b_28.md](karar_esligi_v6b_28.md) içinde.
+
+## V6b.29 — case_sensitive_like
+
+Hazırlama etkisi, iki LIKE kaydı, BUSY/expire ve paylaşılan builtin bayrakları C ile hizalandı; açılan makine yolunda UTF-16 Column/Concat/işlev-sonuç kodlaması düzeltildi. 1116 yeni native akış aynı; 48 bağlı desen örneğinde D139 status farkı açık ve sonraki doğruluk işidir. Kapalı testte mevcut F4 beklentisi görünür oldu; C API ile doğrulandı, beklenti korunuyor. D52/D103/E28 ve kalan PRAGMA/M4 açık. Kanıt ve dört kapı [karar_esligi_v6b_29.md](karar_esligi_v6b_29.md).

@@ -27,6 +27,7 @@ use sqliters_types::{
     decode_record_with_encoding, encode_runtime_record_into, fallible_sort_by,
 };
 
+pub use func_c::eval_registered_like;
 pub use functions::{
     AccumulatorTable, AggregateAccumulator, AggregateKind, CompiledLikePattern, FastSumAccum,
     TestFunctionsScope, VmRuntimeContext, builtin_scalar_flags, builtin_window_arity,

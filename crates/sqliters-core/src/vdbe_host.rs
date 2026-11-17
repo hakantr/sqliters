@@ -98,7 +98,14 @@ pub(crate) fn machine_program(
     if !exec_switch_on() {
         return Ok(None);
     }
-    read_machine_program(inner, stmt, raw_sql, n_param, false)
+    read_machine_program(inner, stmt, raw_sql, n_param, false, false)
+}
+
+/// LIKE's binding and index selection depend on prepare-time function metadata.
+pub(crate) fn like_machine_program(
+    inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize,
+) -> Result<Option<Arc<Program>>> {
+    read_machine_program(inner, stmt, raw_sql, n_param, false, true)
 }
 
 /// A read rejected by legacy validation despite C eliminating its table source.
@@ -108,11 +115,11 @@ pub(crate) fn machine_program(
 pub(crate) fn schema_free_read_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize,
 ) -> Result<Option<Arc<Program>>> {
-    read_machine_program(inner, stmt, raw_sql, n_param, true)
+    read_machine_program(inner, stmt, raw_sql, n_param, true, false)
 }
 
 fn read_machine_program(
-    inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, schema_free: bool,
+    inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, schema_free: bool, like_only: bool,
 ) -> Result<Option<Arc<Program>>> {
     if !matches!(stmt, Some(Stmt::Select(_))) {
         return Ok(None);
@@ -146,12 +153,13 @@ fn read_machine_program(
     } else {
         None
     };
-    if inner.effective_encoding() != TextEncoding::Utf8 {
+    if inner.effective_encoding() != TextEncoding::Utf8 && !like_only {
         trace("fallback: UTF-16 database", raw_sql);
         return Ok(None);
     }
     match prepared.unwrap_or_else(|| crate::cgen::c_prepare(inner, raw_sql).0) {
         PrepareResult::Program(p) => {
+            if like_only && !crate::cgen::program_has_like(&p) { return Ok(None); }
             if schema_free && p.btree_mask != 0 { return Ok(None); }
             if p.explain != 0 {
                 return Ok(None);
@@ -436,6 +444,17 @@ macro_rules! host_common {
             // their first argument names (fts5ApiCallback)
             if func.func_flags & 0x0010 != 0 && sqliters_ext::Fts5AuxRegistry::is_aux_function(&func.name) {
                 return self.fts5_aux(&func.name, args);
+            }
+            if func.name.eq_ignore_ascii_case("like") {
+                let svc = self.svc();
+                if func.func_flags & sqliters_codegen::consts::SQLITE_FUNC_BUILTIN != 0 {
+                    let values: Vec<Value> = args.iter().map(|v| v.value.clone()).collect();
+                    return sqliters_vdbe::eval_registered_like(&values, svc.runtime, false).map(RuntimeValue::plain);
+                }
+                return svc.functions.call_scalar_bound(
+                    &func.name, (func.n_arg >= 0).then_some(func.n_arg as usize),
+                    args, svc.runtime, svc.strict_subtype,
+                );
             }
             self.svc().call_scalar(&func.name, args)
         }
