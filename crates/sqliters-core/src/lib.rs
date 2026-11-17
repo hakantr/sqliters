@@ -5360,6 +5360,23 @@ fn select_schema_use_of(inner: &ConnectionInner, stmt: &Stmt, sql: &str) -> Opti
     matches!(body, Stmt::Select(_)).then(|| cgen::select_schema_use(inner, sql)).flatten()
 }
 
+/// callback.c:216–232: a missing collation is a prepare error even when a
+/// legacy constant ORDER BY path would never compare values at execution.
+fn check_missing_collation_on_prepare(
+    inner: &mut ConnectionInner, usage: Option<&cgen::SelectSchemaUse>, sql: &str,
+) -> Result<()> {
+    if !usage.is_some_and(|u| u.btree_mask.is_none()) { return Ok(()); }
+    let (result, _, _) = cgen::c_prepare_quiet(inner, sql);
+    apply_codegen_pragma_effects(inner)?;
+    if let sqliters_codegen::PrepareResult::Error { code, message, offset } = result
+        && code == sqliters_types::extended::SQLITE_ERROR_MISSING_COLLSEQ
+    {
+        return Err(SqliteError::with_extended(code, message)
+            .with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }));
+    }
+    Ok(())
+}
+
 fn apply_select_schema_use(artifacts: &mut CompiledArtifacts, usage: Option<&cgen::SelectSchemaUse>) {
     if usage.is_some_and(|usage| usage.btree_mask == Some(0)) {
         artifacts.requires_schema = false;
@@ -6015,8 +6032,8 @@ fn prepare_pragma_program(inner: &mut ConnectionInner, sql: &str) -> Result<Opti
     let program = match result {
         sqliters_codegen::PrepareResult::Program(program) => program,
         sqliters_codegen::PrepareResult::Unsupported(_) => return Ok(None),
-        sqliters_codegen::PrepareResult::Error { message, offset } => {
-            return Err(SqliteError::new(ErrorCode::Error, message)
+        sqliters_codegen::PrepareResult::Error { code, message, offset } => {
+            return Err(SqliteError::with_extended(code, message)
                 .with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }));
         }
     };
@@ -6046,12 +6063,38 @@ fn prepare_row_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &st
     Ok(Some(Arc::new(*program)))
 }
 
-fn apply_row_pragma(artifacts: &mut CompiledArtifacts, program: &sqliters_vdbe::vdbeaux::Program) {
+fn apply_data_free_program(artifacts: &mut CompiledArtifacts, program: &sqliters_vdbe::vdbeaux::Program) {
     artifacts.category = Some(StmtCategory::Read);
     artifacts.requires_schema = false;
     artifacts.compiled_vdbe = None;
     artifacts.compiled_fast_read = None;
     artifacts.column_names = vdbe_host::column_names(program).unwrap_or_default();
+}
+
+/// C can discard an entire comparison (e.g. WHERE 0 AND ... COLLATE missing).
+/// The checked integer program also preserves C's counters in both switch states.
+fn prepare_integer_collation_select(
+    inner: &mut ConnectionInner, stmt: Option<&Stmt>, usage: Option<&cgen::SelectSchemaUse>, sql: &str,
+) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
+    if inner.authorizer.is_some() || !matches!(stmt, Some(Stmt::Select(_)))
+        || !usage.is_some_and(|u| u.btree_mask == Some(0)) { return Ok(None); }
+    let bytes = sql.as_bytes();
+    let mut pos = 0;
+    let mut collate = false;
+    while pos < bytes.len() {
+        let (n, token) = sqliters_codegen::tokenize::sqlite3_get_token(&bytes[pos..]);
+        if n == 0 { break; }
+        if token == sqliters_codegen::tk::TK_COLLATE { collate = true; break; }
+        pos += n;
+    }
+    if !collate { return Ok(None); }
+    let (result, _, _) = cgen::c_prepare_quiet(inner, sql);
+    apply_codegen_pragma_effects(inner)?;
+    if let sqliters_codegen::PrepareResult::Program(p) = result
+        && vdbe_host::integer_program_path(&p, true)
+        && sqliters_vdbe::vdbe::unsupported_reason(&p).is_none()
+    { return Ok(Some(Arc::new(*p))); }
+    Ok(None)
 }
 
 #[derive(Clone, Copy)]
@@ -7556,12 +7599,12 @@ impl Statement {
         match route {
             vdbe_host::WriteRoute::Engine => Ok(None),
             vdbe_host::WriteRoute::Program(p) => Ok(Some(p)),
-            vdbe_host::WriteRoute::Error { message, offset } => {
+            vdbe_host::WriteRoute::Error { code, message, offset } => {
                 if loaded {
                     // C's sqlite3ReadSchema() loaded the schemas before the error
                     inner.db_set.c_mark_schemas_loaded();
                 }
-                let e = SqliteError::new(ErrorCode::Error, message);
+                let e = SqliteError::with_extended(code, message);
                 Err(e.with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }))
             }
         }
@@ -7598,8 +7641,8 @@ impl Statement {
         match cgen::c_explain(inner, raw_sql) {
             cgen::CExplain::Program(p) => Ok(Some(p)),
             cgen::CExplain::Unsupported => Ok(None),
-            cgen::CExplain::Error { message, offset } => {
-                let e = SqliteError::new(ErrorCode::Error, message);
+            cgen::CExplain::Error { code, message, offset } => {
+                let e = SqliteError::with_extended(code, message);
                 Err(e.with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }))
             }
         }
@@ -7648,12 +7691,12 @@ impl Statement {
                     // `sqlite3Init()` clears, see `Db.encoding_fixed`).
                     let result = cgen::c_explain_tail(inner, sql);
                     apply_codegen_pragma_effects(inner)?;
-                    if let (cgen::CExplain::Error { message, offset }, _, loaded) = result {
+                    if let (cgen::CExplain::Error { code, message, offset }, _, loaded) = result {
                         if loaded {
                             // C's sqlite3ReadSchema() loaded the schemas before the error
                             inner.db_set.c_mark_schemas_loaded();
                         }
-                        let ce = SqliteError::new(ErrorCode::Error, message);
+                        let ce = SqliteError::with_extended(code, message);
                         return Err(ce.with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }));
                     }
                     return Err(e);
@@ -7661,12 +7704,12 @@ impl Statement {
                 let result = cgen::c_explain_tail(inner, sql);
                 apply_codegen_pragma_effects(inner)?;
                 match result {
-                    (cgen::CExplain::Error { message, offset }, _, loaded) => {
+                    (cgen::CExplain::Error { code, message, offset }, _, loaded) => {
                         if loaded {
                             // C's sqlite3ReadSchema() loaded the schemas before the error
                             inner.db_set.c_mark_schemas_loaded();
                         }
-                        let ce = SqliteError::new(ErrorCode::Error, message);
+                        let ce = SqliteError::with_extended(code, message);
                         return Err(ce.with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }));
                     }
                     (cgen::CExplain::Program(prog), tail_ofs, _) => {
@@ -7737,6 +7780,8 @@ impl Statement {
             }
         }
 
+        check_missing_collation_on_prepare(inner, select_schema_use.as_ref(), &raw_sql)?;
+
         if c_first_load {
             // sqlite3Init() -> sqlite3AnalysisLoad() on fresh schema objects
             inner.db_set.c_note_stats(false);
@@ -7766,6 +7811,7 @@ impl Statement {
         };
         let c_prepared_pragma = prepare_constant_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
         let c_row_pragma = prepare_row_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
+        let c_integer_collation = prepare_integer_collation_select(inner, stmt_opt.as_ref(), select_schema_use.as_ref(), &raw_sql)?;
         let c_prepared_default_cache = prepare_default_cache_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
         let c_prepared_auto_vacuum = prepare_auto_vacuum_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
         // C's ALTER TABLE (RENAME TO, RENAME COLUMN, DROP COLUMN of a non-TEMP table) reads
@@ -7966,8 +8012,8 @@ impl Statement {
             }
         }
 
-        let c_machine = if let Some(program) = c_row_pragma {
-            apply_row_pragma(&mut artifacts, &program);
+        let c_machine = if let Some(program) = c_row_pragma.or(c_integer_collation.filter(|p| p.n_var as usize == artifacts.max_param)) {
+            apply_data_free_program(&mut artifacts, &program);
             Some(program)
         } else {
             Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some())?
@@ -8588,6 +8634,7 @@ impl Statement {
                     let _ = inner.ensure_schemas_loaded_for_prepare(false)?;
                 }
             }
+            check_missing_collation_on_prepare(inner, select_schema_use.as_ref(), &self.raw_sql)?;
             let (parsed_stmt, c_explain) = match parsed_stmt {
                 None if cgen::is_explain(&self.raw_sql) => match cgen::c_explain(inner, &self.raw_sql) {
                     cgen::CExplain::Program(prog) => {
@@ -8603,6 +8650,7 @@ impl Statement {
             apply_codegen_pragma_effects(inner)?;
             let c_prepared_pragma = prepare_constant_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
             let c_row_pragma = prepare_row_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
+            let c_integer_collation = prepare_integer_collation_select(inner, parsed_stmt.as_ref(), select_schema_use.as_ref(), &self.raw_sql)?;
             self.c_prepared_default_cache = prepare_default_cache_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
             let c_prepared_auto_vacuum = prepare_auto_vacuum_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
             self.c_prepared_auto_vacuum = c_prepared_auto_vacuum;
@@ -8676,8 +8724,8 @@ impl Statement {
                 artifacts.requires_schema = false;
                 artifacts.column_names = explain_column_names(prog.explain);
             }
-            let c_machine = if let Some(program) = c_row_pragma {
-                apply_row_pragma(&mut artifacts, &program);
+            let c_machine = if let Some(program) = c_row_pragma.or(c_integer_collation.filter(|p| p.n_var as usize == artifacts.max_param)) {
+                apply_data_free_program(&mut artifacts, &program);
                 Some(program)
             } else {
                 Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some())?

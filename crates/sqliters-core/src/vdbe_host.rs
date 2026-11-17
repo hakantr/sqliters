@@ -172,7 +172,7 @@ fn read_machine_program(
             trace("machine", raw_sql);
             Ok(Some(Arc::new(*p)))
         }
-        PrepareResult::Error { message, offset } => {
+        PrepareResult::Error { code, message, offset } => {
             // A function the engine's library has and the generator's function table does not
             // (testfixture functions of `enable_test_functions`): the engine runs the statement.
             if let Some(name) = message.strip_prefix("no such function: ")
@@ -184,7 +184,7 @@ fn read_machine_program(
                 return Ok(None);
             }
             trace(&format!("machine: C compile error: {message}"), raw_sql);
-            let e = SqliteError::new(ErrorCode::Error, message);
+            let e = SqliteError::with_extended(code, message);
             Err(e.with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }))
         }
         PrepareResult::Unsupported(why) => {
@@ -199,7 +199,13 @@ fn read_machine_program(
 /// halt, invalid jump, or cycle leaves the ordinary machine guards in force.
 #[allow(non_upper_case_globals)]
 fn empty_program_path(program: &Program) -> bool {
-    use sqliters_vdbe::opcodes::{OP_Goto, OP_Halt, OP_Init, OP_Integer};
+    integer_program_path(program, false)
+}
+
+/// Acyclic, data-free integer results do not evaluate collations or text.
+#[allow(non_upper_case_globals)]
+pub(crate) fn integer_program_path(program: &Program, rows: bool) -> bool {
+    use sqliters_vdbe::opcodes::{OP_Goto, OP_Halt, OP_Init, OP_Integer, OP_ResultRow};
     if program.explain != 0 || program.btree_mask != 0 { return false; }
     let mut pc = 0usize;
     for _ in 0..program.a_op.len() {
@@ -212,6 +218,7 @@ fn empty_program_path(program: &Program) -> bool {
             }
             OP_Halt => return op.p1 == 0,
             OP_Integer => pc += 1,
+            OP_ResultRow if rows => pc += 1,
             _ => return false,
         }
     }
@@ -226,7 +233,7 @@ pub(crate) enum WriteRoute {
     /// C's program: the machine runs it inside the engine's write statement.
     Program(Arc<Program>),
     /// C's compile error (`sqlite3_prepare` fails): message and byte offset (-1: none).
-    Error { message: String, offset: i32 },
+    Error { code: i32, message: String, offset: i32 },
 }
 
 /// The route of an INSERT / UPDATE / DELETE (also with a WITH prefix): C's compile result —
@@ -303,7 +310,7 @@ pub(crate) fn machine_write_program(inner: &ConnectionInner, stmt: Option<&Stmt>
             trace("machine", raw_sql);
             WriteRoute::Program(Arc::new(*p))
         }
-        PrepareResult::Error { message, offset } => {
+        PrepareResult::Error { code, message, offset } => {
             // A function the engine's library has and the generator's function table does not
             // (testfixture functions of `enable_test_functions`): the engine runs the statement.
             if let Some(name) = message.strip_prefix("no such function: ")
@@ -315,7 +322,7 @@ pub(crate) fn machine_write_program(inner: &ConnectionInner, stmt: Option<&Stmt>
                 return (WriteRoute::Engine, loaded);
             }
             trace(&format!("machine: C compile error: {message}"), raw_sql);
-            WriteRoute::Error { message, offset }
+            WriteRoute::Error { code, message, offset }
         }
         PrepareResult::Unsupported(why) => {
             trace(&format!("fallback: generator: {why}"), raw_sql);

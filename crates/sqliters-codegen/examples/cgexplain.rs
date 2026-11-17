@@ -42,7 +42,7 @@ fn main() {
                     let _ = out.write_all(b"\n");
                 }
             }
-            PrepareResult::Error { message, offset } => {
+            PrepareResult::Error { message, offset, .. } => {
                 let _ = writeln!(out, "ERR {offset} {message}");
             }
             PrepareResult::Unsupported(why) => {

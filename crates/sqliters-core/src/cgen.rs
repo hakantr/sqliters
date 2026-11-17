@@ -657,8 +657,8 @@ fn trace_on() -> bool {
 pub(crate) enum CExplain {
     /// C's program for the statement: `EXPLAIN` lists it.
     Program(Arc<Program>),
-    /// The statement does not compile in C: the error message and byte offset.
-    Error { message: String, offset: i32 },
+    /// The statement does not compile in C: Parse.rc, error message and byte offset.
+    Error { code: i32, message: String, offset: i32 },
     /// The generator does not support the statement yet: the engine's old output is kept.
     Unsupported,
 }
@@ -682,7 +682,7 @@ pub(crate) fn c_explain_tail(inner: &ConnectionInner, sql: &str) -> (CExplain, u
     }
     let r = match r {
         PrepareResult::Program(p) => CExplain::Program(Arc::new(*p)),
-        PrepareResult::Error { message, offset } => CExplain::Error { message, offset },
+        PrepareResult::Error { code, message, offset } => CExplain::Error { code, message, offset },
         PrepareResult::Unsupported(_) => CExplain::Unsupported,
     };
     (r, tail, loaded)

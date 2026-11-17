@@ -177,7 +177,7 @@ fn rows(sql: &str) -> Vec<String> {
             })
             .collect(),
         PrepareResult::Program(prog) => crate::explain_text(&prog),
-        PrepareResult::Error { message, offset } => vec![format!("ERR {offset} {message}")],
+        PrepareResult::Error { message, offset, .. } => vec![format!("ERR {offset} {message}")],
         other => panic!("not compiled: {sql}: {other:?}"),
     }
 }
@@ -354,7 +354,7 @@ fn vtx(sql: &str) -> (Vec<String>, Vec<String>) {
     let (r, _, dump) = crate::prepare_with_where_dump(db, sql);
     let rows = match r {
         PrepareResult::Program(prog) => crate::explain_text(&prog),
-        PrepareResult::Error { message, offset } => vec![format!("ERR {offset} {message}")],
+        PrepareResult::Error { message, offset, .. } => vec![format!("ERR {offset} {message}")],
         other => panic!("not compiled: {sql}: {other:?}"),
     };
     (rows, dump)

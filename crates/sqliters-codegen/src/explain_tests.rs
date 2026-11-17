@@ -8,7 +8,7 @@ use crate::{Db, NoHost, PrepareResult, explain_text, prepare};
 fn run(sql: &str) -> Vec<String> {
     match prepare(Db::new(&NoHost), sql) {
         PrepareResult::Program(prog) => explain_text(&prog),
-        PrepareResult::Error { message, offset } => vec![format!("ERR {offset} {message}")],
+        PrepareResult::Error { message, offset, .. } => vec![format!("ERR {offset} {message}")],
         PrepareResult::Unsupported(why) => vec![format!("UNSUPPORTED {why}")],
     }
 }
@@ -111,18 +111,18 @@ fn unsupported_statements_are_reported_not_approximated() {
         prepare(Db::new(&NoHost), "create table t(x)"),
         PrepareResult::Program(_)
     ));
-    let PrepareResult::Error { message, offset } = prepare(Db::new(&NoHost), "drop table t") else {
+    let PrepareResult::Error { message, offset, .. } = prepare(Db::new(&NoHost), "drop table t") else {
         panic!("drop table t")
     };
     assert_eq!((message.as_str(), offset), ("no such table: t", -1));
     // DML is compiled since step V5: with no schema it is C's error (C 3.54.1:
     // "Parse error near line 1: no such table: t", no error offset).
-    let PrepareResult::Error { message, offset } = prepare(Db::new(&NoHost), "insert into t values(1)") else {
+    let PrepareResult::Error { message, offset, .. } = prepare(Db::new(&NoHost), "insert into t values(1)") else {
         panic!("insert into t values(1)")
     };
     assert_eq!((message.as_str(), offset), ("no such table: t", -1));
     // A table in FROM is compiled since step V2: with no schema it is C's error.
-    let PrepareResult::Error { message, offset } = prepare(Db::new(&NoHost), "select a from t") else {
+    let PrepareResult::Error { message, offset, .. } = prepare(Db::new(&NoHost), "select a from t") else {
         panic!("select a from t")
     };
     assert_eq!((message.as_str(), offset), ("no such table: t", -1));

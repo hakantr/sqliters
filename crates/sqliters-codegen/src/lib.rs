@@ -66,9 +66,9 @@ pub use sqliteint::{Db, DbInfo, Host, NoHost, Parse};
 pub enum PrepareResult {
     /// The statement was compiled: the program (ready for the machine / for `EXPLAIN`).
     Program(Box<Program>),
-    /// The statement failed to compile, with the error message and byte offset
+    /// The statement failed to compile, with C's primary/extended Parse.rc, message and byte offset
     /// (`sqlite3_error_offset()`, -1 if none) C SQLite reports.
-    Error { message: String, offset: i32 },
+    Error { code: i32, message: String, offset: i32 },
     /// The statement needs a part of C's code generator that is not ported yet; the text
     /// names the first missing piece.
     Unsupported(&'static str),
@@ -142,6 +142,7 @@ fn prepare_result(mut p: Parse<'_>) -> PrepareResult {
     }
     if p.z_err_msg.is_some() || (p.rc != sqliteint::SQLITE_OK && p.rc != sqliteint::SQLITE_DONE) {
         return PrepareResult::Error {
+            code: p.rc,
             message: p.z_err_msg.clone().unwrap_or_else(|| "SQL logic error".to_owned()),
             offset: p.err_byte_offset,
         };
