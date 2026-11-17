@@ -44,6 +44,7 @@
 | V6b.24 — compile_options | `3a17161` | 42 seçenek, get/used, Reusable ve hata konumu | 13372 tam program; 3990 native aynı; bütün dosyalar aynı | 1,052× taban; W14 1,369× | kapalı 1117/0; açık 1102/15 bilinen; 337 yok sayıldı |
 | V6b.25 — defer_foreign_keys; D131 açık | bu commit | Prepare/live bayrak, normal FK/işlem sonu, RESTRICT yazım sırası | 13414 tam program; 1624/1644 native aynı (20 D52); bütün dosyalar aynı; D131 6 fark açık | 1,050× taban; W14 1,358× | kapalı 1118/0; açık 1103/15 bilinen; 337 yok sayıldı |
 | V6b.26 — EXPLAIN yazıcı ömrü | bu commit | RUN/EOF/reset/finalize, changeCntOn, bekleyen işlem kapanışı | 72+408 native aynı; 120/192 kapanış tam aynı, 72 D132; eski altı D131 aynı | 1.060x taban; W14 1.369x | kapalı 1119/0; açık 1104/15 bilinen; 337 yok sayıldı |
+| V6b.27 — commit hook hata metni | bu commit | D132 varsayılan 531 metni | 192/192 EXPLAIN; 26/36 doğrudan aynı, 10 D133; önceki 72+408 aynı | 1.051x taban; W14 1.367x | kapalı 1120/0; açık 1105/15 bilinen; 337 yok sayıldı |
 
 ## V1 — kod üreticinin temeli
 
@@ -480,3 +481,7 @@ Prepare anı ile live bayrak ayrıldı; normal işlem sonu ve şema yükleme etk
 ## V6b.26 — EXPLAIN yazıcı ömrü ve D131
 
 EXPLAIN, açıkladığı programın yazıcı sayımına katılır ve EOF sonrasında reset/finalize’a kadar etkin kalır. Kapanıştaki değişiklik sayacı, FK hatası ve BUSY C ile hizalandı; commit-hook hata metni D132 olarak açık. 72+408 native akış ve eski altı D131 aynı; bütün ana dosya baytları eşit. D52/D103/E28 ve kalan PRAGMA/M4 işleri açık. Kanıt [karar_esligi_v6b_26.md](karar_esligi_v6b_26.md) içinde.
+
+## V6b.27 — D132 commit hook hata metni
+
+531 hook reddi C’nin constraint failed iletisini döndürür. 192/192 EXPLAIN ve 26/36 doğru yazmalı doğrudan işlem akışı tamamen aynı; eski 72+36 hata metni farkı giderildi. 10 D133 legacy autocommit farkı sıradaki iş. D52/D103/E28 ve kalan PRAGMA/M4 açıktır. D133 sonrasında case_sensitive_like hazırlama etkisine dönülecek. Kanıt [karar_esligi_v6b_27.md](karar_esligi_v6b_27.md) içinde.

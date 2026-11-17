@@ -916,7 +916,7 @@ impl CommitCoordinatorHooks {
                 Ok(true) => {
                     return Err(SqliteError::with_extended(
                         extended::SQLITE_CONSTRAINT_COMMITHOOK,
-                        "commit hook vetoed commit",
+                        "constraint failed",
                     ));
                 }
                 Err(payload) => {
