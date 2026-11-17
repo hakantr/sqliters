@@ -98,14 +98,14 @@ pub(crate) fn machine_program(
     if !exec_switch_on() {
         return Ok(None);
     }
-    read_machine_program(inner, stmt, raw_sql, n_param, false, false)
+    read_machine_program(inner, stmt, raw_sql, n_param, false, false, None)
 }
 
 /// LIKE's binding and index selection depend on prepare-time function metadata.
 pub(crate) fn like_machine_program(
-    inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize,
+    inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, bound_values: Option<&[Value]>,
 ) -> Result<Option<Arc<Program>>> {
-    read_machine_program(inner, stmt, raw_sql, n_param, false, true)
+    read_machine_program(inner, stmt, raw_sql, n_param, false, true, bound_values)
 }
 
 /// A read rejected by legacy validation despite C eliminating its table source.
@@ -115,11 +115,11 @@ pub(crate) fn like_machine_program(
 pub(crate) fn schema_free_read_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize,
 ) -> Result<Option<Arc<Program>>> {
-    read_machine_program(inner, stmt, raw_sql, n_param, true, false)
+    read_machine_program(inner, stmt, raw_sql, n_param, true, false, None)
 }
 
 fn read_machine_program(
-    inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, schema_free: bool, like_only: bool,
+    inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, schema_free: bool, like_only: bool, bound_values: Option<&[Value]>,
 ) -> Result<Option<Arc<Program>>> {
     if !matches!(stmt, Some(Stmt::Select(_))) {
         return Ok(None);
@@ -157,7 +157,10 @@ fn read_machine_program(
         trace("fallback: UTF-16 database", raw_sql);
         return Ok(None);
     }
-    match prepared.unwrap_or_else(|| crate::cgen::c_prepare(inner, raw_sql).0) {
+    match prepared.unwrap_or_else(|| match bound_values {
+        Some(values) => crate::cgen::c_prepare_bound(inner, raw_sql, values).0,
+        None => crate::cgen::c_prepare(inner, raw_sql).0,
+    }) {
         PrepareResult::Program(p) => {
             if like_only && !crate::cgen::program_has_like(&p) { return Ok(None); }
             if schema_free && p.btree_mask != 0 { return Ok(None); }

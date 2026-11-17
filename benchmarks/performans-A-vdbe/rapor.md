@@ -494,3 +494,7 @@ Legacy COMMIT/transaction RELEASE, callback sırasında C gibi autocommit 1 gös
 ## V6b.29 — case_sensitive_like
 
 Hazırlama etkisi, iki LIKE kaydı, BUSY/expire ve paylaşılan builtin bayrakları C ile hizalandı; açılan makine yolunda UTF-16 Column/Concat/işlev-sonuç kodlaması düzeltildi. 1116 yeni native akış aynı; 48 bağlı desen örneğinde D139 status farkı açık ve sonraki doğruluk işidir. Kapalı testte mevcut F4 beklentisi görünür oldu; C API ile doğrulandı, beklenti korunuyor. D52/D103/E28 ve kalan PRAGMA/M4 açık. Kanıt ve dört kapı [karar_esligi_v6b_29.md](karar_esligi_v6b_29.md).
+
+## V6b.30 — bağlı LIKE yeniden üretimi
+
+Bağlı değer, maskeli bind/clear ve dummy Variable üretimi C ile hizalandı; V1, EXPLAIN ve sayaç aktarımı denetlendi. D139 ana matrisinde 40/48 tam eşit, 8 UTF-16 NOCASE farkı açık. 144 bound açıklama, 48 ömür, 84 API/parametre ve 144 tam program karşılaştırması aynı. D140 NUL/NOCASE ve D141 ham Unicode üst sınırı farkları doğrulandı; sıradaki iş kodlama/collation/ham token baytlarıdır. D52/D103/E28 ve kalan PRAGMA/M4 sürer. Kanıt [karar_esligi_v6b_30.md](karar_esligi_v6b_30.md).

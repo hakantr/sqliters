@@ -7362,21 +7362,18 @@ enum MachineStart {
 }
 
 impl Statement {
-    /// C expires a statement when a parameter named in `expmask` is bound
-    /// (`sqlite3VdbeReprepareOnBind`: the LIKE optimisation reads the bound value) and
-    /// prepares it again with the value. The port of the generator has no bound values, so an
-    /// execution with such a parameter bound stays on the engine's executor.
-    fn c_machine_reprepared_by_bind(&self) -> bool {
-        let Some(prog) = &self.c_machine else {
-            return false;
-        };
-        if prog.expmask == 0 {
-            return false;
-        }
-        self.params.iter().enumerate().any(|(i, v)| {
-            let bit = if i >= 31 { 0x8000_0000u32 } else { 1u32 << i };
-            prog.expmask & bit != 0 && !matches!(v, Value::Null)
-        })
+    /// vdbeaux.c:73–75 clears the mask for the V1 prepare API.
+    fn c_bind_expmask(&self) -> u32 {
+        if self.mode == PrepareMode::V1 || self.c_machine_fixed { return 0; }
+        self.c_machine.as_ref().or(self.c_explain.as_ref()).or(self.c_machine_write.as_ref())
+            .map_or(0, |p| p.expmask)
+    }
+
+    /// vdbeapi.c:1753–1765: unbinding a masked parameter expires the plan,
+    /// including binding NULL again. An active VM applies this on its next run.
+    fn expire_for_binding(&mut self, index_1_based: usize) {
+        let bit = if index_1_based >= 32 { 0x8000_0000 } else { 1 << (index_1_based - 1) };
+        if self.c_bind_expmask() & bit != 0 { self.expired = true; }
     }
 
     /// Test oracle of the port of C's virtual machine: `prog` is the program C SQLite
@@ -7417,6 +7414,12 @@ impl Statement {
 
     /// `sqlite3_stmt_status(pStmt, op, resetFlg)` of a statement run by the port of C's
     /// virtual machine; 0 otherwise.
+    /// Current immutable generated program, for C program-equivalence probes.
+    #[doc(hidden)]
+    pub fn c_program_for_testing(&self) -> Option<&sqliters_vdbe::vdbeaux::Program> {
+        self.c_machine.as_deref().or(self.c_explain.as_deref()).or(self.c_machine_write.as_deref())
+    }
+
     #[doc(hidden)]
     pub fn machine_stmt_status(&mut self, op: usize, reset: bool) -> u32 {
         if let StatementLifecycle::Running(RunningExec::Machine { vm, .. }) = &mut self.lifecycle {
@@ -7428,7 +7431,7 @@ impl Statement {
     fn reprepare_machine_vm(&mut self, counters: [u32; 9]) {
         // vdbeaux.c:152–153: sqlite3VdbeSwap preserves aCounter and counts
         // the successful reprepare, including one before the first step.
-        self.c_machine_vm = self.c_machine.as_ref().map(|program| {
+        self.c_machine_vm = self.c_machine.as_ref().or(self.c_explain.as_ref()).map(|program| {
             let mut vm = Box::new(sqliters_vdbe::vdbe::Vdbe::new(Arc::clone(program)));
             vm.a_counter = counters;
             let count = &mut vm.a_counter[sqliters_vdbe::vdbe::SQLITE_STMTSTATUS_REPREPARE];
@@ -7614,12 +7617,13 @@ impl Statement {
         raw_sql: &str,
         is_explain: bool,
         has_like: bool,
+        bound_values: Option<&[Value]>,
     ) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
         if (!vdbe_host::exec_switch_on() && !has_like) || is_explain || artifacts.category != Some(StmtCategory::Read) {
             return Ok(None);
         }
         let result = if has_like {
-            vdbe_host::like_machine_program(inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param)
+            vdbe_host::like_machine_program(inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param, bound_values)
         } else {
             vdbe_host::machine_program(inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param)
         };
@@ -7710,11 +7714,12 @@ impl Statement {
         inner: &ConnectionInner,
         stmt: Option<&Stmt>,
         raw_sql: &str,
+        bound_values: Option<&[Value]>,
     ) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
         let Some(Stmt::Explain { .. }) = stmt else {
             return Ok(None);
         };
-        match cgen::c_explain(inner, raw_sql) {
+        match bound_values.map_or_else(|| cgen::c_explain(inner, raw_sql), |values| cgen::c_explain_bound(inner, raw_sql, values)) {
             cgen::CExplain::Program(p) => Ok(Some(p)),
             cgen::CExplain::Unsupported => Ok(None),
             cgen::CExplain::Error { code, message, offset } => {
@@ -7880,7 +7885,7 @@ impl Statement {
         let c_explain = match c_explain_of_rejected {
             Some(prog) => Some(prog),
             None => {
-                let result = Self::c_explain_of(inner, stmt_opt.as_ref(), &raw_sql);
+                let result = Self::c_explain_of(inner, stmt_opt.as_ref(), &raw_sql, None);
                 apply_codegen_pragma_effects(inner)?;
                 result?
             }
@@ -8092,7 +8097,7 @@ impl Statement {
             apply_data_free_program(&mut artifacts, &program);
             Some(program)
         } else {
-            Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some(), select_schema_use.as_ref().is_some_and(|u| u.has_like))?
+            Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some(), select_schema_use.as_ref().is_some_and(|u| u.has_like), None)?
                 .or_else(|| schema_free_fallback.into_inner())
         };
         if let Some(out) = &c_prepared_pragma {
@@ -8356,6 +8361,7 @@ impl Statement {
                 format!("column/bind index {index_1_based} out of range"),
             ));
         }
+        self.expire_for_binding(index_1_based);
         self.params[index_1_based - 1] = value;
         Ok(())
     }
@@ -8374,6 +8380,7 @@ impl Statement {
             ));
         }
         for (i, v) in values.iter().enumerate() {
+            self.expire_for_binding(i + 1);
             self.params[i] = v.clone();
         }
         Ok(())
@@ -8399,6 +8406,7 @@ impl Statement {
                     format!("column/bind index {index_1_based} out of range"),
                 ));
             }
+            self.expire_for_binding(index_1_based);
             self.params[index_1_based - 1] = value.into();
             return Ok(self);
         }
@@ -8421,6 +8429,7 @@ impl Statement {
                     format!("column/bind index {index_1_based} out of range"),
                 ));
             }
+            self.expire_for_binding(index_1_based);
             let slot = &mut self.params[index_1_based - 1];
             if let Value::Text(s) = slot {
                 s.clear();
@@ -8445,6 +8454,7 @@ impl Statement {
                     format!("unknown bind parameter: {name}"),
                 ));
             };
+            self.expire_for_binding(idx);
             self.params[idx - 1] = value.into();
             return Ok(self);
         }
@@ -8458,6 +8468,7 @@ impl Statement {
                 format!("unknown bind parameter: {name}"),
             ));
         };
+        self.expire_for_binding(idx);
         self.params[idx - 1] = value.into();
         drop(session);
         Ok(self)
@@ -8480,6 +8491,7 @@ impl Statement {
                 ));
             }
             for (i, v) in values.iter().enumerate() {
+                self.expire_for_binding(i + 1);
                 self.params[i] = v.clone();
             }
             return Ok(self);
@@ -8498,12 +8510,14 @@ impl Statement {
     /// reset execution position, close cursors, or end active `ActivityTracker` leases.
     pub fn clear_bindings(&mut self) -> Result<()> {
         if self.can_fast_bind() {
+            if self.c_bind_expmask() != 0 { self.expired = true; }
             self.params.fill(Value::Null);
             return Ok(());
         }
         let shared = Arc::clone(&self.shared);
         let session = shared.enter()?;
         session.inner().ensure_usable()?;
+        if self.c_bind_expmask() != 0 { self.expired = true; }
         self.params.fill(Value::Null);
         Ok(())
     }
@@ -8717,14 +8731,14 @@ impl Statement {
             }
             check_c_prepare_error(inner, select_schema_use.as_ref(), &self.raw_sql)?;
             let (parsed_stmt, c_explain) = match parsed_stmt {
-                None if cgen::is_explain(&self.raw_sql) => match cgen::c_explain(inner, &self.raw_sql) {
+                None if cgen::is_explain(&self.raw_sql) => match cgen::c_explain_bound(inner, &self.raw_sql, &self.params) {
                     cgen::CExplain::Program(prog) => {
                         (parse_one("EXPLAIN SELECT 1").ok().and_then(|(st, _)| st), Some(prog))
                     }
                     _ => (None, None),
                 },
                 st => {
-                    let c = Self::c_explain_of(inner, st.as_ref(), &self.raw_sql)?;
+                    let c = Self::c_explain_of(inner, st.as_ref(), &self.raw_sql, Some(&self.params))?;
                     (st, c)
                 }
             };
@@ -8809,7 +8823,7 @@ impl Statement {
                 apply_data_free_program(&mut artifacts, &program);
                 Some(program)
             } else {
-                Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some(), select_schema_use.as_ref().is_some_and(|u| u.has_like))?
+                Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some(), select_schema_use.as_ref().is_some_and(|u| u.has_like), Some(&self.params))?
                     .or(schema_free_fallback)
             };
             if let Some(prog) = &c_write
@@ -10237,7 +10251,7 @@ impl Statement {
 
                 // Diagnostic switch SQLITERS_VDBE_EXEC: the statement runs on the port of C's
                 // virtual machine, one row per step.
-                if self.c_machine.is_some() && !self.c_machine_reprepared_by_bind() {
+                if self.c_machine.is_some() {
                     match self.machine_start(hid, shared, inner, lease_cursors, read_instances) {
                         MachineStart::Stepped(r) => return r,
                         // (the program is of another schema version, or names a database the

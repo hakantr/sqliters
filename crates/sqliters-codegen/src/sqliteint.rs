@@ -1121,6 +1121,10 @@ pub struct DbInfo {
 /// What the code generator asks of the engine: the schema adapter and the registries of
 /// application-defined functions and collations.
 pub trait Host {
+    /// sqlite3VdbeGetBoundValue(pReprepare, iVar, SQLITE_AFF_BLOB).
+    /// Initial preparation has no previous statement; NULL is returned as None.
+    fn bound_value(&self, _i_var: usize) -> Option<sqliters_types::Value> { None }
+
     /// A connection/pager value read at prepare time by pragma.c. `None` means that
     /// the host does not represent this state; the generator must not approximate it.
     fn pragma_int(&self, _i_db: usize, _name: &str) -> Option<i64> {

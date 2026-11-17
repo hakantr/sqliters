@@ -287,10 +287,12 @@ fn is_like_or_glob(p: &mut Parse, e: ExprId, pp_prefix: &mut ExprId, pis_complet
     let op = p.e(p_right).op;
     let mut z: Option<Vec<u8>> = None;
     if op == TK_VARIABLE && (p.db.flags & SQLITE_EnableQPSG) == 0 {
-        // pVal = sqlite3VdbeGetBoundValue(pReprepare, iCol, SQLITE_AFF_BLOB): there is no
-        // statement being re-prepared, so no bound value;
-        // sqlite3VdbeReprepareOnBind(pParse->pVdbe, iCol, 0)
         let i_col = p.e(p_right).i_column as i32;
+        // whereexpr.c:207–218: BLOB affinity leaves the storage class unchanged.
+        // Only a bound TEXT supplies the prefix; NULL/BLOB/numeric values do not.
+        if let Some(sqliters_types::Value::Text(text)) = p.db.host.bound_value(i_col as usize) {
+            z = Some(text.into_bytes());
+        }
         p.v.reprepare_on_bind(i_col);
     } else if op == TK_STRING {
         z = Some(p.e(p_right).tok().as_bytes().to_vec());
@@ -374,7 +376,19 @@ fn is_like_or_glob(p: &mut Parse, e: ExprId, pp_prefix: &mut ExprId, pis_complet
         // the bytes of the prefix are kept exactly (the prefix can end inside a multi-byte
         // character only when the pattern itself is malformed)
         *pp_prefix = prefix;
-        // (op==TK_VARIABLE: z is NULL here, see above)
+        // whereexpr.c:313–329: retain the named/numbered parameter even when
+        // the complete prefix removes the residual LIKE function.
+        if op == TK_VARIABLE {
+            let i_col = p.e(p_right).i_column as i32;
+            p.v.reprepare_on_bind(i_col);
+            if *pis_complete && p.e(p_right).tok().len() > 1 {
+                let reg = sqlite3_get_temp_reg(p);
+                sqlite3_expr_code_target(p, p_right, reg);
+                let addr = p.v.current_addr() - 1;
+                p.v.change_p3(addr, 0);
+                sqlite3_release_temp_reg(p, reg);
+            }
+        }
         true
     } else {
         false

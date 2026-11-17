@@ -27,6 +27,7 @@ use crate::execution_context::{CollationRegistry, FunctionRegistry};
 const SQLITE_FUNC_UNSAFE: u32 = 0x0020_0000;
 
 struct EngineHost<'a> {
+    bound_values: Option<&'a [Value]>,
     functions: &'a FunctionRegistry,
     collations: &'a CollationRegistry,
     db_set: &'a crate::db_set::DatabaseSet,
@@ -98,6 +99,11 @@ pub(crate) fn func_flags(flags: FunctionFlags) -> u32 {
 }
 
 impl Host for EngineHost<'_> {
+    fn bound_value(&self, i_var: usize) -> Option<Value> {
+        self.bound_values?.get(i_var.checked_sub(1)?)
+            .filter(|v| !matches!(v, Value::Null)).cloned()
+    }
+
     fn pragma_collations(&self) -> Option<Vec<String>> {
         Some(self.collations.all_collation_names())
     }
@@ -466,7 +472,20 @@ pub(crate) fn c_prepare_quiet(inner: &ConnectionInner, sql: &str) -> (PrepareRes
 /// Run C's parser and code generator over one statement (`sqlite3Prepare`).
 /// The third value: C's `sqlite3Init()` loaded the schemas during this prepare.
 pub(crate) fn c_prepare(inner: &ConnectionInner, sql: &str) -> (PrepareResult, usize, bool) {
-    c_prepare_impl(inner, sql, false)
+    c_prepare_impl(inner, sql, false, None)
+}
+
+/// Recompile with the old statement's parameter values (pParse->pReprepare).
+pub(crate) fn c_prepare_bound(inner: &ConnectionInner, sql: &str, values: &[Value]) -> (PrepareResult, usize, bool) {
+    c_prepare_impl(inner, sql, false, Some(values))
+}
+
+pub(crate) fn c_explain_bound(inner: &ConnectionInner, sql: &str, values: &[Value]) -> CExplain {
+    match c_prepare_bound(inner, sql, values).0 {
+        PrepareResult::Program(p) => CExplain::Program(Arc::new(*p)),
+        PrepareResult::Error { code, message, offset } => CExplain::Error { code, message, offset },
+        PrepareResult::Unsupported(_) => CExplain::Unsupported,
+    }
 }
 
 /// SELECT decisions made by C's compiler with the schema cache assumed unloaded.
@@ -492,7 +511,7 @@ pub(crate) fn select_schema_use(inner: &ConnectionInner, sql: &str) -> Option<Se
     let temp = take_c_temp_opened();
     let rowest = take_c_rowest_clamped();
     let quiet = C_QUIET.with(|c| c.replace(true));
-    let (result, _, reads_schema) = c_prepare_impl(inner, sql, true);
+    let (result, _, reads_schema) = c_prepare_impl(inner, sql, true, None);
     C_QUIET.with(|c| c.set(quiet));
     C_PRAGMA_EFFECTS.with(|c| *c.borrow_mut() = effects);
     C_TEMP_OPENED.with(|c| c.set(temp));
@@ -504,8 +523,9 @@ pub(crate) fn select_schema_use(inner: &ConnectionInner, sql: &str) -> Option<Se
     }
 }
 
-fn c_prepare_impl(inner: &ConnectionInner, sql: &str, schema_probe: bool) -> (PrepareResult, usize, bool) {
+fn c_prepare_impl(inner: &ConnectionInner, sql: &str, schema_probe: bool, bound_values: Option<&[Value]>) -> (PrepareResult, usize, bool) {
     let host = EngineHost {
+        bound_values,
         functions: &inner.functions,
         collations: &inner.collations,
         db_set: &inner.db_set,
