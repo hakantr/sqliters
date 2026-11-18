@@ -659,3 +659,7 @@ Legacy CHECK, yazma ve doğrudan fiziksel BLOB sütununda veritabanı kodlaması
 ## V6b.70 — Özel geçici DB dosyasının açılış zamanı
 
 C iki özel TEMP DB'de boş okuma, işlem başlangıcı ve küçük COMMIT boyunca dosyayı açmadı. Her birinin ilk cache spill'i tek TEMP_DB xOpen yaptı ve veri izolasyonu korundu. Rust testinin eski dosya açma beklentisi ölçüme göre güncellendi. OFF 1170/5/337, ON 1157/18/337. DML ve ayrışma bulucu V6b.69 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,234 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_70.md).
+
+## V6b.71 — Skaler fonksiyon çağrısında yıldız
+
+Legacy skaler doğrulama yıldızla gelen fonksiyon çağrısını sıfır argümanla çözüyor. 468 native vakada DB özetleri iki kipte eşit. Tam API eşliği OFF 384, ON 408 vaka. Group46/65 C beklentisiyle iki kipte geçti. OFF 1170/5/337, ON 1158/17/337. DML ve ayrışma bulucu V6b.70 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,241 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_71.md).

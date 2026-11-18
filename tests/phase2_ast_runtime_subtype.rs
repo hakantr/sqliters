@@ -1490,11 +1490,8 @@ fn group46_65_inline_shortcircuit_star_arg_and_custom_collation_regressions() {
         );
     }
 
-    // 2. Reject `*` on non-aggregate scalar functions:
-    //    - Differential C SQLite 3.54.1 vs Rust check on `coalesce(*)`, `iif(*)`, `if(*)`, `abs(*)`
-    //      across both compiled VDBE and CTE-forced interpreter;
-    //    - Explicit Rust VDBE + CTE interpreter parity check on `random(*)` rejecting
-    //      `FunctionArgs::Star` with `"wrong number of arguments to function random()"`.
+    // 2. Function-call star supplies zero arguments. Required arguments
+    // still produce the ordinary arity error.
     for bad_fn in ["coalesce", "iif", "if", "abs"] {
         for sql in [
             format!("SELECT {bad_fn}(*);"),
@@ -1512,15 +1509,12 @@ fn group46_65_inline_shortcircuit_star_arg_and_custom_collation_regressions() {
         }
     }
     for sql in [
-        "SELECT random(*);",
-        "WITH c AS (SELECT 1) SELECT random(*) FROM c;",
+        "SELECT typeof(random(*)), sqlite_version(*);",
+        "WITH c AS (SELECT 1) SELECT typeof(random(*)), sqlite_version(*) FROM c;",
     ] {
-        let r_err = conn.query(sql, &[]).unwrap_err();
-        assert_eq!(r_err.code, ErrorCode::Error);
-        assert_eq!(
-            r_err.message, "wrong number of arguments to function random()",
-            "Rust mismatch on `{sql}`"
-        );
+        let expected = run_c_sql(sql).expect(sql);
+        let actual = run_rust_script(&conn, sql).expect(sql);
+        assert_eq!(actual, expected, "Rust mismatch on {sql}");
     }
 
     // 3. Custom collation in `CASE operand WHEN expr`, `BETWEEN`, and 1-column `IN (...)`

@@ -1345,7 +1345,9 @@ pub fn validate_function_call(
                     format!("no such function: {name}"),
                 ));
             };
-            if star_args || arg_count < min || arg_count > max {
+            // parse.y builds fn(*) with an empty argument list.
+            let argc = if star_args { 0 } else { arg_count };
+            if argc < min || argc > max {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
                     format!("wrong number of arguments to function {name}()"),
