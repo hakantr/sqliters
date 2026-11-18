@@ -1320,6 +1320,12 @@ fn step_ops_loop(
     local_ticks: &mut u64,
 ) -> Result<VmStep> {
     let empty_orders: Arc<[KeySortOrder]> = Arc::from([]);
+    let truthiness = |value: &Value, storage: &dyn BtreeAccess| {
+        let encoding = storage
+            .btree_ref(DatabaseId::MAIN)
+            .map_or(TextEncoding::Utf8, Btree::encoding);
+        value.truthiness_with_encoding(encoding)
+    };
     let mut fast_poll = services.fast_interrupt_and_no_progress();
     while *pc < ops.len() {
         if let Some(flag) = fast_poll {
@@ -2123,8 +2129,8 @@ fn step_ops_loop(
                 pool.recycle_value(old.value);
             }
             Opcode::And => {
-                let a = regs[ins.p1 as usize].value.truthiness();
-                let b = regs[ins.p2 as usize].value.truthiness();
+                let a = truthiness(&regs[ins.p1 as usize].value, storage);
+                let b = truthiness(&regs[ins.p2 as usize].value, storage);
                 regs[ins.p3 as usize] = RuntimeValue::plain(match (a, b) {
                     (Some(false), _) | (_, Some(false)) => Value::Integer(0),
                     (Some(true), Some(true)) => Value::Integer(1),
@@ -2132,8 +2138,8 @@ fn step_ops_loop(
                 });
             }
             Opcode::Or => {
-                let a = regs[ins.p1 as usize].value.truthiness();
-                let b = regs[ins.p2 as usize].value.truthiness();
+                let a = truthiness(&regs[ins.p1 as usize].value, storage);
+                let b = truthiness(&regs[ins.p2 as usize].value, storage);
                 regs[ins.p3 as usize] = RuntimeValue::plain(match (a, b) {
                     (Some(true), _) | (_, Some(true)) => Value::Integer(1),
                     (Some(false), Some(false)) => Value::Integer(0),
@@ -2141,7 +2147,7 @@ fn step_ops_loop(
                 });
             }
             Opcode::Not => {
-                let a = regs[ins.p1 as usize].value.truthiness();
+                let a = truthiness(&regs[ins.p1 as usize].value, storage);
                 regs[ins.p2 as usize] = RuntimeValue::plain(match a {
                     None => Value::Null,
                     Some(b) => Value::Integer(i64::from(!b)),
@@ -2165,13 +2171,13 @@ fn step_ops_loop(
                 }
             }
             Opcode::JumpIfTrue => {
-                if regs[ins.p1 as usize].value.truthiness() == Some(true) {
+                if truthiness(&regs[ins.p1 as usize].value, storage) == Some(true) {
                     next_pc = ins.p2 as usize;
                 }
             }
             Opcode::JumpIfFalse => {
                 // Jump when false, or when NULL if p3 != 0 (`jumpIfNull` flag in SQLite `OP_IfNot`!)
-                match regs[ins.p1 as usize].value.truthiness() {
+                match truthiness(&regs[ins.p1 as usize].value, storage) {
                     Some(false) => next_pc = ins.p2 as usize,
                     None if ins.p3 != 0 => next_pc = ins.p2 as usize,
                     _ => {}

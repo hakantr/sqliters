@@ -1014,6 +1014,55 @@ fn group64_dml_alias_and_returning_wildcard_and_qualifier_c_parity() {
     assert_eq!(r_err.message, "RETURNING may not use \"TABLE.*\" wildcards");
 }
 
+#[test]
+fn numeric_blob_boolean_predicates_follow_database_encoding() {
+    use Value::{Integer, Null};
+
+    for (encoding, true_blob, false_blob) in [
+        ("UTF-8", "32", "0032"),
+        ("UTF-16le", "3200", "32"),
+        ("UTF-16be", "0032", "3200"),
+    ] {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(&format!("PRAGMA encoding='{encoding}'"))
+            .unwrap();
+        let literal = conn
+            .query(&format!("SELECT NOT x'{true_blob}', NOT x'{false_blob}'"), &[])
+            .unwrap();
+        assert_eq!(literal.rows[0].values(), &[Integer(0), Integer(1)], "{encoding}");
+
+        conn.execute_batch(&format!(
+            "CREATE TABLE vals(id INTEGER PRIMARY KEY, x);
+             INSERT INTO vals VALUES (1,x'{true_blob}'), (2,x'{false_blob}'), (3,NULL);",
+        ))
+        .unwrap();
+        let projection = "NOT x, CASE WHEN x THEN 7 ELSE 8 END, x AND NULL, x OR NULL";
+        let expected = [
+            vec![Integer(0), Integer(7), Null, Integer(1)],
+            vec![Integer(1), Integer(8), Integer(0), Null],
+            vec![Null, Integer(8), Null, Null],
+        ];
+        for sql in [
+            format!("SELECT {projection} FROM vals ORDER BY id"),
+            format!(
+                "WITH src AS MATERIALIZED (SELECT * FROM vals)
+                 SELECT {projection} FROM src ORDER BY id",
+            ),
+        ] {
+            let rows = conn.query(&sql, &[]).unwrap().rows;
+            assert_eq!(rows.len(), expected.len());
+            for (row, expected) in rows.iter().zip(&expected) {
+                assert_eq!(row.values(), expected, "{encoding}: {sql}");
+            }
+        }
+
+        let rows = conn.query("SELECT id FROM vals WHERE x", &[]).unwrap().rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values(), &[Integer(1)]);
+    }
+    assert_eq!(Value::blob(b"2").truthiness(), Some(false));
+}
+
 // ============================================================================
 // Group 65: `RuntimeValue` `u8` Subtype Contract & `SQLITE_STRICT_SUBTYPE` Parity
 // ============================================================================

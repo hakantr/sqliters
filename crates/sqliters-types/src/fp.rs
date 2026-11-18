@@ -5,6 +5,8 @@
 //! tokens, CLI output).
 #![forbid(unsafe_code)]
 
+use crate::value::TextEncoding;
+
 const POWERSOF10_FIRST: i32 = -348;
 const POWERSOF10_LAST: i32 = 347;
 
@@ -588,6 +590,24 @@ pub fn sqlite_atof(z: &[u8]) -> (f64, i32) {
         }
     }
     (r, (0xffff_fff0u32 | m_state as u32) as i32)
+}
+
+/// `sqlite3MemRealValueRC`: SQLite numeric parsing of bytes in the memory cell's encoding.
+#[must_use]
+pub fn sqlite_atof_with_encoding(bytes: &[u8], encoding: TextEncoding) -> (f64, i32) {
+    let (lo, hi) = match encoding {
+        TextEncoding::Utf8 => return sqlite_atof(bytes),
+        TextEncoding::Utf16Le => (0, 1),
+        TextEncoding::Utf16Be => (1, 0),
+    };
+    let mut ascii = Vec::with_capacity(bytes.len() / 2);
+    for unit in bytes.chunks_exact(2) {
+        if unit[hi] != 0 {
+            return (sqlite_atof(&ascii).0, -100);
+        }
+        ascii.push(unit[lo]);
+    }
+    sqlite_atof(&ascii)
 }
 
 /// `sqlite3Atoi64(z, &v, n, SQLITE_UTF8)`: value and return code

@@ -3514,7 +3514,8 @@ fn evaluate_call_on_partition(
                 };
                 let agg_grp = item.group_rows.as_deref().map(|gr| (gr, outer_scopes));
                 let pass = if let Some(ref fe) = call.filter {
-                    eval_expr_pub(ctx, fe, params, scopes, ctes, agg_grp)?.truthiness()
+                    eval_expr_pub(ctx, fe, params, scopes, ctes, agg_grp)?
+                        .truthiness_with_encoding(ctx.encoding())
                         == Some(true)
                 } else {
                     true

@@ -1058,7 +1058,7 @@ impl FastExpr {
                     Ok(if *negated { !is_n } else { is_n })
                 }
             }
-            other => Ok(other.eval_value(ctx)?.truthiness() == Some(true)),
+            other => Ok(other.eval_value(ctx)?.truthiness_with_encoding(ctx.enc) == Some(true)),
         }
     }
 
@@ -1137,7 +1137,7 @@ impl FastExpr {
             Self::Col(c) => Ok(ctx.get_col(*c).to_owned_value(ctx.enc)),
             Self::UnaryPlus(inner) => inner.eval_value(ctx),
             Self::Negate(inner) => Ok(eval_unary_negate(&inner.eval_value(ctx)?)),
-            Self::Not(inner) => Ok(match inner.eval_value(ctx)?.truthiness() {
+            Self::Not(inner) => Ok(match inner.eval_value(ctx)?.truthiness_with_encoding(ctx.enc) {
                 None => Value::Null,
                 Some(b) => Value::Integer(i64::from(!b)),
             }),
@@ -1298,11 +1298,11 @@ impl FastExpr {
                 ))
             }
             Self::And(a, b) => {
-                let av = a.eval_value(ctx)?.truthiness();
+                let av = a.eval_value(ctx)?.truthiness_with_encoding(ctx.enc);
                 if av == Some(false) {
                     return Ok(Value::Integer(0));
                 }
-                let bv = b.eval_value(ctx)?.truthiness();
+                let bv = b.eval_value(ctx)?.truthiness_with_encoding(ctx.enc);
                 Ok(match (av, bv) {
                     (Some(false), _) | (_, Some(false)) => Value::Integer(0),
                     (Some(true), Some(true)) => Value::Integer(1),
@@ -1310,11 +1310,11 @@ impl FastExpr {
                 })
             }
             Self::Or(a, b) => {
-                let av = a.eval_value(ctx)?.truthiness();
+                let av = a.eval_value(ctx)?.truthiness_with_encoding(ctx.enc);
                 if av == Some(true) {
                     return Ok(Value::Integer(1));
                 }
-                let bv = b.eval_value(ctx)?.truthiness();
+                let bv = b.eval_value(ctx)?.truthiness_with_encoding(ctx.enc);
                 Ok(match (av, bv) {
                     (Some(true), _) | (_, Some(true)) => Value::Integer(1),
                     (Some(false), Some(false)) => Value::Integer(0),

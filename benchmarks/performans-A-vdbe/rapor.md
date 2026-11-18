@@ -643,3 +643,7 @@ Pozitif infix REGEXP 192/192 vakada callback değerini ve türünü C gibi dönd
 ## V6b.66 — Örtük kapanış rollback hook'u ve boş WAL başlığı
 
 Son bağlantı kapanışı yazma veya kapalı autocommit koşulunda rollback callback'ini çağırıyor. Boş WAL, C gibi sıfır sayfa boyutlu SHM başlığını yayımlıyor. Birleşik adayda 10 kapanış, 90 yeniden açılış ve 28 guard sonuçları eşit. Üç gerçek sayfa boyutunda 12 ilk SHM karşılaştırması birebir. Sonraki TRUNCATE'teki iki eski SHM hücresi farkı açık. OFF 1165/6/337, ON 1152/19/337. DML ve ayrışma bulucu V6b.65 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,236 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_66.md).
+
+## V6b.67 — Sayısal BLOB koşulları
+
+Legacy SQL, sayısal BLOB koşulunu veritabanı kodlamasına göre değerlendiriyor. İki Rust kipinde 2160 koşul ve 576 REGEXP vakası C ile eşit. Önceki 16 REGEXP koşul farkı kapandı. Ayrı CHECK ve `IS TRUE/FALSE` kapsamları açık. OFF 1166/6/337, ON 1153/19/337. DML ve ayrışma bulucu V6b.66 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_67.md).

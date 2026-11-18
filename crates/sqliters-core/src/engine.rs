@@ -6785,7 +6785,9 @@ fn exec_recursive_cte(
                 ) {
                     let erow = EvalRow::new(Rc::clone(cols), cur_row.clone());
                     let sc = push_scope(caller_outer_scopes, &erow);
-                    if eval_expr(ctx, we, params, &sc, ow_ctes, None)?.truthiness() == Some(true) {
+                    if eval_expr(ctx, we, params, &sc, ow_ctes, None)?
+                        .truthiness_with_encoding(ctx.encoding())
+                        == Some(true) {
                         outer_kept += 1;
                     }
                 } else {
@@ -7409,7 +7411,7 @@ fn exec_single_select_core_inner(
                         &scope_buf
                     };
                     let v = eval_expr(ctx, where_expr, params, scopes, ctes, None)?;
-                    if v.truthiness() == Some(true) {
+                    if v.truthiness_with_encoding(ctx.encoding()) == Some(true) {
                         filtered.push(r);
                     }
                 }
@@ -7590,7 +7592,7 @@ fn exec_single_select_core_inner(
                                 ctes,
                                 Some((&group_rows, outer_scopes)),
                             )?;
-                            if hv.truthiness() != Some(true) {
+                            if hv.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                                 continue;
                             }
                         }
@@ -7755,7 +7757,7 @@ fn exec_single_select_core_inner(
                             ctes,
                             Some((&group_rows, outer_scopes)),
                         )?;
-                        if hv.truthiness() != Some(true) {
+                        if hv.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                             continue;
                         }
                     }
@@ -8116,7 +8118,7 @@ fn choose_aggregate_representative_row(
         let row_scopes = push_scope(outer_scopes, gr);
         if let Some(fe) = filt_expr {
             let fv = eval_expr(ctx, fe, params, &row_scopes, ctes, None)?;
-            if fv.truthiness() != Some(true) {
+            if fv.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                 continue;
             }
         }
@@ -8939,7 +8941,9 @@ fn eval_from_clause_inner(
                 let mut kept = Vec::with_capacity(left_rows.len());
                 for r in left_rows {
                     let sc = push_scope(outer_scopes, &r);
-                    if eval_expr(ctx, conj, params, &sc, ctes, None)?.truthiness() == Some(true) {
+                    if eval_expr(ctx, conj, params, &sc, ctes, None)?
+                        .truthiness_with_encoding(ctx.encoding())
+                        == Some(true) {
                         kept.push(r);
                     }
                 }
@@ -9174,14 +9178,15 @@ fn eval_from_clause_inner(
                     for r in left_rows {
                         if outer_scopes.is_empty() {
                             if eval_expr(ctx, conj, params, std::slice::from_ref(&r), ctes, None)?
-                                .truthiness()
+                                .truthiness_with_encoding(ctx.encoding())
                                 == Some(true)
                             {
                                 kept.push(r);
                             }
                         } else {
                             let sc = push_scope(outer_scopes, &r);
-                            if eval_expr(ctx, conj, params, &sc, ctes, None)?.truthiness()
+                            if eval_expr(ctx, conj, params, &sc, ctes, None)?
+                                .truthiness_with_encoding(ctx.encoding())
                                 == Some(true)
                             {
                                 kept.push(r);
@@ -10442,7 +10447,9 @@ fn eval_vtab_scan(
             for r in b_rows {
                 if let Some(ref res_e) = residual {
                     let sc = push_scope(outer_scopes, &r);
-                    if eval_expr(ctx, res_e, params, &sc, ctes, None)?.truthiness() != Some(true) {
+                    if eval_expr(ctx, res_e, params, &sc, ctes, None)?
+                        .truthiness_with_encoding(ctx.encoding())
+                        != Some(true) {
                         continue;
                     }
                 }
@@ -10992,7 +10999,8 @@ fn open_filtered_vtab_cursor_inner(
                 }
                 None => {
                     expr_can_eval_with_cols(conj, &[], cols, outer_scopes)
-                        && eval_expr(ctx, conj, params, outer_scopes, ctes, None)?.truthiness()
+                        && eval_expr(ctx, conj, params, outer_scopes, ctes, None)?
+                               .truthiness_with_encoding(ctx.encoding())
                             != Some(true)
                 }
             };
@@ -11825,7 +11833,7 @@ fn try_exec_lazy_single_vtab_select(
                         .pop()
                         .and_then(|mut r| r.pop())
                         .unwrap_or(Value::Null);
-                    if v.truthiness() != Some(true) {
+                    if v.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                         pass = false;
                         break;
                     }
@@ -14793,7 +14801,9 @@ fn apply_join(
             if !right_only_conjuncts.is_empty() {
                 let r_scopes = push_scope(outer_scopes, r);
                 for &rc in &right_only_conjuncts {
-                    if eval_expr(ctx, rc, params, &r_scopes, ctes, None)?.truthiness() != Some(true)
+                    if eval_expr(ctx, rc, params, &r_scopes, ctes, None)?
+                        .truthiness_with_encoding(ctx.encoding())
+                        != Some(true)
                     {
                         ok = false;
                         break;
@@ -14831,7 +14841,9 @@ fn apply_join(
         if !right_rows.is_empty() && !left_only_conjuncts.is_empty() {
             let l_scopes = push_scope(outer_scopes, l);
             for &lc in &left_only_conjuncts {
-                if eval_expr(ctx, lc, params, &l_scopes, ctes, None)?.truthiness() != Some(true) {
+                if eval_expr(ctx, lc, params, &l_scopes, ctes, None)?
+                    .truthiness_with_encoding(ctx.encoding())
+                    != Some(true) {
                     left_ok = false;
                     break;
                 }
@@ -14936,7 +14948,7 @@ fn apply_join(
                         let single_scope = std::slice::from_ref(&cand);
                         if let Some(JoinConstraint::On(on_expr)) = &join.constraint
                             && eval_expr(ctx, on_expr, params, single_scope, ctes, None)?
-                                .truthiness()
+                                .truthiness_with_encoding(ctx.encoding())
                                 != Some(true)
                         {
                             ok = false;
@@ -14944,7 +14956,7 @@ fn apply_join(
                         if ok {
                             for &wc in extra_where_conjuncts {
                                 if eval_expr(ctx, wc, params, single_scope, ctes, None)?
-                                    .truthiness()
+                                    .truthiness_with_encoding(ctx.encoding())
                                     != Some(true)
                                 {
                                     ok = false;
@@ -14955,14 +14967,16 @@ fn apply_join(
                     } else {
                         let scopes = push_scope(outer_scopes, &cand);
                         if let Some(JoinConstraint::On(on_expr)) = &join.constraint
-                            && eval_expr(ctx, on_expr, params, &scopes, ctes, None)?.truthiness()
+                            && eval_expr(ctx, on_expr, params, &scopes, ctes, None)?
+                                   .truthiness_with_encoding(ctx.encoding())
                                 != Some(true)
                         {
                             ok = false;
                         }
                         if ok {
                             for &wc in extra_where_conjuncts {
-                                if eval_expr(ctx, wc, params, &scopes, ctes, None)?.truthiness()
+                                if eval_expr(ctx, wc, params, &scopes, ctes, None)?
+                                    .truthiness_with_encoding(ctx.encoding())
                                     != Some(true)
                                 {
                                     ok = false;
@@ -17704,7 +17718,7 @@ fn eval_expr_rt(
                         Value::Integer(!v.to_integer_lossy())
                     }
                 }
-                UnaryOp::Not => match v.truthiness() {
+                UnaryOp::Not => match v.truthiness_with_encoding(ctx.encoding()) {
                     None => Value::Null,
                     Some(b) => Value::Integer(i64::from(!b)),
                 },
@@ -17721,12 +17735,15 @@ fn eval_expr_rt(
             // Short-circuit AND / OR
             if *op == BinaryOp::And {
                 let lv = eval_expr(ctx, left, params, scopes, ctes, agg_group)?;
-                if lv.truthiness() == Some(false) {
+                if lv.truthiness_with_encoding(ctx.encoding()) == Some(false) {
                     return Ok(RuntimeValue::plain(Value::Integer(0)));
                 }
                 let rv = eval_expr(ctx, right, params, scopes, ctes, agg_group)?;
                 return Ok(RuntimeValue::plain(
-                    match (lv.truthiness(), rv.truthiness()) {
+                    match (
+                        lv.truthiness_with_encoding(ctx.encoding()),
+                        rv.truthiness_with_encoding(ctx.encoding()),
+                    ) {
                         (_, Some(false)) => Value::Integer(0),
                         (Some(true), Some(true)) => Value::Integer(1),
                         _ => Value::Null,
@@ -17735,12 +17752,15 @@ fn eval_expr_rt(
             }
             if *op == BinaryOp::Or {
                 let lv = eval_expr(ctx, left, params, scopes, ctes, agg_group)?;
-                if lv.truthiness() == Some(true) {
+                if lv.truthiness_with_encoding(ctx.encoding()) == Some(true) {
                     return Ok(RuntimeValue::plain(Value::Integer(1)));
                 }
                 let rv = eval_expr(ctx, right, params, scopes, ctes, agg_group)?;
                 return Ok(RuntimeValue::plain(
-                    match (lv.truthiness(), rv.truthiness()) {
+                    match (
+                        lv.truthiness_with_encoding(ctx.encoding()),
+                        rv.truthiness_with_encoding(ctx.encoding()),
+                    ) {
                         (_, Some(true)) => Value::Integer(1),
                         (Some(false), Some(false)) => Value::Integer(0),
                         _ => Value::Null,
@@ -18343,7 +18363,7 @@ fn eval_expr_rt(
                 if *op == LikeOp::Regexp && !*negated {
                     return Ok(res);
                 }
-                return Ok(match res.value.truthiness() {
+                return Ok(match res.value.truthiness_with_encoding(ctx.encoding()) {
                     None => RuntimeValue::null(),
                     Some(b) => RuntimeValue::plain(Value::Integer(i64::from(if *negated {
                         !b
@@ -18412,7 +18432,9 @@ fn eval_expr_rt(
                     .truthiness()
                         == Some(true)
                 } else {
-                    eval_expr(ctx, we, params, scopes, ctes, agg_group)?.truthiness() == Some(true)
+                    eval_expr(ctx, we, params, scopes, ctes, agg_group)?
+                        .truthiness_with_encoding(ctx.encoding())
+                        == Some(true)
                 };
                 if cond_true {
                     return eval_expr_rt(ctx, te, params, scopes, ctes, agg_group);
@@ -18547,7 +18569,7 @@ fn eval_expr_rt(
                         let row_scopes = push_scope(base_outer, gr);
                         if let Some(f_expr) = filter {
                             let fv = eval_expr(ctx, f_expr, params, &row_scopes, ctes, None)?;
-                            if fv.truthiness() != Some(true) {
+                            if fv.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                                 continue;
                             }
                         }
@@ -18587,7 +18609,7 @@ fn eval_expr_rt(
                     let row_scopes = push_scope(base_outer, gr);
                     if let Some(f_expr) = filter {
                         let fv = eval_expr(ctx, f_expr, params, &row_scopes, ctes, None)?;
-                        if fv.truthiness() != Some(true) {
+                        if fv.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                             continue;
                         }
                     }
@@ -18709,7 +18731,7 @@ fn eval_expr_rt(
                     let row_scopes = push_scope(base_outer, gr);
                     if let Some(f_expr) = filter {
                         let fv = eval_expr(ctx, f_expr, params, &row_scopes, ctes, None)?;
-                        if fv.truthiness() != Some(true) {
+                        if fv.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                             continue;
                         }
                     }
@@ -18810,7 +18832,7 @@ fn eval_expr_rt(
                         let mut idx = 0;
                         while idx + 1 < expr_list.len() {
                             if eval_expr(ctx, &expr_list[idx], params, scopes, ctes, agg_group)?
-                                .truthiness()
+                                .truthiness_with_encoding(ctx.encoding())
                                 == Some(true)
                             {
                                 return eval_expr_rt(
@@ -20029,7 +20051,11 @@ fn index_row_passes_partial_where(
         return Ok(true);
     };
     let scope = make_single_table_scope(tbl, schema_name, None, rowid, logical_vals);
-    Ok(eval_expr(ctx, w, params, &[scope], &CteStore::default(), None)?.truthiness() == Some(true))
+    Ok(
+        eval_expr(ctx, w, params, &[scope], &CteStore::default(), None)?
+            .truthiness_with_encoding(ctx.encoding())
+            == Some(true),
+    )
 }
 
 fn eval_index_column_values(
@@ -20885,7 +20911,7 @@ fn eval_trigger_when_cond(
         &CteStore::default(),
         None,
     )?;
-    Ok(v.truthiness() == Some(true))
+    Ok(v.truthiness_with_encoding(ctx.encoding()) == Some(true))
 }
 
 #[inline(never)]
@@ -27508,7 +27534,7 @@ fn execute_upsert_table_insert_row_inner(
 
                 if let Some(dw) = where_clause {
                     let cond = eval_expr(ctx, dw, params, &scopes, &p.dml_ctes, None)?;
-                    if cond.truthiness() != Some(true) {
+                    if cond.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                         return Ok(());
                     }
                 }
@@ -28852,7 +28878,7 @@ fn prepare_update_exec<'a>(
 
                             if let Some(ref w) = upd.selection {
                                 let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
-                                if cond.truthiness() != Some(true) {
+                                if cond.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                                     continue;
                                 }
                             }
@@ -28965,7 +28991,7 @@ fn prepare_update_exec<'a>(
 
                             if let Some(ref w) = upd.selection {
                                 let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
-                                if cond.truthiness() != Some(true) {
+                                if cond.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                                     continue;
                                 }
                             }
@@ -29030,7 +29056,7 @@ fn prepare_update_exec<'a>(
                     scopes.extend_from_slice(outer_scopes);
                     if let Some(ref w) = upd.selection {
                         let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
-                        if cond.truthiness() != Some(true) {
+                        if cond.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                             continue;
                         }
                     }
@@ -29254,7 +29280,7 @@ fn prepare_update_exec<'a>(
 
                             if let Some(ref w) = upd.selection {
                                 let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
-                                if cond.truthiness() != Some(true) {
+                                if cond.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                                     continue;
                                 }
                             }
@@ -29347,7 +29373,7 @@ fn prepare_update_exec<'a>(
 
                             if let Some(ref w) = upd.selection {
                                 let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
-                                if cond.truthiness() != Some(true) {
+                                if cond.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                                     continue;
                                 }
                             }
@@ -29424,7 +29450,7 @@ fn prepare_update_exec<'a>(
                     scopes.extend_from_slice(outer_scopes);
                     if let Some(ref w) = upd.selection {
                         let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
-                        if cond.truthiness() != Some(true) {
+                        if cond.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                             continue;
                         }
                     }
@@ -29614,7 +29640,7 @@ fn prepare_update_exec<'a>(
                         scopes.extend_from_slice(outer_scopes);
                         if let Some(ref w) = eff_selection {
                             let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
-                            if cond.truthiness() != Some(true) {
+                            if cond.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                                 continue;
                             }
                         }
@@ -29628,7 +29654,7 @@ fn prepare_update_exec<'a>(
                     scopes.extend_from_slice(outer_scopes);
                     if let Some(ref w) = eff_selection {
                         let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
-                        if cond.truthiness() != Some(true) {
+                        if cond.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                             continue;
                         }
                     }
@@ -30448,7 +30474,7 @@ fn prepare_delete_exec(
                 scopes.extend_from_slice(outer_scopes);
                 if let Some(ref w) = del.selection {
                     let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
-                    if cond.truthiness() != Some(true) {
+                    if cond.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                         continue;
                     }
                 }
@@ -30586,7 +30612,7 @@ fn prepare_delete_exec(
                 scopes.extend_from_slice(outer_scopes);
                 if let Some(ref w) = del.selection {
                     let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
-                    if cond.truthiness() != Some(true) {
+                    if cond.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                         continue;
                     }
                 }
@@ -30696,7 +30722,7 @@ fn prepare_delete_exec(
                 scopes.extend_from_slice(outer_scopes);
                 if let Some(ref where_expr) = eff_selection {
                     let v = eval_expr(ctx, where_expr, params, &scopes, &dml_ctes, None)?;
-                    if v.truthiness() != Some(true) {
+                    if v.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                         continue;
                     }
                 }

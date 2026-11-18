@@ -531,6 +531,16 @@ impl Value {
         }
     }
 
+    /// SQL boolean conversion with the database encoding used for raw BLOB bytes.
+    #[inline]
+    pub fn truthiness_with_encoding(&self, encoding: TextEncoding) -> Option<bool> {
+        if let Self::Blob(bytes) = self {
+            Some(crate::fp::sqlite_atof_with_encoding(bytes, encoding).0 != 0.0)
+        } else {
+            self.truthiness()
+        }
+    }
+
     /// Compares two values using SQLite's exact B-tree / `ORDER BY` sort rules (`sqlite3MemCompare`).
     ///
     /// Order: `NULL < (Integer / Real) < Text < Blob`.

@@ -8,8 +8,8 @@
 
 use std::sync::Arc;
 
-use sqliters_types::fp::{REAL_TEXT_MAX, sqlite_atof, sqlite_atoi64, write_real_text};
-use sqliters_types::{RuntimeValue, Value};
+use sqliters_types::fp::{REAL_TEXT_MAX, sqlite_atof_with_encoding, sqlite_atoi64, write_real_text};
+use sqliters_types::{RuntimeValue, TextEncoding, Value};
 
 pub const MEM_UNDEFINED: u16 = 0x0000;
 pub const MEM_NULL: u16 = 0x0001;
@@ -318,26 +318,12 @@ impl Mem {
     /// `sqlite3MemRealValueRC`: the value and the return code of `sqlite3AtoF`.
     #[inline]
     pub fn real_value_rc(&self) -> (f64, i32) {
-        if self.z.is_empty() {
-            return (0.0, 0);
-        }
-        if self.enc == 1 {
-            return sqlite_atof(&self.z);
-        }
-        // sqlite3MemRealValueRCSlowPath copies ASCII code units only. A
-        // nonzero high byte forces rc=-100 even after an earlier terminator.
-        let mut ascii = Vec::with_capacity(self.z.len() / 2);
-        let mut non_num = false;
-        for unit in self.z.chunks_exact(2) {
-            let (lo, hi) = if self.enc == 2 { (unit[0], unit[1]) } else { (unit[1], unit[0]) };
-            if hi != 0 {
-                non_num = true;
-                break;
-            }
-            ascii.push(lo);
-        }
-        let (value, rc) = sqlite_atof(&ascii);
-        (value, if non_num { -100 } else { rc })
+        let encoding = match self.enc {
+            1 => TextEncoding::Utf8,
+            2 => TextEncoding::Utf16Le,
+            _ => TextEncoding::Utf16Be,
+        };
+        sqlite_atof_with_encoding(&self.z, encoding)
     }
 
     /// `sqlite3VdbeRealValue`
