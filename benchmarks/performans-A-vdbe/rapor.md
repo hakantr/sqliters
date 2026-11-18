@@ -559,3 +559,7 @@ Sıcak journal kayıtları ayrı numara, sayfa ve checksum okumalarıyla sırayl
 ## V6b.45 — D149 sıcak journal bölüm başlığı
 
 Sıcak journal önce super-journal trailer'ını denetliyor, sonra magic ve 32 bit başlık alanlarını C sınırlarında okuyor. Başlık ve kayıt kısa okumaları ayrı sonuç veriyor. 203 native vaka, özgün dört vaka ve sekiz sync sınırı vakası C ile eşit. Önceki 147 kurtarma vakası, 12 dosya imajı ve dört gerçek çöküş imajı eşit. Ana gcov kapsamı 96 dal ve alınmayan 11 çıkış. OFF 1144/7/337, ON 1130/21/337. DML ve ayrışma bulucu V6b.44 ile aynı. Rust 1.100 süre oranı 1,248 ve 14 digest eşit. D150 sıcak DELETE sonlandırma sırası açık. [Karar ve doğrulama](karar_esligi_v6b_45.md).
+
+## V6b.46 — D150 normal sıcak DELETE sonlandırması
+
+Normal sıcak DELETE journal xClose, kipin gerektirdiği xDelete ve SHARED sırasıyla sonlandırılıyor. Birleşik hatada ilk sonlandırma hatası dönüyor. Super-journal temizliği başarılı SHARED sonrasında geliyor. 40 native ve 24 ek sayfa boyutu vakası C ile eşit. D149'un 203 başlık vakası ve önceki 147 kurtarma vakası tekrar eşit. Gcov 18 dal ve alınmayan 7 çıkış. OFF 1145/7/337, ON 1131/21/337. DML ve ayrışma bulucu V6b.45 ile aynı. Rust 1.100 süre oranı 1,249 ve 14 digest eşit. D151 PERSIST/TRUNCATE ve D152 sync file-control açık. [Karar ve doğrulama](karar_esligi_v6b_46.md).

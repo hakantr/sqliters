@@ -3110,6 +3110,12 @@ impl Pager {
         let retained_reader = self.reader_snapshot_held;
         let mut snapshot_established = false;
         if let Err(e) = self.begin_read_under_shared_lock(retained_reader, &mut snapshot_established) {
+            if self.uses_normal_delete_journal() && self.pager_error.is_some() {
+                // Hot recovery already latched the error. Let pager_unlock's
+                // equivalent release the database lock once.
+                self.end_error_transaction(false);
+                return Err(e);
+            }
             if !snapshot_established { self.reader_snapshot_held = false; }
             self.set_state(TransactionState::Open);
             if snapshot_established {
@@ -5686,6 +5692,10 @@ impl Pager {
         Ok(())
     }
 
+    fn uses_normal_delete_journal(&self) -> bool {
+        self.journal_mode == JournalMode::Delete && self.locking_mode == LockingMode::Normal
+    }
+
     fn keeps_delete_journal(&self) -> bool {
         self.journal_mode == JournalMode::Delete && self.locking_mode == LockingMode::Exclusive
     }
@@ -6359,7 +6369,7 @@ impl Pager {
         let result = self.play_hot_journal(&jpath);
         if let Err(ref error) = result {
             self.latch_pager_error(error);
-            if self.pager_error.is_some() {
+            if !self.uses_normal_delete_journal() && self.pager_error.is_some() {
                 self.end_error_transaction(false);
             }
         }
@@ -6472,8 +6482,17 @@ impl Pager {
             }
         };
 
-        // Finalize before inspecting sibling journals (pager_playback).
-        self.finish_hot_journal(jpath, jfile, z_super.is_some(), read_header)?;
+        // Normal DELETE follows pager_end_transaction: attempt the downgrade
+        // even when deletion fails and keep the first error.
+        let normal_delete = self.uses_normal_delete_journal();
+        let finalized = self.finish_hot_journal(jpath, jfile, z_super.is_some(), read_header);
+        let downgraded = if normal_delete {
+            self.unlock_db_file(LockLevel::Shared)
+        } else {
+            Ok(())
+        };
+        finalized?;
+        downgraded?;
         if should_replay && let Some(ref super_name) = z_super {
             self.pager_delsuper(super_name)?;
         }
@@ -6485,7 +6504,7 @@ impl Pager {
             self.page_size_fixed = false;
             self.header_loaded = false;
         }
-        if self.locking_mode == LockingMode::Normal {
+        if !normal_delete && self.locking_mode == LockingMode::Normal {
             self.unlock_db_file(LockLevel::Shared)?;
         }
         Ok(true)
@@ -6653,6 +6672,9 @@ impl Pager {
             let result = self.zero_journal_header(has_super);
             self.journal_off = 0;
             result
+        } else if self.uses_normal_delete_journal() {
+            self.journal_file = Some(journal);
+            self.remove_delete_journal()
         } else {
             journal.close()?;
             self.finalize_recovered_journal_file(jpath, has_super)
@@ -7818,6 +7840,12 @@ mod tests {
     // WAL intermediate states under I/O faults (`walLimitSize`, close-time checkpoint)
     // ------------------------------------------------------------------------------------------
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum RecoveryCall {
+        Delete { sync_dir: bool },
+        Unlock(LockLevel),
+    }
+
     /// What a [`FaultVfs`] injects and observes.
     #[derive(Default)]
     struct FaultCtl {
@@ -7840,6 +7868,8 @@ mod tests {
         fail_hot_journal_sync: AtomicBool,
         short_hot_journal_count: AtomicBool,
         fail_db_unlock: AtomicBool,
+        fail_db_shared_unlock: AtomicBool,
+        recovery_calls: Mutex<Vec<RecoveryCall>>,
         /// Ordered trace of the operations that matter for durability.
         events: Mutex<Vec<&'static str>>,
     }
@@ -7889,13 +7919,14 @@ mod tests {
             if path.to_string_lossy().ends_with("-wal") {
                 self.ctl.events.lock().unwrap().push("wal-delete");
             }
-            if path.to_string_lossy().ends_with("-journal")
-                && let Some(after_delete) = self.ctl.journal_delete_error.lock().unwrap().take()
-            {
-                if after_delete {
-                    self.inner.delete(path, sync_dir)?;
+            if path.to_string_lossy().ends_with("-journal") {
+                self.ctl.recovery_calls.lock().unwrap().push(RecoveryCall::Delete { sync_dir });
+                if let Some(after_delete) = self.ctl.journal_delete_error.lock().unwrap().take() {
+                    if after_delete {
+                        self.inner.delete(path, sync_dir)?;
+                    }
+                    return Err(SqliteError::with_extended(extended::SQLITE_IOERR_DELETE, "disk I/O error"));
                 }
-                return Err(SqliteError::with_extended(extended::SQLITE_IOERR_DELETE, "disk I/O error"));
             }
             self.inner.delete(path, sync_dir)
         }
@@ -8003,10 +8034,18 @@ mod tests {
             self.inner.lock(level)
         }
         fn unlock(&self, level: LockLevel) -> Result<()> {
-            if self.is_db && level == LockLevel::NoLock
-                && self.ctl.fail_db_unlock.swap(false, std::sync::atomic::Ordering::Relaxed)
-            {
-                return Err(SqliteError::with_extended(extended::SQLITE_IOERR_UNLOCK, "disk I/O error"));
+            if self.is_db {
+                use std::sync::atomic::Ordering::Relaxed;
+
+                self.ctl.recovery_calls.lock().unwrap().push(RecoveryCall::Unlock(level));
+                let fail = match level {
+                    LockLevel::Shared => self.ctl.fail_db_shared_unlock.swap(false, Relaxed),
+                    LockLevel::NoLock => self.ctl.fail_db_unlock.swap(false, Relaxed),
+                    _ => false,
+                };
+                if fail {
+                    return Err(SqliteError::with_extended(extended::SQLITE_IOERR_UNLOCK, "disk I/O error"));
+                }
             }
             self.inner.unlock(level)
         }
@@ -8114,6 +8153,61 @@ mod tests {
             pager.end_read_if_unused().unwrap();
             pager.close().unwrap();
             assert!(!vfs.exists(journal).unwrap());
+        }
+    }
+
+    #[test]
+    fn hot_delete_finalization_respects_directory_sync_and_first_error() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        for (synchronous, sync_dir) in [(2, false), (3, true)] {
+            let ctl = Arc::new(FaultCtl::default());
+            let vfs = Arc::new(FaultVfs { inner: Arc::new(MemoryVfs::new()), ctl: ctl.clone() });
+            let path = Path::new("hot-delete.db");
+            let journal = Path::new("hot-delete.db-journal");
+            let flags = OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB;
+            let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+            pager.set_synchronous(synchronous);
+            pager.begin_write().unwrap();
+            let page = pager.allocate_raw_page().unwrap();
+            pager.write_page(page).unwrap()[0] = 1;
+            pager.commit().unwrap();
+
+            // Stop the next commit just before unlinking its hot journal.
+            pager.begin_write().unwrap();
+            pager.write_page(page).unwrap()[0] = 2;
+            pager.commit_phase_one(None).unwrap();
+            *ctl.journal_delete_error.lock().unwrap() = Some(false);
+            let error = pager.commit_phase_two(false, false).unwrap_err();
+            assert_eq!(error.extended_code, extended::SQLITE_IOERR_DELETE);
+            assert_eq!(pager.rollback().unwrap_err(), error);
+            assert!(vfs.exists(journal).unwrap());
+
+            ctl.recovery_calls.lock().unwrap().clear();
+            *ctl.journal_delete_error.lock().unwrap() = Some(false);
+            ctl.fail_db_shared_unlock.store(true, Relaxed);
+            assert_eq!(pager.begin_read().unwrap_err().extended_code, extended::SQLITE_IOERR_DELETE);
+            assert!(vfs.exists(journal).unwrap());
+            assert!(!ctl.fail_db_shared_unlock.load(Relaxed));
+            assert_eq!(
+                *ctl.recovery_calls.lock().unwrap(),
+                [
+                    RecoveryCall::Delete { sync_dir },
+                    RecoveryCall::Unlock(LockLevel::Shared),
+                    RecoveryCall::Unlock(LockLevel::NoLock),
+                ]
+            );
+
+            ctl.recovery_calls.lock().unwrap().clear();
+            pager.begin_read().unwrap();
+            assert_eq!(pager.read_page(page).unwrap()[0], 1);
+            assert!(!vfs.exists(journal).unwrap());
+            assert_eq!(
+                *ctl.recovery_calls.lock().unwrap(),
+                [RecoveryCall::Delete { sync_dir }, RecoveryCall::Unlock(LockLevel::Shared)]
+            );
+            pager.end_read_if_unused().unwrap();
+            pager.close().unwrap();
         }
     }
 
