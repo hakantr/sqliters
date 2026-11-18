@@ -558,6 +558,10 @@ impl Pager {
                     canonical.as_path()
                 };
                 let opened = vfs.open(Some(open_target), flags)?;
+                if options.persist_wal {
+                    let mut mode = 1;
+                    let _ = opened.persist_wal_mode(&mut mode);
+                }
                 let ro = opened.is_readonly() || flags.is_readonly();
                 (
                     Some(canonical),
@@ -1316,6 +1320,10 @@ impl Pager {
     #[inline]
     pub fn set_persist_wal(&mut self, persist: bool) {
         self.persist_wal = persist;
+        if self.db_kind == DatabaseKind::NamedDisk && let Some(file) = self.file.as_deref() {
+            let mut mode = i32::from(persist);
+            let _ = file.persist_wal_mode(&mut mode);
+        }
     }
 
     // ========================================================================
@@ -6414,6 +6422,12 @@ impl Pager {
             && !self.journal_started_in_tx
             && !self.use_wal()
             && matches!(self.journal_mode, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate);
+        let idle_wal = self.state == TransactionState::Open
+            && self.locking_mode == LockingMode::Normal
+            && !self.uses_temp_file_semantics()
+            && !self.readonly
+            && self.pager_error.is_none()
+            && self.use_wal();
         let mut first_err: Option<SqliteError> = None;
         self.release_mapped_pages();
 
@@ -6429,9 +6443,12 @@ impl Pager {
             let ckpt_sync = self.ckpt_sync_flags();
             let persist_wal = self.persist_wal;
             if let Some(ref db_fd) = self.file {
-                if let Err(e) = wal.close(db_fd.as_ref(), ckpt_sync, persist_wal)
-                    && first_err.is_none()
-                {
+                let close = if idle_wal {
+                    wal.close_for_database(db_fd.as_ref(), ckpt_sync, persist_wal)
+                } else {
+                    wal.close(db_fd.as_ref(), ckpt_sync, persist_wal)
+                };
+                if let Err(e) = close && first_err.is_none() {
                     first_err = Some(e);
                 }
             } else {
@@ -6454,6 +6471,9 @@ impl Pager {
         }
         self.journal_off = 0;
 
+        if idle_wal {
+            let _ = self.unlock_db_file(LockLevel::NoLock);
+        }
         if let Some(mut fd) = self.file.take()
             && let Err(e) = fd.close()
             && first_err.is_none()
@@ -8059,6 +8079,9 @@ mod tests {
     enum RecoveryCall {
         Delete { sync_dir: bool },
         CommitPhaseTwo,
+        PersistWal { input: i32, output: i32 },
+        WalClose,
+        WalDelete,
         Unlock(LockLevel),
         JournalSync(SyncFlags),
         JournalSize,
@@ -8092,6 +8115,7 @@ mod tests {
         db_sync_notification_error: Mutex<Option<i32>>,
         db_sync_notifications: Mutex<Vec<Option<PathBuf>>>,
         db_commit_phase_two_result: Mutex<Option<i32>>,
+        persist_wal_override: Mutex<Option<i32>>,
         short_hot_journal_count: AtomicBool,
         fail_db_unlock: AtomicBool,
         fail_db_shared_unlock: AtomicBool,
@@ -8127,10 +8151,10 @@ mod tests {
         }
     }
 
-    /// `MemoryVfs` wrapper that can fail `file_size` / `truncate` on `-wal` files and records
+    /// VFS wrapper that can fail `file_size` / `truncate` on `-wal` files and records
     /// writes and syncs of the database and the `-wal`, and the removal of the `-wal`.
     struct FaultVfs {
-        inner: Arc<MemoryVfs>,
+        inner: Arc<dyn Vfs>,
         ctl: Arc<FaultCtl>,
     }
 
@@ -8165,6 +8189,7 @@ mod tests {
         fn delete(&self, path: &Path, sync_dir: bool) -> Result<()> {
             if path.to_string_lossy().ends_with("-wal") {
                 self.ctl.events.lock().unwrap().push("wal-delete");
+                self.ctl.record_close_call(RecoveryCall::WalDelete);
             }
             if path.to_string_lossy().ends_with("-journal") {
                 self.ctl.recovery_calls.lock().unwrap().push(RecoveryCall::Delete { sync_dir });
@@ -8189,6 +8214,21 @@ mod tests {
     }
 
     impl VfsFile for FaultFile {
+        fn persist_wal_mode(&self, mode: &mut i32) -> Option<Result<()>> {
+            if !self.is_db || *mode >= 0 {
+                return self.inner.persist_wal_mode(mode);
+            }
+            let input = *mode;
+            let result = if let Some(output) = *self.ctl.persist_wal_override.lock().unwrap() {
+                *mode = output;
+                Some(Ok(()))
+            } else {
+                self.inner.persist_wal_mode(mode)
+            };
+            self.ctl.record_close_call(RecoveryCall::PersistWal { input, output: *mode });
+            result
+        }
+
         fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
             if buf.len() >= DB_HEADER_SIZE
                 && ((self.is_db && offset == 0 && !self.ctl.short_wal_only.load(std::sync::atomic::Ordering::Relaxed)) || self.is_wal)
@@ -8357,6 +8397,8 @@ mod tests {
         fn close(&mut self) -> Result<()> {
             if self.is_journal {
                 self.ctl.record_close_call(RecoveryCall::JournalClose);
+            } else if self.is_wal {
+                self.ctl.record_close_call(RecoveryCall::WalClose);
             } else if self.is_db {
                 self.ctl.record_close_call(RecoveryCall::DatabaseClose);
             }
@@ -9421,6 +9463,81 @@ mod tests {
             JournalMode::Wal
         );
         (inner, ctl, pager)
+    }
+
+    #[test]
+    fn os_wal_close_queries_persistence_before_releasing_the_database_lock() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        struct TestDirectory(PathBuf);
+
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "sqliters-wal-close-{}-{timestamp}", std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let directory = TestDirectory(directory);
+        for (name, persist, override_mode, expected_keep) in [
+            ("default.db", false, None, false),
+            ("persistent.db", true, None, true),
+            ("override.db", false, Some(1), true),
+        ] {
+            let db_path = directory.0.join(name);
+            let inner = Arc::new(sqliters_vfs::OsVfs::new());
+            let ctl = Arc::new(FaultCtl::default());
+            let vfs = Arc::new(FaultVfs { inner: inner.clone(), ctl: ctl.clone() });
+            let flags = OpenFlags::READWRITE | OpenFlags::MAIN_DB;
+            let mut pager = Pager::open_with_vfs(vfs, Some(&db_path), flags | OpenFlags::CREATE).unwrap();
+            pager.set_synchronous(2);
+            pager.begin_write().unwrap();
+            let page = pager.allocate_raw_page().unwrap();
+            stamp_page(&mut pager, page, 1);
+            pager.commit().unwrap();
+            assert_eq!(pager.set_journal_mode(JournalMode::Wal).unwrap(), JournalMode::Wal);
+            let wal_path = pager.wal_path().unwrap().to_path_buf();
+            let shm_path = pager.shm_path().unwrap().to_path_buf();
+            let before = std::fs::read(&db_path).unwrap();
+            let data_offset = (page as usize - 1) * pager.page_size() as usize + 4;
+            assert_eq!(before[data_offset], 1);
+            pager.set_persist_wal(persist);
+            pager.begin_write().unwrap();
+            stamp_page(&mut pager, page, 7);
+            pager.commit().unwrap();
+            assert_eq!(std::fs::read(&db_path).unwrap(), before);
+            assert!(wal_path.exists() && shm_path.exists());
+
+            *ctl.persist_wal_override.lock().unwrap() = override_mode;
+            ctl.recovery_calls.lock().unwrap().clear();
+            ctl.trace_close.store(true, Relaxed);
+            pager.close().unwrap();
+            let mut expected = vec![
+                RecoveryCall::PersistWal { input: -1, output: i32::from(expected_keep) },
+                RecoveryCall::WalClose,
+            ];
+            if !expected_keep {
+                expected.push(RecoveryCall::WalDelete);
+            }
+            expected.extend([RecoveryCall::Unlock(LockLevel::NoLock), RecoveryCall::DatabaseClose]);
+            assert_eq!(*ctl.recovery_calls.lock().unwrap(), expected, "{name}");
+            assert_eq!(wal_path.exists(), expected_keep);
+            assert_eq!(shm_path.exists(), expected_keep);
+            assert_eq!(std::fs::read(&db_path).unwrap()[data_offset], 7);
+
+            let mut reader = Pager::open_with_vfs(inner, Some(&db_path), flags).unwrap();
+            reader.begin_read().unwrap();
+            assert_eq!(reader.read_page_unchecked(page).unwrap()[4], 7);
+            reader.end_read_if_unused().unwrap();
+            reader.close().unwrap();
+        }
     }
 
     #[test]

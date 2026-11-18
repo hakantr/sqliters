@@ -623,3 +623,7 @@ Otomatik `pragma_locking_mode` tanısı bilinmeyen şema ofsetini C gibi V1 step
 ## V6b.61 — D165 prepared UPDATE ve DELETE RETURNING sayaçları
 
 Legacy prepared UPDATE ve DELETE, ilk RETURNING satırında üst sayacı bekletiyor. Trigger katkısı görünür ve üst sayaç ifade kapanışında yayımlanıyor. Gerçek kaynak 36 UPDATE/DELETE, 27 INSERT ve 33 INSERT OR FAIL vakasında C ile eşit. Önceki 147 kurtarma eşit. OFF 1158/7/337, ON 1144/21/337. DML ve ayrışma bulucu V6b.60 ile aynı. Rust 1.100 süre oranı 1,240 ve 14 digest eşit. Sırada normal WAL kapanış VFS sözleşmesi var. [Karar ve doğrulama](karar_esligi_v6b_61.md).
+
+## V6b.62 — D166 normal WAL kapanışında VFS kararları
+
+Normal disk WAL kapanışı checkpoint'ten sonra VFS kalıcılık değerini sorguluyor. BUSY sonrasında terminal kilit bırakma sırası C ile aynı. 6 sağlıklı, 7 VFS yanıtı ve 3 eski adapter vakasında SQL, yeniden açılış ve DB/WAL/SHM özetleri eşit. C dal kapsamı 15/22. Önceki 147 kurtarma eşit. OFF 1159/7/337, ON 1145/21/337. DML ve ayrışma bulucu V6b.61 ile aynı. Rust 1.100 süre oranı 1,242 ve 14 digest eşit. D167 kapanış öncesi dosya kimliği denetimi sırada. [Karar ve doğrulama](karar_esligi_v6b_62.md).

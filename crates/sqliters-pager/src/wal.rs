@@ -2721,10 +2721,29 @@ impl Wal {
     /// - When `LockLevel::Exclusive` returns `Busy` (other connections remain open), cleanly closes
     ///   this connection's `-shm` (`delete_if_last = false`) and `-wal` without disturbing others!
     pub fn close(
+        self,
+        db_file: &dyn VfsFile,
+        sync_flags: Option<SyncFlags>,
+        persist_wal: bool,
+    ) -> Result<()> {
+        self.close_inner(db_file, sync_flags, persist_wal, false)
+    }
+
+    pub(super) fn close_for_database(
+        self,
+        db_file: &dyn VfsFile,
+        sync_flags: Option<SyncFlags>,
+        persist_wal: bool,
+    ) -> Result<()> {
+        self.close_inner(db_file, sync_flags, persist_wal, true)
+    }
+
+    fn close_inner(
         mut self,
         db_file: &dyn VfsFile,
         sync_flags: Option<SyncFlags>,
         persist_wal: bool,
+        database_close: bool,
     ) -> Result<()> {
         let _ = self.end_read_transaction();
 
@@ -2746,7 +2765,9 @@ impl Wal {
                 if lock_res.is_ok() {
                     true
                 } else {
-                    let _ = db_file.unlock(prev_lock);
+                    if !database_close {
+                        let _ = db_file.unlock(prev_lock);
+                    }
                     false
                 }
             };
@@ -2757,6 +2778,12 @@ impl Wal {
                 }
                 match self.checkpoint(db_file, WalCheckpointMode::Passive, None, sync_flags, None) {
                     Ok((res, _)) if !res.busy => {
+                        let mut mode = -1;
+                        let persist_wal = if database_close && db_file.persist_wal_mode(&mut mode).is_some() {
+                            mode == 1
+                        } else {
+                            persist_wal
+                        };
                         if !persist_wal {
                             is_delete = true;
                         } else if self.mx_wal_size >= 0

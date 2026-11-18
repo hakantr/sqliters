@@ -211,6 +211,13 @@ pub trait VfsFile: Send + Sync {
         Err(SqliteError::new(ErrorCode::NotFound, ErrorCode::NotFound.as_str()))
     }
 
+    /// SQLITE_FCNTL_PERSIST_WAL. A negative mode queries the current
+    /// per-handle flag, and a nonnegative mode updates it. None indicates
+    /// that this VFS leaves ownership of the setting to the pager.
+    fn persist_wal_mode(&self, _mode: &mut i32) -> Option<Result<()>> {
+        None
+    }
+
     /// Flushes OS buffers to persistent storage (`xSync`).
     fn sync(&self, flags: SyncFlags) -> Result<()>;
 
@@ -2154,6 +2161,7 @@ struct OsFile {
     path: Option<PathBuf>,
     delete_on_close: bool,
     readonly: bool,
+    persist_wal: AtomicBool,
     pending_dir_sync: AtomicBool,
     #[cfg(windows)]
     mmap_size_max: AtomicI64,
@@ -2188,6 +2196,18 @@ impl Drop for OsFile {
 }
 
 impl VfsFile for OsFile {
+    fn persist_wal_mode(&self, mode: &mut i32) -> Option<Result<()>> {
+        if let Err(error) = self.file_ref() {
+            return Some(Err(error));
+        }
+        if *mode < 0 {
+            *mode = i32::from(self.persist_wal.load(AtomicOrdering::Relaxed));
+        } else {
+            self.persist_wal.store(*mode != 0, AtomicOrdering::Relaxed);
+        }
+        Some(Ok(()))
+    }
+
     fn size_hint(&self, size: u64) -> Result<()> {
         #[cfg(unix)]
         {
@@ -3631,6 +3651,7 @@ impl Vfs for OsVfs {
             path: Some(target_path),
             delete_on_close,
             readonly,
+            persist_wal: AtomicBool::new(false),
             pending_dir_sync: AtomicBool::new(pending_dir_sync),
             #[cfg(windows)]
             mmap_size_max: AtomicI64::new(0),
