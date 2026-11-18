@@ -563,3 +563,7 @@ Sıcak journal önce super-journal trailer'ını denetliyor, sonra magic ve 32 b
 ## V6b.46 — D150 normal sıcak DELETE sonlandırması
 
 Normal sıcak DELETE journal xClose, kipin gerektirdiği xDelete ve SHARED sırasıyla sonlandırılıyor. Birleşik hatada ilk sonlandırma hatası dönüyor. Super-journal temizliği başarılı SHARED sonrasında geliyor. 40 native ve 24 ek sayfa boyutu vakası C ile eşit. D149'un 203 başlık vakası ve önceki 147 kurtarma vakası tekrar eşit. Gcov 18 dal ve alınmayan 7 çıkış. OFF 1145/7/337, ON 1131/21/337. DML ve ayrışma bulucu V6b.45 ile aynı. Rust 1.100 süre oranı 1,249 ve 14 digest eşit. D151 PERSIST/TRUNCATE ve D152 sync file-control açık. [Karar ve doğrulama](karar_esligi_v6b_46.md).
+
+## V6b.47 — D151 sıcak PERSIST ve TRUNCATE journal sonlandırması
+
+Sıcak PERSIST ve TRUNCATE aynı açık tanıtıcıyla sonlandırılıyor. JournalOff sıfırsa mevcut dosya korunuyor. 24 native vaka, sekiz cihaz özelliği ve altı 2PC commit noktası vakasında sorgu izleri ile tüm dosya özetleri C ile eşit. Gerçek C 2PC görüntüsü iki DB açılış sırasında üç motorda eşit. Eski PERSIST sıfır uzunluk beklentisi C'nin koruduğu tüm dosya baytlarını karşılaştıracak şekilde doğrulandı ve düzeltildi. Tekrar sonrası OFF 1145/7/337, ON 1131/21/337, başarısız kümeler aynı. DML ve ayrışma bulucu V6b.46 ile aynı. Rust 1.100 süre oranı 1,238 ve 14 digest eşit. Gcov ana ölçümde 42 dal, dokuz alınmayan çıkış. D152 sync bildirimi ve D153 terminal kilit ve journal sync sırası açık. [Karar ve doğrulama](karar_esligi_v6b_47.md).

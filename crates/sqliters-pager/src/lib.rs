@@ -3110,7 +3110,7 @@ impl Pager {
         let retained_reader = self.reader_snapshot_held;
         let mut snapshot_established = false;
         if let Err(e) = self.begin_read_under_shared_lock(retained_reader, &mut snapshot_established) {
-            if self.uses_normal_delete_journal() && self.pager_error.is_some() {
+            if self.uses_transaction_end_for_hot_recovery() && self.pager_error.is_some() {
                 // Hot recovery already latched the error. Let pager_unlock's
                 // equivalent release the database lock once.
                 self.end_error_transaction(false);
@@ -3125,6 +3125,9 @@ impl Pager {
                     let _ = wal.end_read_transaction();
                 }
                 if self.locking_mode == LockingMode::Normal {
+                    if self.uses_persistent_rollback_journal() {
+                        self.close_journal_before_unlock();
+                    }
                     let _ = self.unlock_db_file(LockLevel::NoLock);
                 }
             } else if had_wal_before {
@@ -3135,6 +3138,9 @@ impl Pager {
                 if let Some(wal) = self.wal.take() {
                     wal.abort_open();
                     self.journal_mode = JournalMode::Delete;
+                }
+                if self.locking_mode == LockingMode::Normal && self.uses_persistent_rollback_journal() {
+                    self.close_journal_before_unlock();
                 }
                 if self.locking_mode == LockingMode::Normal || prev_lock == LockLevel::NoLock {
                     let _ = self.unlock_db_file(LockLevel::NoLock);
@@ -3650,7 +3656,7 @@ impl Pager {
                 .and_then(|()| self.initialize_empty_database())
         {
             if !self.use_wal() {
-                let _ = self.finalize_journal_after_tx();
+                let _ = self.finalize_journal_after_tx(self.set_super);
             }
             self.cache_drop(1);
             self.page_count = 0;
@@ -4900,6 +4906,9 @@ impl Pager {
                 self.set_state(TransactionState::Read);
             } else {
                 self.release_retained_delete_journal(false);
+                if self.uses_persistent_rollback_journal() {
+                    self.close_journal_before_unlock();
+                }
                 self.unlock_db_file(LockLevel::NoLock)?;
                 self.set_state(TransactionState::Open);
             }
@@ -4948,6 +4957,21 @@ impl Pager {
         }
     }
 
+    /// pager_unlock closes the rollback journal before releasing the database
+    /// lock unless a PERSIST/TRUNCATE journal cannot be removed while open.
+    fn close_journal_before_unlock(&mut self) {
+        if self.journal_file.is_none() {
+            return;
+        }
+        let keep_journal = self.uses_persistent_rollback_journal()
+            && self.file.as_deref().is_some_and(|file| {
+                file.device_characteristics() & sqliters_vfs::IOCAP_UNDELETABLE_WHEN_OPEN != 0
+            });
+        if !keep_journal && let Some(mut journal) = self.journal_file.take() {
+            let _ = journal.close();
+        }
+    }
+
     /// pagerUnlockAndRollback: ERROR suppresses playback through the failed
     /// transaction. Leave a disk journal intact for a new shared-lock attempt.
     #[cold]
@@ -4965,13 +4989,7 @@ impl Pager {
         if let Some(wal) = self.wal.as_mut() {
             let _ = wal.end_read_transaction();
         } else if self.locking_mode == LockingMode::Normal {
-            let keep_journal = matches!(self.journal_mode, JournalMode::Truncate | JournalMode::Persist)
-                && self.file.as_deref().is_some_and(|file| {
-                    file.device_characteristics() & sqliters_vfs::IOCAP_UNDELETABLE_WHEN_OPEN != 0
-                });
-            if !keep_journal && let Some(mut journal) = self.journal_file.take() {
-                let _ = journal.close();
-            }
+            self.close_journal_before_unlock();
             self.error_lock_unknown = self.unlock_db_file(LockLevel::NoLock).is_err();
         }
         if self.db_kind == DatabaseKind::PrivateTemporary {
@@ -5356,7 +5374,7 @@ impl Pager {
                     return self.finish_tx_to_read_or_open(retain_read);
                 }
 
-                self.finalize_journal_after_tx()?;
+                self.finalize_journal_after_tx(self.set_super)?;
 
                 if self.pending_byte_copy.is_none() {
                     // `pager_end_transaction`: "else if( rc==SQLITE_OK && bCommit &&
@@ -5604,7 +5622,7 @@ impl Pager {
 
                 // Preserve the journal on a playback error. Finalize only
                 // after the original pages have been restored.
-                self.finalize_journal_after_tx()?;
+                self.finalize_journal_after_tx(self.set_super)?;
                 self.set_super = false;
                 self.journal_started_in_tx = false;
 
@@ -5665,7 +5683,7 @@ impl Pager {
         self.tx_journaled.clear_all();
         self.subsavepoints.clear();
         self.notify_backup_restart();
-        self.finalize_journal_after_tx()?;
+        self.finalize_journal_after_tx(self.set_super)?;
         self.set_super = false;
         self.journal_started_in_tx = false;
 
@@ -5692,8 +5710,13 @@ impl Pager {
         Ok(())
     }
 
-    fn uses_normal_delete_journal(&self) -> bool {
-        self.journal_mode == JournalMode::Delete && self.locking_mode == LockingMode::Normal
+    fn uses_persistent_rollback_journal(&self) -> bool {
+        matches!(self.journal_mode, JournalMode::Persist | JournalMode::Truncate)
+    }
+
+    fn uses_transaction_end_for_hot_recovery(&self) -> bool {
+        self.uses_persistent_rollback_journal()
+            || (self.journal_mode == JournalMode::Delete && self.locking_mode == LockingMode::Normal)
     }
 
     fn keeps_delete_journal(&self) -> bool {
@@ -5737,9 +5760,9 @@ impl Pager {
     }
 
     /// pager_end_transaction (pager.c:2117–2161).
-    fn finalize_journal_after_tx(&mut self) -> Result<()> {
+    fn finalize_journal_after_tx(&mut self, has_super: bool) -> Result<()> {
         if self.keeps_delete_journal() || self.journal_mode == JournalMode::Persist {
-            let result = self.zero_journal_header(self.set_super);
+            let result = self.zero_journal_header(has_super);
             self.journal_off = 0;
             return result;
         }
@@ -6369,7 +6392,7 @@ impl Pager {
         let result = self.play_hot_journal(&jpath);
         if let Err(ref error) = result {
             self.latch_pager_error(error);
-            if !self.uses_normal_delete_journal() && self.pager_error.is_some() {
+            if !self.uses_transaction_end_for_hot_recovery() && self.pager_error.is_some() {
                 self.end_error_transaction(false);
             }
         }
@@ -6423,7 +6446,8 @@ impl Pager {
     }
 
     fn play_hot_journal(&mut self, jpath: &Path) -> Result<bool> {
-        let reuse = self.keeps_delete_journal() && self.journal_file.is_some();
+        let keep_journal = self.keeps_delete_journal() || self.uses_persistent_rollback_journal();
+        let reuse = keep_journal && self.journal_file.is_some();
         if !reuse && !self.vfs.exists(jpath)? {
             if self.locking_mode == LockingMode::Normal {
                 self.unlock_db_file(LockLevel::Shared)?;
@@ -6460,10 +6484,16 @@ impl Pager {
                 Some(name) => self.vfs.exists(Path::new(name))?,
                 None => true,
             };
-            let read_header = should_replay
-                && self.replay_hot_journal_sections(
+            let read_header = if should_replay {
+                if self.uses_persistent_rollback_journal() {
+                    self.journal_off = 0;
+                }
+                self.replay_hot_journal_sections(
                     jfile.as_ref(), jsize, synced_through, &mut need_cache_reset,
-                )?;
+                )?
+            } else {
+                false
+            };
             if !self.pager_no_sync() {
                 self.db_file()?.sync(self.file_sync_flags())?;
             }
@@ -6473,7 +6503,7 @@ impl Pager {
         let (z_super, should_replay, read_header) = match playback_res {
             Ok(result) => result,
             Err(error) => {
-                if self.keeps_delete_journal() {
+                if keep_journal {
                     self.journal_file = Some(jfile);
                 } else {
                     let _ = jfile.close();
@@ -6482,11 +6512,11 @@ impl Pager {
             }
         };
 
-        // Normal DELETE follows pager_end_transaction: attempt the downgrade
-        // even when deletion fails and keep the first error.
-        let normal_delete = self.uses_normal_delete_journal();
+        // pager_end_transaction attempts the downgrade after finalization and
+        // gives the first error priority.
+        let transaction_end = self.uses_transaction_end_for_hot_recovery();
         let finalized = self.finish_hot_journal(jpath, jfile, z_super.is_some(), read_header);
-        let downgraded = if normal_delete {
+        let downgraded = if transaction_end && self.locking_mode == LockingMode::Normal {
             self.unlock_db_file(LockLevel::Shared)
         } else {
             Ok(())
@@ -6504,7 +6534,7 @@ impl Pager {
             self.page_size_fixed = false;
             self.header_loaded = false;
         }
-        if !normal_delete && self.locking_mode == LockingMode::Normal {
+        if !transaction_end && self.locking_mode == LockingMode::Normal {
             self.unlock_db_file(LockLevel::Shared)?;
         }
         Ok(true)
@@ -6664,47 +6694,16 @@ impl Pager {
         has_super: bool,
         read_header: bool,
     ) -> Result<()> {
-        if self.keeps_delete_journal() {
-            self.journal_file = Some(journal);
-            if read_header {
-                self.journal_off = self.journal_sector_size as u64;
-            }
-            let result = self.zero_journal_header(has_super);
-            self.journal_off = 0;
-            result
-        } else if self.uses_normal_delete_journal() {
-            self.journal_file = Some(journal);
-            self.remove_delete_journal()
-        } else {
-            journal.close()?;
-            self.finalize_recovered_journal_file(jpath, has_super)
-        }
-    }
-
-    fn finalize_recovered_journal_file(&mut self, jpath: &Path, has_super: bool) -> Result<()> {
-        if !has_super {
-            return self.vfs.delete(jpath, true);
-        }
         match self.journal_mode {
-            JournalMode::Truncate | JournalMode::Persist => {
-                let mut jf = self
-                    .vfs
-                    .open(Some(jpath), OpenFlags::READWRITE | OpenFlags::MAIN_JOURNAL)?;
-                let res: Result<()> = (|| {
-                    jf.truncate(0)?;
-                    if self.journal_mode == JournalMode::Persist && self.synchronous > 0 {
-                        jf.sync(self.data_sync_flags())?;
-                    } else if self.journal_mode == JournalMode::Truncate && self.synchronous >= 2 {
-                        let sflags = self.file_sync_flags();
-                        jf.sync(sflags)?;
-                    }
-                    Ok(())
-                })();
-                let close_res = jf.close();
-                res?;
-                close_res
+            JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate => {
+                self.journal_file = Some(journal);
+                if read_header && (self.keeps_delete_journal() || self.uses_persistent_rollback_journal()) {
+                    self.journal_off = u64::from(self.journal_sector_size);
+                }
+                self.finalize_journal_after_tx(has_super)
             }
-            JournalMode::Delete | JournalMode::Memory | JournalMode::Off | JournalMode::Wal => {
+            JournalMode::Memory | JournalMode::Off | JournalMode::Wal => {
+                journal.close()?;
                 self.vfs.delete(jpath, true)
             }
         }
@@ -8345,16 +8344,38 @@ mod tests {
             journal.extend(page);
             journal.extend(check.to_be_bytes());
         }
-        let file = vfs.open(Some(journal_path), OpenFlags::READWRITE | OpenFlags::CREATE).unwrap();
-        file.write_at(&journal, 0).unwrap();
-        drop(file);
+        for mode in [JournalMode::Delete, JournalMode::Persist, JournalMode::Truncate] {
+            let mut db = vfs.open(Some(path), OpenFlags::READWRITE | OpenFlags::MAIN_DB).unwrap();
+            db.write_at(&[3], u64::from(pgno - 1) * u64::from(page_size)).unwrap();
+            db.close().unwrap();
 
-        let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
-        pager.begin_read().unwrap();
-        assert_eq!(pager.read_page(pgno).unwrap()[0], 2);
-        pager.end_read_if_unused().unwrap();
-        pager.close().unwrap();
-        assert!(!vfs.exists(journal_path).unwrap());
+            let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+            assert_eq!(pager.set_journal_mode(mode).unwrap(), mode);
+            pager.begin_read().unwrap();
+            pager.end_read_if_unused().unwrap();
+
+            // Install the hot journal after configuring the idle reader.
+            let mut file = vfs.open(Some(journal_path), OpenFlags::READWRITE | OpenFlags::CREATE).unwrap();
+            file.write_at(&journal, 0).unwrap();
+            file.close().unwrap();
+
+            pager.begin_read().unwrap();
+            assert_eq!(pager.read_page(pgno).unwrap()[0], 2);
+            pager.end_read_if_unused().unwrap();
+            pager.close().unwrap();
+
+            match mode {
+                JournalMode::Delete => assert!(!vfs.exists(journal_path).unwrap()),
+                JournalMode::Persist => {
+                    let retained = vfs_file_image(vfs.as_ref(), journal_path);
+                    let (header, body) = retained.split_at(JOURNAL_HEADER_CORE_BYTES);
+                    assert_eq!(header, &[0; JOURNAL_HEADER_CORE_BYTES]);
+                    assert_eq!(body, &journal[JOURNAL_HEADER_CORE_BYTES..]);
+                }
+                JournalMode::Truncate => assert!(vfs_file_image(vfs.as_ref(), journal_path).is_empty()),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]

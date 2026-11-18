@@ -2022,6 +2022,7 @@ fn test_crash_matrix_pager_delsuper_order_independence_bseen_and_exists_ioerr_gu
             };
 
             for (db_path, jrnl_path, root, expected_second_row) in order {
+                let journal_before = fs::read(jrnl_path).unwrap();
                 let mut rec = Btree::open_with_vfs(
                     os_vfs.clone(),
                     Some(db_path),
@@ -2044,7 +2045,12 @@ fn test_crash_matrix_pager_delsuper_order_independence_bseen_and_exists_ioerr_gu
 
                 match jmode {
                     JournalMode::Delete => assert!(!jrnl_path.exists()),
-                    JournalMode::Persist => assert_eq!(fs::metadata(jrnl_path).unwrap().len(), 0),
+                    JournalMode::Persist => {
+                        // A missing super-journal skips playback before journalOff advances
+                        // (pager.c:2903–2906). With journalOff still zero, zeroJournalHdr
+                        // preserves the complete file (pager.c:1436–1444).
+                        assert_eq!(fs::read(jrnl_path).unwrap(), journal_before);
+                    }
                     _ => unreachable!(),
                 }
             }
