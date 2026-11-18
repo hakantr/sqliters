@@ -607,3 +607,7 @@ EXCLUSIVE disk rollback COMMIT gerçek yazımdan sonra phase-two bildirimi gönd
 ## V6b.57 — D52 prepared INSERT RETURNING sayaçları
 
 Prepared INSERT RETURNING üst sayaçları C gibi ifade kapanışında yayımlıyor. İlk satır ve araya giren DML, DONE, reset, finalize ve Drop doğrulandı. 27 bağımsız yaşam döngüsü, 72 geniş vaka, 24 aktif yazıcı ve iki commit hook karşılaştırması eşit. Önceki 147 kurtarma vakası korundu. OFF 1154/7/337, ON 1140/21/337. DML ve ayrışma bulucu V6b.56 ile aynı. Rust 1.100 süre oranı 1,240 ve 14 digest eşit. Sırada 2PC phase-one bildirimi ve aktif rollback. [Karar ve doğrulama](karar_esligi_v6b_57.md).
+
+## V6b.58 — D162 iki dosyalı COMMIT ve aktif rollback
+
+Phase-one SYNC, super-journal yolunu C ile aynı koşulda bildiriyor. Aktif rollback, commit noktasını fiziksel journal ile denetliyor ve katılımcı sonlandırması sonrası super-journal temizliğini C sırasına alıyor. 48 iki dosyalı vaka ve sekiz guard açılış vakası eşit. Tek dosya 27/27 veri ve yeniden açılışta eşit, tam iz 17/27. Gcov 55/76. Önceki 147 kurtarma eşit. OFF 1155/7/337, ON 1141/21/337. DML ve ayrışma bulucu V6b.57 ile aynı. Rust 1.100 süre oranı 1,245 ve 14 digest eşit. D163 tek dosya spill rollback sırası sırada. [Karar ve doğrulama](karar_esligi_v6b_58.md).

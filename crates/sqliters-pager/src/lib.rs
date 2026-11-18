@@ -2063,6 +2063,20 @@ impl Pager {
         self.synchronous == 0 || self.db_kind != DatabaseKind::NamedDisk
     }
 
+    /// sqlite3PagerSync after rollback playback, with a NULL super-journal argument.
+    fn sync_db_after_playback(&self) -> Result<()> {
+        let db = self.db_file()?;
+        if let Err(error) = db.notify_sync(None)
+            && error.extended_code != ErrorCode::NotFound as i32
+        {
+            return Err(error);
+        }
+        if !self.pager_no_sync() {
+            db.sync(self.file_sync_flags())?;
+        }
+        Ok(())
+    }
+
     /// `syncJournal(pPager, newHdr)`: "sync the journal file ... and write the nRec field of
     /// the most recent journal header". The device capabilities determine which writes and
     /// syncs are needed and whether `new_hdr` begins another section. Takes EXCLUSIVE first; every
@@ -5314,6 +5328,17 @@ impl Pager {
                 }
             }
 
+            // sqlite3PagerSync sends the super-journal path before xSync.
+            if let Some(name) = super_journal.filter(|name| !name.is_empty())
+                && self.db_kind == DatabaseKind::NamedDisk
+                && !self.uses_temp_file_semantics()
+                && matches!(self.journal_mode, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate)
+                && let Err(error) = self.db_file()?.notify_sync(Some(Path::new(name)))
+                && error.extended_code != ErrorCode::NotFound as i32
+            {
+                return Err(error);
+            }
+
             if !self.is_memdb_backing
                 && self.db_kind != DatabaseKind::PrivateTemporary
                 && self.synchronous > 0
@@ -5622,6 +5647,32 @@ impl Pager {
                     return self.rollback_journal_mode_off(retain_read);
                 }
 
+                let disk_rollback = self.db_kind == DatabaseKind::NamedDisk
+                    && !self.uses_temp_file_semantics()
+                    && self.pending_byte_copy.is_none()
+                    && matches!(
+                        self.journal_mode,
+                        JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate
+                    );
+                // set_super is set before writing the trailer. Inspect the
+                // journal to learn whether a valid pointer was written.
+                let super_journal = if disk_rollback && self.set_super
+                    && let Some(journal) = self.journal_file.as_deref()
+                {
+                    super_journal::read_super_journal(
+                        journal,
+                        super_journal::SUPER_JOURNAL_MAX_PATH_BYTES,
+                    )?
+                } else {
+                    None
+                };
+                // If the super-journal was unlinked, the commit point has
+                // passed, even if its xDelete returned an error (e.g. dir sync).
+                let should_replay = match &super_journal {
+                    Some(name) => self.vfs.exists(Path::new(name))?,
+                    None => true,
+                };
+
                 // pager_playback resets this; an empty WRITER_LOCKED rollback
                 // only ends the transaction and keeps the retained-lock flag.
                 if self.journal_started_in_tx {
@@ -5637,31 +5688,35 @@ impl Pager {
                 // `<db>-journal`. If any disk operation fails here, keep `<db>-journal` intact on
                 // disk so hot-journal recovery can still restore atomicity!
                 if self.db_file_modified && !self.is_memdb_backing {
-                    self.lock_db_file(LockLevel::Exclusive)?;
-                    let ps = u64::from(self.tx_orig_header.page_size);
-                    let lock_byte_pgno = self
-                        .lock_geometry
-                        .lock_byte_page(self.tx_orig_header.page_size);
-                    let mut restore_pgnos: Vec<Pgno> = self
-                        .tx_preimages
-                        .keys()
-                        .copied()
-                        .filter(|&pgno| pgno > 0 && pgno <= orig_count && pgno != lock_byte_pgno)
-                        .collect();
-                    // pager_playback processes records in journal order.
-                    restore_pgnos.sort_unstable_by_key(|pgno| self.tx_journal_end[pgno]);
+                    if should_replay {
+                        self.lock_db_file(LockLevel::Exclusive)?;
+                        let ps = u64::from(self.tx_orig_header.page_size);
+                        let lock_byte_pgno = self
+                            .lock_geometry
+                            .lock_byte_page(self.tx_orig_header.page_size);
+                        let mut restore_pgnos: Vec<Pgno> = self
+                            .tx_preimages
+                            .keys()
+                            .copied()
+                            .filter(|&pgno| pgno > 0 && pgno <= orig_count && pgno != lock_byte_pgno)
+                            .collect();
+                        // pager_playback processes records in journal order.
+                        restore_pgnos.sort_unstable_by_key(|pgno| self.tx_journal_end[pgno]);
 
-                    for pgno in restore_pgnos {
-                        let orig_data = self.tx_preimages.get(&pgno).expect("key exists");
-                        let offset = u64::from(pgno - 1) * ps;
-                        self.db_file()?.write_at(orig_data, offset)?;
-                    }
+                        for pgno in restore_pgnos {
+                            let orig_data = self.tx_preimages.get(&pgno).expect("key exists");
+                            let offset = u64::from(pgno - 1) * ps;
+                            self.db_file()?.write_at(orig_data, offset)?;
+                        }
 
-                    let orig_size = u64::from(orig_count) * ps;
-                    if self.db_file()?.file_size()? != orig_size {
-                        self.db_file()?.truncate(orig_size)?;
+                        let orig_size = u64::from(orig_count) * ps;
+                        if self.db_file()?.file_size()? != orig_size {
+                            self.db_file()?.truncate(orig_size)?;
+                        }
                     }
-                    if self.db_kind != DatabaseKind::PrivateTemporary && self.synchronous > 0 {
+                    if disk_rollback {
+                        self.sync_db_after_playback()?;
+                    } else if self.db_kind != DatabaseKind::PrivateTemporary && self.synchronous > 0 {
                         self.db_file()?.sync(self.file_sync_flags())?;
                     }
                     self.db_file_modified = false;
@@ -5672,28 +5727,32 @@ impl Pager {
                 // `pager_end_transaction` then makes every page clean (`sqlite3PcacheCleanAll`)
                 // and cuts the cache back to the database size.
                 self.release_transient();
-                for (pgno, orig_data) in self.tx_preimages.drain() {
-                    if pgno == 1 && pgno <= orig_count {
-                        self.db_file_vers.copy_from_slice(&orig_data[24..40]);
-                        self.db_file_vers_cc = u32::from_be_bytes(orig_data[24..28].try_into().unwrap());
+                if should_replay {
+                    for (pgno, orig_data) in self.tx_preimages.drain() {
+                        if pgno == 1 && pgno <= orig_count {
+                            self.db_file_vers.copy_from_slice(&orig_data[24..40]);
+                            self.db_file_vers_cc = u32::from_be_bytes(orig_data[24..28].try_into().unwrap());
+                        }
+                        if pgno <= orig_count
+                            && let Some(d) = self.cache.get_data_mut(pgno)
+                            && d.len() == orig_data.len()
+                        {
+                            d.copy_from_slice(&orig_data);
+                        }
                     }
-                    if pgno <= orig_count
-                        && let Some(d) = self.cache.get_data_mut(pgno)
-                        && d.len() == orig_data.len()
-                    {
-                        d.copy_from_slice(&orig_data);
-                    }
+                    self.page_count = orig_count;
+                    self.header = self.tx_orig_header.clone();
+                } else {
+                    self.tx_preimages.clear();
                 }
                 if self.db_kind == DatabaseKind::PrivateTemporary && !self.is_memdb_backing {
                     self.cache.clear_writable();
                 } else {
                     self.cache.clean_all();
                 }
-                self.cache.truncate(orig_count);
+                self.cache.truncate(self.page_count);
 
-                self.page_count = orig_count;
-                self.header = self.tx_orig_header.clone();
-                self.page_size_fixed = orig_count > 0;
+                self.page_size_fixed = self.page_count > 0;
                 self.tx_journaled.clear_all();
                 self.commit_phase_one_done = false;
                 self.db_file_modified = false;
@@ -5710,10 +5769,33 @@ impl Pager {
 
                 // Preserve the journal on a playback error. Finalize only
                 // after the original pages have been restored.
-                self.finalize_journal_after_tx(self.set_super)?;
+                let has_super = if disk_rollback { super_journal.is_some() } else { self.set_super };
+                let finalized = self.finalize_journal_after_tx(has_super);
+                let normal_rollback = disk_rollback && self.locking_mode == LockingMode::Normal;
+                let downgraded = if normal_rollback {
+                    self.unlock_db_file(LockLevel::Shared)
+                } else {
+                    Ok(())
+                };
+                finalized?;
+                downgraded?;
                 self.set_super = false;
                 self.journal_started_in_tx = false;
 
+                if should_replay && let Some(name) = &super_journal {
+                    // pager_end_transaction has already left the pager in READER.
+                    self.set_state(TransactionState::Read);
+                    if let Err(error) = self.pager_delsuper(name) {
+                        if !retain_read && !matches!(error.code, ErrorCode::IoErr | ErrorCode::Full) {
+                            let _ = self.finish_tx_to_read_or_open(false);
+                        }
+                        return Err(error);
+                    }
+                }
+                if normal_rollback && retain_read {
+                    self.set_state(TransactionState::Read);
+                    return Ok(());
+                }
                 self.finish_tx_to_read_or_open(retain_read)
             }
         }
@@ -6623,16 +6705,7 @@ impl Pager {
             } else {
                 false
             };
-            // sqlite3PagerSync notifies the VFS even when xSync is skipped.
-            let db = self.db_file()?;
-            if let Err(error) = db.notify_sync(None)
-                && error.extended_code != ErrorCode::NotFound as i32
-            {
-                return Err(error);
-            }
-            if !self.pager_no_sync() {
-                db.sync(self.file_sync_flags())?;
-            }
+            self.sync_db_after_playback()?;
             Ok((z_super, should_replay, read_header))
         })();
 

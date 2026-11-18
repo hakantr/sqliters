@@ -124,6 +124,10 @@ enum VfsOpEvent {
         path: PathBuf,
         flags: SyncFlags,
     },
+    SyncNotification {
+        path: PathBuf,
+        super_journal: Option<PathBuf>,
+    },
     InitialDirSync {
         path: PathBuf,
     },
@@ -134,10 +138,15 @@ enum VfsOpEvent {
     Exists {
         path: PathBuf,
     },
+    Unlock {
+        path: PathBuf,
+        level: LockLevel,
+    },
 }
 
 type PathFaultHook = Box<dyn Fn(&Path) -> Option<SqliteError> + Send + Sync>;
 type DeleteObserveHook = Box<dyn Fn(&Path, bool) -> Option<SqliteError> + Send + Sync>;
+type SyncNotifyFaultHook = Box<dyn Fn(&Path, Option<&Path>) -> Option<SqliteError> + Send + Sync>;
 
 #[derive(Default)]
 struct FaultConfig {
@@ -147,6 +156,7 @@ struct FaultConfig {
     fail_write: Option<PathFaultHook>,
     fail_truncate: Option<PathFaultHook>,
     fail_sync: Option<PathFaultHook>,
+    fail_notify_sync: Option<SyncNotifyFaultHook>,
     before_delete: Option<DeleteObserveHook>,
     after_delete: Option<DeleteObserveHook>,
 }
@@ -248,12 +258,30 @@ impl VfsFile for ObservingFaultFile {
         self.inner.file_size()
     }
 
+    fn notify_sync(&self, super_journal: Option<&Path>) -> Result<()> {
+        self.events.lock().unwrap().push(VfsOpEvent::SyncNotification {
+            path: self.path.clone(),
+            super_journal: super_journal.map(Path::to_path_buf),
+        });
+        if let Some(ref hook) = self.faults.lock().unwrap().fail_notify_sync
+            && let Some(err) = hook(&self.path, super_journal)
+        {
+            return Err(err);
+        }
+        self.inner.notify_sync(super_journal)
+    }
+
     fn lock(&self, level: LockLevel) -> Result<()> {
         self.inner.lock(level)
     }
 
     fn unlock(&self, level: LockLevel) -> Result<()> {
-        self.inner.unlock(level)
+        self.inner.unlock(level)?;
+        self.events.lock().unwrap().push(VfsOpEvent::Unlock {
+            path: self.path.clone(),
+            level,
+        });
+        Ok(())
     }
 
     fn check_reserved_lock(&self) -> Result<bool> {
@@ -1453,6 +1481,128 @@ fn test_sync_ordering_and_post_unlink_benign_phase2_fault_c_and_rust_reopen() {
         assert!(!c_reopen_dir.join("db1.db-journal").exists());
         assert!(!c_reopen_dir.join("db2.db-journal").exists());
     }
+}
+
+#[test]
+fn test_phase_one_sync_rejection_rolls_back_both_children_before_super_journal_delete() {
+    let sandbox = TempSandbox::new("phase_one_sync_rejection");
+    let vfs = Arc::new(ObservingFaultVfs::new(Arc::new(OsVfs::new())));
+    let main = vfs.full_pathname(&sandbox.path().join("main.db")).unwrap();
+    let aux = vfs.full_pathname(&sandbox.path().join("aux.db")).unwrap();
+    let main_journal = main.with_file_name("main.db-journal");
+    let aux_journal = aux.with_file_name("aux.db-journal");
+    for (path, value) in [(&main, 1), (&aux, 11)] {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(&format!("CREATE TABLE t(a INTEGER); INSERT INTO t VALUES({value});"))
+            .unwrap();
+        conn.try_close().unwrap();
+    }
+    let original_main = fs::read(&main).unwrap();
+    let original_aux = fs::read(&aux).unwrap();
+    let conn = Connection::open_with_vfs(
+        vfs.clone(),
+        Some(&main),
+        OpenFlags::READWRITE | OpenFlags::MAIN_DB,
+    )
+    .unwrap();
+    let aux_sql = aux.to_string_lossy().replace('\'', "''");
+    conn.execute_batch(&format!(
+        "ATTACH '{aux_sql}' AS aux;
+         PRAGMA main.journal_mode=DELETE; PRAGMA aux.journal_mode=DELETE;
+         BEGIN; UPDATE main.t SET a=2; UPDATE aux.t SET a=12;"
+    ))
+    .unwrap();
+
+    let fail_path = aux.clone();
+    vfs.faults.lock().unwrap().fail_notify_sync = Some(Box::new(move |path, super_journal| {
+        (path == fail_path.as_path() && super_journal.is_some()).then(|| {
+            SqliteError::with_extended(
+                extended::SQLITE_IOERR_WRITE,
+                "injected second participant phase-one sync notification error",
+            )
+        })
+    }));
+    vfs.clear_events();
+    let error = conn.execute("COMMIT").unwrap_err();
+    assert_eq!(error.extended_code, extended::SQLITE_IOERR_WRITE);
+    assert!(conn.is_autocommit());
+
+    let events = vfs.events_snapshot();
+    let super_journal = events
+        .iter()
+        .find_map(|event| match event {
+            VfsOpEvent::Open { path, flags }
+                if flags.contains(OpenFlags::SUPER_JOURNAL | OpenFlags::CREATE) =>
+            {
+                Some(path)
+            }
+            _ => None,
+        })
+        .expect("phase-one super-journal");
+    let position = |pred: &dyn Fn(&VfsOpEvent) -> bool| {
+        events
+            .iter()
+            .position(pred)
+            .unwrap_or_else(|| panic!("missing event in {events:#?}"))
+    };
+    let notified = |db: &Path, super_name: Option<&Path>| {
+        position(&|event| {
+            matches!(event, VfsOpEvent::SyncNotification { path, super_journal }
+                if path == db && super_journal.as_deref() == super_name)
+        })
+    };
+    let synced = |db: &Path| {
+        position(&|event| matches!(event, VfsOpEvent::FileSync { path, .. } if path == db))
+    };
+    let deleted = |journal: &Path| {
+        position(&|event| {
+            matches!(event, VfsOpEvent::Delete { path, sync_dir: false } if path == journal)
+        })
+    };
+    let unlocked = |db: &Path, target: LockLevel| {
+        position(&|event| {
+            matches!(event, VfsOpEvent::Unlock { path, level } if path == db && *level == target)
+        })
+    };
+    let scan_aux = position(&|event| {
+        matches!(event, VfsOpEvent::Open { path, flags }
+            if path == &aux_journal && flags.contains(OpenFlags::READONLY | OpenFlags::SUPER_JOURNAL))
+    });
+    let timeline = [
+        notified(&main, Some(super_journal)),
+        synced(&main),
+        notified(&aux, Some(super_journal)),
+        notified(&main, None),
+        deleted(&main_journal),
+        unlocked(&main, LockLevel::Shared),
+        scan_aux,
+        notified(&aux, None),
+        synced(&aux),
+        deleted(&aux_journal),
+        unlocked(&aux, LockLevel::Shared),
+        deleted(super_journal),
+        unlocked(&aux, LockLevel::NoLock),
+    ];
+    assert!(timeline.windows(2).all(|pair| pair[0] < pair[1]), "{events:#?}");
+    let super_deletes: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            VfsOpEvent::Delete { path, sync_dir } if path == super_journal => Some(*sync_dir),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(super_deletes, [false]);
+    assert!(!main_journal.exists());
+    assert!(!aux_journal.exists());
+    assert!(find_super_journals_in_dir(sandbox.path()).is_empty());
+    assert_eq!(fs::read(&main).unwrap(), original_main);
+    assert_eq!(fs::read(&aux).unwrap(), original_aux);
+
+    let row = conn.query_row("SELECT (SELECT a FROM main.t), (SELECT a FROM aux.t)", &[])
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.values(), &[Value::Integer(1), Value::Integer(11)]);
+    conn.try_close().unwrap();
 }
 
 // ============================================================================
