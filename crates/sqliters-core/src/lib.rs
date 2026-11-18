@@ -7581,7 +7581,8 @@ impl Statement {
             None => Box::new(sqliters_vdbe::vdbe::Vdbe::new(prog)),
         };
 
-        let result = vdbe_host::step(inner, shared, hid, &mut vm, &self.params, true, &self.raw_sql);
+        let (result, pragma_schema_error_offset) =
+            vdbe_host::step(inner, shared, hid, &mut vm, &self.params, true, &self.raw_sql);
         if vm.expired_on_reset { self.expired = true; }
         match result {
             Ok(Some(row)) => {
@@ -7649,12 +7650,24 @@ impl Statement {
                     },
                     shared,
                 );
-                self.lifecycle = StatementLifecycle::Halted {
-                    last_error: Some(e.clone()),
-                };
-                MachineStart::Stepped(Err(e))
+                MachineStart::Stepped(Err(self.finish_read_machine_error(e, pragma_schema_error_offset)))
             }
         }
+    }
+
+    fn finish_read_machine_error(
+        &mut self,
+        mut error: SqliteError,
+        pragma_schema_error_offset: Option<usize>,
+    ) -> SqliteError {
+        // sqlite3_reset and sqlite3_finalize transfer the saved error without the inner offset.
+        self.lifecycle = StatementLifecycle::Halted {
+            last_error: Some(error.clone()),
+        };
+        if self.mode == PrepareMode::V1 && let Some(offset) = pragma_schema_error_offset {
+            error.offset = Some(offset);
+        }
+        error
     }
 
     /// A further `sqlite3_step` of a statement suspended at a row of the machine.
@@ -7667,7 +7680,8 @@ impl Statement {
         let StatementLifecycle::Running(RunningExec::Machine { vm, .. }) = &mut self.lifecycle else {
             unreachable!("machine_advance requires a statement suspended on the machine");
         };
-        let res = vdbe_host::step(inner, shared, hid, vm, &self.params, false, &self.raw_sql);
+        let (res, pragma_schema_error_offset) =
+            vdbe_host::step(inner, shared, hid, vm, &self.params, false, &self.raw_sql);
         if vm.expired_on_reset { self.expired = true; }
         if let Ok(Some(row)) = res {
             if vm.prog.uses_vtab() {
@@ -7696,10 +7710,7 @@ impl Statement {
                     },
                     shared,
                 );
-                self.lifecycle = StatementLifecycle::Halted {
-                    last_error: Some(e.clone()),
-                };
-                Err(e)
+                Err(self.finish_read_machine_error(e, pragma_schema_error_offset))
             }
             _ => {
                 let fin_res = inner.finish_activity(

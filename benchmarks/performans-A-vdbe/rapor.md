@@ -615,3 +615,7 @@ Phase-one SYNC, super-journal yolunu C ile aynı koşulda bildiriyor. Aktif roll
 ## V6b.59 — D163 spill rollback geri yazma sınırı
 
 Aktif rollback sync açıkken yalnız tamamı senkronize ana journal kaydını DB'ye geri yazıyor. Önceki altı ek yazım kalktı ve cache geri yüklemesi korundu. 27/27 tek dosya vakası VFS, SQL ve ana DB özetlerinde eşit. Ham dosya kümesi 21/27 ve altı PERSIST farkı nonce/checksum alanlarında. D162'nin 56 vakası ile önceki 147 kurtarma vakası eşit. Gcov 11/18. OFF 1156/7/337, ON 1142/21/337. DML ve ayrışma bulucu V6b.58 ile aynı. Rust 1.100 süre oranı 1,250 ve 14 digest eşit. Sırada iç PRAGMA V1 ofseti var. [Karar ve doğrulama](karar_esligi_v6b_59.md).
+
+## V6b.60 — D164 V1 iç PRAGMA hata ofseti
+
+Otomatik `pragma_locking_mode` tanısı bilinmeyen şema ofsetini C gibi V1 step sırasında gösteriyor. V2, reset ve finalize ofsetleri ile doğrudan hazırlama tanıları korundu. Eski sekiz fark kapandı. 184 geniş native ve 16 odak vaka ile fiziksel dosya özetleri eşit. Önceki 147 kurtarma eşit. OFF 1157/7/337, ON 1143/21/337. DML ve ayrışma bulucu V6b.59 ile aynı. Rust 1.100 süre oranı 1,235 ve 14 digest eşit. Sırada prepared UPDATE/DELETE RETURNING sayaçları var. [Karar ve doğrulama](karar_esligi_v6b_60.md).

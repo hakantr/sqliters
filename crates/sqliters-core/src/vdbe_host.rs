@@ -1561,7 +1561,7 @@ pub(crate) fn step(
     params: &[Value],
     start: bool,
     sql: &str,
-) -> Result<Option<Vec<Value>>> {
+) -> (Result<Option<Vec<Value>>>, Option<usize>) {
     if start {
         vm.rewind();
         for (i, v) in params.iter().enumerate() {
@@ -1581,6 +1581,7 @@ pub(crate) fn step(
     if prev_ts.is_none() {
         inner.runtime.stmt_timestamp_ms = Some(inner.db_set.main_btree().pager().vfs().current_unix_millis());
     }
+    let mut pragma_schema_error_offset = None;
     let res = if vm.prog.uses_vtab() {
         // Virtual tables: their methods run SQL of their own and reach the connection through
         // the engine's statement context (`ExecContext`), as in a statement that writes.
@@ -1588,13 +1589,15 @@ pub(crate) fn step(
         let encoding = inner.effective_encoding();
         let mut stmt_tx = crate::engine::StmtTxTracker::default();
         let mut expire_self_only = false;
-        inner.with_exec_ctx(shared, summary, &mut stmt_tx, &mut expire_self_only, |ctx| {
+        let result = inner.with_exec_ctx(shared, summary, &mut stmt_tx, &mut expire_self_only, |ctx| {
             let steps_before = vm.n_vm_step;
             let mut host = WriteHost { ctx, encoding, control: false, sp_pos: 0, read_stmt: true };
             let r = vm.exec(&mut host);
             host.ctx.progress.add_ops(vm.n_vm_step - steps_before);
             r
-        })
+        });
+        pragma_schema_error_offset = stmt_tx.pragma_schema_error_offset;
+        result
     } else {
         let steps_before = vm.n_vm_step;
         let mut host = MachineHost::new(inner);
@@ -1613,7 +1616,7 @@ pub(crate) fn step(
     {
         inner.db_set.set_corrupt_rdonly(true);
     }
-    match res {
+    let row = match res {
         Ok(true) => Ok(Some(vm.result_row().iter().map(Mem::to_value).collect())),
         Ok(false) => Ok(None),
         Err(e) => {
@@ -1626,7 +1629,8 @@ pub(crate) fn step(
             }
             Err(e)
         }
-    }
+    };
+    (row, pragma_schema_error_offset)
 }
 
 /// The keys (`engine::vtab_cursor_key`) of the virtual tables `vm` keeps a cursor positioned

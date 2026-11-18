@@ -144,6 +144,8 @@ pub struct StmtTxTracker {
     pub delete_idx_no_seek: Option<Pgno>,
     /// The prepared legacy INSERT can leave its change count with the returned rows.
     pub(crate) defer_insert_returning_changes: bool,
+    /// Inner schema token from an automatic PRAGMA table filter, for legacy sqlite3_step.
+    pub(crate) pragma_schema_error_offset: Option<usize>,
     /// Statement-local change count for a write suspended at a result row.
     pub pending_changes: Option<i64>,
     /// Nesting of `execute_read_body` / `execute_write_body` (a statement run from inside

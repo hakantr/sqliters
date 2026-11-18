@@ -3,8 +3,8 @@
 //! (`OP_AutoCommit`, `OP_Savepoint`, `OP_Transaction`) on the machine, and a SELECT that reads a virtual table runs on
 //! the machine with C's xBestIndex plan handed to xFilter (`VirtualCursor::filter_c`). Every expected line is what
 //! the reference `sqlite3` 3.54.1 (or the C API driver `m3c/drv/c/rdrv4`) gives for the same statements.
-use crate::{Connection, StepResult};
-use sqliters_types::Value;
+use crate::{Connection, PrepareMode, StepResult};
+use sqliters_types::{ErrorCode, SqliteError, Value};
 
 fn show(v: &Value) -> String {
     match v {
@@ -224,6 +224,33 @@ fn m3c_virtual_table_reads_take_c_plans() {
         out,
         vec!["7", "10", "13", "10", "7", "4", "1", "a", "b", "sqlite_schema", "t2", "sqlite_autoindex_t2_1", "t2a", "t2a"]
     );
+}
+
+#[test]
+fn legacy_pragma_locking_mode_offset_is_reported_at_step() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("ATTACH ':memory:' AS aux; CREATE TABLE t(a);")
+        .unwrap();
+    let check = |error: SqliteError, offset| {
+        assert_eq!(error.extended_code, ErrorCode::Error as i32);
+        assert_eq!(error.message, "unknown database 'other'");
+        assert_eq!(error.c_offset(), offset);
+    };
+
+    let query = "SELECT locking_mode FROM pragma_locking_mode('other')";
+    for (mode, step_offset) in [(PrepareMode::V1, 7), (PrepareMode::V2, -1)] {
+        let mut statement = conn.prepare_with_mode(query, mode).unwrap();
+        check(statement.step().unwrap_err(), step_offset);
+        check(statement.reset().unwrap_err(), -1);
+        check(statement.step().unwrap_err(), step_offset);
+        check(statement.finalize().unwrap_err(), -1);
+
+        let error = conn
+            .prepare_with_mode("PRAGMA 'other'.locking_mode", mode)
+            .err()
+            .expect("the qualifier is diagnosed during prepare");
+        check(error, 7);
+    }
 }
 
 /// D58: a SELECT the engine's own prepare rejects is decided by C's compile result on the switch-on path

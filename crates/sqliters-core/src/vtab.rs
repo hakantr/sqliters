@@ -909,7 +909,18 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
     }
 
     fn query_sql(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>> {
-        crate::engine::query_internal_vtab_sql(self.ctx, sql, params)
+        let result = crate::engine::query_internal_vtab_sql(self.ctx, sql, params);
+        if let Err(error) = &result
+            && error.extended_code == ErrorCode::Error as i32
+            && self.table_name.eq_ignore_ascii_case("pragma_locking_mode")
+            && self.ctx.db_set.vtab_registry().has_automatic_pragma_module(self.table_name)
+            && let Some(schema) = error.message.strip_prefix("unknown database ")
+            && sql == format!("{PRAGMA_SQL_PREFIX}{}.locking_mode", quote_string_literal(schema))
+        {
+            // sqlite3TwoPartName records the qualifier's location within the nested SQL.
+            self.ctx.stmt_tx.pragma_schema_error_offset = Some(PRAGMA_SQL_PREFIX.len());
+        }
+        result
     }
 
     fn shadow_get_rowid(&mut self, shadow_table: &str, rowid: i64) -> Result<Option<Vec<Value>>> {
@@ -3750,6 +3761,8 @@ fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+const PRAGMA_SQL_PREFIX: &str = "PRAGMA ";
+
 fn quote_string_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
@@ -3823,12 +3836,12 @@ impl VirtualCursor for PragmaVTabCursor {
 
         let pragma_sql = if !self.arg_val.is_null() {
             format!(
-                "PRAGMA {schema_prefix}{}({})",
+                "{PRAGMA_SQL_PREFIX}{schema_prefix}{}({})",
                 self.spec.pragma_name,
                 quote_string_literal(&self.arg_val.to_text_lossy())
             )
         } else {
-            format!("PRAGMA {schema_prefix}{}", self.spec.pragma_name)
+            format!("{PRAGMA_SQL_PREFIX}{schema_prefix}{}", self.spec.pragma_name)
         };
 
         self.rows = ctx.query_sql(&pragma_sql, &[]).map_err(|mut error| {
