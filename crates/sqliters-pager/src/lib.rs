@@ -5380,14 +5380,27 @@ impl Pager {
                     && self.pending_byte_copy.is_none()
                     && matches!(self.journal_mode, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate);
                 let finalized = self.finalize_rollback_commit();
-                // pager_end_transaction attempts SHARED despite finalization
-                // failure. The earlier error has priority.
+                let notified = if normal_rollback && finalized.is_ok() {
+                    self.db_file().and_then(|db| db.notify_commit_phase_two())
+                } else {
+                    Ok(())
+                };
+                // pager_end_transaction attempts SHARED after an earlier
+                // error and returns that error first.
                 let downgraded = if normal_rollback {
                     self.unlock_db_file(LockLevel::Shared)
                 } else {
                     Ok(())
                 };
                 finalized?;
+                if let Err(error) = notified
+                    && error.extended_code != ErrorCode::NotFound as i32
+                {
+                    // The journal is already finalized. An upper-layer
+                    // rollback after the notification error ends the reader.
+                    self.set_state(TransactionState::Read);
+                    return Err(error);
+                }
                 downgraded?;
                 if normal_rollback && retain_read {
                     self.set_state(TransactionState::Read);
@@ -7904,6 +7917,7 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     enum RecoveryCall {
         Delete { sync_dir: bool },
+        CommitPhaseTwo,
         Unlock(LockLevel),
         JournalSync(SyncFlags),
         JournalSize,
@@ -7933,6 +7947,7 @@ mod tests {
         fail_hot_journal_sync: AtomicBool,
         db_sync_notification_error: Mutex<Option<i32>>,
         db_sync_notifications: Mutex<Vec<Option<PathBuf>>>,
+        db_commit_phase_two_error: Mutex<Option<i32>>,
         short_hot_journal_count: AtomicBool,
         fail_db_unlock: AtomicBool,
         fail_db_shared_unlock: AtomicBool,
@@ -8088,6 +8103,15 @@ mod tests {
             }
             self.inner.notify_sync(super_journal)
         }
+        fn notify_commit_phase_two(&self) -> Result<()> {
+            if self.is_db {
+                self.ctl.recovery_calls.lock().unwrap().push(RecoveryCall::CommitPhaseTwo);
+                if let Some(code) = self.ctl.db_commit_phase_two_error.lock().unwrap().take() {
+                    return Err(SqliteError::with_extended(code, ErrorCode::from_raw_primary(code).as_str()));
+                }
+            }
+            self.inner.notify_commit_phase_two()
+        }
         fn sync(&self, flags: SyncFlags) -> Result<()> {
             if self.is_journal {
                 self.ctl.record_close_call(RecoveryCall::JournalSync(flags));
@@ -8203,6 +8227,7 @@ mod tests {
             if locking_mode == LockingMode::Normal {
                 let mut expected_calls = vec![
                     RecoveryCall::Delete { sync_dir: false },
+                    RecoveryCall::CommitPhaseTwo,
                     RecoveryCall::Unlock(LockLevel::Shared),
                 ];
                 if retain_read {
@@ -8280,6 +8305,56 @@ mod tests {
             pager.end_read_if_unused().unwrap();
             pager.close().unwrap();
             assert!(!vfs.exists(journal).unwrap());
+        }
+    }
+
+    #[test]
+    fn commit_phase_two_notifies_after_delete_and_preserves_committed_data() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        for notification in [ErrorCode::NotFound as i32, extended::SQLITE_IOERR_WRITE] {
+            let ctl = Arc::new(FaultCtl::default());
+            let vfs = Arc::new(FaultVfs { inner: Arc::new(MemoryVfs::new()), ctl: ctl.clone() });
+            let path = Path::new("phase2-notify.db");
+            let journal = Path::new("phase2-notify.db-journal");
+            let flags = OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB;
+            let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+            pager.begin_write().unwrap();
+            let page = pager.allocate_raw_page().unwrap();
+            pager.write_page(page).unwrap()[0] = 1;
+            pager.commit().unwrap();
+
+            pager.begin_write().unwrap();
+            pager.write_page(page).unwrap()[0] = 2;
+            pager.commit_phase_one(None).unwrap();
+            ctl.recovery_calls.lock().unwrap().clear();
+            *ctl.db_commit_phase_two_error.lock().unwrap() = Some(notification);
+            let fail = notification == extended::SQLITE_IOERR_WRITE;
+            ctl.fail_db_shared_unlock.store(fail, Relaxed);
+            let result = pager.commit_phase_two(false, false);
+            let mut expected = vec![
+                RecoveryCall::Delete { sync_dir: false },
+                RecoveryCall::CommitPhaseTwo,
+                RecoveryCall::Unlock(LockLevel::Shared),
+            ];
+            if fail {
+                let error = result.unwrap_err();
+                assert_eq!(error.extended_code, extended::SQLITE_IOERR_WRITE);
+                assert!(!ctl.fail_db_shared_unlock.load(Relaxed));
+                assert_eq!(*ctl.recovery_calls.lock().unwrap(), expected);
+                assert_eq!(pager.rollback().unwrap_err(), error);
+            } else {
+                result.unwrap();
+                expected.push(RecoveryCall::Unlock(LockLevel::NoLock));
+                assert_eq!(*ctl.recovery_calls.lock().unwrap(), expected);
+            }
+
+            assert!(!vfs.exists(journal).unwrap());
+            pager.close().unwrap();
+            let mut reader = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+            reader.begin_read().unwrap();
+            assert_eq!(reader.read_page(page).unwrap()[0], 2);
+            reader.close().unwrap();
         }
     }
 

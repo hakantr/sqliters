@@ -579,3 +579,7 @@ Olağan disk kapanışı açık journal için sync ve boyut okumasını, ardınd
 ## V6b.50 — D154 normal rollback-journal COMMIT sonu kilit sırası
 
 Normal disk COMMIT journal sonlandırma sonucunu saklayıp SHARED'a geçmeyi deniyor. İlk hata korunuyor ve okuyucusu bulunan bağlantı son okura kadar SHARED'da kalıyor. 24 gerçek kaynak native vakası ve ayrı 36 phase-two ile 18 açık-okur aday vakasında ölçülen terminal izleri, SQL ve DB özetleri eşit. D153 kapanış 18/18 ve önceki 147 kurtarma eşit. Gcov 14 çıkış ve alınmayan sekiz sınıflı. OFF 1147/7/337, ON 1133/21/337. DML ve ayrışma bulucu V6b.49 ile aynı. Rust 1.100 süre oranı 1,247 ve 14 digest eşit. D155 COMMIT_PHASETWO ve D156 kayıt yazım sınırı açık. [Karar ve doğrulama](karar_esligi_v6b_50.md).
+
+## V6b.51 — D155 normal COMMIT phase-two bildirimi
+
+Normal disk rollback-journal COMMIT artık journal sonlandırmasından sonra ve SHARED öncesinde `SQLITE_FCNTL_COMMIT_PHASETWO` gönderiyor. 24 gerçek kaynak vakasında terminal sıra ve DB özetleri eşit. Ayrı 60 callback ve hata vakasında ilk hata ile kalıcı veri korundu. Gcov 14 çıkış ve alınmayan sekiz sınıflı. Önceki 147 kurtarma vakası eşit. OFF 1148/7/337, ON 1134/21/337. DML ve ayrışma bulucu V6b.50 ile aynı. Rust 1.100 süre oranı 1,242 ve 14 digest eşit. D156 kayıt yazım sınırı sırada. [Karar ve doğrulama](karar_esligi_v6b_51.md).

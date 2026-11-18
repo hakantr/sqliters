@@ -203,6 +203,12 @@ pub trait VfsFile: Send + Sync {
         Err(SqliteError::new(ErrorCode::NotFound, ErrorCode::NotFound.as_str()))
     }
 
+    /// SQLITE_FCNTL_COMMIT_PHASETWO. Notifies the database VFS after commit
+    /// finalization and before unlocking. Unsupported backends return SQLITE_NOTFOUND.
+    fn notify_commit_phase_two(&self) -> Result<()> {
+        Err(SqliteError::new(ErrorCode::NotFound, ErrorCode::NotFound.as_str()))
+    }
+
     /// Flushes OS buffers to persistent storage (`xSync`).
     fn sync(&self, flags: SyncFlags) -> Result<()>;
 
