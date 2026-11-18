@@ -18340,6 +18340,9 @@ fn eval_expr_rt(
                     arg_vals.push(eval_expr_rt(ctx, ee, params, scopes, ctes, agg_group)?);
                 }
                 let res = ctx.call_scalar_rt(fname, &arg_vals)?;
+                if *op == LikeOp::Regexp && !*negated {
+                    return Ok(res);
+                }
                 return Ok(match res.value.truthiness() {
                     None => RuntimeValue::null(),
                     Some(b) => RuntimeValue::plain(Value::Integer(i64::from(if *negated {

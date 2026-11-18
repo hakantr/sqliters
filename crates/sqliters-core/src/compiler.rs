@@ -5865,8 +5865,9 @@ fn compile_expr(
             if let Some(esc) = escape {
                 compile_expr(prog, esc, binding, functions, arg_base + 2)?;
             }
-            let needs_bool_norm = matches!(op, LikeOp::Regexp | LikeOp::Match)
-                || functions.find_scalar(fname, argc).is_some();
+            // REGEXP's function result is consumed directly unless SQL applies NOT.
+            let needs_bool_norm = *op != LikeOp::Regexp
+                && (*op == LikeOp::Match || functions.find_scalar(fname, argc).is_some());
             let res_reg = if *negated || needs_bool_norm {
                 prog.alloc_register()
             } else {

@@ -635,3 +635,7 @@ Olağan disk WAL kapanışı checkpoint öncesinde VFS dosya kimliğini sorguluy
 ## V6b.64 — F9 REGEXP hazırlama tanısı
 
 SELECT hazırlamasındaki bulunamayan REGEXP ve yanlış arite hataları, C'nin özgün token yazımını ve UTF-8 bayt ofsetini koruyor. 54 hazırlama, 72 kayıtlı fonksiyon ve 6 stored-view vakası iki Rust kipinde eşit. C resolver kapsamı 10/16. Group54 iki kipte geçiyor. OFF 1161/7/337, ON 1148/20/337. DML ve ayrışma bulucu V6b.63 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,232 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_64.md).
+
+## V6b.65 — REGEXP callback değeri ve bellek PRAGMA testi
+
+Pozitif infix REGEXP 192/192 vakada callback değerini ve türünü C gibi döndürüyor. Tam matris OFF 560/576, ON 576/576. Sayısal BLOB'un 16 eski OFF koşulu açık. Bellek içi `mmap_size` için sekiz bağımsız karşılaştırma, sıfır satır ve korunan metadata beklentisini doğruladı. OFF 1163/6/337, ON 1150/19/337. DML ve ayrışma bulucu V6b.64 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,227 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_65.md).

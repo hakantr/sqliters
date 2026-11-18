@@ -15262,8 +15262,7 @@ mod c_parity_tests {
         }
     }
 
-    /// `analysis_limit`, `cell_size_check`, `mmap_size` and `data_version` return what C
-    /// returns: a row with the setting (no row for the `cell_size_check` assignment).
+    /// Verify the rows and result columns of setting PRAGMAs on an in-memory connection.
     #[test]
     fn pragmas_that_report_a_setting_return_one_row() {
         let conn = Connection::open_in_memory().unwrap();
@@ -15303,11 +15302,9 @@ mod c_parity_tests {
             ("PRAGMA cell_size_check", Some(1)),
             ("PRAGMA cell_size_check=-1", None),
             ("PRAGMA cell_size_check", Some(0)),
-            // No memory mapping in this engine: the effective limit is always 0, as in a C
-            // build with `SQLITE_MAX_MMAP_SIZE=0`.
-            ("PRAGMA mmap_size", Some(0)),
-            ("PRAGMA mmap_size=1048576", Some(0)),
-            ("PRAGMA main.mmap_size", Some(0)),
+            ("PRAGMA mmap_size", None),
+            ("PRAGMA mmap_size=1048576", None),
+            ("PRAGMA main.mmap_size", None),
             ("PRAGMA data_version", Some(1)),
             ("PRAGMA data_version=7", Some(1)),
             ("PRAGMA temp.data_version", Some(1)),

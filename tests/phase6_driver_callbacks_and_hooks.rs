@@ -221,6 +221,58 @@ fn test_regexp_prepare_preserves_operator_spelling_and_utf8_offset() {
     }
 }
 
+#[test]
+fn test_regexp_infix_preserves_callback_value_types() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE words(w TEXT); INSERT INTO words VALUES('alpha');")
+        .unwrap();
+    for arity in [2, 3] {
+        conn.create_scalar_function("regexp", arity, FunctionFlags::DETERMINISTIC, move |args| {
+            assert_eq!(args[1].value, Value::Text("alpha".into()));
+            if arity == 3 {
+                assert_eq!(args[2].value, Value::Text("!".into()));
+            }
+            let value = match args[0].value.to_text_lossy().as_str() {
+                "integer" => Value::Integer(if arity == 2 { 21 } else { 31 }),
+                "real" => Value::Real(-0.75),
+                "text" => Value::Text("aé".into()),
+                "blob" => Value::blob([0x89, 0, 0xff]),
+                "null" => Value::Null,
+                pattern => panic!("unexpected REGEXP argument {pattern:?}"),
+            };
+            Ok(RuntimeValue::plain(value))
+        })
+        .unwrap();
+    }
+
+    let projection = "w REGEXP 'integer', w REGEXP 'integer' ESCAPE '!', \
+                      w REGEXP 'real' ESCAPE '!', w REGEXP 'text', w REGEXP 'blob', \
+                      w REGEXP 'null', w NOT REGEXP 'null', w NOT REGEXP 'integer'";
+    let expected = vec![vec![
+        Value::Integer(21),
+        Value::Integer(31),
+        Value::Real(-0.75),
+        Value::Text("aé".into()),
+        Value::blob([0x89, 0, 0xff]),
+        Value::Null,
+        Value::Null,
+        Value::Integer(0),
+    ]];
+    assert_eq!(query_vals(&conn, &format!("SELECT {projection} FROM words")), expected);
+    assert_eq!(
+        query_vals(
+            &conn,
+            &format!("WITH args(w) AS MATERIALIZED (VALUES('alpha')) SELECT {projection} FROM args"),
+        ),
+        expected,
+    );
+    assert_eq!(
+        query_vals(&conn, "SELECT w FROM words WHERE w REGEXP 'integer'"),
+        vec![vec![Value::Text("alpha".into())]],
+    );
+    assert!(query_vals(&conn, "SELECT w FROM words WHERE w REGEXP 'blob'").is_empty());
+}
+
 // ============================================================================
 // Group 21: Custom Collations, Fallible Collations, Panic Isolation & Rebinding
 // ============================================================================
