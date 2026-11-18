@@ -142,8 +142,9 @@ pub struct StmtTxTracker {
     /// Set while a one-pass DELETE removes a row: root of the index the scan runs on
     /// (`iIdxNoSeek` of `sqlite3GenerateRowDelete`), whose entry is deleted after the table row.
     pub delete_idx_no_seek: Option<Pgno>,
-    /// `p->nChange` of a statement the machine ran that returned rows (RETURNING): stored
-    /// when the statement halts, not when it returns its first row.
+    /// The prepared legacy INSERT can leave its change count with the returned rows.
+    pub(crate) defer_insert_returning_changes: bool,
+    /// Statement-local change count for a write suspended at a result row.
     pub pending_changes: Option<i64>,
     /// Nesting of `execute_read_body` / `execute_write_body` (a statement run from inside
     /// another one). The cursors of a statement are closed when the outermost one ends.
@@ -26008,9 +26009,16 @@ fn finalize_dml_step_result(
                 if *ctx.foreign_keys && !suspects.is_empty() {
                     verify_fk_suspects(ctx, &suspects)?;
                 }
-                ctx.runtime.last_changes = stmt_changes;
-                ctx.runtime.total_changes += stmt_changes;
-                ctx.publish();
+                if ctx.stmt_tx.defer_insert_returning_changes
+                    && ctx.stmt_tx.exec_depth == 1
+                    && !out.rows.is_empty()
+                {
+                    ctx.stmt_tx.pending_changes = Some(stmt_changes as i64);
+                } else {
+                    ctx.runtime.last_changes = stmt_changes;
+                    ctx.runtime.total_changes += stmt_changes;
+                    ctx.publish();
+                }
                 if *ctx.count_changes && out.column_names.is_empty() {
                     out = QueryOutput {
                         column_names: vec!["count".to_owned()],

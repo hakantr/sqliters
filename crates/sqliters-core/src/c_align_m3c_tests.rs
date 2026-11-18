@@ -150,6 +150,55 @@ fn m3c_returning_changes_counted_at_halt() {
     assert_eq!((conn.changes(), conn.total_changes()), (2, 2));
 }
 
+#[test]
+fn d52_legacy_returning_publishes_changes_at_halt() {
+    enum Terminal {
+        Done,
+        Reset,
+        Finalize,
+        Drop,
+    }
+    let query = "SELECT a, b, changes(), total_changes(), last_insert_rowid()
+                 FROM t WHERE a IN (3, 4) ORDER BY a";
+    for terminal in [Terminal::Done, Terminal::Reset, Terminal::Finalize, Terminal::Drop] {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA encoding='UTF-16le'; CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+             INSERT INTO t VALUES(1,1),(2,2); CREATE TABLE u(a INTEGER PRIMARY KEY);",
+        ).unwrap();
+        let counters = || (conn.changes(), conn.total_changes(), conn.last_insert_rowid());
+        let snapshot = || run(&conn, &[query]);
+        let mut stmt = conn.prepare("INSERT INTO t(b) VALUES(3),(4) RETURNING a").unwrap();
+        let StepResult::Row(row) = stmt.step().unwrap() else {
+            panic!("the INSERT must return row 3");
+        };
+        assert_eq!(row.values(), &[Value::Integer(3)]);
+        assert_eq!(counters(), (2, 2, 4));
+        assert_eq!(snapshot(), ["3|3|2|2|4", "4|4|2|2|4"]);
+
+        conn.execute_batch("INSERT INTO u VALUES(7),(8),(9)").unwrap();
+        assert_eq!(counters(), (3, 5, 9));
+        assert_eq!(snapshot(), ["3|3|3|5|9", "4|4|3|5|9"]);
+        match terminal {
+            Terminal::Done => {
+                let StepResult::Row(row) = stmt.step().unwrap() else {
+                    panic!("the INSERT must return row 4 before DONE");
+                };
+                assert_eq!(row.values(), &[Value::Integer(4)]);
+                assert_eq!(snapshot(), ["3|3|3|5|9", "4|4|3|5|9"]);
+                assert!(matches!(stmt.step(), Ok(StepResult::Done)));
+                assert_eq!(snapshot(), ["3|3|2|7|9", "4|4|2|7|9"]);
+                stmt.finalize().unwrap();
+            }
+            Terminal::Reset => stmt.reset().unwrap(),
+            Terminal::Finalize => stmt.finalize().unwrap(),
+            Terminal::Drop => drop(stmt),
+        }
+        assert_eq!(counters(), (2, 7, 9));
+        assert_eq!(snapshot(), ["3|3|2|7|9", "4|4|2|7|9"]);
+    }
+}
+
 /// D37 / D35: virtual tables read on the machine get C's xBestIndex plan (constraints on hidden columns are
 /// checked by C's program; LIMIT / OFFSET reach generate_series; dbstat's ORDER BY name / name= / aggregate).
 #[test]

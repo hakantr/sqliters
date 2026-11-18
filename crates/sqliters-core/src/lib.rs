@@ -950,9 +950,7 @@ pub(crate) enum RunningExec {
     ReturningWrite {
         rows: std::vec::IntoIter<Vec<Value>>,
         abort_snapshot: WriteAbortSnapshot,
-        /// `p->nChange` of a statement the machine ran, stored by `sqlite3VdbeSetChanges` when
-        /// the statement halts (after its last row or at its reset), not when it returns its
-        /// first row.
+        /// `p->nChange` while the statement is suspended at a result row.
         pending_changes: Option<i64>,
     },
     IncrementalVacuum {
@@ -1021,6 +1019,7 @@ pub(crate) enum ActivityFinish {
     },
     WriteCompleted {
         abort_snapshot: WriteAbortSnapshot,
+        pending_changes: Option<i64>,
     },
     PendingCommitAborted,
 }
@@ -1823,6 +1822,7 @@ impl ConnectionInner {
                 hid,
                 ActivityFinish::WriteCompleted {
                     abort_snapshot: snap,
+                    pending_changes: None,
                 },
                 shared,
             )
@@ -2249,7 +2249,7 @@ impl ConnectionInner {
                 Ok(())
             }
 
-            ActivityFinish::WriteCompleted { abort_snapshot } => {
+            ActivityFinish::WriteCompleted { abort_snapshot, pending_changes } => {
                 if !self.is_autocommit() {
                     if let Some(sp_slot) = abort_snapshot.stmt_sp_slot
                         && sp_slot != ELIDED_STMT_SP
@@ -2281,6 +2281,9 @@ impl ConnectionInner {
                             }
                         }
                     }
+                    if let Some(n) = pending_changes {
+                        self.set_halt_changes(n);
+                    }
                     self.publish(shared);
                     return Ok(());
                 }
@@ -2303,6 +2306,9 @@ impl ConnectionInner {
                         {
                             return Err(self.poison_with(e));
                         }
+                    }
+                    if let Some(n) = pending_changes {
+                        self.set_halt_changes(n);
                     }
                     self.publish(shared);
                     return Ok(());
@@ -2355,7 +2361,8 @@ impl ConnectionInner {
                     // vdbeaux.c `sqlite3VdbeHalt`: the statement commits (xSync of the virtual
                     // tables may step nested statements) and only then stores its own row count
                     // with `sqlite3VdbeSetChanges` — a DML statement's `changes()` is its own.
-                    let dml_changes = abort_snapshot.is_dml.then_some(ctx.runtime.last_changes);
+                    let dml_changes = (abort_snapshot.is_dml && pending_changes.is_none())
+                        .then_some(ctx.runtime.last_changes);
                     match commit_all_databases(&mut ctx) {
                         Ok(()) => {
                             if let Some(n) = dml_changes {
@@ -2399,11 +2406,13 @@ impl ConnectionInner {
                             "TR|stmt|halt|rc={} o=auto-rollback",
                             (cm_err.code as i32) & 0xff
                         );
-                        self.runtime.total_changes = self
-                            .runtime
-                            .total_changes
-                            .saturating_sub(self.runtime.last_changes)
-                            .max(abort_snapshot.rt_before.total_changes);
+                        if pending_changes.is_none() {
+                            self.runtime.total_changes = self
+                                .runtime
+                                .total_changes
+                                .saturating_sub(self.runtime.last_changes)
+                                .max(abort_snapshot.rt_before.total_changes);
+                        }
                     } else {
                         self.runtime.total_changes = abort_snapshot.rt_before.total_changes;
                         self.runtime.last_insert_rowid = abort_snapshot.rt_before.last_insert_rowid;
@@ -2430,6 +2439,9 @@ impl ConnectionInner {
 
                 self.schema_changed_in_tx = false;
                 self.deferred_fk_suspects.clear();
+                if let Some(n) = pending_changes {
+                    self.set_halt_changes(n);
+                }
                 self.publish(shared);
                 self.maybe_run_wal_autocheckpoint();
                 Ok(())
@@ -2981,15 +2993,17 @@ impl ConnectionInner {
                 Some(prog) => self.finish_explain(hid, &prog, shared),
                 None => self.finish_activity(hid, ActivityFinish::NoLock, shared),
             },
-            RunningExec::ReturningWrite { abort_snapshot, pending_changes, .. } => {
-                if let Some(n) = pending_changes {
-                    self.set_halt_changes(n);
-                }
-                self.finish_activity(hid, ActivityFinish::WriteCompleted { abort_snapshot }, shared)
-            }
+            RunningExec::ReturningWrite { abort_snapshot, pending_changes, .. } => self.finish_activity(
+                hid,
+                ActivityFinish::WriteCompleted { abort_snapshot, pending_changes },
+                shared,
+            ),
             RunningExec::IncrementalVacuum { abort_snapshot, .. } => self.finish_activity(
                 hid,
-                ActivityFinish::WriteCompleted { abort_snapshot },
+                ActivityFinish::WriteCompleted {
+                    abort_snapshot,
+                    pending_changes: None,
+                },
                 shared,
             ),
             RunningExec::PendingCommit { last_busy, .. } => {
@@ -3078,6 +3092,7 @@ impl ConnectionInner {
                             handle_id,
                             ActivityFinish::WriteCompleted {
                                 abort_snapshot: dummy_snap,
+                                pending_changes: None,
                             },
                             shared,
                         );
@@ -5204,6 +5219,7 @@ impl TestBlobHandle {
                 hid,
                 ActivityFinish::WriteCompleted {
                     abort_snapshot: snap,
+                    pending_changes: None,
                 },
                 &self.shared,
             )
@@ -7073,6 +7089,7 @@ impl ConnectionInner {
             HandleId(0),
             ActivityFinish::WriteCompleted {
                 abort_snapshot: snap,
+                pending_changes: None,
             },
             shared,
         );
@@ -10663,7 +10680,10 @@ impl Statement {
                 if remaining == 0 {
                     return match inner.finish_activity(
                         hid,
-                        ActivityFinish::WriteCompleted { abort_snapshot },
+                        ActivityFinish::WriteCompleted {
+                            abort_snapshot,
+                            pending_changes: None,
+                        },
                         shared,
                     ) {
                         Ok(()) => {
@@ -10700,7 +10720,10 @@ impl Statement {
                     }
                     Ok(false) => match inner.finish_activity(
                         hid,
-                        ActivityFinish::WriteCompleted { abort_snapshot },
+                        ActivityFinish::WriteCompleted {
+                            abort_snapshot,
+                            pending_changes: None,
+                        },
                         shared,
                     ) {
                         Ok(()) => {
@@ -11043,6 +11066,8 @@ impl Statement {
                         }
                         crate::vtab::ensure_stmt_vtabs_connected(ctx, stmt_ref)?;
                         engine::vtab_begin_for_dml(ctx, stmt_ref)?;
+                        ctx.stmt_tx.defer_insert_returning_changes =
+                            matches!(stmt_ref, Stmt::Insert(insert) if !insert.returning.is_empty());
                         execute_write_body(ctx, stmt_ref, params_ref)
                     },
                 );
@@ -11114,7 +11139,10 @@ impl Statement {
                         } else {
                             match inner.finish_activity(
                                 hid,
-                                ActivityFinish::WriteCompleted { abort_snapshot },
+                                ActivityFinish::WriteCompleted {
+                                    abort_snapshot,
+                                    pending_changes: None,
+                                },
                                 shared,
                             ) {
                                 Ok(()) => {
@@ -11516,14 +11544,12 @@ impl Statement {
                 if let Some(vals) = rows.next() {
                     Ok(StepResult::Row(Row::new(vals)))
                 } else {
-                    if let Some(n) = pending_changes.take() {
-                        inner.set_halt_changes(n);
-                    }
                     let snap = abort_snapshot.clone();
                     match inner.finish_activity(
                         hid,
                         ActivityFinish::WriteCompleted {
                             abort_snapshot: snap,
+                            pending_changes: pending_changes.take(),
                         },
                         shared,
                     ) {
@@ -11561,6 +11587,7 @@ impl Statement {
                         hid,
                         ActivityFinish::WriteCompleted {
                             abort_snapshot: snap,
+                            pending_changes: None,
                         },
                         shared,
                     ) {
@@ -11594,6 +11621,7 @@ impl Statement {
                             hid,
                             ActivityFinish::WriteCompleted {
                                 abort_snapshot: snap,
+                                pending_changes: None,
                             },
                             shared,
                         ) {
@@ -12892,6 +12920,7 @@ fn try_fast_compiled_main_write_fields(
         hid,
         ActivityFinish::WriteCompleted {
             abort_snapshot: snap,
+            pending_changes: None,
         },
         shared,
     ) {

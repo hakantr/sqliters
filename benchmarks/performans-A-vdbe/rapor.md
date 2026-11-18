@@ -603,3 +603,7 @@ Normal disk WAL COMMIT yazıcıyı bıraktıktan sonra `SQLITE_FCNTL_COMMIT_PHAS
 ## V6b.56 — D160 EXCLUSIVE rollback COMMIT phase-two bildirimi
 
 EXCLUSIVE disk rollback COMMIT gerçek yazımdan sonra phase-two bildirimi gönderiyor. Boş EXCLUSIVE PERSIST için C'nin erken dönüşü korunuyor. 56 vaka iki Rust kipinde SQL sonucu, bildirim sırası, yeniden açılış ve DB özetlerinde eşit. 120 journal görüntüsü denetlendi. On ham PERSIST farkı bağımsız nonce checksum alanlarıyla sınırlı. Önceki 147 kurtarma eşit. OFF 1153/7/337, ON 1139/21/337. DML ve ayrışma bulucu V6b.55 ile aynı. Rust 1.100 süre oranı 1,243 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_56.md).
+
+## V6b.57 — D52 prepared INSERT RETURNING sayaçları
+
+Prepared INSERT RETURNING üst sayaçları C gibi ifade kapanışında yayımlıyor. İlk satır ve araya giren DML, DONE, reset, finalize ve Drop doğrulandı. 27 bağımsız yaşam döngüsü, 72 geniş vaka, 24 aktif yazıcı ve iki commit hook karşılaştırması eşit. Önceki 147 kurtarma vakası korundu. OFF 1154/7/337, ON 1140/21/337. DML ve ayrışma bulucu V6b.56 ile aynı. Rust 1.100 süre oranı 1,240 ve 14 digest eşit. Sırada 2PC phase-one bildirimi ve aktif rollback. [Karar ve doğrulama](karar_esligi_v6b_57.md).
