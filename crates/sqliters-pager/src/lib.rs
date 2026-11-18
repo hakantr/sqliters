@@ -5683,7 +5683,7 @@ impl Pager {
                 }
                 let orig_count = self.tx_orig_page_count;
 
-                // If `commit` already started modifying `.db` (`db_file_modified`), restore all
+                // If the transaction started modifying `.db`, restore the appropriate
                 // pre-images and original file size on disk and sync BEFORE finalizing/deleting
                 // `<db>-journal`. If any disk operation fails here, keep `<db>-journal` intact on
                 // disk so hot-journal recovery can still restore atomicity!
@@ -5703,7 +5703,14 @@ impl Pager {
                         // pager_playback processes records in journal order.
                         restore_pgnos.sort_unstable_by_key(|pgno| self.tx_journal_end[pgno]);
 
+                        let check_sync_boundary = disk_rollback && !self.pager_no_sync();
                         for pgno in restore_pgnos {
+                            // pager_playback_one_page writes a main-journal page to the
+                            // database only if its entire record is synced. The cache
+                            // also needs the preimages of pages past this boundary.
+                            if check_sync_boundary && self.tx_journal_end[&pgno] > self.journal_hdr {
+                                continue;
+                            }
                             let orig_data = self.tx_preimages.get(&pgno).expect("key exists");
                             let offset = u64::from(pgno - 1) * ps;
                             self.db_file()?.write_at(orig_data, offset)?;
@@ -8070,6 +8077,7 @@ mod tests {
         short_page1: Mutex<Option<(usize, bool)>>,
         short_wal_only: std::sync::atomic::AtomicBool,
         db_reads: Mutex<Vec<(u64, usize)>>,
+        db_writes: Mutex<Vec<(u64, usize)>>,
         /// `xFileSize` of `<db>-wal` fails.
         fail_wal_file_size: std::sync::atomic::AtomicBool,
         /// `xTruncate` of `<db>-wal` fails.
@@ -8244,6 +8252,7 @@ mod tests {
             drop(fault);
             if self.is_db {
                 self.ctl.events.lock().unwrap().push("db-write");
+                self.ctl.db_writes.lock().unwrap().push((offset, buf.len()));
             }
             self.inner.write_at(buf, offset)
         }
@@ -8574,6 +8583,57 @@ mod tests {
         reader.begin_read().unwrap();
         assert_eq!(reader.read_page(page).unwrap()[0], 2);
         reader.close().unwrap();
+    }
+
+    #[test]
+    fn spill_rollback_writes_only_synced_journal_records_unless_synchronous_is_off() {
+        for synchronous in [0, 1, 2] {
+            let ctl = Arc::new(FaultCtl::default());
+            let vfs = Arc::new(FaultVfs {
+                inner: Arc::new(MemoryVfs::new()),
+                ctl: ctl.clone(),
+            });
+            let path = Path::new("spill-rollback.db");
+            let flags = OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB;
+            let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+            pager.begin_write().unwrap();
+            let spilled = pager.allocate_raw_page().unwrap();
+            let cached = pager.allocate_raw_page().unwrap();
+            pager.write_page(spilled).unwrap()[0] = 1;
+            pager.write_page(cached).unwrap()[0] = 2;
+            pager.commit().unwrap();
+            let original = vfs_file_image(vfs.as_ref(), path);
+            let page_size = pager.header().page_size as usize;
+            let spilled_offset = u64::from(spilled - 1) * page_size as u64;
+            let cached_offset = u64::from(cached - 1) * page_size as u64;
+
+            pager.set_synchronous(synchronous);
+            pager.begin_write().unwrap();
+            pager.write_page(spilled).unwrap()[0] = 3;
+            assert_eq!(pager.flush_unreferenced_dirty().unwrap(), 1);
+            pager.write_page(cached).unwrap()[0] = 4;
+            if synchronous > 0 {
+                assert!(pager.tx_journal_end[&spilled] <= pager.journal_hdr);
+                assert!(pager.tx_journal_end[&cached] > pager.journal_hdr);
+            }
+            let before_rollback = vfs_file_image(vfs.as_ref(), path);
+            assert_eq!(before_rollback[spilled_offset as usize], 3);
+            assert_eq!(before_rollback[cached_offset as usize], 2);
+            assert_eq!(pager.read_page_unchecked(cached).unwrap()[0], 4);
+
+            ctl.db_writes.lock().unwrap().clear();
+            pager.rollback_retaining_read(true).unwrap();
+            let mut expected_writes = vec![(spilled_offset, page_size)];
+            if synchronous == 0 {
+                expected_writes.push((cached_offset, page_size));
+            }
+            assert_eq!(*ctl.db_writes.lock().unwrap(), expected_writes, "synchronous={synchronous}");
+            assert_eq!(vfs_file_image(vfs.as_ref(), path), original);
+            assert_eq!(pager.read_page_unchecked(spilled).unwrap()[0], 1);
+            assert_eq!(pager.read_page_unchecked(cached).unwrap()[0], 2);
+            pager.end_read_if_unused().unwrap();
+            pager.close().unwrap();
+        }
     }
 
     #[test]
