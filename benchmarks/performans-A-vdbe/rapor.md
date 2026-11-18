@@ -639,3 +639,7 @@ SELECT hazırlamasındaki bulunamayan REGEXP ve yanlış arite hataları, C'nin 
 ## V6b.65 — REGEXP callback değeri ve bellek PRAGMA testi
 
 Pozitif infix REGEXP 192/192 vakada callback değerini ve türünü C gibi döndürüyor. Tam matris OFF 560/576, ON 576/576. Sayısal BLOB'un 16 eski OFF koşulu açık. Bellek içi `mmap_size` için sekiz bağımsız karşılaştırma, sıfır satır ve korunan metadata beklentisini doğruladı. OFF 1163/6/337, ON 1150/19/337. DML ve ayrışma bulucu V6b.64 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,227 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_65.md).
+
+## V6b.66 — Örtük kapanış rollback hook'u ve boş WAL başlığı
+
+Son bağlantı kapanışı yazma veya kapalı autocommit koşulunda rollback callback'ini çağırıyor. Boş WAL, C gibi sıfır sayfa boyutlu SHM başlığını yayımlıyor. Birleşik adayda 10 kapanış, 90 yeniden açılış ve 28 guard sonuçları eşit. Üç gerçek sayfa boyutunda 12 ilk SHM karşılaştırması birebir. Sonraki TRUNCATE'teki iki eski SHM hücresi farkı açık. OFF 1165/6/337, ON 1152/19/337. DML ve ayrışma bulucu V6b.65 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,236 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_66.md).

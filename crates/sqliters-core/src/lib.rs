@@ -1590,14 +1590,20 @@ impl Drop for ConnectionShared {
             }
         }
         if !matches!(inner.state, ConnectionState::Closed) {
+            let mut notify_rollback = !inner.is_autocommit();
             for slot in inner.db_set.slots_mut().iter_mut().rev() {
                 if let Some(ref mut bt) = slot.btree {
                     bt.close_all_cursors();
-                    if bt.transaction_state() != TransactionState::Open {
+                    let state = bt.transaction_state();
+                    if state != TransactionState::Open {
+                        notify_rollback |= state == TransactionState::Write;
                         let _ =
                             bt.rollback_with_trip(extended::SQLITE_ABORT_ROLLBACK, false, false);
                     }
                 }
+            }
+            if notify_rollback {
+                let _ = inner.commit_hooks.invoke_rollback_hook();
             }
             let _ = inner.db_set.close_all();
             inner.state = ConnectionState::Closed;
@@ -15080,6 +15086,39 @@ mod fts5_c_compat_tests;
 mod c_parity_tests {
     use super::*;
     use sqliters_vfs::MemoryVfs;
+
+
+    #[test]
+    fn connection_drop_rollback_hook_catches_panic_and_prevents_reentry() {
+        for explicit in [false, true] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE t(x); BEGIN; INSERT INTO t VALUES(1);")
+                .unwrap();
+            let weak = Arc::downgrade(&conn.shared);
+            let attempts = Arc::new(Mutex::new(Vec::new()));
+            let observed = Arc::clone(&attempts);
+            conn.rollback_hook(Some(Box::new(move || {
+                let reentry = weak.upgrade().map(|shared| match shared.enter() {
+                    Err(error) => error.code,
+                    Ok(_) => panic!("rollback callback reentered closing connection"),
+                });
+                observed.lock().unwrap().push(reentry);
+                panic!("rollback callback panic");
+            })))
+            .unwrap();
+
+            let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if explicit {
+                    assert!(conn.try_close().is_ok());
+                } else {
+                    drop(conn);
+                }
+            }));
+            assert!(closed.is_ok());
+            let expected = explicit.then_some(ErrorCode::Misuse);
+            assert_eq!(&*attempts.lock().unwrap(), &[expected]);
+        }
+    }
 
     fn open(vfs: &Arc<MemoryVfs>, path: &Path) -> Connection {
         Connection::open_with_vfs(

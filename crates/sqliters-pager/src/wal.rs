@@ -1952,6 +1952,11 @@ impl Wal {
         };
 
         let n_size = wal_fd.file_size()?;
+        if n_size == 0 {
+            // walIndexRecover publishes the zeroed WalIndexHdr when there is no WAL header.
+            let header = WalIndexHeaderData::new(0, 0, 0, 0, false, [0, 0], [0, 0])?;
+            return Ok((header, 0, 0, Vec::new()));
+        }
         if n_size <= WAL_HDRSIZE as u64 {
             return Ok((empty_hdr, 0, 0, Vec::new()));
         }

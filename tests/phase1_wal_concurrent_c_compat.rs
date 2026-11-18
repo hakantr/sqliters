@@ -2990,3 +2990,66 @@ fn autocheckpoint_exclusive_locking_readonly_immutable_and_last_close_unlink() {
     assert_eq!(c_after_close.journal_mode, "wal");
     assert_eq!(c_after_close.summary.count, 25);
 }
+
+#[test]
+fn readonly_empty_wal_index_uses_zero_page_size_until_first_write() {
+    let sandbox = TempSandbox::new("readonly_empty_wal_index");
+    for page_size in [512u32, 4096, 65536] {
+        let db = sandbox.path().join(format!("page_{page_size}.db"));
+        let seed = Connection::open(&db).unwrap();
+        seed.execute_batch(&format!(
+            "PRAGMA page_size={page_size}; PRAGMA journal_mode=WAL;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t VALUES(1, 'committed');"
+        ))
+        .unwrap();
+        seed.try_close().unwrap();
+
+        let wal = wal_sidecar(&db);
+        let shm = shm_sidecar(&db);
+        assert!(!wal.exists());
+        assert!(!shm.exists());
+        let reader = Connection::open_with_flags(&db, OpenFlags::READONLY).unwrap();
+        let before = reader.query("SELECT v FROM t ORDER BY id", &[]).unwrap();
+        assert_eq!(before.rows.len(), 1);
+        assert_eq!(before.rows[0].get_str(0), Some("committed"));
+        assert_eq!(fs::metadata(&wal).unwrap().len(), 0);
+
+        let index = fs::read(&shm).unwrap();
+        let first = index[..WALINDEX_HDR_COPY_LEN].try_into().unwrap();
+        let second = index[WALINDEX_HDR_COPY2_OFFSET
+            ..WALINDEX_HDR_COPY2_OFFSET + WALINDEX_HDR_COPY_LEN]
+            .try_into()
+            .unwrap();
+        let header = sqliters::vfs::WalIndexHeaderData::decode_verified_pair(first, second).unwrap();
+        assert_eq!((header.page_size, header.mx_frame, header.n_page), (0, 0, 0));
+        assert_eq!(header.big_end_cksum, 0);
+
+        let writer = Connection::open(&db).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+                 BEGIN; INSERT INTO t VALUES(2, 'second'); COMMIT;",
+            )
+            .unwrap();
+        let bytes = fs::read(&wal).unwrap();
+        let disk_header = WalFileHeader::decode_for_recovery(bytes[..WAL_HDRSIZE].try_into().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(disk_header.page_size, page_size);
+        let checkpoint = writer
+            .wal_checkpoint_v2(None, WalCheckpointMode::Truncate)
+            .unwrap();
+        assert!(!checkpoint.busy);
+        reader.try_close().unwrap();
+        writer.try_close().unwrap();
+
+        let reopened = Connection::open_with_flags(&db, OpenFlags::READONLY).unwrap();
+        let values = reopened.query("SELECT v FROM t ORDER BY id", &[]).unwrap();
+        assert_eq!(values.rows.len(), 2);
+        assert_eq!(values.rows[0].get_str(0), Some("committed"));
+        assert_eq!(values.rows[1].get_str(0), Some("second"));
+        let integrity = reopened.query("PRAGMA integrity_check", &[]).unwrap();
+        assert_eq!(integrity.rows[0].get_str(0), Some("ok"));
+    }
+}
