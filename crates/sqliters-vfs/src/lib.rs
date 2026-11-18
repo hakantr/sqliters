@@ -196,6 +196,13 @@ pub trait VfsFile: Send + Sync {
     /// Truncates (or extends) the file to `size` bytes (`xTruncate`).
     fn truncate(&self, size: u64) -> Result<()>;
 
+    /// SQLITE_FCNTL_SYNC. Notifies the VFS before a database sync, including
+    /// when synchronous=OFF omits xSync. Multi-database commits may supply
+    /// the super-journal path. Unsupported backends return SQLITE_NOTFOUND.
+    fn notify_sync(&self, _super_journal: Option<&Path>) -> Result<()> {
+        Err(SqliteError::new(ErrorCode::NotFound, ErrorCode::NotFound.as_str()))
+    }
+
     /// Flushes OS buffers to persistent storage (`xSync`).
     fn sync(&self, flags: SyncFlags) -> Result<()>;
 

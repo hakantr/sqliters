@@ -6494,8 +6494,15 @@ impl Pager {
             } else {
                 false
             };
+            // sqlite3PagerSync notifies the VFS even when xSync is skipped.
+            let db = self.db_file()?;
+            if let Err(error) = db.notify_sync(None)
+                && error.extended_code != ErrorCode::NotFound as i32
+            {
+                return Err(error);
+            }
             if !self.pager_no_sync() {
-                self.db_file()?.sync(self.file_sync_flags())?;
+                db.sync(self.file_sync_flags())?;
             }
             Ok((z_super, should_replay, read_header))
         })();
@@ -7865,6 +7872,8 @@ mod tests {
         journal_delete_error: Mutex<Option<bool>>,
         fail_journal_zero: AtomicBool,
         fail_hot_journal_sync: AtomicBool,
+        db_sync_notification_error: Mutex<Option<i32>>,
+        db_sync_notifications: Mutex<Vec<Option<PathBuf>>>,
         short_hot_journal_count: AtomicBool,
         fail_db_unlock: AtomicBool,
         fail_db_shared_unlock: AtomicBool,
@@ -8003,6 +8012,15 @@ mod tests {
                 ));
             }
             self.inner.truncate(size)
+        }
+        fn notify_sync(&self, super_journal: Option<&Path>) -> Result<()> {
+            if self.is_db {
+                self.ctl.db_sync_notifications.lock().unwrap().push(super_journal.map(Path::to_path_buf));
+                if let Some(code) = self.ctl.db_sync_notification_error.lock().unwrap().take() {
+                    return Err(SqliteError::with_extended(code, ErrorCode::from_raw_primary(code).as_str()));
+                }
+            }
+            self.inner.notify_sync(super_journal)
         }
         fn sync(&self, flags: SyncFlags) -> Result<()> {
             if self.is_journal && self.ctl.fail_hot_journal_sync.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -8208,6 +8226,46 @@ mod tests {
             pager.end_read_if_unused().unwrap();
             pager.close().unwrap();
         }
+    }
+
+    #[test]
+    fn hot_journal_sync_notification_preserves_retry_with_synchronous_off() {
+        let ctl = Arc::new(FaultCtl::default());
+        let vfs = Arc::new(FaultVfs { inner: Arc::new(MemoryVfs::new()), ctl: ctl.clone() });
+        let path = Path::new("hot-sync.db");
+        let journal = Path::new("hot-sync.db-journal");
+        let flags = OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB;
+        let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+        pager.begin_write().unwrap();
+        let page = pager.allocate_raw_page().unwrap();
+        pager.write_page(page).unwrap()[0] = 1;
+        pager.commit().unwrap();
+
+        pager.begin_write().unwrap();
+        pager.write_page(page).unwrap()[0] = 2;
+        pager.commit_phase_one(None).unwrap();
+        *ctl.journal_delete_error.lock().unwrap() = Some(false);
+        let error = pager.commit_phase_two(false, false).unwrap_err();
+        assert_eq!(error.extended_code, extended::SQLITE_IOERR_DELETE);
+        assert_eq!(pager.rollback().unwrap_err(), error);
+        let hot = vfs_file_image(vfs.as_ref(), journal);
+
+        pager.set_synchronous(0);
+        ctl.take_events();
+        *ctl.db_sync_notification_error.lock().unwrap() = Some(ErrorCode::IoErr as i32);
+        assert_eq!(pager.begin_read().unwrap_err().extended_code, ErrorCode::IoErr as i32);
+        assert_eq!(vfs_file_image(vfs.as_ref(), journal), hot);
+        assert_eq!(*ctl.db_sync_notifications.lock().unwrap(), [None]);
+        assert!(!ctl.take_events().contains(&"db-sync"));
+
+        *ctl.db_sync_notification_error.lock().unwrap() = Some(ErrorCode::NotFound as i32);
+        pager.begin_read().unwrap();
+        assert_eq!(pager.read_page(page).unwrap()[0], 1);
+        assert!(!vfs.exists(journal).unwrap());
+        assert_eq!(*ctl.db_sync_notifications.lock().unwrap(), [None, None]);
+        assert!(!ctl.take_events().contains(&"db-sync"));
+        pager.end_read_if_unused().unwrap();
+        pager.close().unwrap();
     }
 
     #[test]

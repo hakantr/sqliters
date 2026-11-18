@@ -567,3 +567,7 @@ Normal sıcak DELETE journal xClose, kipin gerektirdiği xDelete ve SHARED sıra
 ## V6b.47 — D151 sıcak PERSIST ve TRUNCATE journal sonlandırması
 
 Sıcak PERSIST ve TRUNCATE aynı açık tanıtıcıyla sonlandırılıyor. JournalOff sıfırsa mevcut dosya korunuyor. 24 native vaka, sekiz cihaz özelliği ve altı 2PC commit noktası vakasında sorgu izleri ile tüm dosya özetleri C ile eşit. Gerçek C 2PC görüntüsü iki DB açılış sırasında üç motorda eşit. Eski PERSIST sıfır uzunluk beklentisi C'nin koruduğu tüm dosya baytlarını karşılaştıracak şekilde doğrulandı ve düzeltildi. Tekrar sonrası OFF 1145/7/337, ON 1131/21/337, başarısız kümeler aynı. DML ve ayrışma bulucu V6b.46 ile aynı. Rust 1.100 süre oranı 1,238 ve 14 digest eşit. Gcov ana ölçümde 42 dal, dokuz alınmayan çıkış. D152 sync bildirimi ve D153 terminal kilit ve journal sync sırası açık. [Karar ve doğrulama](karar_esligi_v6b_47.md).
+
+## V6b.48 — D152 sıcak journal kurtarmasında DB sync bildirimi
+
+Sıcak playback `SQLITE_FCNTL_SYNC` bildirimini ana DB fiziksel sync seçiminden önce gönderiyor. NOTFOUND kurtarmayı sürdürüyor, G/Ç hatası journal'ı yeniden denemeye bırakıyor. 20 native vaka ve altı C çıkışı doğrulandı. D151'in 24 kurtarma ve sekiz cihaz yeteneği vakası ile önceki 147 kurtarma vakası korundu. OFF 1146/7/337, ON 1132/21/337. DML ve ayrışma bulucu V6b.47 ile aynı. Rust 1.100 süre oranı 1,244 ve 14 digest eşit. D153 terminal bağlantı kapatma sırası açık. [Karar ve doğrulama](karar_esligi_v6b_48.md).
