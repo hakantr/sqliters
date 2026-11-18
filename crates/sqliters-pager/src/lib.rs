@@ -17,7 +17,8 @@ use sqliters_types::{
     SQLITE_VERSION_NUMBER, SqliteError, TextEncoding, decode_db_header_page_size, extended,
 };
 use sqliters_vfs::{
-    FetchPage, LockLevel, MemoryVfs, OpenFlags, OsVfs, ShmOpenOptions, SyncFlags, Vfs, VfsFile,
+    FetchPage, IOCAP_SAFE_APPEND, IOCAP_SEQUENTIAL, LockLevel, MemoryVfs, OpenFlags, OsVfs,
+    ShmOpenOptions, SyncFlags, Vfs, VfsFile,
 };
 
 pub use header::{AutoVacuumMode, DB_HEADER_SIZE, DatabaseHeader};
@@ -2063,8 +2064,8 @@ impl Pager {
     }
 
     /// `syncJournal(pPager, newHdr)`: "sync the journal file ... and write the nRec field of
-    /// the most recent journal header"; with `new_hdr` a new header starts the next section
-    /// of the journal. Takes the EXCLUSIVE lock first (`sqlite3PagerExclusiveLock`); every
+    /// the most recent journal header". The device capabilities determine which writes and
+    /// syncs are needed and whether `new_hdr` begins another section. Takes EXCLUSIVE first; every
     /// dirty page loses `PGHDR_NEED_SYNC` and the pager is in `PAGER_WRITER_DBMOD` afterwards.
     fn sync_journal(&mut self, new_hdr: bool) -> Result<()> {
         let lock_res = self.lock_db_file(LockLevel::Exclusive);
@@ -2082,13 +2083,14 @@ impl Pager {
         lock_res?;
 
         if !self.pager_no_sync() {
-            if self.journal_file.is_some() && self.journal_mode != JournalMode::Memory {
-                let hdr_sz = u64::from(
-                    self.journal_sector_size
-                        .max(MIN_JOURNAL_HEADER_BYTES as u32),
-                );
-                {
-                    let jfile = self.journal_file.as_deref().expect("checked Some");
+            if let Some(jfile) = self.journal_file.as_deref()
+                && self.journal_mode != JournalMode::Memory
+            {
+                let characteristics = self.file.as_deref().map_or(0, VfsFile::device_characteristics);
+                let safe_append = characteristics & IOCAP_SAFE_APPEND != 0;
+                let sequential = characteristics & IOCAP_SEQUENTIAL != 0;
+                let sflags = self.file_sync_flags();
+                if !safe_append {
                     // "If the last connection to a database crashed while writing a persistent
                     // journal ... the magic of a stale header that follows the last record of
                     // this section is zeroed."
@@ -2100,20 +2102,19 @@ impl Pager {
                     if jfile.read_at(&mut magic, next_hdr_off)? == 8 && magic == JOURNAL_MAGIC {
                         jfile.write_at(&[0u8], next_hdr_off)?;
                     }
-                    let _ = hdr_sz;
-
-                    let sflags = self.file_sync_flags();
-                    if self.synchronous >= 2 {
+                    if self.synchronous >= 2 && !sequential {
                         jfile.sync(sflags)?;
                     }
                     let mut hdr12 = [0u8; 12];
                     hdr12[0..8].copy_from_slice(&JOURNAL_MAGIC);
                     hdr12[8..12].copy_from_slice(&self.journal_records_written.to_be_bytes());
                     jfile.write_at(&hdr12, self.journal_hdr)?;
+                }
+                if !sequential {
                     jfile.sync(if self.full_fsync { SyncFlags::FullDataOnly } else { sflags })?;
                 }
                 self.journal_hdr = self.journal_off;
-                if new_hdr {
+                if new_hdr && !safe_append {
                     self.journal_records_written = 0;
                     self.write_journal_hdr()?;
                 }
@@ -2129,9 +2130,9 @@ impl Pager {
         Ok(())
     }
 
-    /// `writeJournalHdr`: a journal header at the next sector boundary. The magic and the
-    /// record count are zero until `syncJournal` writes them (unless nothing is synced anyway:
-    /// then magic and `0xffffffff`); every header has its own checksum initialiser.
+    /// `writeJournalHdr`: a journal header at the next sector boundary. With safe append,
+    /// no-sync or memory journaling, the magic and the `0xffffffff` count are written now.
+    /// Otherwise they remain zero until `syncJournal`. Each header has its own checksum seed.
     fn write_journal_hdr(&mut self) -> Result<()> {
         let hdr_sz = (self.journal_sector_size as usize).max(MIN_JOURNAL_HEADER_BYTES);
         let off = super_journal::journal_hdr_offset(self.journal_off, self.journal_sector_size);
@@ -2146,6 +2147,11 @@ impl Pager {
         self.journal_hdr = off;
         self.journal_off = off;
         let memory = self.journal_mode == JournalMode::Memory;
+        let write_magic = self.pager_no_sync()
+            || memory
+            || self.file.as_deref().is_some_and(|file| {
+                file.device_characteristics() & IOCAP_SAFE_APPEND != 0
+            });
         if !memory {
             let mut nonce_bytes = [0u8; 4];
             self.vfs.randomness(&mut nonce_bytes);
@@ -2154,7 +2160,7 @@ impl Pager {
         let page_size = self.header.page_size as usize;
         let n_header = page_size.min(hdr_sz);
         let mut hdr = vec![0u8; n_header];
-        if self.pager_no_sync() || memory {
+        if write_magic {
             hdr[0..8].copy_from_slice(&JOURNAL_MAGIC);
             hdr[8..12].copy_from_slice(&0xffff_ffffu32.to_be_bytes());
         }
@@ -7964,7 +7970,8 @@ mod tests {
         /// `xTruncate` of `<db>-wal` fails.
         fail_wal_truncate: std::sync::atomic::AtomicBool,
         page_write_error: Mutex<Option<(&'static str, i32)>>,
-        journal_write_trace: Mutex<Option<JournalWriteTrace>>,
+        journal_trace: Mutex<Option<JournalTrace>>,
+        db_device_characteristics: std::sync::atomic::AtomicU32,
         // true injects the error after successfully removing the journal.
         journal_delete_error: Mutex<Option<bool>>,
         fail_journal_zero: AtomicBool,
@@ -7981,9 +7988,15 @@ mod tests {
         events: Mutex<Vec<&'static str>>,
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum JournalCall {
+        Write(u64, usize),
+        Sync(SyncFlags),
+    }
+
     #[derive(Default)]
-    struct JournalWriteTrace {
-        writes: Vec<(u64, usize)>,
+    struct JournalTrace {
+        calls: Vec<JournalCall>,
         fail_offset: Option<u64>,
     }
 
@@ -8093,9 +8106,9 @@ mod tests {
         }
         fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
             if self.is_journal
-                && let Some(trace) = self.ctl.journal_write_trace.lock().unwrap().as_mut()
+                && let Some(trace) = self.ctl.journal_trace.lock().unwrap().as_mut()
             {
-                trace.writes.push((offset, buf.len()));
+                trace.calls.push(JournalCall::Write(offset, buf.len()));
                 if trace.fail_offset.take_if(|target| *target == offset).is_some() {
                     return Err(SqliteError::with_extended(extended::SQLITE_IOERR_WRITE, "disk I/O error"));
                 }
@@ -8153,6 +8166,9 @@ mod tests {
         fn sync(&self, flags: SyncFlags) -> Result<()> {
             if self.is_journal {
                 self.ctl.record_close_call(RecoveryCall::JournalSync(flags));
+                if let Some(trace) = self.ctl.journal_trace.lock().unwrap().as_mut() {
+                    trace.calls.push(JournalCall::Sync(flags));
+                }
             }
             if self.is_journal && self.ctl.fail_hot_journal_sync.swap(false, std::sync::atomic::Ordering::Relaxed) {
                 return Err(SqliteError::with_extended(extended::SQLITE_IOERR_FSYNC, "disk I/O error"));
@@ -8227,7 +8243,12 @@ mod tests {
             self.inner.supports_wal_shm()
         }
         fn device_characteristics(&self) -> u32 {
-            self.inner.device_characteristics()
+            let native = self.inner.device_characteristics();
+            if self.is_db {
+                native | self.ctl.db_device_characteristics.load(std::sync::atomic::Ordering::Relaxed)
+            } else {
+                native
+            }
         }
         fn sector_size(&self) -> u32 {
             self.inner.sector_size()
@@ -8422,9 +8443,9 @@ mod tests {
             ];
             let record_end = writes[2].0 + 4;
             let fail_offset = failed_part.map(|part| writes[part].0);
-            *ctl.journal_write_trace.lock().unwrap() = Some(JournalWriteTrace {
+            *ctl.journal_trace.lock().unwrap() = Some(JournalTrace {
                 fail_offset,
-                ..JournalWriteTrace::default()
+                ..JournalTrace::default()
             });
             let result = pager.write_page(page);
             if failed_part.is_some() {
@@ -8432,10 +8453,13 @@ mod tests {
             } else {
                 result.unwrap()[0] = 2;
             }
-            let trace = ctl.journal_write_trace.lock().unwrap().take().unwrap();
+            let trace = ctl.journal_trace.lock().unwrap().take().unwrap();
             assert_eq!(trace.fail_offset, None);
-            let record_writes: Vec<_> = trace.writes.into_iter()
-                .filter(|&(offset, _)| offset >= record_start)
+            let record_writes: Vec<_> = trace.calls.into_iter()
+                .filter_map(|call| match call {
+                    JournalCall::Write(offset, size) if offset >= record_start => Some((offset, size)),
+                    _ => None,
+                })
                 .collect();
             let attempted = failed_part.map_or(writes.len(), |part| part + 1);
             assert_eq!(record_writes, writes[..attempted]);
@@ -8463,6 +8487,69 @@ mod tests {
             reader.begin_read().unwrap();
             assert_eq!(reader.read_page(page).unwrap()[0], if complete { 2 } else { 1 });
             reader.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn journal_header_and_sync_follow_main_database_device_characteristics() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use JournalCall::{Sync, Write};
+
+        let promote = Write(0, 12);
+        let initial_sync = Sync(SyncFlags::Full);
+        let final_sync = Sync(SyncFlags::FullDataOnly);
+        for (capabilities, expected) in [
+            (0, &[initial_sync, promote, final_sync][..]),
+            (IOCAP_SAFE_APPEND, &[Sync(SyncFlags::FullDataOnly)]),
+            (IOCAP_SEQUENTIAL, &[Write(0, 12)]),
+            (IOCAP_SAFE_APPEND | IOCAP_SEQUENTIAL, &[]),
+        ] {
+            let ctl = Arc::new(FaultCtl::default());
+            ctl.db_device_characteristics.store(capabilities, Relaxed);
+            let vfs = Arc::new(FaultVfs { inner: Arc::new(MemoryVfs::new()), ctl: ctl.clone() });
+            let path = Path::new("journal-caps.db");
+            let journal = Path::new("journal-caps.db-journal");
+            let flags = OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB;
+            let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+            pager.set_journal_mode(JournalMode::Persist).unwrap();
+            pager.set_synchronous(2);
+            pager.set_full_sync_flags(true, false);
+            pager.begin_write().unwrap();
+            let page = pager.allocate_raw_page().unwrap();
+            pager.write_page(page).unwrap()[0] = 1;
+            pager.commit().unwrap();
+
+            pager.begin_write().unwrap();
+            pager.write_page(page).unwrap()[0] = 2;
+            let initial = vfs_file_image(vfs.as_ref(), journal);
+            let safe_append = capabilities & IOCAP_SAFE_APPEND != 0;
+            if safe_append {
+                assert_eq!(&initial[..8], &JOURNAL_MAGIC);
+                assert_eq!(&initial[8..12], &u32::MAX.to_be_bytes());
+            } else {
+                assert_eq!(&initial[..12], &[0; 12]);
+            }
+
+            *ctl.journal_trace.lock().unwrap() = Some(JournalTrace::default());
+            pager.commit_phase_one(None).unwrap();
+            let mut trace = ctl.journal_trace.lock().unwrap();
+            let header_calls: Vec<_> = std::mem::take(&mut trace.as_mut().unwrap().calls)
+                .into_iter()
+                .filter(|call| matches!(call, Write(0, 12) | Sync(_)))
+                .collect();
+            assert_eq!(header_calls, expected, "device capabilities {capabilities:#x}");
+            drop(trace);
+            let promoted = vfs_file_image(vfs.as_ref(), journal);
+            assert_eq!(&promoted[..8], &JOURNAL_MAGIC);
+            let n_rec = if safe_append { u32::MAX } else { 2 };
+            assert_eq!(&promoted[8..12], &n_rec.to_be_bytes());
+
+            pager.commit_phase_two(false, false).unwrap();
+            assert_eq!(
+                ctl.journal_trace.lock().unwrap().take().unwrap().calls,
+                [Write(0, JOURNAL_HEADER_CORE_BYTES), Sync(SyncFlags::FullDataOnly)]
+            );
+            pager.close().unwrap();
         }
     }
 

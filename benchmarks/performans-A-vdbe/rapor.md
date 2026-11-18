@@ -587,3 +587,7 @@ Normal disk rollback-journal COMMIT artık journal sonlandırmasından sonra ve 
 ## V6b.52 — D156 disk rollback-journal kayıt yazımı
 
 Ana journal sayfa numarasını, preimage sayfasını ve checksum'u C boyut ve ofsetleriyle ayrı yazıyor. Başarısız alan kaydı ilerletmiyor ve NEED_SYNC korunuyor. 12 sağlıklı ve 144 hata vakasında iki Rust kipi C ile eşit. Ortak nonce altında bütün journal görüntüleri, her koşuda ana DB özetleri eşit. Üç xWrite kararının altı C çıkışı alındı. Önceki 147 kurtarma eşit. OFF 1149/7/337, ON 1135/21/337. DML ve ayrışma bulucu V6b.51 ile aynı. Rust 1.100 süre oranı 1,246 ve 14 digest eşit. D157 cihaz bayrakları sırada. [Karar ve doğrulama](karar_esligi_v6b_52.md).
+
+## V6b.53 — D157 rollback journal cihaz yetenekleri
+
+SAFE_APPEND ve SEQUENTIAL, ana journal başlığını, sync sırasını ve spill bölüm sınırlarını C ile aynı koşullarda belirliyor. 32 cihaz, 32 FULLFSYNC ve dört spill vakası iki Rust kipinde eşit. Üç C kapsamı birlikte 28/40 dal çıkışını aldı. D156'nın 144 yazma hatası ve önceki 147 kurtarma vakası tekrar eşit. OFF 1150/7/337, ON 1136/21/337. DML ve ayrışma bulucu V6b.52 ile aynı. Rust 1.100 süre oranı 1,248 ve 14 digest eşit. D158 hizalı sonraki journal başlığının kısa okuması sırada. [Karar ve doğrulama](karar_esligi_v6b_53.md).

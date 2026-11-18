@@ -44,6 +44,8 @@ pub use shm::{
     wal_frame_page, wal_hash_slot, wal_lock_byte_offset, wal_read_lock_slot,
 };
 
+/// Appended bytes are written before the file size grows (`SQLITE_IOCAP_SAFE_APPEND`).
+pub const IOCAP_SAFE_APPEND: u32 = 0x0000_0200;
 /// Device characteristic bit indicating writes occur sequentially (`SQLITE_IOCAP_SEQUENTIAL`).
 pub const IOCAP_SEQUENTIAL: u32 = 0x0000_0400;
 /// Device characteristic bit indicating power-safe overwrites (`SQLITE_IOCAP_POWERSAFE_OVERWRITE`).
