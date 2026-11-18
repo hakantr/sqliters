@@ -5448,8 +5448,8 @@ fn select_schema_use_of(inner: &ConnectionInner, stmt: &Stmt, sql: &str) -> Opti
     matches!(body, Stmt::Select(_)).then(|| cgen::select_schema_use(inner, sql)).flatten()
 }
 
-/// Preserve the C errors that legacy validation can defer or lose: missing
-/// collations and the diagnostic functions' argument-count error locations.
+/// Preserve C's missing-collation and function diagnostics that legacy validation
+/// can defer or lose, including the original operator spelling and byte offset.
 fn check_c_prepare_error(
     inner: &mut ConnectionInner, usage: Option<&cgen::SelectSchemaUse>, sql: &str,
 ) -> Result<()> {
@@ -5459,7 +5459,9 @@ fn check_c_prepare_error(
     if let sqliters_codegen::PrepareResult::Error { code, message, offset } = result
         && (code == sqliters_types::extended::SQLITE_ERROR_MISSING_COLLSEQ
             || message.eq_ignore_ascii_case("wrong number of arguments to function sqlite_compileoption_get()")
-            || message.eq_ignore_ascii_case("wrong number of arguments to function sqlite_compileoption_used()"))
+            || message.eq_ignore_ascii_case("wrong number of arguments to function sqlite_compileoption_used()")
+            || message.eq_ignore_ascii_case("no such function: regexp")
+            || message.eq_ignore_ascii_case("wrong number of arguments to function regexp()"))
     {
         return Err(SqliteError::with_extended(code, message)
             .with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }));

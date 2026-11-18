@@ -631,3 +631,7 @@ Normal disk WAL kapanışı checkpoint'ten sonra VFS kalıcılık değerini sorg
 ## V6b.63 — D167 WAL kapanışında dosya kimliği
 
 Olağan disk WAL kapanışı checkpoint öncesinde VFS dosya kimliğini sorguluyor. Bağımsız 40/40 C karşılaştırmasında ortak olay sırası, üç dosya özeti ve C yeniden açılışı eşit. Odak Rust testleri 10/10 geçti. C kapsamı 55 kapanışta checkpoint'e 37 kez izin verildiğini ve 18 kez atlandığını gösteriyor. Önceki 147 kurtarma eşit. OFF 1160/7/337, ON 1146/21/337. DML ve ayrışma bulucu V6b.62 ile aynı. Rust 1.100 süre oranı 1,252 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_63.md).
+
+## V6b.64 — F9 REGEXP hazırlama tanısı
+
+SELECT hazırlamasındaki bulunamayan REGEXP ve yanlış arite hataları, C'nin özgün token yazımını ve UTF-8 bayt ofsetini koruyor. 54 hazırlama, 72 kayıtlı fonksiyon ve 6 stored-view vakası iki Rust kipinde eşit. C resolver kapsamı 10/16. Group54 iki kipte geçiyor. OFF 1161/7/337, ON 1148/20/337. DML ve ayrışma bulucu V6b.63 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,232 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_64.md).

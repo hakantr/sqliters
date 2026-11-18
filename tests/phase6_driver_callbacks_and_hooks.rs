@@ -30,15 +30,13 @@ fn test_group54_regexp_match_unregistered_and_custom_registration() {
     conn.execute("INSERT INTO words VALUES (1, 'alpha'), (2, 'beta'), (3, 'alphanumeric');")
         .unwrap();
 
-    // 1. Unregistered `REGEXP` and `MATCH` must fail with `no such function: regexp` / `match`
+    // 1. The unregistered operator reports its source spelling and byte offset.
     let err_re = conn
         .query("SELECT w FROM words WHERE w REGEXP '^alpha';", &[])
         .unwrap_err();
     assert_eq!(err_re.code, ErrorCode::Error);
-    assert!(
-        err_re.message.contains("no such function: regexp"),
-        "unexpected error: {err_re}"
-    );
+    assert_eq!(err_re.message, "no such function: REGEXP");
+    assert_eq!(err_re.c_offset(), 28);
 
     let err_match = conn
         .query("SELECT w FROM words WHERE w MATCH 'alpha*';", &[])
@@ -105,12 +103,8 @@ fn test_group54_regexp_match_unregistered_and_custom_registration() {
         .query("SELECT 'alpha' REGEXP '^a' ESCAPE '\\';", &[])
         .unwrap_err();
     assert_eq!(esc_err.code, ErrorCode::Error);
-    assert!(
-        esc_err
-            .message
-            .contains("wrong number of arguments to function regexp()"),
-        "unexpected error: {esc_err}"
-    );
+    assert_eq!(esc_err.message, "wrong number of arguments to function REGEXP()");
+    assert_eq!(esc_err.c_offset(), 15);
 
     // Register 3-arg `regexp` and verify `ESCAPE` works
     conn.create_scalar_function("regexp", 3, FunctionFlags::DETERMINISTIC, |args| {
@@ -171,6 +165,60 @@ fn test_group54_regexp_match_unregistered_and_custom_registration() {
         builtin_like,
         vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]
     );
+}
+
+#[test]
+fn test_regexp_prepare_preserves_operator_spelling_and_utf8_offset() {
+    let sql = r#"SELECT 'é' NOT ReGeXp '^a' ESCAPE '!';"#;
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(&format!("PRAGMA encoding='{encoding}'")).unwrap();
+        conn.execute("CREATE TABLE words(w TEXT)").unwrap();
+
+        for prepare in [Connection::prepare, Connection::prepare_v1] {
+            let Err(err) = prepare(&conn, sql) else {
+                panic!("unregistered REGEXP prepared for {encoding}");
+            };
+            assert_eq!(err.code, ErrorCode::Error);
+            assert_eq!(err.message, "no such function: ReGeXp");
+            assert_eq!(err.c_offset(), 16);
+        }
+
+        conn.create_scalar_function("regexp", 2, FunctionFlags::DETERMINISTIC, |args| {
+            assert_eq!(args[0].value, Value::Text("^a".into()));
+            assert_eq!(args[1].value, Value::Text("é".into()));
+            Ok(RuntimeValue::from(Value::Integer(1)))
+        })
+        .unwrap();
+        for prepare in [Connection::prepare, Connection::prepare_v1] {
+            let Err(err) = prepare(&conn, sql) else {
+                panic!("two-argument REGEXP prepared with ESCAPE for {encoding}");
+            };
+            assert_eq!(err.code, ErrorCode::Error);
+            assert_eq!(err.message, "wrong number of arguments to function ReGeXp()");
+            assert_eq!(err.c_offset(), 16);
+        }
+
+        conn.create_scalar_function("REGEXP", 3, FunctionFlags::DETERMINISTIC, |args| {
+            assert_eq!(args[0].value, Value::Text("^a".into()));
+            assert_eq!(args[1].value, Value::Text("é".into()));
+            assert_eq!(args[2].value, Value::Text("!".into()));
+            Ok(RuntimeValue::from(Value::Integer(1)))
+        })
+        .unwrap();
+        for prepare in [Connection::prepare, Connection::prepare_v1] {
+            let mut stmt = prepare(&conn, sql).unwrap();
+            let StepResult::Row(row) = stmt.step().unwrap() else {
+                panic!("REGEXP returned no row for {encoding}");
+            };
+            assert_eq!(row.values(), &[Value::Integer(0)]);
+            assert!(matches!(stmt.step().unwrap(), StepResult::Done));
+        }
+        assert_eq!(
+            query_vals(&conn, "SELECT 'é' ReGeXp '^a'"),
+            vec![vec![Value::Integer(1)]],
+        );
+    }
 }
 
 // ============================================================================
