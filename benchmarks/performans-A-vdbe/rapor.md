@@ -575,3 +575,7 @@ Sıcak playback `SQLITE_FCNTL_SYNC` bildirimini ana DB fiziksel sync seçiminden
 ## V6b.49 — D153 olağan rollback-journal bağlantı kapanışı
 
 Olağan disk kapanışı açık journal için sync ve boyut okumasını, ardından kilit ve iki dosyanın kapanış sırasını C ile hizalıyor. 18 native vaka ile D151'in 24 kurtarma ve sekiz cihaz yeteneği vakası kapanış dahil eşit. D152 20/20, önceki 147 kurtarma vakası eşit. Gcov 32 çıkış, alınmayan 13 sınıflı. OFF 1147/7/337, ON 1133/21/337. DML ve ayrışma bulucu V6b.48 ile aynı. Rust 1.100 süre oranı 1,240 ve 14 digest eşit. D154 normal COMMIT SHARED, D155 COMMIT_PHASETWO ve D156 kayıt yazma sınırı açık. [Karar ve doğrulama](karar_esligi_v6b_49.md).
+
+## V6b.50 — D154 normal rollback-journal COMMIT sonu kilit sırası
+
+Normal disk COMMIT journal sonlandırma sonucunu saklayıp SHARED'a geçmeyi deniyor. İlk hata korunuyor ve okuyucusu bulunan bağlantı son okura kadar SHARED'da kalıyor. 24 gerçek kaynak native vakası ve ayrı 36 phase-two ile 18 açık-okur aday vakasında ölçülen terminal izleri, SQL ve DB özetleri eşit. D153 kapanış 18/18 ve önceki 147 kurtarma eşit. Gcov 14 çıkış ve alınmayan sekiz sınıflı. OFF 1147/7/337, ON 1133/21/337. DML ve ayrışma bulucu V6b.49 ile aynı. Rust 1.100 süre oranı 1,247 ve 14 digest eşit. D155 COMMIT_PHASETWO ve D156 kayıt yazım sınırı açık. [Karar ve doğrulama](karar_esligi_v6b_50.md).

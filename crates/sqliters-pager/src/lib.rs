@@ -5375,64 +5375,86 @@ impl Pager {
                     return self.finish_tx_to_read_or_open(retain_read);
                 }
 
-                self.finalize_journal_after_tx(self.set_super)?;
-
-                if self.pending_byte_copy.is_none() {
-                    // `pager_end_transaction`: "else if( rc==SQLITE_OK && bCommit &&
-                    // pPager->dbFileSize>pPager->dbSize ) rc = pager_truncate(pPager, dbSize)" —
-                    // a database that became smaller is cut back only now, with the journal
-                    // already finalized.
-                    let lock_byte_pgno = self.lock_byte_page();
-                    let effective_disk_pages = if self.page_count == lock_byte_pgno {
-                        self.page_count - 1
-                    } else {
-                        self.page_count
-                    };
-                    let target_size =
-                        u64::from(effective_disk_pages) * u64::from(self.header.page_size);
-                    if let Some(f) = self.file.as_deref()
-                        && f.file_size().is_ok_and(|sz| sz > target_size)
-                    {
-                        f.truncate(target_size)?;
-                    }
+                let normal_rollback = self.locking_mode == LockingMode::Normal
+                    && !self.uses_temp_file_semantics()
+                    && self.pending_byte_copy.is_none()
+                    && matches!(self.journal_mode, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate);
+                let finalized = self.finalize_rollback_commit();
+                // pager_end_transaction attempts SHARED despite finalization
+                // failure. The earlier error has priority.
+                let downgraded = if normal_rollback {
+                    self.unlock_db_file(LockLevel::Shared)
+                } else {
+                    Ok(())
+                };
+                finalized?;
+                downgraded?;
+                if normal_rollback && retain_read {
+                    self.set_state(TransactionState::Read);
+                    return Ok(());
                 }
-                if let Some(pending) = self.pending_byte_copy.take() {
-                    self.pcache_reset();
-                    if pending.new_header.page_size != self.header.page_size {
-                        // The copy changed the page size of the cache
-                        // (`sqlite3PagerSetPagesize` → `pager_reset()`).
-                        self.bump_data_version();
-                    }
-                    self.header = pending.new_header;
-                    self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
-                    self.page_count = pending.new_page_count;
-                    self.next_page_size = None;
-                }
-                if self.db_kind == DatabaseKind::PrivateTemporary && !self.is_memdb_backing {
-                    self.cache.clear_writable();
-                }
-                self.set_super = false;
-                self.staged_raw_copy = false;
-                self.backup_raw_staging = None;
-                self.commit_phase_one_done = false;
-                self.db_file_modified = false;
-                self.cache_modified = false;
-                if self.change_counter_bumped {
-                    // `pager_write_pagelist`: page 1 reached the database file.
-                    self.db_file_vers_cc = self.header.change_counter;
-                }
-                self.change_counter_bumped = false;
-                self.journal_started_in_tx = false;
-                self.tx_preimages.clear();
-                self.tx_journaled.clear_all();
-                self.subsavepoints.clear();
-                self.header_loaded = true;
-                self.page_size_fixed = self.page_count > 0;
-                self.notify_backup_self_commit();
-
                 self.finish_tx_to_read_or_open(retain_read)
             }
         }
+    }
+
+    fn finalize_rollback_commit(&mut self) -> Result<()> {
+        self.finalize_journal_after_tx(self.set_super)?;
+
+        if self.pending_byte_copy.is_none() {
+            // `pager_end_transaction`: "else if( rc==SQLITE_OK && bCommit &&
+            // pPager->dbFileSize>pPager->dbSize ) rc = pager_truncate(pPager, dbSize)" —
+            // a database that became smaller is cut back only now, with the journal
+            // already finalized.
+            let lock_byte_pgno = self.lock_byte_page();
+            let effective_disk_pages = if self.page_count == lock_byte_pgno {
+                self.page_count - 1
+            } else {
+                self.page_count
+            };
+            let target_size =
+                u64::from(effective_disk_pages) * u64::from(self.header.page_size);
+            if let Some(f) = self.file.as_deref()
+                && f.file_size().is_ok_and(|sz| sz > target_size)
+            {
+                f.truncate(target_size)?;
+            }
+        }
+        if let Some(pending) = self.pending_byte_copy.take() {
+            self.pcache_reset();
+            if pending.new_header.page_size != self.header.page_size {
+                // The copy changed the page size of the cache
+                // (`sqlite3PagerSetPagesize` → `pager_reset()`).
+                self.bump_data_version();
+            }
+            self.header = pending.new_header;
+            self.configured_auto_vacuum = AutoVacuumMode::from_header(&self.header);
+            self.page_count = pending.new_page_count;
+            self.next_page_size = None;
+        }
+        if self.db_kind == DatabaseKind::PrivateTemporary && !self.is_memdb_backing {
+            self.cache.clear_writable();
+        }
+        self.set_super = false;
+        self.staged_raw_copy = false;
+        self.backup_raw_staging = None;
+        self.commit_phase_one_done = false;
+        self.db_file_modified = false;
+        self.cache_modified = false;
+        if self.change_counter_bumped {
+            // `pager_write_pagelist`: page 1 reached the database file.
+            self.db_file_vers_cc = self.header.change_counter;
+        }
+        self.change_counter_bumped = false;
+        self.journal_started_in_tx = false;
+        self.tx_preimages.clear();
+        self.tx_journaled.clear_all();
+        self.subsavepoints.clear();
+        self.header_loaded = true;
+        self.page_size_fixed = self.page_count > 0;
+        self.notify_backup_self_commit();
+
+        Ok(())
     }
 
     /// Commits the active transaction. When `retain_read` is `true`, downgrades to
@@ -8157,10 +8179,10 @@ mod tests {
     fn delete_commit_error_defers_recovery_and_respects_the_journal_commit_point() {
         use std::sync::atomic::Ordering::Relaxed;
 
-        for (locking_mode, after_delete) in [
-            (LockingMode::Normal, false),
-            (LockingMode::Exclusive, false),
-            (LockingMode::Normal, true),
+        for (locking_mode, after_delete, retain_read) in [
+            (LockingMode::Normal, false, false),
+            (LockingMode::Exclusive, false, false),
+            (LockingMode::Normal, true, true),
         ] {
             let ctl = Arc::new(FaultCtl::default());
             let vfs = Arc::new(FaultVfs { inner: Arc::new(MemoryVfs::new()), ctl: ctl.clone() });
@@ -8172,21 +8194,54 @@ mod tests {
             pager.begin_write().unwrap();
             let pgno = pager.allocate_raw_page().unwrap();
             pager.write_page(pgno).unwrap()[0] = 1;
-            pager.commit().unwrap();
+            if retain_read {
+                pager.page_ref(pgno).unwrap();
+            }
+            pager.commit_phase_one(None).unwrap();
+            ctl.recovery_calls.lock().unwrap().clear();
+            pager.commit_phase_two(retain_read, false).unwrap();
+            if locking_mode == LockingMode::Normal {
+                let mut expected_calls = vec![
+                    RecoveryCall::Delete { sync_dir: false },
+                    RecoveryCall::Unlock(LockLevel::Shared),
+                ];
+                if retain_read {
+                    assert_eq!(*ctl.recovery_calls.lock().unwrap(), expected_calls);
+                    assert_eq!(pager.transaction_state(), TransactionState::Read);
+                    assert_eq!(pager.file.as_deref().unwrap().lock_level(), LockLevel::Shared);
+                    pager.page_unref(pgno);
+                    pager.end_read_if_unused().unwrap();
+                }
+                expected_calls.push(RecoveryCall::Unlock(LockLevel::NoLock));
+                assert_eq!(*ctl.recovery_calls.lock().unwrap(), expected_calls);
+                assert_eq!(pager.transaction_state(), TransactionState::Open);
+                assert_eq!(pager.file.as_deref().unwrap().lock_level(), LockLevel::NoLock);
+            }
 
             pager.begin_write().unwrap();
             pager.write_page(pgno).unwrap()[0] = 2;
             pager.page_ref(pgno).unwrap();
             pager.commit_phase_one(None).unwrap();
+            ctl.recovery_calls.lock().unwrap().clear();
             let expected_code = if locking_mode == LockingMode::Exclusive {
                 ctl.fail_journal_zero.store(true, Relaxed);
                 extended::SQLITE_IOERR_WRITE
             } else {
                 *ctl.journal_delete_error.lock().unwrap() = Some(after_delete);
+                ctl.fail_db_shared_unlock.store(!after_delete, Relaxed);
                 extended::SQLITE_IOERR_DELETE
             };
             let error = pager.commit_phase_two(false, false).unwrap_err();
             assert_eq!(error.extended_code, expected_code);
+            if locking_mode == LockingMode::Normal {
+                assert_eq!(
+                    *ctl.recovery_calls.lock().unwrap(),
+                    [
+                        RecoveryCall::Delete { sync_dir: false },
+                        RecoveryCall::Unlock(LockLevel::Shared),
+                    ]
+                );
+            }
             assert_eq!(pager.page_ref(pgno).unwrap_err(), error);
             assert_eq!(pager.write_page(pgno).unwrap_err(), error);
             let epoch = pager.pcache_epoch();
