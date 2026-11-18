@@ -627,3 +627,7 @@ Legacy prepared UPDATE ve DELETE, ilk RETURNING satırında üst sayacı bekleti
 ## V6b.62 — D166 normal WAL kapanışında VFS kararları
 
 Normal disk WAL kapanışı checkpoint'ten sonra VFS kalıcılık değerini sorguluyor. BUSY sonrasında terminal kilit bırakma sırası C ile aynı. 6 sağlıklı, 7 VFS yanıtı ve 3 eski adapter vakasında SQL, yeniden açılış ve DB/WAL/SHM özetleri eşit. C dal kapsamı 15/22. Önceki 147 kurtarma eşit. OFF 1159/7/337, ON 1145/21/337. DML ve ayrışma bulucu V6b.61 ile aynı. Rust 1.100 süre oranı 1,242 ve 14 digest eşit. D167 kapanış öncesi dosya kimliği denetimi sırada. [Karar ve doğrulama](karar_esligi_v6b_62.md).
+
+## V6b.63 — D167 WAL kapanışında dosya kimliği
+
+Olağan disk WAL kapanışı checkpoint öncesinde VFS dosya kimliğini sorguluyor. Bağımsız 40/40 C karşılaştırmasında ortak olay sırası, üç dosya özeti ve C yeniden açılışı eşit. Odak Rust testleri 10/10 geçti. C kapsamı 55 kapanışta checkpoint'e 37 kez izin verildiğini ve 18 kez atlandığını gösteriyor. Önceki 147 kurtarma eşit. OFF 1160/7/337, ON 1146/21/337. DML ve ayrışma bulucu V6b.62 ile aynı. Rust 1.100 süre oranı 1,252 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_63.md).

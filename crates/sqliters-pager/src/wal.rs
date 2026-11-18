@@ -2726,7 +2726,7 @@ impl Wal {
         sync_flags: Option<SyncFlags>,
         persist_wal: bool,
     ) -> Result<()> {
-        self.close_inner(db_file, sync_flags, persist_wal, false)
+        self.close_inner(db_file, sync_flags, persist_wal, None)
     }
 
     pub(super) fn close_for_database(
@@ -2734,8 +2734,9 @@ impl Wal {
         db_file: &dyn VfsFile,
         sync_flags: Option<SyncFlags>,
         persist_wal: bool,
+        checkpoint_on_close: bool,
     ) -> Result<()> {
-        self.close_inner(db_file, sync_flags, persist_wal, true)
+        self.close_inner(db_file, sync_flags, persist_wal, Some(checkpoint_on_close))
     }
 
     fn close_inner(
@@ -2743,14 +2744,17 @@ impl Wal {
         db_file: &dyn VfsFile,
         sync_flags: Option<SyncFlags>,
         persist_wal: bool,
-        database_close: bool,
+        checkpoint_on_database_close: Option<bool>,
     ) -> Result<()> {
         let _ = self.end_read_transaction();
 
         let mut is_delete = false;
         let mut first_err: Option<SqliteError> = None;
 
-        if self.read_only_flags == WAL_RDWR && !self.immutable {
+        if checkpoint_on_database_close.unwrap_or(true)
+            && self.read_only_flags == WAL_RDWR && !self.immutable
+        {
+            let database_close = checkpoint_on_database_close.is_some();
             let prev_lock = db_file.lock_level();
             let got_exclusive = if prev_lock >= sqliters_vfs::LockLevel::Exclusive {
                 true

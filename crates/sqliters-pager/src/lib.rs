@@ -6444,7 +6444,11 @@ impl Pager {
             let persist_wal = self.persist_wal;
             if let Some(ref db_fd) = self.file {
                 let close = if idle_wal {
-                    wal.close_for_database(db_fd.as_ref(), ckpt_sync, persist_wal)
+                    let checkpoint_on_close = self.db_size == 0 || match db_fd.has_moved() {
+                        Ok(moved) => !moved,
+                        Err(error) => error.extended_code == ErrorCode::NotFound as i32,
+                    };
+                    wal.close_for_database(db_fd.as_ref(), ckpt_sync, persist_wal, checkpoint_on_close)
                 } else {
                     wal.close(db_fd.as_ref(), ckpt_sync, persist_wal)
                 };
@@ -8079,6 +8083,8 @@ mod tests {
     enum RecoveryCall {
         Delete { sync_dir: bool },
         CommitPhaseTwo,
+        HasMoved,
+        Lock(LockLevel),
         PersistWal { input: i32, output: i32 },
         WalClose,
         WalDelete,
@@ -8116,6 +8122,7 @@ mod tests {
         db_sync_notifications: Mutex<Vec<Option<PathBuf>>>,
         db_commit_phase_two_result: Mutex<Option<i32>>,
         persist_wal_override: Mutex<Option<i32>>,
+        has_moved_reply: Mutex<Option<std::result::Result<bool, i32>>>,
         short_hot_journal_count: AtomicBool,
         fail_db_unlock: AtomicBool,
         fail_db_shared_unlock: AtomicBool,
@@ -8214,6 +8221,16 @@ mod tests {
     }
 
     impl VfsFile for FaultFile {
+        fn has_moved(&self) -> Result<bool> {
+            if self.is_db && let Some(reply) = *self.ctl.has_moved_reply.lock().unwrap() {
+                self.ctl.record_close_call(RecoveryCall::HasMoved);
+                return reply.map_err(|code| {
+                    SqliteError::with_extended(code, ErrorCode::from_raw_primary(code).as_str())
+                });
+            }
+            self.inner.has_moved()
+        }
+
         fn persist_wal_mode(&self, mode: &mut i32) -> Option<Result<()>> {
             if !self.is_db || *mode >= 0 {
                 return self.inner.persist_wal_mode(mode);
@@ -8367,6 +8384,9 @@ mod tests {
             self.inner.file_size()
         }
         fn lock(&self, level: LockLevel) -> Result<()> {
+            if self.is_db {
+                self.ctl.record_close_call(RecoveryCall::Lock(level));
+            }
             self.inner.lock(level)
         }
         fn unlock(&self, level: LockLevel) -> Result<()> {
@@ -9465,27 +9485,33 @@ mod tests {
         (inner, ctl, pager)
     }
 
+    struct WalCloseTestDirectory(PathBuf);
+
+    impl WalCloseTestDirectory {
+        fn new(name: &str) -> Self {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "sqliters-wal-close-{name}-{}-{timestamp}", std::process::id()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            Self(directory)
+        }
+    }
+
+    impl Drop for WalCloseTestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn os_wal_close_queries_persistence_before_releasing_the_database_lock() {
         use std::sync::atomic::Ordering::Relaxed;
 
-        struct TestDirectory(PathBuf);
-
-        impl Drop for TestDirectory {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "sqliters-wal-close-{}-{timestamp}", std::process::id()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let directory = TestDirectory(directory);
+        let directory = WalCloseTestDirectory::new("persist");
         for (name, persist, override_mode, expected_keep) in [
             ("default.db", false, None, false),
             ("persistent.db", true, None, true),
@@ -9520,6 +9546,7 @@ mod tests {
             ctl.trace_close.store(true, Relaxed);
             pager.close().unwrap();
             let mut expected = vec![
+                RecoveryCall::Lock(LockLevel::Exclusive),
                 RecoveryCall::PersistWal { input: -1, output: i32::from(expected_keep) },
                 RecoveryCall::WalClose,
             ];
@@ -9535,6 +9562,74 @@ mod tests {
             let mut reader = Pager::open_with_vfs(inner, Some(&db_path), flags).unwrap();
             reader.begin_read().unwrap();
             assert_eq!(reader.read_page_unchecked(page).unwrap()[4], 7);
+            reader.end_read_if_unused().unwrap();
+            reader.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn wal_close_checks_has_moved_before_checkpoint_and_preserves_committed_data() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let directory = WalCloseTestDirectory::new("has-moved");
+        for (name, reply, checkpoint) in [
+            ("unmoved.db", Ok(false), true),
+            ("moved.db", Ok(true), false),
+            ("notfound.db", Err(ErrorCode::NotFound as i32), true),
+            ("ioerr.db", Err(extended::SQLITE_IOERR_ACCESS), false),
+        ] {
+            let path = directory.0.join(name);
+            let inner = Arc::new(sqliters_vfs::OsVfs::new());
+            let ctl = Arc::new(FaultCtl::default());
+            let vfs = Arc::new(FaultVfs { inner: inner.clone(), ctl: ctl.clone() });
+            let flags = OpenFlags::READWRITE | OpenFlags::MAIN_DB;
+            let mut pager = Pager::open_with_vfs(vfs, Some(&path), flags | OpenFlags::CREATE).unwrap();
+            pager.set_synchronous(2);
+            pager.begin_write().unwrap();
+            pager.header_mut().unwrap().user_version = 1;
+            pager.commit().unwrap();
+            assert_eq!(pager.set_journal_mode(JournalMode::Wal).unwrap(), JournalMode::Wal);
+            let wal_path = pager.wal_path().unwrap().to_path_buf();
+            let shm_path = pager.shm_path().unwrap().to_path_buf();
+            let before = std::fs::read(&path).unwrap();
+            assert_eq!(DatabaseHeader::parse(&before).unwrap().user_version, 1);
+            pager.begin_write().unwrap();
+            pager.header_mut().unwrap().user_version = 7;
+            pager.commit().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            let sidecars = [std::fs::read(&wal_path).unwrap(), std::fs::read(&shm_path).unwrap()];
+
+            *ctl.has_moved_reply.lock().unwrap() = Some(reply);
+            ctl.recovery_calls.lock().unwrap().clear();
+            ctl.db_writes.lock().unwrap().clear();
+            ctl.trace_close.store(true, Relaxed);
+            pager.close().unwrap();
+            let mut expected = vec![RecoveryCall::HasMoved];
+            if checkpoint {
+                expected.extend([
+                    RecoveryCall::Lock(LockLevel::Exclusive),
+                    RecoveryCall::PersistWal { input: -1, output: 0 },
+                ]);
+            }
+            expected.push(RecoveryCall::WalClose);
+            if checkpoint {
+                expected.push(RecoveryCall::WalDelete);
+            }
+            expected.extend([RecoveryCall::Unlock(LockLevel::NoLock), RecoveryCall::DatabaseClose]);
+            assert_eq!(*ctl.recovery_calls.lock().unwrap(), expected, "{name}");
+            let after = std::fs::read(&path).unwrap();
+            if checkpoint {
+                assert_eq!(DatabaseHeader::parse(&after).unwrap().user_version, 7);
+                assert!(!wal_path.exists() && !shm_path.exists());
+            } else {
+                assert!(ctl.db_writes.lock().unwrap().is_empty());
+                assert_eq!(after, before);
+                assert_eq!([std::fs::read(&wal_path).unwrap(), std::fs::read(&shm_path).unwrap()], sidecars);
+            }
+
+            let mut reader = Pager::open_with_vfs(inner, Some(&path), flags).unwrap();
+            reader.begin_read().unwrap();
+            assert_eq!(reader.header().user_version, 7, "{name}");
             reader.end_read_if_unused().unwrap();
             reader.close().unwrap();
         }

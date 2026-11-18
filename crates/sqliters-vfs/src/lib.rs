@@ -218,6 +218,12 @@ pub trait VfsFile: Send + Sync {
         None
     }
 
+    /// SQLITE_FCNTL_HAS_MOVED. Checks whether the open file's pathname
+    /// still refers to the original file.
+    fn has_moved(&self) -> Result<bool> {
+        Err(SqliteError::new(ErrorCode::NotFound, ErrorCode::NotFound.as_str()))
+    }
+
     /// Flushes OS buffers to persistent storage (`xSync`).
     fn sync(&self, flags: SyncFlags) -> Result<()>;
 
@@ -2206,6 +2212,18 @@ impl VfsFile for OsFile {
             self.persist_wal.store(*mode != 0, AtomicOrdering::Relaxed);
         }
         Some(Ok(()))
+    }
+
+    #[cfg(unix)]
+    fn has_moved(&self) -> Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+
+        self.file_ref()?;
+        Ok(self.path.as_deref().is_some_and(|path| {
+            // Unix fileHasMoved compares the current path's inode with the
+            // inode recorded from the open descriptor.
+            std::fs::metadata(path).map_or(true, |meta| meta.ino() != self.inode_key.1)
+        }))
     }
 
     fn size_hint(&self, size: u64) -> Result<()> {
