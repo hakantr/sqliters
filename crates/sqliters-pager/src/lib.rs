@@ -3997,6 +3997,15 @@ impl Pager {
             && self.journal_mode != JournalMode::Off
             && pgno <= self.tx_orig_page_count
             && !self.tx_journaled.test(pgno);
+        let writes_disk_journal = need_tx_preimage
+            && self.db_kind == DatabaseKind::NamedDisk
+            && self.journal_file.is_some();
+        if writes_disk_journal {
+            // pager_write dirties the page before pagerAddPageToRollbackJournal
+            // marks it NEED_SYNC. That flag survives a failed record write.
+            self.cache.make_dirty(slot);
+            *self.cache.flags_mut(slot) |= PGHDR_NEED_SYNC;
+        }
         let need_sp_preimage = self
             .subsavepoints
             .iter()
@@ -4018,8 +4027,6 @@ impl Pager {
                 orig.clear();
                 orig.extend_from_slice(src);
                 self.append_journal_page(pgno, &orig)?;
-                self.tx_journaled.grow_to(self.tx_orig_page_count.max(pgno));
-                self.tx_journaled.set(pgno)?;
                 self.tx_preimages.insert(pgno, orig);
             } else if !need_tx_preimage && self.subsavepoints.len() == 1 {
                 let sp = &mut self.subsavepoints[0];
@@ -4037,6 +4044,11 @@ impl Pager {
                 orig.clear();
                 orig.extend_from_slice(src);
 
+                if writes_disk_journal {
+                    // The main record covers these savepoints once it is complete.
+                    self.append_journal_page(pgno, &orig)?;
+                }
+
                 // Always record pre-images for active sub-savepoint slots (even in `JournalMode::Off`
                 // so `SAVEPOINT` / `ROLLBACK TO` works in cache per `savepoint-13.4`!).
                 for sp in &mut self.subsavepoints {
@@ -4052,9 +4064,9 @@ impl Pager {
                 }
 
                 if need_tx_preimage {
-                    self.append_journal_page(pgno, &orig)?;
-                    self.tx_journaled.grow_to(self.tx_orig_page_count.max(pgno));
-                    self.tx_journaled.set(pgno)?;
+                    if !writes_disk_journal {
+                        self.append_journal_page(pgno, &orig)?;
+                    }
                     self.tx_preimages.insert(pgno, orig);
                 } else if self.sp_page_buf_pool.len() < 64 {
                     self.sp_page_buf_pool.push(orig);
@@ -4065,10 +4077,12 @@ impl Pager {
         if fl0 & PGHDR_WRITEABLE == 0 {
             // pager_write: `sqlite3PcacheMakeDirty(pPg)` comes before `PGHDR_NEED_SYNC` is set
             // (the dirty list may take the page as `pSynced` at that moment).
-            self.cache.make_dirty(slot);
+            if !writes_disk_journal {
+                self.cache.make_dirty(slot);
+            }
             if !self.use_wal() && self.journal_mode != JournalMode::Off {
                 // (`Pager.pInJournal` exists)
-                if need_tx_preimage {
+                if need_tx_preimage && !writes_disk_journal {
                     // pagerAddPageToRollbackJournal
                     *self.cache.flags_mut(slot) |= PGHDR_NEED_SYNC;
                 } else if pgno > self.tx_orig_page_count {
@@ -6422,15 +6436,24 @@ impl Pager {
         // holds them and only the offsets advance.)
         if let Some(ref jfile) = self.journal_file {
             let cksum = Self::journal_checksum(self.journal_nonce, page_data);
-            let mut buf = Vec::with_capacity(rec_size);
-            buf.extend_from_slice(&pgno.to_be_bytes());
-            buf.extend_from_slice(page_data);
-            buf.extend_from_slice(&cksum.to_be_bytes());
-            jfile.write_at(&buf, offset)?;
+            if self.db_kind == DatabaseKind::NamedDisk {
+                // pagerAddPageToRollbackJournal writes each field separately.
+                jfile.write_at(&pgno.to_be_bytes(), offset)?;
+                jfile.write_at(page_data, offset + 4)?;
+                jfile.write_at(&cksum.to_be_bytes(), offset + 4 + ps as u64)?;
+            } else {
+                let mut buf = Vec::with_capacity(rec_size);
+                buf.extend_from_slice(&pgno.to_be_bytes());
+                buf.extend_from_slice(page_data);
+                buf.extend_from_slice(&cksum.to_be_bytes());
+                jfile.write_at(&buf, offset)?;
+            }
         }
         self.journal_off = offset.saturating_add(rec_size as u64);
         self.journal_records_written += 1;
         self.tx_journal_end.insert(pgno, self.journal_off);
+        self.tx_journaled.grow_to(self.tx_orig_page_count.max(pgno));
+        self.tx_journaled.set(pgno)?;
         Ok(())
     }
 
@@ -7941,6 +7964,7 @@ mod tests {
         /// `xTruncate` of `<db>-wal` fails.
         fail_wal_truncate: std::sync::atomic::AtomicBool,
         page_write_error: Mutex<Option<(&'static str, i32)>>,
+        journal_write_trace: Mutex<Option<JournalWriteTrace>>,
         // true injects the error after successfully removing the journal.
         journal_delete_error: Mutex<Option<bool>>,
         fail_journal_zero: AtomicBool,
@@ -7955,6 +7979,12 @@ mod tests {
         trace_close: AtomicBool,
         /// Ordered trace of the operations that matter for durability.
         events: Mutex<Vec<&'static str>>,
+    }
+
+    #[derive(Default)]
+    struct JournalWriteTrace {
+        writes: Vec<(u64, usize)>,
+        fail_offset: Option<u64>,
     }
 
     impl FaultCtl {
@@ -8062,6 +8092,14 @@ mod tests {
             self.inner.read_at(buf, offset)
         }
         fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
+            if self.is_journal
+                && let Some(trace) = self.ctl.journal_write_trace.lock().unwrap().as_mut()
+            {
+                trace.writes.push((offset, buf.len()));
+                if trace.fail_offset.take_if(|target| *target == offset).is_some() {
+                    return Err(SqliteError::with_extended(extended::SQLITE_IOERR_WRITE, "disk I/O error"));
+                }
+            }
             if self.is_journal && offset == 0 && buf == [0; JOURNAL_HEADER_CORE_BYTES]
                 && self.ctl.fail_journal_zero.swap(false, std::sync::atomic::Ordering::Relaxed)
             {
@@ -8354,6 +8392,76 @@ mod tests {
             let mut reader = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
             reader.begin_read().unwrap();
             assert_eq!(reader.read_page(page).unwrap()[0], 2);
+            reader.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn disk_journal_records_advance_only_after_all_three_writes() {
+        for failed_part in [None, Some(0), Some(1), Some(2)] {
+            let ctl = Arc::new(FaultCtl::default());
+            let vfs = Arc::new(FaultVfs { inner: Arc::new(MemoryVfs::new()), ctl: ctl.clone() });
+            let path = Path::new("journal-record.db");
+            let journal = Path::new("journal-record.db-journal");
+            let flags = OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB;
+            let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+            assert_eq!(pager.db_kind(), DatabaseKind::NamedDisk);
+            pager.begin_write().unwrap();
+            let page = pager.allocate_raw_page().unwrap();
+            pager.write_page(page).unwrap()[0] = 1;
+            pager.commit().unwrap();
+            let original = vfs_file_image(vfs.as_ref(), path);
+
+            pager.begin_write().unwrap();
+            let record_start = u64::from(pager.journal_sector_size);
+            let page_size = pager.page_size() as usize;
+            let writes = [
+                (record_start, 4),
+                (record_start + 4, page_size),
+                (record_start + 4 + page_size as u64, 4),
+            ];
+            let record_end = writes[2].0 + 4;
+            let fail_offset = failed_part.map(|part| writes[part].0);
+            *ctl.journal_write_trace.lock().unwrap() = Some(JournalWriteTrace {
+                fail_offset,
+                ..JournalWriteTrace::default()
+            });
+            let result = pager.write_page(page);
+            if failed_part.is_some() {
+                assert_eq!(result.unwrap_err().extended_code, extended::SQLITE_IOERR_WRITE);
+            } else {
+                result.unwrap()[0] = 2;
+            }
+            let trace = ctl.journal_write_trace.lock().unwrap().take().unwrap();
+            assert_eq!(trace.fail_offset, None);
+            let record_writes: Vec<_> = trace.writes.into_iter()
+                .filter(|&(offset, _)| offset >= record_start)
+                .collect();
+            let attempted = failed_part.map_or(writes.len(), |part| part + 1);
+            assert_eq!(record_writes, writes[..attempted]);
+            assert_eq!(vfs_file_image(vfs.as_ref(), journal).len() as u64,
+                fail_offset.unwrap_or(record_end));
+            assert_eq!(vfs_file_image(vfs.as_ref(), path), original);
+
+            let complete = failed_part.is_none();
+            assert_eq!(pager.journal_off, if complete { record_end } else { record_start });
+            assert_eq!(pager.journal_records_written, u32::from(complete));
+            assert_eq!(pager.tx_journaled.test(page), complete);
+            assert_eq!(pager.tx_journal_end.get(&page).copied(), complete.then_some(record_end));
+            let slot = pager.cache.slot_of(page).unwrap();
+            assert_ne!(pager.cache.flags(slot) & PGHDR_NEED_SYNC, 0);
+
+            if complete {
+                pager.commit().unwrap();
+            } else {
+                pager.rollback().unwrap();
+                assert_eq!(vfs_file_image(vfs.as_ref(), path), original);
+            }
+            pager.close().unwrap();
+            assert!(!vfs.exists(journal).unwrap());
+            let mut reader = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+            reader.begin_read().unwrap();
+            assert_eq!(reader.read_page(page).unwrap()[0], if complete { 2 } else { 1 });
             reader.close().unwrap();
         }
     }
