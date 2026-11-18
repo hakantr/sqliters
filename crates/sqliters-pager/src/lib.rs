@@ -3126,7 +3126,7 @@ impl Pager {
                 }
                 if self.locking_mode == LockingMode::Normal {
                     if self.uses_persistent_rollback_journal() {
-                        self.close_journal_before_unlock();
+                        let _ = self.close_journal_before_unlock();
                     }
                     let _ = self.unlock_db_file(LockLevel::NoLock);
                 }
@@ -3140,7 +3140,7 @@ impl Pager {
                     self.journal_mode = JournalMode::Delete;
                 }
                 if self.locking_mode == LockingMode::Normal && self.uses_persistent_rollback_journal() {
-                    self.close_journal_before_unlock();
+                    let _ = self.close_journal_before_unlock();
                 }
                 if self.locking_mode == LockingMode::Normal || prev_lock == LockLevel::NoLock {
                     let _ = self.unlock_db_file(LockLevel::NoLock);
@@ -4907,7 +4907,7 @@ impl Pager {
             } else {
                 self.release_retained_delete_journal(false);
                 if self.uses_persistent_rollback_journal() {
-                    self.close_journal_before_unlock();
+                    let _ = self.close_journal_before_unlock();
                 }
                 self.unlock_db_file(LockLevel::NoLock)?;
                 self.set_state(TransactionState::Open);
@@ -4959,17 +4959,18 @@ impl Pager {
 
     /// pager_unlock closes the rollback journal before releasing the database
     /// lock unless a PERSIST/TRUNCATE journal cannot be removed while open.
-    fn close_journal_before_unlock(&mut self) {
+    fn close_journal_before_unlock(&mut self) -> Result<()> {
         if self.journal_file.is_none() {
-            return;
+            return Ok(());
         }
         let keep_journal = self.uses_persistent_rollback_journal()
             && self.file.as_deref().is_some_and(|file| {
                 file.device_characteristics() & sqliters_vfs::IOCAP_UNDELETABLE_WHEN_OPEN != 0
             });
         if !keep_journal && let Some(mut journal) = self.journal_file.take() {
-            let _ = journal.close();
+            journal.close()?;
         }
+        Ok(())
     }
 
     /// pagerUnlockAndRollback: ERROR suppresses playback through the failed
@@ -4989,7 +4990,7 @@ impl Pager {
         if let Some(wal) = self.wal.as_mut() {
             let _ = wal.end_read_transaction();
         } else if self.locking_mode == LockingMode::Normal {
-            self.close_journal_before_unlock();
+            let _ = self.close_journal_before_unlock();
             self.error_lock_unknown = self.unlock_db_file(LockLevel::NoLock).is_err();
         }
         if self.db_kind == DatabaseKind::PrivateTemporary {
@@ -6231,6 +6232,12 @@ impl Pager {
             return Ok(());
         }
 
+        let idle_rollback = self.state == TransactionState::Open
+            && !self.uses_temp_file_semantics()
+            && self.pager_error.is_none()
+            && !self.journal_started_in_tx
+            && !self.use_wal()
+            && matches!(self.journal_mode, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate);
         let mut first_err: Option<SqliteError> = None;
         self.release_mapped_pages();
 
@@ -6256,7 +6263,13 @@ impl Pager {
             }
         }
 
-        self.release_retained_delete_journal(true);
+        if idle_rollback {
+            if let Err(e) = self.finish_idle_rollback_close() && first_err.is_none() {
+                first_err = Some(e);
+            }
+        } else {
+            self.release_retained_delete_journal(true);
+        }
         if let Some(mut jfd) = self.journal_file.take()
             && let Err(e) = jfd.close()
             && first_err.is_none()
@@ -6290,6 +6303,26 @@ impl Pager {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    fn finish_idle_rollback_close(&mut self) -> Result<()> {
+        // sqlite3PagerClose syncs an open journal before ending a retained
+        // reader. On failure leave the journal available for hot recovery.
+        let journal_synced = self.journal_file.as_deref()
+            .is_none_or(|journal| self.sync_hot_journal(journal).is_ok());
+        if journal_synced && self.reader_snapshot_held
+            && self.file.as_deref().is_some_and(|db| db.lock_level() >= LockLevel::Reserved)
+        {
+            if self.journal_mode == JournalMode::Delete {
+                self.release_retained_delete_journal(false);
+            } else {
+                let _ = self.finalize_journal_after_tx(false);
+            }
+            let _ = self.unlock_db_file(LockLevel::Shared);
+        }
+        let journal_close = self.close_journal_before_unlock();
+        let _ = self.unlock_db_file(LockLevel::NoLock);
+        journal_close
     }
 
     // ========================================================================
@@ -7850,6 +7883,10 @@ mod tests {
     enum RecoveryCall {
         Delete { sync_dir: bool },
         Unlock(LockLevel),
+        JournalSync(SyncFlags),
+        JournalSize,
+        JournalClose,
+        DatabaseClose,
     }
 
     /// What a [`FaultVfs`] injects and observes.
@@ -7878,11 +7915,18 @@ mod tests {
         fail_db_unlock: AtomicBool,
         fail_db_shared_unlock: AtomicBool,
         recovery_calls: Mutex<Vec<RecoveryCall>>,
+        trace_close: AtomicBool,
         /// Ordered trace of the operations that matter for durability.
         events: Mutex<Vec<&'static str>>,
     }
 
     impl FaultCtl {
+        fn record_close_call(&self, call: RecoveryCall) {
+            if self.trace_close.load(std::sync::atomic::Ordering::Relaxed) {
+                self.recovery_calls.lock().unwrap().push(call);
+            }
+        }
+
         fn take_events(&self) -> Vec<&'static str> {
             std::mem::take(&mut *self.events.lock().unwrap())
         }
@@ -8023,6 +8067,9 @@ mod tests {
             self.inner.notify_sync(super_journal)
         }
         fn sync(&self, flags: SyncFlags) -> Result<()> {
+            if self.is_journal {
+                self.ctl.record_close_call(RecoveryCall::JournalSync(flags));
+            }
             if self.is_journal && self.ctl.fail_hot_journal_sync.swap(false, std::sync::atomic::Ordering::Relaxed) {
                 return Err(SqliteError::with_extended(extended::SQLITE_IOERR_FSYNC, "disk I/O error"));
             }
@@ -8034,6 +8081,9 @@ mod tests {
             self.inner.sync(flags)
         }
         fn file_size(&self) -> Result<u64> {
+            if self.is_journal {
+                self.ctl.record_close_call(RecoveryCall::JournalSize);
+            }
             if self.is_db && self.ctl.fail_db_file_size.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(SqliteError::with_extended(extended::SQLITE_IOERR_FSTAT, "disk I/O error"));
             }
@@ -8076,6 +8126,11 @@ mod tests {
             self.inner.lock_state_for_diagnostics()
         }
         fn close(&mut self) -> Result<()> {
+            if self.is_journal {
+                self.ctl.record_close_call(RecoveryCall::JournalClose);
+            } else if self.is_db {
+                self.ctl.record_close_call(RecoveryCall::DatabaseClose);
+            }
             self.inner.close()
         }
         fn open_wal_shm_with_options(
@@ -8306,6 +8361,44 @@ mod tests {
         assert!(vfs_file_image(vfs.as_ref(), journal).is_empty());
         pager.close().unwrap();
         assert!(!vfs.exists(journal).unwrap());
+    }
+
+    #[test]
+    fn idle_exclusive_persist_close_syncs_and_releases_handles_in_order() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let ctl = Arc::new(FaultCtl::default());
+        let vfs = Arc::new(FaultVfs { inner: Arc::new(MemoryVfs::new()), ctl: ctl.clone() });
+        let path = Path::new("close-persist.db");
+        let journal = Path::new("close-persist.db-journal");
+        let flags = OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB;
+        let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+        assert_eq!(pager.set_journal_mode(JournalMode::Persist).unwrap(), JournalMode::Persist);
+        pager.set_locking_mode(LockingMode::Exclusive);
+        pager.begin_write().unwrap();
+        let page = pager.allocate_raw_page().unwrap();
+        pager.write_page(page).unwrap()[0] = 1;
+        pager.commit().unwrap();
+        assert_eq!(pager.transaction_state(), TransactionState::Open);
+        assert_eq!(pager.db_file().unwrap().lock_level(), LockLevel::Exclusive);
+        let retained = vfs_file_image(vfs.as_ref(), journal);
+
+        ctl.recovery_calls.lock().unwrap().clear();
+        ctl.trace_close.store(true, Relaxed);
+        pager.close().unwrap();
+        ctl.trace_close.store(false, Relaxed);
+        assert_eq!(
+            *ctl.recovery_calls.lock().unwrap(),
+            [
+                RecoveryCall::JournalSync(SyncFlags::Normal),
+                RecoveryCall::JournalSize,
+                RecoveryCall::Unlock(LockLevel::Shared),
+                RecoveryCall::JournalClose,
+                RecoveryCall::Unlock(LockLevel::NoLock),
+                RecoveryCall::DatabaseClose,
+            ]
+        );
+        assert_eq!(vfs_file_image(vfs.as_ref(), journal), retained);
     }
 
     #[test]

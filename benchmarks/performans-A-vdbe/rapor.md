@@ -571,3 +571,7 @@ Sıcak PERSIST ve TRUNCATE aynı açık tanıtıcıyla sonlandırılıyor. Journ
 ## V6b.48 — D152 sıcak journal kurtarmasında DB sync bildirimi
 
 Sıcak playback `SQLITE_FCNTL_SYNC` bildirimini ana DB fiziksel sync seçiminden önce gönderiyor. NOTFOUND kurtarmayı sürdürüyor, G/Ç hatası journal'ı yeniden denemeye bırakıyor. 20 native vaka ve altı C çıkışı doğrulandı. D151'in 24 kurtarma ve sekiz cihaz yeteneği vakası ile önceki 147 kurtarma vakası korundu. OFF 1146/7/337, ON 1132/21/337. DML ve ayrışma bulucu V6b.47 ile aynı. Rust 1.100 süre oranı 1,244 ve 14 digest eşit. D153 terminal bağlantı kapatma sırası açık. [Karar ve doğrulama](karar_esligi_v6b_48.md).
+
+## V6b.49 — D153 olağan rollback-journal bağlantı kapanışı
+
+Olağan disk kapanışı açık journal için sync ve boyut okumasını, ardından kilit ve iki dosyanın kapanış sırasını C ile hizalıyor. 18 native vaka ile D151'in 24 kurtarma ve sekiz cihaz yeteneği vakası kapanış dahil eşit. D152 20/20, önceki 147 kurtarma vakası eşit. Gcov 32 çıkış, alınmayan 13 sınıflı. OFF 1147/7/337, ON 1133/21/337. DML ve ayrışma bulucu V6b.48 ile aynı. Rust 1.100 süre oranı 1,240 ve 14 digest eşit. D154 normal COMMIT SHARED, D155 COMMIT_PHASETWO ve D156 kayıt yazma sınırı açık. [Karar ve doğrulama](karar_esligi_v6b_49.md).
