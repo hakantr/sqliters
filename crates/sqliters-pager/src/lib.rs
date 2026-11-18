@@ -2099,8 +2099,15 @@ impl Pager {
                         self.journal_sector_size,
                     );
                     let mut magic = [0u8; 8];
-                    if jfile.read_at(&mut magic, next_hdr_off)? == 8 && magic == JOURNAL_MAGIC {
-                        jfile.write_at(&[0u8], next_hdr_off)?;
+                    let probe = match jfile.read_at(&mut magic, next_hdr_off) {
+                        Ok(8) if magic == JOURNAL_MAGIC => jfile.write_at(&[0u8], next_hdr_off),
+                        Ok(_) => Ok(()),
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = probe
+                        && error.extended_code != extended::SQLITE_IOERR_SHORT_READ
+                    {
+                        return Err(error);
                     }
                     if self.synchronous >= 2 && !sequential {
                         jfile.sync(sflags)?;
@@ -7990,6 +7997,7 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     enum JournalCall {
+        Read(u64, usize, usize),
         Write(u64, usize),
         Sync(SyncFlags),
     }
@@ -7998,6 +8006,7 @@ mod tests {
     struct JournalTrace {
         calls: Vec<JournalCall>,
         fail_offset: Option<u64>,
+        eof_probe_error: Option<i32>,
     }
 
     impl FaultCtl {
@@ -8102,7 +8111,16 @@ mod tests {
                 buf.fill(0);
                 return self.inner.read_at(&mut buf[..2], offset);
             }
-            self.inner.read_at(buf, offset)
+            let count = self.inner.read_at(buf, offset)?;
+            if self.is_journal && buf.len() == JOURNAL_MAGIC.len()
+                && let Some(trace) = self.ctl.journal_trace.lock().unwrap().as_mut()
+            {
+                trace.calls.push(JournalCall::Read(offset, buf.len(), count));
+                if count == 0 && let Some(code) = trace.eof_probe_error.take() {
+                    return Err(SqliteError::with_extended(code, "disk I/O error"));
+                }
+            }
+            Ok(count)
         }
         fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
             if self.is_journal
@@ -8550,6 +8568,78 @@ mod tests {
                 [Write(0, JOURNAL_HEADER_CORE_BYTES), Sync(SyncFlags::FullDataOnly)]
             );
             pager.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn journal_stale_header_probe_accepts_both_eof_representations() {
+        use JournalCall::{Read, Sync, Write};
+
+        let mut committed = None;
+        for eof_probe_error in [
+            None,
+            Some(extended::SQLITE_IOERR_SHORT_READ),
+            Some(extended::SQLITE_IOERR_READ),
+        ] {
+            let ctl = Arc::new(FaultCtl::default());
+            let vfs = Arc::new(FaultVfs { inner: Arc::new(MemoryVfs::new()), ctl: ctl.clone() });
+            let path = Path::new("journal-eof.db");
+            let journal = Path::new("journal-eof.db-journal");
+            let flags = OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB;
+            let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+            assert_eq!(pager.db_kind(), DatabaseKind::NamedDisk);
+            pager.set_synchronous(1);
+            pager.begin_write().unwrap();
+            let page = pager.allocate_raw_page().unwrap();
+            pager.write_page(page).unwrap()[0] = 1;
+            pager.commit().unwrap();
+            let original = vfs_file_image(vfs.as_ref(), path);
+
+            pager.begin_write().unwrap();
+            pager.write_page(page).unwrap()[0] = 2;
+            let sector = pager.journal_sector_size;
+            let record_size = u64::from(pager.page_size()) + 8;
+            let probe_offset = super_journal::journal_hdr_offset(
+                u64::from(sector) + 2 * record_size,
+                sector,
+            );
+            *ctl.journal_trace.lock().unwrap() = Some(JournalTrace {
+                eof_probe_error,
+                ..JournalTrace::default()
+            });
+            let result = pager.commit();
+            let trace = ctl.journal_trace.lock().unwrap().take().unwrap();
+            assert_eq!(trace.eof_probe_error, None);
+            let header_calls: Vec<_> = trace.calls.into_iter()
+                .filter(|call| matches!(call, Read(..) | Write(0, 12) | Sync(_)))
+                .collect();
+
+            let failed = eof_probe_error == Some(extended::SQLITE_IOERR_READ);
+            if failed {
+                assert_eq!(result.unwrap_err().extended_code, extended::SQLITE_IOERR_READ);
+                assert_eq!(header_calls, [Read(probe_offset, 8, 0)]);
+                assert_eq!(vfs_file_image(vfs.as_ref(), path), original);
+                pager.rollback().unwrap();
+                assert_eq!(vfs_file_image(vfs.as_ref(), path), original);
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    header_calls,
+                    [Read(probe_offset, 8, 0), Write(0, 12), Sync(SyncFlags::Normal)]
+                );
+                let image = vfs_file_image(vfs.as_ref(), path);
+                if let Some(ref expected) = committed {
+                    assert_eq!(&image, expected);
+                } else {
+                    committed = Some(image);
+                }
+            }
+            pager.close().unwrap();
+            assert!(!vfs.exists(journal).unwrap());
+            let mut reader = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+            reader.begin_read().unwrap();
+            assert_eq!(reader.read_page(page).unwrap()[0], if failed { 1 } else { 2 });
+            reader.close().unwrap();
         }
     }
 
