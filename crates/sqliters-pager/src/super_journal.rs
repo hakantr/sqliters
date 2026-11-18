@@ -121,7 +121,7 @@ pub(crate) fn read_exact_from_vfs(file: &dyn VfsFile, buf: &mut [u8], offset: u6
     if n < buf.len() {
         return Err(SqliteError::with_extended(
             extended::SQLITE_IOERR_SHORT_READ,
-            "short read while reading super-journal file or trailer",
+            "disk I/O error",
         ));
     }
     Ok(())

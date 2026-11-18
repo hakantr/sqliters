@@ -555,3 +555,7 @@ Sıfır baytlık DB'nin yanındaki eski journal artık RESERVED kilidi altında 
 ## V6b.44 — D147/D148 sıcak journal playback
 
 Sıcak journal kayıtları ayrı numara, sayfa ve checksum okumalarıyla sırayla uygulanıyor. Kısa kayıt okuması playback'i sonlandırıyor ve diğer IOERR kodları korunuyor. Ana dosya uzunluğu eşitse bırakılıyor, küçültme xTruncate, tam sayfalık büyütme sıfır sayfa xWrite ile yapılıyor. 28 native akış, 12 dosya imajı, dört gerçek C çöküşü ve önceki 147 kurtarma vakası eşit. Gcov 56 dal, alınmayan 20 çıkış sınıflı. OFF 1144/7/337, ON 1130/21/337. DML ve ayrışma bulucu V6b.43 ile aynı. Rust 1.100 süre oranı 1,229 ve 14 digest eşit. D149 journal bölüm başlığındaki xRead sınırları açık. [Karar ve doğrulama](karar_esligi_v6b_44.md).
+
+## V6b.45 — D149 sıcak journal bölüm başlığı
+
+Sıcak journal önce super-journal trailer'ını denetliyor, sonra magic ve 32 bit başlık alanlarını C sınırlarında okuyor. Başlık ve kayıt kısa okumaları ayrı sonuç veriyor. 203 native vaka, özgün dört vaka ve sekiz sync sınırı vakası C ile eşit. Önceki 147 kurtarma vakası, 12 dosya imajı ve dört gerçek çöküş imajı eşit. Ana gcov kapsamı 96 dal ve alınmayan 11 çıkış. OFF 1144/7/337, ON 1130/21/337. DML ve ayrışma bulucu V6b.44 ile aynı. Rust 1.100 süre oranı 1,248 ve 14 digest eşit. D150 sıcak DELETE sonlandırma sırası açık. [Karar ve doğrulama](karar_esligi_v6b_45.md).

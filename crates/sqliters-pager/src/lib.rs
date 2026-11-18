@@ -269,6 +269,12 @@ impl PageSource {
     pub const CACHE: Self = Self(0);
 }
 
+struct HotJournalSection {
+    record_count: u32,
+    checksum_seed: u32,
+    original_pages: Pgno,
+}
+
 /// Manages page-level reads, writes, caching, rollback journaling, WAL protocol, crash recovery,
 /// and sub-savepoints.
 pub struct Pager {
@@ -6257,10 +6263,8 @@ impl Pager {
     // Rollback Journal Binary Format (`writeJournalHdr`, `syncJournal`, `pager_playback`)
     // ========================================================================
 
-    /// `setSectorSize` (`pager.c`): 512 for a temporary file or when the device promises
-    /// power-safe overwrite (`SQLITE_IOCAP_POWERSAFE_OVERWRITE`, the default of the OS layer);
-    /// otherwise the VFS sector size. It is the size of the rollback-journal header segment.
-    fn effective_sector_size(&self) -> u32 {
+    /// `setSectorSize` / `sqlite3SectorSize` (`pager.c`).
+    fn journal_vfs_sector_size(&self) -> u32 {
         let psow = self.file.as_deref().is_some_and(|f| {
             f.device_characteristics() & sqliters_vfs::IOCAP_POWERSAFE_OVERWRITE != 0
         });
@@ -6274,21 +6278,21 @@ impl Pager {
                 "vfs-sector-size"
             }
         );
-        // (`tempFile` covers C's temporary and in-memory pagers alike.)
         if self.db_kind != DatabaseKind::NamedDisk || psow {
             return 512;
         }
-        let raw = self
-            .file
-            .as_deref()
-            .map_or(4096, VfsFile::sector_size)
-            .clamp(MIN_JOURNAL_HEADER_BYTES as u32, MAX_JOURNAL_SECTOR_BYTES);
-        if raw.is_power_of_two() {
-            raw
+        let raw = self.file.as_deref().map_or(4096, VfsFile::sector_size);
+        if raw < 32 {
+            512
         } else {
-            raw.next_power_of_two()
-                .clamp(MIN_JOURNAL_HEADER_BYTES as u32, MAX_JOURNAL_SECTOR_BYTES)
+            raw.min(MAX_JOURNAL_SECTOR_BYTES)
         }
+    }
+
+    fn effective_sector_size(&self) -> u32 {
+        self.journal_vfs_sector_size()
+            .max(MIN_JOURNAL_HEADER_BYTES as u32)
+            .next_power_of_two()
     }
 
     fn journal_checksum(nonce: u32, page_data: &[u8]) -> u32 {
@@ -6431,46 +6435,85 @@ impl Pager {
             }
             journal
         };
-        let jsize = match self.sync_hot_journal(jfile.as_ref()) {
-            Ok(size) => size,
+        let mut need_cache_reset = true;
+        let playback_res = (|| {
+            let synced_through = self.sync_hot_journal(jfile.as_ref())?;
+            let jsize = jfile.file_size()?;
+            let z_super = super_journal::read_super_journal(
+                jfile.as_ref(),
+                super_journal::SUPER_JOURNAL_MAX_PATH_BYTES,
+            )?;
+            // A missing super-journal is the commit point of a multi-database
+            // transaction. Inspect the trailer and check existence before
+            // touching any section header (pager_playback).
+            let should_replay = match &z_super {
+                Some(name) => self.vfs.exists(Path::new(name))?,
+                None => true,
+            };
+            let read_header = should_replay
+                && self.replay_hot_journal_sections(
+                    jfile.as_ref(), jsize, synced_through, &mut need_cache_reset,
+                )?;
+            if !self.pager_no_sync() {
+                self.db_file()?.sync(self.file_sync_flags())?;
+            }
+            Ok((z_super, should_replay, read_header))
+        })();
+
+        let (z_super, should_replay, read_header) = match playback_res {
+            Ok(result) => result,
             Err(error) => {
                 if self.keeps_delete_journal() {
                     self.journal_file = Some(jfile);
+                } else {
+                    let _ = jfile.close();
                 }
                 return Err(error);
             }
         };
-        if jsize < JOURNAL_HEADER_CORE_BYTES as u64 {
-            self.finish_hot_journal(jpath, jfile, false, false)?;
-            if self.locking_mode == LockingMode::Normal {
-                self.unlock_db_file(LockLevel::Shared)?;
-            }
-            return Ok(true);
+
+        // Finalize before inspecting sibling journals (pager_playback).
+        self.finish_hot_journal(jpath, jfile, z_super.is_some(), read_header)?;
+        if should_replay && let Some(ref super_name) = z_super {
+            self.pager_delsuper(super_name)?;
         }
 
-        let mut hdr0 = [0u8; JOURNAL_HEADER_CORE_BYTES];
-        if let Err(e) = jfile.read_at(&mut hdr0, 0) {
-            let _ = jfile.close();
-            return Err(e);
-        }
-        if hdr0[0..8] != JOURNAL_MAGIC {
-            self.finish_hot_journal(jpath, jfile, false, false)?;
-            if self.locking_mode == LockingMode::Normal {
-                self.unlock_db_file(LockLevel::Shared)?;
+        if read_header || !should_replay {
+            if need_cache_reset {
+                self.pcache_reset();
             }
-            return Ok(true);
+            self.page_size_fixed = false;
+            self.header_loaded = false;
         }
+        if self.locking_mode == LockingMode::Normal {
+            self.unlock_db_file(LockLevel::Shared)?;
+        }
+        Ok(true)
+    }
 
-        let orig_pages = u32::from_be_bytes([hdr0[16], hdr0[17], hdr0[18], hdr0[19]]);
-        let raw_sector_size = u32::from_be_bytes([hdr0[20], hdr0[21], hdr0[22], hdr0[23]]);
-        let raw_page_size = u32::from_be_bytes([hdr0[24], hdr0[25], hdr0[26], hdr0[27]]);
+    fn replay_hot_journal_sections(
+        &mut self,
+        journal: &dyn VfsFile,
+        jsize: u64,
+        synced_through: u64,
+        need_cache_reset: &mut bool,
+    ) -> Result<bool> {
+        // The first size check uses this VFS' sector size. Only a valid first
+        // header can change the size used for playback (readJournalHdr).
+        if jsize < u64::from(self.journal_vfs_sector_size()) {
+            return Ok(false);
+        }
+        let Some(mut section) = Self::read_hot_section_header(journal, 0)? else {
+            return Ok(false);
+        };
+        let sector_size = Self::read_hot_header_word(journal, 20)?;
+        let raw_page_size = Self::read_hot_header_word(journal, 24)?;
         let page_size = if raw_page_size == 0 {
-            // Legacy journal header without page size (`pager.c:1686`): inspect `.db` bytes 16..18
-            // before falling back to `self.header.page_size`.
+            // Older journals omit the page size. The database header supplies
+            // the hint used by SQLite's pager before reading these journals.
+            let db = self.db_file()?;
             let mut ps_bytes = [0u8; 2];
-            if self.db_file()?.file_size()? >= 18
-                && self.db_file()?.read_at(&mut ps_bytes, 16)? == 2
-            {
+            if db.file_size()? >= 18 && db.read_at(&mut ps_bytes, 16)? == ps_bytes.len() {
                 decode_db_header_page_size(ps_bytes).unwrap_or(self.header.page_size)
             } else {
                 self.header.page_size
@@ -6478,183 +6521,106 @@ impl Pager {
         } else {
             raw_page_size
         };
-
-        // Validate `page_size` and `sector_size` per `readJournalHdr` (`pager.c:1700-1710`).
-        let valid_sector = (32..=MAX_JOURNAL_SECTOR_BYTES).contains(&raw_sector_size)
-            && raw_sector_size.is_power_of_two();
-        let hdr_sz = u64::from(raw_sector_size);
-        if !DatabaseHeader::is_valid_page_size(page_size) || !valid_sector || jsize < hdr_sz {
-            self.finish_hot_journal(jpath, jfile, false, false)?;
-            if self.locking_mode == LockingMode::Normal {
-                self.unlock_db_file(LockLevel::Shared)?;
-            }
-            return Ok(true);
+        if !DatabaseHeader::is_valid_page_size(page_size)
+            || !(32..=MAX_JOURNAL_SECTOR_BYTES).contains(&sector_size)
+            || !sector_size.is_power_of_two()
+        {
+            return Ok(false);
         }
 
-        // Inspect optional super-journal trailer BEFORE playing back `.db` (`pager.c:2894-2905`).
-        let z_super = match super_journal::read_super_journal(
-            &*jfile,
-            super_journal::SUPER_JOURNAL_MAX_PATH_BYTES,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = jfile.close();
-                if self.locking_mode == LockingMode::Normal {
-                    let _ = self.unlock_db_file(LockLevel::Shared);
-                }
-                return Err(e);
-            }
-        };
-
-        if let Some(ref super_name) = z_super {
-            // CRITICAL (`implementation_plan.md:589`): Any I/O error from `vfs.exists` MUST be
-            // propagated and NEVER treated as `false` ("super-journal deleted -> committed")!
-            let super_exists = match self.vfs.exists(Path::new(super_name)) {
-                Ok(exists) => exists,
-                Err(e) => {
-                    let _ = jfile.close();
-                    if self.locking_mode == LockingMode::Normal {
-                        let _ = self.unlock_db_file(LockLevel::Shared);
-                    }
-                    return Err(e);
-                }
-            };
-
-            if !super_exists {
-                // Super-journal was already unlinked: the multi-DB transaction COMMITTED!
-                // Do NOT play back `.db` (`pager.c:2895-2905`).
-                self.finish_hot_journal(jpath, jfile, true, false)?;
-                self.pcache_reset();
-                self.page_size_fixed = false;
-                self.header_loaded = false;
-                if self.locking_mode == LockingMode::Normal {
-                    self.unlock_db_file(LockLevel::Shared)?;
-                }
-                return Ok(true);
-            }
+        let orig_pages = section.original_pages;
+        let ps = page_size as usize;
+        let mut page = vec![0u8; ps];
+        let db = self.db_file()?;
+        let original_size = u64::from(orig_pages) * u64::from(page_size);
+        let size_on_disk = db.file_size()?;
+        // pager_truncate leaves equal sizes alone and extends by writing a
+        // zero page when a whole page is missing.
+        if size_on_disk > original_size {
+            db.truncate(original_size)?;
+        } else if original_size - size_on_disk >= u64::from(page_size) {
+            let _ = db.size_hint(original_size);
+            db.write_at(&page, original_size - u64::from(page_size))?;
         }
 
-        let mut need_cache_reset = true;
-        let playback_res: Result<()> = (|| {
-            let ps = page_size as usize;
-            let mut page = vec![0u8; ps];
-            let db = self.db_file()?;
-            let original_size = u64::from(orig_pages) * u64::from(page_size);
-            let size_on_disk = db.file_size()?;
-            // pager_truncate (pager.c:2726): leave equal sizes alone and
-            // extend by writing a zero page when a whole page is missing.
-            if size_on_disk > original_size {
-                db.truncate(original_size)?;
-            } else if original_size - size_on_disk >= u64::from(page_size) {
-                let _ = db.size_hint(original_size);
-                db.write_at(&page, original_size - u64::from(page_size))?;
-            }
-            let rec_size = (4 + ps + 4) as u64;
-            let sj_pgno = self.lock_geometry.sj_pgno(page_size);
-            let mut word = [0u8; 4];
-            let mut journal_off: u64 = 0;
-
-            // Multi-section playback loop (`pager.c:2913-3003`):
-            // C SQLite writes a new sector-aligned journal header each time its page cache spills.
-            'sections: loop {
-                if journal_off > 0 {
-                    journal_off = ((journal_off - 1) / hdr_sz + 1) * hdr_sz;
-                }
-                if journal_off.saturating_add(hdr_sz) > jsize {
-                    break;
-                }
-
-                let mut sec_hdr = [0u8; JOURNAL_HEADER_CORE_BYTES];
-                jfile.read_at(&mut sec_hdr, journal_off)?;
-                if sec_hdr[0..8] != JOURNAL_MAGIC {
-                    break;
-                }
-
-                let raw_nrec =
-                    u32::from_be_bytes([sec_hdr[8], sec_hdr[9], sec_hdr[10], sec_hdr[11]]);
-                let nonce =
-                    u32::from_be_bytes([sec_hdr[12], sec_hdr[13], sec_hdr[14], sec_hdr[15]]);
-                journal_off += hdr_sz;
-
-                // A zero nRec in a hot journal is an unsynced section.
-                // Its bytes can include records left in a reused journal.
-                let nrec: u64 = if raw_nrec == 0xffff_ffff {
-                    (jsize.saturating_sub(journal_off)) / rec_size
-                } else {
-                    u64::from(raw_nrec)
-                };
-
-                if need_cache_reset && nrec != 0 {
-                    // pager_playback resets the cache before its first hot
-                    // record. SharedLock still compares the file version.
-                    self.pcache_reset();
-                    self.bump_data_version();
-                    self.notify_backup_restart();
-                    need_cache_reset = false;
-                }
-
-                for _ in 0..nrec {
-                    // pager_playback_one_page reads pgno, page data, then
-                    // checksum. A short read in any part ends hot replay.
-                    if !Self::read_hot_record_part(jfile.as_ref(), &mut word, journal_off)?
-                        || !Self::read_hot_record_part(jfile.as_ref(), &mut page, journal_off + 4)?
-                    {
-                        break 'sections;
-                    }
-                    journal_off += rec_size;
-                    let pgno = u32::from_be_bytes(word);
-                    if pgno == 0 || pgno == sj_pgno {
-                        break 'sections;
-                    }
-                    // The hot replay path passes a null pDone bitvec. A later
-                    // valid record for the same page replaces the earlier one.
-                    if pgno > orig_pages {
-                        continue;
-                    }
-                    if !Self::read_hot_record_part(jfile.as_ref(), &mut word, journal_off - 4)?
-                        || Self::journal_checksum(nonce, &page) != u32::from_be_bytes(word)
-                    {
-                        break 'sections;
-                    }
-                    let db_off = u64::from(pgno - 1) * u64::from(page_size);
-                    self.db_file()?.write_at(&page, db_off)?;
-                }
-
-                if raw_nrec == 0xffff_ffff {
-                    break;
-                }
-            }
-
-            if !self.pager_no_sync() {
-                self.db_file()?.sync(self.file_sync_flags())?;
-            }
-            Ok(())
-        })();
-
-        if let Err(error) = playback_res {
-            if self.keeps_delete_journal() {
-                self.journal_file = Some(jfile);
+        let rec_size = (4 + ps + 4) as u64;
+        let hdr_sz = u64::from(sector_size);
+        let sj_pgno = self.lock_geometry.sj_pgno(page_size);
+        let mut word = [0u8; 4];
+        let mut journal_off = hdr_sz;
+        'sections: loop {
+            // Zero records in a hot journal means an unsynced section. The
+            // no-sync sentinel derives the count using the first sector size.
+            let nrec = if section.record_count == u32::MAX {
+                ((i128::from(jsize) - i128::from(hdr_sz)) / i128::from(rec_size)) as u32
             } else {
-                let _ = jfile.close();
+                section.record_count
+            };
+            if *need_cache_reset && nrec != 0 {
+                self.pcache_reset();
+                self.bump_data_version();
+                self.notify_backup_restart();
+                *need_cache_reset = false;
             }
-            return Err(error);
-        }
+            for _ in 0..nrec {
+                // A short page-record read ends hot replay (pager_playback).
+                if !Self::read_hot_record_part(journal, &mut word, journal_off)?
+                    || !Self::read_hot_record_part(journal, &mut page, journal_off + 4)?
+                {
+                    break 'sections;
+                }
+                journal_off += rec_size;
+                let pgno = u32::from_be_bytes(word);
+                if pgno == 0 || pgno == sj_pgno {
+                    break 'sections;
+                }
+                // Hot playback applies duplicate valid records in order.
+                if pgno > orig_pages {
+                    continue;
+                }
+                if !Self::read_hot_record_part(journal, &mut word, journal_off - 4)?
+                    || Self::journal_checksum(section.checksum_seed, &page) != u32::from_be_bytes(word)
+                {
+                    break 'sections;
+                }
+                // pager_playback_one_page only writes a complete record
+                // within the extent confirmed by pagerSyncHotJournal.
+                if self.pager_no_sync() || journal_off <= synced_through {
+                    self.db_file()?
+                        .write_at(&page, u64::from(pgno - 1) * u64::from(page_size))?;
+                }
+            }
 
-        // Finalize before inspecting sibling journals (pager.c:3036–3046).
-        self.finish_hot_journal(jpath, jfile, z_super.is_some(), true)?;
-        if let Some(ref super_name) = z_super {
-            self.pager_delsuper(super_name)?;
-        }
-
-        if need_cache_reset {
-            self.pcache_reset();
-        }
-        self.page_size_fixed = false;
-        self.header_loaded = false;
-        if self.locking_mode == LockingMode::Normal {
-            self.unlock_db_file(LockLevel::Shared)?;
+            journal_off = journal_off.div_ceil(hdr_sz) * hdr_sz;
+            if journal_off.saturating_add(hdr_sz) > jsize {
+                break;
+            }
+            let Some(next_section) = Self::read_hot_section_header(journal, journal_off)? else {
+                break;
+            };
+            section = next_section;
+            journal_off += hdr_sz;
         }
         Ok(true)
+    }
+
+    fn read_hot_section_header(journal: &dyn VfsFile, offset: u64) -> Result<Option<HotJournalSection>> {
+        let mut magic = [0u8; JOURNAL_MAGIC.len()];
+        super_journal::read_exact_from_vfs(journal, &mut magic, offset)?;
+        if magic != JOURNAL_MAGIC {
+            return Ok(None);
+        }
+        Ok(Some(HotJournalSection {
+            record_count: Self::read_hot_header_word(journal, offset + 8)?,
+            checksum_seed: Self::read_hot_header_word(journal, offset + 12)?,
+            original_pages: Self::read_hot_header_word(journal, offset + 16)?,
+        }))
+    }
+
+    fn read_hot_header_word(journal: &dyn VfsFile, offset: u64) -> Result<u32> {
+        let mut word = [0u8; 4];
+        super_journal::read_exact_from_vfs(journal, &mut word, offset)?;
+        Ok(u32::from_be_bytes(word))
     }
 
     fn read_hot_record_part(journal: &dyn VfsFile, bytes: &mut [u8], offset: u64) -> Result<bool> {
@@ -7872,6 +7838,7 @@ mod tests {
         journal_delete_error: Mutex<Option<bool>>,
         fail_journal_zero: AtomicBool,
         fail_hot_journal_sync: AtomicBool,
+        short_hot_journal_count: AtomicBool,
         fail_db_unlock: AtomicBool,
         /// Ordered trace of the operations that matter for durability.
         events: Mutex<Vec<&'static str>>,
@@ -7965,6 +7932,12 @@ mod tests {
                 if offset < 24 && self.ctl.fail_db_prefix_read.load(std::sync::atomic::Ordering::Relaxed) {
                     return Err(SqliteError::with_extended(extended::SQLITE_IOERR_READ, "disk I/O error"));
                 }
+            }
+            if self.is_journal && offset == 8 && buf.len() == 4
+                && self.ctl.short_hot_journal_count.swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                buf.fill(0);
+                return self.inner.read_at(&mut buf[..2], offset);
             }
             self.inner.read_at(buf, offset)
         }
@@ -8122,6 +8095,12 @@ mod tests {
             assert_ne!(pager.pcache_epoch(), epoch);
             if !after_delete && locking_mode == LockingMode::Normal {
                 assert_eq!(pager.begin_read().unwrap_err().extended_code, extended::SQLITE_IOERR_FSYNC);
+                assert!(vfs.exists(journal).unwrap());
+
+                // A VFS short count on the hot header is an error and
+                // preserves the journal for the next recovery attempt.
+                ctl.short_hot_journal_count.store(true, Relaxed);
+                assert_eq!(pager.begin_read().unwrap_err().extended_code, extended::SQLITE_IOERR_SHORT_READ);
                 assert!(vfs.exists(journal).unwrap());
             }
             pager.begin_read().unwrap();
