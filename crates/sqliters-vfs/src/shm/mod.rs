@@ -1933,7 +1933,8 @@ impl WalShm {
                 Ordering::Release,
             )?;
         }
-        self.truncate_frames_above_internal(0)?;
+        // As in walRestartHdr, leave old index slots outside mxFrame. The first
+        // append to each block clears its page-number and hash arrays.
         Ok(published)
     }
 

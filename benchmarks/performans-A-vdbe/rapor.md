@@ -647,3 +647,7 @@ Son bağlantı kapanışı yazma veya kapalı autocommit koşulunda rollback cal
 ## V6b.67 — Sayısal BLOB koşulları
 
 Legacy SQL, sayısal BLOB koşulunu veritabanı kodlamasına göre değerlendiriyor. İki Rust kipinde 2160 koşul ve 576 REGEXP vakası C ile eşit. Önceki 16 REGEXP koşul farkı kapandı. Ayrı CHECK ve `IS TRUE/FALSE` kapsamları açık. OFF 1166/6/337, ON 1153/19/337. DML ve ayrışma bulucu V6b.66 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_67.md).
+
+## V6b.68 — WAL restart ve eski indeks hücreleri
+
+WAL restart başlık ve readmark'ı C gibi yayımlıyor. Her indeks bölgesi eski slotlarını kendi ilk append'inde temizliyor. Olağan TRUNCATE ve doğal writer restart 12/12 iki kipte eşit, 16 eski SHM farkı kapandı. OFF 1167/6/337, ON 1154/19/337. DML ve ayrışma bulucu V6b.67 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,232 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_68.md).

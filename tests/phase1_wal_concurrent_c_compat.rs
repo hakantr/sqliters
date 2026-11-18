@@ -3053,3 +3053,121 @@ fn readonly_empty_wal_index_uses_zero_page_size_until_first_write() {
         assert_eq!(integrity.rows[0].get_str(0), Some("ok"));
     }
 }
+
+#[test]
+fn wal_restart_preserves_old_index_slots_until_first_append_to_each_block() {
+    use sqliters::vfs::{
+        HASHTABLE_NPAGE_ONE, HASHTABLE_NSLOT, SHM_CHUNK_SIZE, WALINDEX_HDR_TOTAL_SIZE,
+        WalIndexHeaderData,
+    };
+
+    let sandbox = TempSandbox::new("wal_restart_preserves_index_slots");
+    let db = sandbox.path().join("restart.db");
+    let writer = Connection::open(&db).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA page_size=512; PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0; PRAGMA cache_size=-10000;
+             CREATE TABLE items(id INTEGER PRIMARY KEY,v TEXT,data BLOB);
+             BEGIN;",
+        )
+        .unwrap();
+    for id in 1..=4300 {
+        writer
+            .execute_params(
+                "INSERT INTO items VALUES (?1,'before',zeroblob(420))",
+                &[Value::Integer(id)],
+            )
+            .unwrap();
+    }
+    writer.execute("COMMIT").unwrap();
+
+    let wal = wal_sidecar(&db);
+    let shm = shm_sidecar(&db);
+    let read_index = || {
+        let bytes = fs::read(&shm).unwrap();
+        let first = bytes[..WALINDEX_HDR_COPY_LEN].try_into().unwrap();
+        let second = bytes
+            [WALINDEX_HDR_COPY2_OFFSET..WALINDEX_HDR_COPY2_OFFSET + WALINDEX_HDR_COPY_LEN]
+            .try_into()
+            .unwrap();
+        let header = WalIndexHeaderData::decode_verified_pair(first, second).unwrap();
+        (bytes, header)
+    };
+    let count_updated = |conn: &Connection| {
+        let result = conn
+            .query("SELECT count(*) FROM items WHERE v='after!'", &[])
+            .unwrap();
+        result.rows[0].get_i64(0).unwrap()
+    };
+    let checkpoint = |mode| {
+        let result = writer.wal_checkpoint_v2(None, mode).unwrap();
+        assert!(!result.busy);
+        result
+    };
+
+    let full = checkpoint(WalCheckpointMode::Full);
+    assert!(full.n_log > HASHTABLE_NPAGE_ONE as i32);
+    assert_eq!(full.n_log, full.n_ckpt);
+    let (old_index, old_header) = read_index();
+    assert!(old_index.len() >= 2 * SHM_CHUNK_SIZE);
+
+    // An active reader started after a full checkpoint uses the main DB snapshot.
+    let reader = Connection::open(&db).unwrap();
+    reader.execute("BEGIN").unwrap();
+    assert_eq!(count_updated(&reader), 0);
+
+    let truncate = checkpoint(WalCheckpointMode::Truncate);
+    assert_eq!((truncate.n_log, truncate.n_ckpt), (0, 0));
+    assert_eq!(fs::metadata(&wal).unwrap().len(), 0);
+    let (truncated, truncated_header) = read_index();
+    assert_eq!(truncated_header.mx_frame, 0);
+    assert_eq!(truncated_header.salt[0], old_header.salt[0].wrapping_add(1));
+    assert!(truncated[WALINDEX_HDR_TOTAL_SIZE..] == old_index[WALINDEX_HDR_TOTAL_SIZE..]);
+
+    writer
+        .execute("UPDATE items SET v='after!' WHERE id=1")
+        .unwrap();
+    let (first, first_header) = read_index();
+    assert!(first_header.mx_frame > 0 && first_header.mx_frame < HASHTABLE_NPAGE_ONE);
+    let pgno_end = SHM_CHUNK_SIZE - HASHTABLE_NSLOT * size_of::<u16>();
+    let used = WALINDEX_HDR_TOTAL_SIZE + first_header.mx_frame as usize * size_of::<u32>();
+    assert!(first[used..pgno_end].iter().all(|byte| *byte == 0));
+    assert_eq!(
+        first[pgno_end..SHM_CHUNK_SIZE]
+            .chunks_exact(size_of::<u16>())
+            .filter(|slot| slot.iter().any(|byte| *byte != 0))
+            .count(),
+        first_header.mx_frame as usize
+    );
+    assert!(first[SHM_CHUNK_SIZE..] == old_index[SHM_CHUNK_SIZE..]);
+    assert_eq!(count_updated(&reader), 0);
+    reader.execute("COMMIT").unwrap();
+    assert_eq!(count_updated(&reader), 1);
+    reader.try_close().unwrap();
+
+    writer
+        .execute("UPDATE items SET v='after!' WHERE id>1")
+        .unwrap();
+    let (next, next_header) = read_index();
+    assert!(next_header.mx_frame > HASHTABLE_NPAGE_ONE);
+    assert!(next[SHM_CHUNK_SIZE..] != old_index[SHM_CHUNK_SIZE..]);
+    assert_eq!(count_updated(&writer), 4300);
+    let full = checkpoint(WalCheckpointMode::Full);
+    assert_eq!(full.n_log, full.n_ckpt);
+
+    // A normal writer restart also leaves untouched blocks until their next append.
+    writer
+        .execute("UPDATE items SET v='before' WHERE id=4300")
+        .unwrap();
+    let (restarted, restarted_header) = read_index();
+    assert_eq!(
+        restarted_header.salt[0],
+        next_header.salt[0].wrapping_add(1)
+    );
+    assert!(restarted_header.mx_frame > 0 && restarted_header.mx_frame < HASHTABLE_NPAGE_ONE);
+    assert!(restarted[SHM_CHUNK_SIZE..] == next[SHM_CHUNK_SIZE..]);
+    assert_eq!(count_updated(&writer), 4299);
+    let integrity = writer.query("PRAGMA integrity_check", &[]).unwrap();
+    assert_eq!(integrity.rows[0].get_str(0), Some("ok"));
+}
