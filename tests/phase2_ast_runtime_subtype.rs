@@ -1063,6 +1063,137 @@ fn numeric_blob_boolean_predicates_follow_database_encoding() {
     assert_eq!(Value::blob(b"2").truthiness(), Some(false));
 }
 
+#[test]
+fn numeric_blob_check_predicates_follow_database_encoding() {
+    for (encoding, truthy, falsy) in [
+        ("UTF-8", "32", "0032"),
+        ("UTF-16le", "3200", "32"),
+        ("UTF-16be", "0032", "3200"),
+    ] {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}';
+             CREATE TABLE t(id INTEGER PRIMARY KEY, v, CHECK(v));
+             INSERT OR IGNORE INTO t VALUES(1,x'{truthy}'),(2,x'{falsy}'),(3,NULL),(4,7);
+             UPDATE OR IGNORE t SET v=x'{truthy}' WHERE id=3;
+             UPDATE OR IGNORE t SET v=x'{falsy}' WHERE id=4;",
+        ))
+        .unwrap();
+
+        let sql = "SELECT id, hex(v) FROM t ORDER BY id";
+        let rows = conn.query(sql, &[]).unwrap().rows;
+        assert_eq!(rows.len(), 3, "{encoding}");
+        for (row, id, expected) in [
+            (&rows[0], 1, truthy),
+            (&rows[1], 3, truthy),
+            (&rows[2], 4, "37"),
+        ] {
+            assert_eq!(row.get_i64(0), Some(id), "{encoding}");
+            assert_eq!(row.get_str(1), Some(expected), "{encoding}");
+        }
+
+        for sql in ["PRAGMA integrity_check", "PRAGMA quick_check"] {
+            let integrity = conn.query(sql, &[]).unwrap();
+            assert_eq!(integrity.rows.len(), 1, "{encoding}: {sql}");
+            assert_eq!(integrity.rows[0].get_str(0), Some("ok"), "{encoding}: {sql}");
+        }
+    }
+}
+
+#[test]
+fn integrity_check_distinguishes_blob_defaults_from_stored_values() {
+    struct FixtureDir(PathBuf);
+
+    impl Drop for FixtureDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!("sqliters-check-blob-{}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let dir = FixtureDir(dir);
+
+    for (name, create, default, invalid) in [
+        (
+            "rowid",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, g AS (id+1) VIRTUAL)",
+            "32",
+            false,
+        ),
+        (
+            "without-rowid",
+            "CREATE TABLE t(g AS (id+1) VIRTUAL, id INTEGER PRIMARY KEY) WITHOUT ROWID",
+            "32",
+            false,
+        ),
+        (
+            "invalid-default",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY)",
+            "0032",
+            true,
+        ),
+    ] {
+        let path = dir.0.join(format!("{name}.db"));
+        let flag = if invalid {
+            "PRAGMA ignore_check_constraints=ON;"
+        } else {
+            ""
+        };
+        // The row predates ALTER, so v has no serial-type entry in this record.
+        let seed = format!(
+            "PRAGMA encoding='UTF-16be'; {create}; INSERT INTO t(id) VALUES(1);
+             {flag} ALTER TABLE t ADD COLUMN v DEFAULT x'{default}' CHECK(v);",
+        );
+        let seeded = Command::new(c_p2a_helper())
+            .arg(&path)
+            .arg(seed)
+            .output()
+            .unwrap();
+        assert!(
+            seeded.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&seeded.stderr)
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        let check = || {
+            let expected = if invalid {
+                "CHECK constraint failed in t"
+            } else {
+                "ok"
+            };
+            for sql in ["PRAGMA integrity_check", "PRAGMA quick_check"] {
+                let rows = conn.query(sql, &[]).unwrap().rows;
+                assert_eq!(rows.len(), 1, "{name}: {sql}");
+                assert_eq!(rows[0].get_str(0), Some(expected), "{name}: {sql}");
+            }
+        };
+        check();
+        if invalid {
+            // New INSERT evaluates the literal under the DB encoding and stores the BLOB.
+            conn.execute("INSERT INTO t(id) VALUES(2)").unwrap();
+        } else {
+            let err = conn.execute("INSERT INTO t(id) VALUES(2)").unwrap_err();
+            assert_eq!(
+                err.extended_code,
+                sqliters::types::extended::SQLITE_CONSTRAINT_CHECK
+            );
+            conn.execute("INSERT INTO t(id,v) VALUES(2,x'0032')")
+                .unwrap();
+        }
+
+        let rows = conn
+            .query("SELECT id,hex(v) FROM t ORDER BY id", &[])
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 2, "{name}");
+        assert_eq!(rows[0].get_str(1), Some(default), "{name}");
+        assert_eq!(rows[1].get_str(1), Some("0032"), "{name}");
+        check();
+    }
+}
+
 // ============================================================================
 // Group 65: `RuntimeValue` `u8` Subtype Contract & `SQLITE_STRICT_SUBTYPE` Parity
 // ============================================================================

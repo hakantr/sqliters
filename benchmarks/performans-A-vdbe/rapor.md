@@ -651,3 +651,7 @@ Legacy SQL, sayısal BLOB koşulunu veritabanı kodlamasına göre değerlendiri
 ## V6b.68 — WAL restart ve eski indeks hücreleri
 
 WAL restart başlık ve readmark'ı C gibi yayımlıyor. Her indeks bölgesi eski slotlarını kendi ilk append'inde temizliyor. Olağan TRUNCATE ve doğal writer restart 12/12 iki kipte eşit, 16 eski SHM farkı kapandı. OFF 1167/6/337, ON 1154/19/337. DML ve ayrışma bulucu V6b.67 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,232 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_68.md).
+
+## V6b.69 — CHECK için kayıt ve varsayılan BLOB kodlaması
+
+Legacy CHECK, yazma ve doğrudan fiziksel BLOB sütununda veritabanı kodlamasını kullanıyor. Integrity denetiminde kısa fiziksel kaydın literal BLOB varsayılanı UTF-8 olarak değerlendiriliyor. Üç kodlama, her motorda 75 adım ve yedi kısa kayıt C ile eşit. Önceki 147 kurtarma eşit. OFF 1169/6/337, ON 1156/19/337. DML ve ayrışma bulucu V6b.68 ile aynı. Rust 1.100 süre oranı 1,249 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_69.md).

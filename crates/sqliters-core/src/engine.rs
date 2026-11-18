@@ -21350,7 +21350,7 @@ fn validate_and_write_row_inner(
                 &CteStore::default(),
                 None,
             )?;
-            if cv.truthiness() == Some(false) {
+            if cv.truthiness_with_encoding(ctx.encoding()) == Some(false) {
                 if eff == ConflictAction::Ignore {
                     return Ok(None);
                 }
@@ -24964,7 +24964,7 @@ fn prepare_proposed_insert_row(
                 &CteStore::default(),
                 None,
             )?;
-            if cv.truthiness() == Some(false) {
+            if cv.truthiness_with_encoding(ctx.encoding()) == Some(false) {
                 if eff == ConflictAction::Ignore {
                     return Ok(None);
                 }
@@ -42809,6 +42809,39 @@ fn record_field_count(rec: &[u8]) -> usize {
     n
 }
 
+/// Encoding used by SQLite's Boolean opcodes for a direct BLOB column during a
+/// table check. A schema default synthesized by OP_Column carries its own encoding.
+fn integrity_check_blob_column_encoding(
+    tbl: &TableSchema,
+    expr: &Expr,
+    payload: &[u8],
+    disk_encoding: TextEncoding,
+) -> Option<TextEncoding> {
+    let Expr::Column(cref) = expr else {
+        return None;
+    };
+    let (col_idx, col) = tbl.find_column(&cref.column)?;
+    if tbl.rowid_alias_col == Some(col_idx) || matches!(col.generated, Some((_, false))) {
+        return None;
+    }
+    let slot = if tbl.without_rowid {
+        tbl.physical_record_slot(col_idx)
+    } else {
+        tbl.columns[..col_idx]
+            .iter()
+            .filter(|c| !matches!(c.generated, Some((_, false))))
+            .count()
+    };
+    if slot < record_field_count(payload) {
+        Some(disk_encoding)
+    } else if matches!(col.default_expr, Some(Expr::Blob(_))) {
+        // sqlite3ValueFromExpr(TK_BLOB) builds the OP_Column P4 with UTF-8.
+        Some(TextEncoding::Utf8)
+    } else {
+        None
+    }
+}
+
 /// The row loop of `PRAGMA integrity_check` for one ordinary table (`pragma.c`): for every row,
 /// in storage order,
 ///  * `WITHOUT ROWID` keys are ascending (not for `quick_check`),
@@ -43026,7 +43059,17 @@ fn integrity_check_table_rows(
                         &CteStore::default(),
                         None,
                     )?;
-                    if cv.truthiness() == Some(false) {
+                    let blob_encoding = match cv {
+                        Value::Blob(_) => {
+                            integrity_check_blob_column_encoding(tbl, &chk.expr, &payload, enc)
+                        }
+                        _ => None,
+                    };
+                    let truth = blob_encoding.map_or_else(
+                        || cv.truthiness(),
+                        |encoding| cv.truthiness_with_encoding(encoding),
+                    );
+                    if truth == Some(false) {
                         failed = true;
                         break;
                     }
