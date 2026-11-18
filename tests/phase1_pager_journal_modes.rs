@@ -862,7 +862,7 @@ fn test_database_kind_named_private_temporary_and_memory_lifecycle() {
     temp_mem.close().unwrap();
 
     // 3) Two file-backed `PrivateTemporary` pagers (`""` and `open_private_temporary`) have isolated
-    // identities, open their backing OS file lazily on first write, report `None` -> `Some(...)`,
+    // identities, materialize their OS files on cache spill, report `None` -> `Some(...)`,
     // and delete the temporary OS file on `close()`!
     let mut tmp_a = Pager::open_with_options(
         vfs.clone(),
@@ -888,38 +888,57 @@ fn test_database_kind_named_private_temporary_and_memory_lifecycle() {
     tmp_a.end_read_if_unused().unwrap();
     assert_eq!(spy.counters.temp_db_opens.load(Ordering::Relaxed), 0);
 
-    // First write on `tmp_a` materializes its private temporary OS file!
+    // SQLite leaves the file unopened through the first small commit.
     tmp_a.begin_write().unwrap();
-    assert_eq!(spy.counters.temp_db_opens.load(Ordering::Relaxed), 1);
-    let tmp_a_path = spy.last_temp_db_path().expect("temp_a path recorded");
-    assert!(tmp_a_path.exists());
-    // C tempFile pagers set noLock=1 (pager.c:5067–5070). Even after
-    // materialization SQLITE_FCNTL_LOCKSTATE reports 0 during the write.
-    assert_eq!(
-        tmp_a.lock_state_for_diagnostics().unwrap(),
-        Some(LockLevel::NoLock)
-    );
+    assert_eq!(spy.counters.temp_db_opens.load(Ordering::Relaxed), 0);
+    assert_eq!(tmp_a.lock_state_for_diagnostics().unwrap(), None);
     let pa2 = tmp_a.allocate_raw_page().unwrap();
     tmp_a.write_page(pa2).unwrap()[0..6].copy_from_slice(b"TEMP_A");
     tmp_a.commit().unwrap();
-    assert_eq!(
-        tmp_a.lock_state_for_diagnostics().unwrap(),
-        Some(LockLevel::NoLock)
-    );
+    assert_eq!(spy.counters.temp_db_opens.load(Ordering::Relaxed), 0);
+    assert_eq!(tmp_a.lock_state_for_diagnostics().unwrap(), None);
 
-    // `tmp_b` is completely isolated from `tmp_a`: still 0 pages until its own write!
+    // The other pager remains empty until its own write.
     tmp_b.begin_read().unwrap();
     assert_eq!(tmp_b.page_count(), 0);
     tmp_b.end_read_if_unused().unwrap();
-
     tmp_b.begin_write().unwrap();
-    assert_eq!(spy.counters.temp_db_opens.load(Ordering::Relaxed), 2);
-    let tmp_b_path = spy.last_temp_db_path().expect("temp_b path recorded");
-    assert_ne!(tmp_a_path, tmp_b_path);
-    assert!(tmp_b_path.exists());
     let pb2 = tmp_b.allocate_raw_page().unwrap();
     tmp_b.write_page(pb2).unwrap()[0..6].copy_from_slice(b"TEMP_B");
     tmp_b.commit().unwrap();
+    assert_eq!(spy.counters.temp_db_opens.load(Ordering::Relaxed), 0);
+    assert_eq!(tmp_b.lock_state_for_diagnostics().unwrap(), None);
+
+    // Dirty pages materialize a file when pagerStress spills. SQLite TEMP
+    // pagers use noLock, so SQLITE_FCNTL_LOCKSTATE then returns zero.
+    let mut paths = Vec::new();
+    for (index, pager) in [&mut tmp_a, &mut tmp_b].into_iter().enumerate() {
+        pager.set_cache_size(2);
+        pager.set_spill_size(2);
+        pager.begin_write().unwrap();
+        assert_eq!(spy.counters.temp_db_opens.load(Ordering::Relaxed), index);
+        for _ in 0..60 {
+            let pgno = pager.allocate_raw_page().unwrap();
+            pager.write_page(pgno).unwrap()[0] = 1;
+        }
+        assert_eq!(spy.counters.temp_db_opens.load(Ordering::Relaxed), index + 1);
+        let path = spy.last_temp_db_path().expect("temporary DB path recorded");
+        assert!(path.exists());
+        paths.push(path);
+        assert_eq!(
+            pager.lock_state_for_diagnostics().unwrap(),
+            Some(LockLevel::NoLock)
+        );
+        pager.commit().unwrap();
+        assert_eq!(
+            pager.lock_state_for_diagnostics().unwrap(),
+            Some(LockLevel::NoLock)
+        );
+    }
+    let [tmp_a_path, tmp_b_path] = paths.as_slice() else {
+        panic!("both private temporary files opened");
+    };
+    assert_ne!(tmp_a_path, tmp_b_path);
 
     tmp_a.begin_read().unwrap();
     assert_eq!(&tmp_a.read_page(2).unwrap()[0..6], b"TEMP_A");
@@ -946,17 +965,13 @@ fn test_database_kind_named_private_temporary_and_memory_lifecycle() {
     assert!(!direct_tmp.is_memdb_backing());
     assert_eq!(direct_tmp.lock_state_for_diagnostics().unwrap(), None);
     direct_tmp.begin_write().unwrap();
-    assert_eq!(
-        direct_tmp.lock_state_for_diagnostics().unwrap(),
-        Some(LockLevel::NoLock)
-    );
+    assert_eq!(direct_tmp.lock_state_for_diagnostics().unwrap(), None);
     let dp2 = direct_tmp.allocate_raw_page().unwrap();
     direct_tmp.write_page(dp2).unwrap()[0..4].copy_from_slice(b"OS_T");
     direct_tmp.commit().unwrap();
-    assert_eq!(
-        direct_tmp.lock_state_for_diagnostics().unwrap(),
-        Some(LockLevel::NoLock)
-    );
+    assert_eq!(direct_tmp.lock_state_for_diagnostics().unwrap(), None);
+    direct_tmp.begin_read().unwrap();
+    assert_eq!(&direct_tmp.read_page(dp2).unwrap()[0..4], b"OS_T");
     direct_tmp.close().unwrap();
 }
 

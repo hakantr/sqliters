@@ -655,3 +655,7 @@ WAL restart başlık ve readmark'ı C gibi yayımlıyor. Her indeks bölgesi esk
 ## V6b.69 — CHECK için kayıt ve varsayılan BLOB kodlaması
 
 Legacy CHECK, yazma ve doğrudan fiziksel BLOB sütununda veritabanı kodlamasını kullanıyor. Integrity denetiminde kısa fiziksel kaydın literal BLOB varsayılanı UTF-8 olarak değerlendiriliyor. Üç kodlama, her motorda 75 adım ve yedi kısa kayıt C ile eşit. Önceki 147 kurtarma eşit. OFF 1169/6/337, ON 1156/19/337. DML ve ayrışma bulucu V6b.68 ile aynı. Rust 1.100 süre oranı 1,249 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_69.md).
+
+## V6b.70 — Özel geçici DB dosyasının açılış zamanı
+
+C iki özel TEMP DB'de boş okuma, işlem başlangıcı ve küçük COMMIT boyunca dosyayı açmadı. Her birinin ilk cache spill'i tek TEMP_DB xOpen yaptı ve veri izolasyonu korundu. Rust testinin eski dosya açma beklentisi ölçüme göre güncellendi. OFF 1170/5/337, ON 1157/18/337. DML ve ayrışma bulucu V6b.69 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,234 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_70.md).
