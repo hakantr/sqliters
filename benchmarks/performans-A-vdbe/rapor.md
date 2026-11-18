@@ -599,3 +599,7 @@ Sonraki journal başlığı taraması kısa bayt sayısı ve SHORT_READ ile C gi
 ## V6b.55 — D159 normal WAL COMMIT phase-two bildirimi
 
 Normal disk WAL COMMIT yazıcıyı bıraktıktan sonra `SQLITE_FCNTL_COMMIT_PHASETWO` gönderiyor. Bildirim hatası C ile aynı sonucu döndürüyor ve kalıcı veri yeniden açılışta okunuyor. 16 WAL vakası ve 60 rollback regresyonu iki kipte eşit. 48 WAL görüntüsü checksum ve commit sayfası yönünden denetlendi. Önceki 147 kurtarma eşit. OFF 1152/7/337, ON 1138/21/337. DML ve ayrışma bulucu V6b.54 ile aynı. Rust 1.100 süre oranı 1,242 ve 14 digest eşit. D160 EXCLUSIVE rollback bildirimi sırada. [Karar ve doğrulama](karar_esligi_v6b_55.md).
+
+## V6b.56 — D160 EXCLUSIVE rollback COMMIT phase-two bildirimi
+
+EXCLUSIVE disk rollback COMMIT gerçek yazımdan sonra phase-two bildirimi gönderiyor. Boş EXCLUSIVE PERSIST için C'nin erken dönüşü korunuyor. 56 vaka iki Rust kipinde SQL sonucu, bildirim sırası, yeniden açılış ve DB özetlerinde eşit. 120 journal görüntüsü denetlendi. On ham PERSIST farkı bağımsız nonce checksum alanlarıyla sınırlı. Önceki 147 kurtarma eşit. OFF 1153/7/337, ON 1139/21/337. DML ve ayrışma bulucu V6b.55 ile aynı. Rust 1.100 süre oranı 1,243 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_56.md).

@@ -5415,12 +5415,19 @@ impl Pager {
                     return self.finish_tx_to_read_or_open(retain_read);
                 }
 
-                let normal_rollback = self.locking_mode == LockingMode::Normal
-                    && !self.uses_temp_file_semantics()
+                let disk_rollback = !self.uses_temp_file_semantics()
                     && self.pending_byte_copy.is_none()
                     && matches!(self.journal_mode, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate);
+                let normal_rollback = disk_rollback && self.locking_mode == LockingMode::Normal;
+                // sqlite3PagerCommitPhaseTwo skips pager_end_transaction for
+                // an EXCLUSIVE PERSIST writer that has not modified the database.
+                let notify = disk_rollback
+                    && (normal_rollback
+                        || self.journal_mode != JournalMode::Persist
+                        || self.cache_modified
+                        || self.db_file_modified);
                 let finalized = self.finalize_rollback_commit();
-                let notified = if normal_rollback && finalized.is_ok() {
+                let notified = if notify && finalized.is_ok() {
                     self.notify_commit_phase_two()
                 } else {
                     Ok(())
@@ -8455,6 +8462,45 @@ mod tests {
             assert_eq!(reader.read_page(page).unwrap()[0], 2);
             reader.close().unwrap();
         }
+    }
+
+    #[test]
+    fn exclusive_persist_notifies_phase_two_only_after_a_write() {
+        let ctl = Arc::new(FaultCtl::default());
+        let vfs = Arc::new(FaultVfs { inner: Arc::new(MemoryVfs::new()), ctl: ctl.clone() });
+        let path = Path::new("exclusive-persist-commit.db");
+        let journal = Path::new("exclusive-persist-commit.db-journal");
+        let flags = OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::MAIN_DB;
+        let mut pager = Pager::open_with_vfs(vfs.clone(), Some(path), flags).unwrap();
+        pager.begin_write().unwrap();
+        let page = pager.allocate_raw_page().unwrap();
+        pager.write_page(page).unwrap()[0] = 1;
+        pager.commit().unwrap();
+        pager.set_locking_mode(LockingMode::Exclusive);
+        assert_eq!(pager.set_journal_mode(JournalMode::Persist).unwrap(), JournalMode::Persist);
+
+        pager.begin_write().unwrap();
+        pager.write_page(page).unwrap()[0] = 2;
+        ctl.recovery_calls.lock().unwrap().clear();
+        pager.commit().unwrap();
+        assert_eq!(*ctl.recovery_calls.lock().unwrap(), [RecoveryCall::CommitPhaseTwo]);
+        let retained = vfs_file_image(vfs.as_ref(), journal);
+        assert_eq!(&retained[..JOURNAL_HEADER_CORE_BYTES], &[0; JOURNAL_HEADER_CORE_BYTES]);
+
+        ctl.recovery_calls.lock().unwrap().clear();
+        let error = extended::SQLITE_IOERR_WRITE;
+        *ctl.db_commit_phase_two_result.lock().unwrap() = Some(error);
+        pager.begin_write().unwrap();
+        pager.commit().unwrap();
+        assert!(ctl.recovery_calls.lock().unwrap().is_empty());
+        assert_eq!(ctl.db_commit_phase_two_result.lock().unwrap().take(), Some(error));
+        assert_eq!(vfs_file_image(vfs.as_ref(), journal), retained);
+        pager.close().unwrap();
+
+        let mut reader = Pager::open_with_vfs(vfs, Some(path), flags).unwrap();
+        reader.begin_read().unwrap();
+        assert_eq!(reader.read_page(page).unwrap()[0], 2);
+        reader.close().unwrap();
     }
 
     #[test]
