@@ -11077,8 +11077,12 @@ impl Statement {
                         }
                         crate::vtab::ensure_stmt_vtabs_connected(ctx, stmt_ref)?;
                         engine::vtab_begin_for_dml(ctx, stmt_ref)?;
-                        ctx.stmt_tx.defer_insert_returning_changes =
-                            matches!(stmt_ref, Stmt::Insert(insert) if !insert.returning.is_empty());
+                        ctx.stmt_tx.defer_returning_changes = match stmt_ref {
+                            Stmt::Insert(insert) => !insert.returning.is_empty(),
+                            Stmt::Update(update) => !update.returning.is_empty(),
+                            Stmt::Delete(delete) => !delete.returning.is_empty(),
+                            _ => false,
+                        };
                         execute_write_body(ctx, stmt_ref, params_ref)
                     },
                 );

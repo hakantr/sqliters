@@ -619,3 +619,7 @@ Aktif rollback sync açıkken yalnız tamamı senkronize ana journal kaydını D
 ## V6b.60 — D164 V1 iç PRAGMA hata ofseti
 
 Otomatik `pragma_locking_mode` tanısı bilinmeyen şema ofsetini C gibi V1 step sırasında gösteriyor. V2, reset ve finalize ofsetleri ile doğrudan hazırlama tanıları korundu. Eski sekiz fark kapandı. 184 geniş native ve 16 odak vaka ile fiziksel dosya özetleri eşit. Önceki 147 kurtarma eşit. OFF 1157/7/337, ON 1143/21/337. DML ve ayrışma bulucu V6b.59 ile aynı. Rust 1.100 süre oranı 1,235 ve 14 digest eşit. Sırada prepared UPDATE/DELETE RETURNING sayaçları var. [Karar ve doğrulama](karar_esligi_v6b_60.md).
+
+## V6b.61 — D165 prepared UPDATE ve DELETE RETURNING sayaçları
+
+Legacy prepared UPDATE ve DELETE, ilk RETURNING satırında üst sayacı bekletiyor. Trigger katkısı görünür ve üst sayaç ifade kapanışında yayımlanıyor. Gerçek kaynak 36 UPDATE/DELETE, 27 INSERT ve 33 INSERT OR FAIL vakasında C ile eşit. Önceki 147 kurtarma eşit. OFF 1158/7/337, ON 1144/21/337. DML ve ayrışma bulucu V6b.60 ile aynı. Rust 1.100 süre oranı 1,240 ve 14 digest eşit. Sırada normal WAL kapanış VFS sözleşmesi var. [Karar ve doğrulama](karar_esligi_v6b_61.md).

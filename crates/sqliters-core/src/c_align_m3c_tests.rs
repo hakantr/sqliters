@@ -199,6 +199,35 @@ fn d52_legacy_returning_publishes_changes_at_halt() {
     }
 }
 
+#[test]
+fn legacy_update_delete_returning_defers_top_level_changes_until_halt() {
+    let counters = "SELECT changes(), total_changes(), last_insert_rowid(), (SELECT count(*) FROM audit)";
+    for (operation, trigger_row, sql) in [
+        ("UPDATE", "new", "UPDATE t SET b=b+100 WHERE a>=3 RETURNING a"),
+        ("DELETE", "old", "DELETE FROM t WHERE a>=3 RETURNING a"),
+    ] {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA encoding='UTF-16le'; CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+             INSERT INTO t VALUES(1,10),(2,20),(3,30),(4,40); CREATE TABLE audit(a);
+             CREATE TRIGGER t_audit AFTER {operation} ON t BEGIN
+                 INSERT INTO audit VALUES({trigger_row}.a);
+                 INSERT INTO audit VALUES({trigger_row}.a+100);
+             END;"
+        ))
+        .unwrap();
+        let mut stmt = conn.prepare(sql).unwrap();
+        let StepResult::Row(first) = stmt.step().unwrap() else {
+            panic!("{operation} should return its first row");
+        };
+        assert_eq!(first.values(), &[Value::Integer(3)]);
+        assert_eq!(run(&conn, &[counters]), ["4|8|4|4"], "{operation}");
+        assert!(matches!(stmt.step(), Ok(StepResult::Row(_))));
+        assert!(matches!(stmt.step(), Ok(StepResult::Done)));
+        assert_eq!(run(&conn, &[counters]), ["2|10|4|4"], "{operation}");
+    }
+}
+
 /// D37 / D35: virtual tables read on the machine get C's xBestIndex plan (constraints on hidden columns are
 /// checked by C's program; LIMIT / OFFSET reach generate_series; dbstat's ORDER BY name / name= / aggregate).
 #[test]

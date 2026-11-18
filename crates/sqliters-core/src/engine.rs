@@ -142,8 +142,8 @@ pub struct StmtTxTracker {
     /// Set while a one-pass DELETE removes a row: root of the index the scan runs on
     /// (`iIdxNoSeek` of `sqlite3GenerateRowDelete`), whose entry is deleted after the table row.
     pub delete_idx_no_seek: Option<Pgno>,
-    /// The prepared legacy INSERT can leave its change count with the returned rows.
-    pub(crate) defer_insert_returning_changes: bool,
+    /// Hold a prepared legacy DML change count while its returned rows are being stepped.
+    pub(crate) defer_returning_changes: bool,
     /// Inner schema token from an automatic PRAGMA table filter, for legacy sqlite3_step.
     pub(crate) pragma_schema_error_offset: Option<usize>,
     /// Statement-local change count for a write suspended at a result row.
@@ -26011,7 +26011,7 @@ fn finalize_dml_step_result(
                 if *ctx.foreign_keys && !suspects.is_empty() {
                     verify_fk_suspects(ctx, &suspects)?;
                 }
-                if ctx.stmt_tx.defer_insert_returning_changes
+                if ctx.stmt_tx.defer_returning_changes
                     && ctx.stmt_tx.exec_depth == 1
                     && !out.rows.is_empty()
                 {
