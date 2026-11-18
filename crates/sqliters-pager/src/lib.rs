@@ -5399,6 +5399,19 @@ impl Pager {
                     self.page_size_fixed = self.page_count > 0;
                     self.notify_backup_self_commit();
 
+                    if self.locking_mode == LockingMode::Normal
+                        && self.db_kind == DatabaseKind::NamedDisk
+                        && !self.uses_temp_file_semantics()
+                        && let Err(error) = self.notify_commit_phase_two()
+                    {
+                        // The commit frame is visible and the writer lock has been released.
+                        // Retain the reader until upper-layer error cleanup.
+                        if self.finish_tx_to_read_or_open(true).is_err() {
+                            self.set_state(TransactionState::Read);
+                        }
+                        return Err(error);
+                    }
+
                     return self.finish_tx_to_read_or_open(retain_read);
                 }
 
@@ -5408,7 +5421,7 @@ impl Pager {
                     && matches!(self.journal_mode, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate);
                 let finalized = self.finalize_rollback_commit();
                 let notified = if normal_rollback && finalized.is_ok() {
-                    self.db_file().and_then(|db| db.notify_commit_phase_two())
+                    self.notify_commit_phase_two()
                 } else {
                     Ok(())
                 };
@@ -5420,9 +5433,7 @@ impl Pager {
                     Ok(())
                 };
                 finalized?;
-                if let Err(error) = notified
-                    && error.extended_code != ErrorCode::NotFound as i32
-                {
+                if let Err(error) = notified {
                     // The journal is already finalized. An upper-layer
                     // rollback after the notification error ends the reader.
                     self.set_state(TransactionState::Read);
@@ -5435,6 +5446,13 @@ impl Pager {
                 }
                 self.finish_tx_to_read_or_open(retain_read)
             }
+        }
+    }
+
+    fn notify_commit_phase_two(&self) -> Result<()> {
+        match self.db_file()?.notify_commit_phase_two() {
+            Err(error) if error.extended_code == ErrorCode::NotFound as i32 => Ok(()),
+            result => result,
         }
     }
 
@@ -7985,7 +8003,7 @@ mod tests {
         fail_hot_journal_sync: AtomicBool,
         db_sync_notification_error: Mutex<Option<i32>>,
         db_sync_notifications: Mutex<Vec<Option<PathBuf>>>,
-        db_commit_phase_two_error: Mutex<Option<i32>>,
+        db_commit_phase_two_result: Mutex<Option<i32>>,
         short_hot_journal_count: AtomicBool,
         fail_db_unlock: AtomicBool,
         fail_db_shared_unlock: AtomicBool,
@@ -8175,8 +8193,12 @@ mod tests {
         fn notify_commit_phase_two(&self) -> Result<()> {
             if self.is_db {
                 self.ctl.recovery_calls.lock().unwrap().push(RecoveryCall::CommitPhaseTwo);
-                if let Some(code) = self.ctl.db_commit_phase_two_error.lock().unwrap().take() {
-                    return Err(SqliteError::with_extended(code, ErrorCode::from_raw_primary(code).as_str()));
+                match self.ctl.db_commit_phase_two_result.lock().unwrap().take() {
+                    Some(0) => return Ok(()),
+                    Some(code) => {
+                        return Err(SqliteError::with_extended(code, ErrorCode::from_raw_primary(code).as_str()));
+                    }
+                    None => {}
                 }
             }
             self.inner.notify_commit_phase_two()
@@ -8405,7 +8427,7 @@ mod tests {
             pager.write_page(page).unwrap()[0] = 2;
             pager.commit_phase_one(None).unwrap();
             ctl.recovery_calls.lock().unwrap().clear();
-            *ctl.db_commit_phase_two_error.lock().unwrap() = Some(notification);
+            *ctl.db_commit_phase_two_result.lock().unwrap() = Some(notification);
             let fail = notification == extended::SQLITE_IOERR_WRITE;
             ctl.fail_db_shared_unlock.store(fail, Relaxed);
             let result = pager.commit_phase_two(false, false);
@@ -9220,6 +9242,49 @@ mod tests {
             JournalMode::Wal
         );
         (inner, ctl, pager)
+    }
+
+    #[test]
+    fn wal_commit_notification_preserves_published_frames_on_error() {
+        for notification in [0, ErrorCode::NotFound as i32, extended::SQLITE_IOERR_WRITE] {
+            let path = Path::new("wal-commit-notify.db");
+            let (inner, ctl, mut pager) = open_wal_db_on_fault_vfs(path);
+            assert_eq!(pager.db_kind(), DatabaseKind::NamedDisk);
+            assert_eq!(pager.locking_mode(), LockingMode::Normal);
+            let wal_path = pager.wal_path().unwrap().to_path_buf();
+            let original = vfs_file_image(inner.as_ref(), path);
+            pager.begin_write().unwrap();
+            stamp_page(&mut pager, 3, 7);
+            pager.commit_phase_one(None).unwrap();
+            let committed_wal = vfs_file_image(inner.as_ref(), &wal_path);
+            assert!(committed_wal.len() > WAL_HDRSIZE);
+            assert!(pager.wal().unwrap().holds_write_lock());
+
+            ctl.recovery_calls.lock().unwrap().clear();
+            *ctl.db_commit_phase_two_result.lock().unwrap() = Some(notification);
+            let result = pager.commit_phase_two(false, false);
+            assert_eq!(*ctl.recovery_calls.lock().unwrap(), [RecoveryCall::CommitPhaseTwo]);
+            assert!(!pager.wal().unwrap().holds_write_lock());
+            if notification == extended::SQLITE_IOERR_WRITE {
+                let error = result.unwrap_err();
+                assert_eq!(error.extended_code, extended::SQLITE_IOERR_WRITE);
+                assert_eq!(pager.transaction_state(), TransactionState::Read);
+                assert!(pager.wal().unwrap().read_lock_slot().is_some());
+                assert_eq!(pager.rollback().unwrap_err(), error);
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(vfs_file_image(inner.as_ref(), path), original);
+            assert_eq!(vfs_file_image(inner.as_ref(), &wal_path), committed_wal);
+
+            let flags = OpenFlags::READWRITE | OpenFlags::MAIN_DB;
+            let mut reader = Pager::open_with_vfs(inner, Some(path), flags).unwrap();
+            reader.begin_read().unwrap();
+            assert_eq!(reader.read_page(3).unwrap()[4], 7);
+            reader.end_read_if_unused().unwrap();
+            reader.close().unwrap();
+            pager.close().unwrap();
+        }
     }
 
     /// `journal_size_limit` is applied by the first commit after the log was reset

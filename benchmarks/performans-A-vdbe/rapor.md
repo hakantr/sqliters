@@ -595,3 +595,7 @@ SAFE_APPEND ve SEQUENTIAL, ana journal başlığını, sync sırasını ve spill
 ## V6b.54 — D158 journal bölüm başlığında kısa okuma
 
 Sonraki journal başlığı taraması kısa bayt sayısı ve SHORT_READ ile C gibi ilerliyor. Diğer G/Ç hataları korunuyor. Doğal EOF 16/16, önceki journal ve hata 14/14, farklı magic 3/3 eşit. Üç C kapsamı birlikte 8/8 dal çıkışını aldı. Önceki 147 kurtarma vakası tekrar eşit. OFF 1151/7/337, ON 1137/21/337. DML ve ayrışma bulucu V6b.53 ile aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. D159 normal WAL COMMIT bildirimi sırada. [Karar ve doğrulama](karar_esligi_v6b_54.md).
+
+## V6b.55 — D159 normal WAL COMMIT phase-two bildirimi
+
+Normal disk WAL COMMIT yazıcıyı bıraktıktan sonra `SQLITE_FCNTL_COMMIT_PHASETWO` gönderiyor. Bildirim hatası C ile aynı sonucu döndürüyor ve kalıcı veri yeniden açılışta okunuyor. 16 WAL vakası ve 60 rollback regresyonu iki kipte eşit. 48 WAL görüntüsü checksum ve commit sayfası yönünden denetlendi. Önceki 147 kurtarma eşit. OFF 1152/7/337, ON 1138/21/337. DML ve ayrışma bulucu V6b.54 ile aynı. Rust 1.100 süre oranı 1,242 ve 14 digest eşit. D160 EXCLUSIVE rollback bildirimi sırada. [Karar ve doğrulama](karar_esligi_v6b_55.md).
