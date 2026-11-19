@@ -2343,19 +2343,19 @@ impl DatabaseSet {
         self.slots[id.index()].btree.as_ref()?.db_path()
     }
 
-    /// Closes all open [`Btree`] handles in reverse order (`attached`, `temp`, `main`).
+    /// Closes open [`Btree`] handles in slot order (`main`, `temp`, attached databases).
     pub fn close_all(&mut self) -> Result<()> {
         self.vtab_registry.disconnect_all();
-        let mut first_err: Option<SqliteError> = None;
-        for slot in self.slots.iter_mut().rev() {
+        let mut last_err: Option<SqliteError> = None;
+        for slot in &mut self.slots {
             if let Some(ref mut bt) = slot.btree
                 && let Err(e) = bt.close()
-                && first_err.is_none()
             {
-                first_err = Some(e);
+                // Preserve the error from the highest slot, as in reverse order.
+                last_err = Some(e);
             }
         }
-        if let Some(e) = first_err {
+        if let Some(e) = last_err {
             Err(e)
         } else {
             Ok(())
