@@ -14481,6 +14481,13 @@ fn read_table_with_plan_ctx(
             crate::dml_c::ScanShape::FullTable => {
                 where_hint.is_none()
                     || matches!(where_hint, Some(Expr::InList { negated: false, .. }))
+                    || slot_ref
+                        .schema
+                        .indexes
+                        .iter()
+                        .find(|index| index.table_name.eq_ignore_ascii_case(&tbl.name))
+                        .and_then(|index| index.columns.first())
+                        .is_some_and(|key| mixed_index_table_equality(tbl, key, where_hint))
             }
             _ => false,
         };
@@ -24488,7 +24495,8 @@ impl<'a> MixedIndexWrite<'a> {
                 && update.from.is_none()
                 && update.returning.is_empty()
                 && (update.selection.is_none()
-                    || mixed_index_rowid_selection(table, update.selection.as_ref()))
+                    || mixed_index_rowid_selection(table, update.selection.as_ref())
+                    || mixed_index_table_equality(table, key, update.selection.as_ref()))
                 && matches!(update.assignments.as_slice(), [assignment]
                     if !assignment.row_value
                         && matches!(assignment.columns.as_slice(), [column]
@@ -24498,7 +24506,8 @@ impl<'a> MixedIndexWrite<'a> {
                 && delete.alias.is_none()
                 && delete.indexed_by.is_none()
                 && delete.returning.is_empty()
-                && mixed_index_rowid_selection(table, delete.selection.as_ref()),
+                && (mixed_index_rowid_selection(table, delete.selection.as_ref())
+                    || mixed_index_table_equality(table, key, delete.selection.as_ref())),
         }
     }
 }
@@ -24571,6 +24580,27 @@ fn mixed_index_ordered_insert_source(
                 None => false,
             }
         })
+}
+
+fn mixed_index_table_equality(
+    table: &TableSchema,
+    key: &IndexedColSchema,
+    selection: Option<&Expr>,
+) -> bool {
+    let (Some(key_column), Some(Expr::Binary { op: BinaryOp::Eq, left, right })) =
+        (key.col_idx, selection)
+    else {
+        return false;
+    };
+    let filter_column = |expr: &Expr| {
+        matches!(expr, Expr::Column(column)
+            if matches!(resolve_target_col_ref(table, "main", None, column),
+                Some(TargetColRef::Col(ci)) if ci != key_column))
+    };
+    let bound = |expr: &Expr| {
+        is_in_order_literal(expr) || matches!(expr, Expr::Bind(_) | Expr::Blob(_))
+    };
+    (filter_column(left) && bound(right)) || (bound(left) && filter_column(right))
 }
 
 fn mixed_index_rowid_selection(
