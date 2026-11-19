@@ -24497,6 +24497,29 @@ pub(crate) enum MixedIndexWrite<'a> {
     },
 }
 
+fn mixed_index_write_value(expr: &Expr) -> bool {
+    matches!(
+        expr, Expr::Null | Expr::Bool(_) | Expr::Integer(_) | Expr::Float(_)
+            | Expr::String(_) | Expr::Blob(_) | Expr::Bind(_)
+    )
+}
+
+fn mixed_index_plain_update(update: &UpdateStmt) -> bool {
+    update.ctes.is_empty()
+        && update.alias.is_none()
+        && update.indexed_by.is_none()
+        && update.or_conflict.is_none()
+        && update.from.is_none()
+        && update.returning.is_empty()
+}
+
+fn mixed_index_update_column(assignment: &SetAssignment) -> Option<&str> {
+    let [column] = assignment.columns.as_slice() else {
+        return None;
+    };
+    (!assignment.row_value && mixed_index_write_value(&assignment.expr)).then_some(column.as_str())
+}
+
 impl<'a> MixedIndexWrite<'a> {
     pub(crate) fn from_stmt(stmt: &'a Stmt, allow_where_one: bool) -> Option<Self> {
         match stmt {
@@ -24532,6 +24555,25 @@ impl<'a> MixedIndexWrite<'a> {
         }
     }
 
+    fn writes_both_keys(self, mixed: &IndexedColSchema, ordinary: &IndexedColSchema) -> bool {
+        let Self::Update(update) = self else {
+            return false;
+        };
+        let [first, second] = update.assignments.as_slice() else {
+            return false;
+        };
+        let (Some(first), Some(second)) =
+            (mixed_index_update_column(first), mixed_index_update_column(second))
+        else {
+            return false;
+        };
+        let matches_keys = |a: &str, b: &str| {
+            a.eq_ignore_ascii_case(&mixed.name) && b.eq_ignore_ascii_case(&ordinary.name)
+        };
+        mixed_index_plain_update(update)
+            && (matches_keys(first, second) || matches_keys(second, first))
+    }
+
     fn applies(
         self,
         table: &TableSchema,
@@ -24539,10 +24581,6 @@ impl<'a> MixedIndexWrite<'a> {
         key: &IndexedColSchema,
         db_set: &DatabaseSet,
     ) -> bool {
-        let literal = |expr: &Expr| matches!(
-            expr, Expr::Null | Expr::Bool(_) | Expr::Integer(_) | Expr::Float(_)
-                | Expr::String(_) | Expr::Blob(_) | Expr::Bind(_)
-        );
         let no_statistics =
             !table.stat1.has_stat1 && index.stat1.as_ref().is_none_or(|stat| !stat.has_stat1);
         let key_equality = |selection| {
@@ -24558,28 +24596,21 @@ impl<'a> MixedIndexWrite<'a> {
                 && insert.upsert_clauses.is_empty()
                 && insert.returning.is_empty()
                 && match &insert.source {
-                    InsertSource::Values(rows) => rows.iter().all(|row| row.iter().all(literal)),
+                    InsertSource::Values(rows) => rows.iter().all(|row| row.iter().all(mixed_index_write_value)),
                     InsertSource::Select(select) => insert.columns.as_ref().is_some_and(|cols| {
                         mixed_index_ordered_insert_source(select, table, cols.len(), db_set)
                     }),
                     InsertSource::DefaultValues => false,
                 },
-            Self::Update(update) => update.ctes.is_empty()
-                && update.alias.is_none()
-                && update.indexed_by.is_none()
-                && update.or_conflict.is_none()
-                && update.from.is_none()
-                && update.returning.is_empty()
+            Self::Update(update) => mixed_index_plain_update(update)
                 && (update.selection.is_none()
                     || mixed_index_rowid_selection(table, update.selection.as_ref())
                     || mixed_index_table_equality(table, key, update.selection.as_ref())
                     || key_equality(update.selection.as_ref())
                     || range_and_equality(update.selection.as_ref()))
                 && matches!(update.assignments.as_slice(), [assignment]
-                    if !assignment.row_value
-                        && matches!(assignment.columns.as_slice(), [column]
-                            if column.eq_ignore_ascii_case(&key.name))
-                        && literal(&assignment.expr)),
+                    if mixed_index_update_column(assignment)
+                        .is_some_and(|column| column.eq_ignore_ascii_case(&key.name))),
             Self::Delete { stmt: delete, allow_where_one } => delete.ctes.is_empty()
                 && delete.alias.is_none()
                 && delete.indexed_by.is_none()
@@ -24959,12 +24990,16 @@ fn mixed_index_write_root<'a>(
                 && mixed_index_key_equality(table, mixed_key, selection).is_some())
             .then_some((mixed.root_pgno, declared));
             let scan_index = ordinary_scan.or(mixed_scan);
+            let ordinary_equality = mixed_index_table_equality(table, mixed_key, selection);
             let writes_scan_key = ordinary_scan.is_some()
                 && matches!(write, MixedIndexWrite::Update(_))
-                && mixed_index_table_equality(table, mixed_key, selection)
+                && ordinary_equality
                 && write.applies(table, ordinary, key, db_set);
+            let writes_both_keys = table.columns[column].affinity == TypeAffinity::Text
+                && (mixed_scan.is_some() || (ordinary_scan.is_some() && ordinary_equality))
+                && write.writes_both_keys(mixed_key, key);
             if (scan_index.is_some() || write.applies_with_second_index(table))
-                && (write.applies(table, mixed, mixed_key, db_set) || writes_scan_key)
+                && (write.applies(table, mixed, mixed_key, db_set) || writes_scan_key || writes_both_keys)
             {
                 return Some(MixedIndexWritePlan {
                     mixed_root: mixed.root_pgno,

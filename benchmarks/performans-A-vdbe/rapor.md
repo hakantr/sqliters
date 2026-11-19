@@ -1187,3 +1187,8 @@ Soğuk salt okunur NamedDisk setter, EXPLAIN ve reprepare mevcut şema yolunu C 
 ## V6b.176 — İki kökte karma anahtar eşitliği
 
 Uygun eşitlik aktif yazma görüntüsünde karma kökü seçer, diğer durumda tablo taraması korunur. 576 native ve 576 takip yazıcısı, 144 çok sayfalı akış ve eski bütünlük farkının kapanışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,261 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_176.md).
+
+
+## V6b.177 — Tek UPDATE ile iki indeks anahtarı
+
+İki kök aynı etkin yazma görüntüsünde doğrulanır, adaylar C sırasıyla bir kere yazılır. 768 native, 768 takip yazıcısı, 1.536 rollback ve 2.304 açılış doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,284 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_177.md).
