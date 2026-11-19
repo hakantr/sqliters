@@ -1047,3 +1047,8 @@ C'nin COLLATE adı kabul ettiği dört konumda tek tırnaklı diziler mevcut ad 
 ## V6b.148 — Miras INDEX_XINFO kolasyon yazımı
 
 Doğrudan anahtar kolonunda C gibi bildirimdeki kolasyon yazımı korunur. 15 eski dosyada 24 metadata farkı iki kipte kapandı ve iki yeni kapsam eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,274 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_148.md).
+
+
+## V6b.149 — WAL MEMORY çıkışında PERSIST_WAL kararı
+
+Tek hedefte sağlıklı WAL çıkışının ilk ROW ve retained yan dosya durumu C ile hizalanır. 708 doğrudan, 738 koruma ve 132 canlı C peer akışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,257 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_149.md).
