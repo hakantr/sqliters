@@ -45242,7 +45242,8 @@ fn exec_pragma(
                 });
             };
             let mut rows = Vec::new();
-            for fk in &tbl.foreign_keys {
+            // SQLite links the last declared foreign key at the head of the list.
+            for (pragma_id, fk) in tbl.foreign_keys.iter().rev().enumerate() {
                 for (seq, from_name) in fk.from_col_names.iter().enumerate() {
                     let to_val = fk
                         .ref_cols
@@ -45250,7 +45251,7 @@ fn exec_pragma(
                         .and_then(|rc| rc.get(seq))
                         .map_or(Value::Null, |s| Value::Text(s.clone()));
                     rows.push(vec![
-                        Value::Integer(fk.id as i64),
+                        Value::Integer(pragma_id as i64),
                         Value::Integer(seq as i64),
                         Value::Text(fk.ref_table.clone()),
                         Value::Text(from_name.clone()),
@@ -45322,7 +45323,7 @@ fn exec_pragma(
                 for (rkey, payload) in raw_rows {
                     let cvals =
                         decode_table_logical_row(ctx, check_db_id, &tbl, &rkey, &payload, &[])?;
-                    for fk in &tbl.foreign_keys {
+                    for (decl_index, fk) in tbl.foreign_keys.iter().enumerate() {
                         if fk.from_cols.iter().any(|&ci| cvals[ci].is_null()) {
                             continue;
                         }
@@ -45340,11 +45341,13 @@ fn exec_pragma(
                                 TableRowKey::Rowid(rid) => Value::Integer(*rid),
                                 TableRowKey::WithoutRowidPk(_) => Value::Null,
                             };
+                            // Report the same index as foreign_key_list.
+                            let pragma_id = tbl.foreign_keys.len() - 1 - decl_index;
                             rows.push(vec![
                                 Value::Text(tbl.name.clone()),
                                 rowid_val,
                                 Value::Text(fk.ref_table.clone()),
-                                Value::Integer(fk.id as i64),
+                                Value::Integer(pragma_id as i64),
                             ]);
                         }
                     }
