@@ -1062,3 +1062,8 @@ Uygun UPDATE ve DELETE hazırlanan rowid IN yönüyle mevcut fiziksel karşıla�
 ## V6b.151 — MEMORY kapanışında terminal NO_LOCK
 
 Açık WAL veya disk journal olmadan NORMAL NamedDisk kapanışı C gibi terminal NO_LOCK verir. 378 MEMORY ve 648 normal koruma akışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_151.md).
+
+
+## V6b.152 — Karma indeksli sıralı INSERT SELECT
+
+Açık hedef sütunlarıyla ayrı MAIN tablosundan rowid sıralı normal ekleme mevcut fiziksel düzeni korur. 144 yazıcı rollback ve 432 C/OFF/ON açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_152.md).

@@ -24463,7 +24463,7 @@ impl<'a> MixedIndexWrite<'a> {
         }
     }
 
-    fn applies(self, table: &TableSchema, key: &IndexedColSchema) -> bool {
+    fn applies(self, table: &TableSchema, key: &IndexedColSchema, db_set: &DatabaseSet) -> bool {
         let literal = |expr: &Expr| matches!(
             expr, Expr::Null | Expr::Bool(_) | Expr::Integer(_) | Expr::Float(_)
                 | Expr::String(_) | Expr::Blob(_) | Expr::Bind(_)
@@ -24474,8 +24474,13 @@ impl<'a> MixedIndexWrite<'a> {
                 && insert.or_conflict.is_none()
                 && insert.upsert_clauses.is_empty()
                 && insert.returning.is_empty()
-                && matches!(&insert.source, InsertSource::Values(rows)
-                    if rows.iter().all(|row| row.iter().all(literal))),
+                && match &insert.source {
+                    InsertSource::Values(rows) => rows.iter().all(|row| row.iter().all(literal)),
+                    InsertSource::Select(select) => insert.columns.as_ref().is_some_and(|cols| {
+                        mixed_index_ordered_insert_source(select, table, cols.len(), db_set)
+                    }),
+                    InsertSource::DefaultValues => false,
+                },
             Self::Update(update) => update.ctes.is_empty()
                 && update.alias.is_none()
                 && update.indexed_by.is_none()
@@ -24496,6 +24501,76 @@ impl<'a> MixedIndexWrite<'a> {
                 && mixed_index_rowid_selection(table, delete.selection.as_ref()),
         }
     }
+}
+
+fn mixed_index_ordered_insert_source(
+    select: &SelectStmt,
+    target: &TableSchema,
+    n_columns: usize,
+    db_set: &DatabaseSet,
+) -> bool {
+    let SelectCore::Select {
+        distinct: false,
+        projection,
+        from: Some(from),
+        selection: None,
+        group_by,
+        having: None,
+        windows,
+    } = &select.body.head else {
+        return false;
+    };
+    let TableOrSubquery::Table {
+        name,
+        table_args: None,
+        alias: None,
+        indexed_by: None,
+    } = &from.head else {
+        return false;
+    };
+    let [OrderByTerm {
+        expr: Expr::Column(order),
+        nulls_last: None,
+        ..
+    }] = select.order_by.as_slice() else {
+        return false;
+    };
+    if !select.ctes.is_empty()
+        || !select.body.compounds.is_empty()
+        || select.limit.is_some()
+        || !from.joins.is_empty()
+        || !group_by.is_empty()
+        || !windows.is_empty()
+        || n_columns != projection.len()
+    {
+        return false;
+    }
+    let Ok(Some((DatabaseId::MAIN, crate::db_set::RelationRef::Table(source)))) =
+        db_set.find_relation_ref_in_set(name)
+    else {
+        return false;
+    };
+    source.root_pgno > 1
+        && source.root_pgno != target.root_pgno
+        && !source.without_rowid
+        && resolve_target_col_ref(source, "main", None, order) == Some(TargetColRef::Rowid)
+        && projection.iter().all(|item| {
+            let ResultColumn::Expr {
+                expr: Expr::Column(column),
+                alias: None,
+                ..
+            } = item else {
+                return false;
+            };
+            match resolve_target_col_ref(source, "main", None, column) {
+                Some(TargetColRef::Rowid) => true,
+                Some(TargetColRef::Col(i)) => source
+                    .columns
+                    .get(i)
+                    .is_some_and(|col| col.generated.is_none()),
+                None => false,
+            }
+        })
 }
 
 fn mixed_index_rowid_selection(
@@ -24580,7 +24655,7 @@ fn mixed_index_write_collation(
             slot.schema.tables.iter().any(|table| !table.foreign_keys.is_empty())
         })
         || ["BINARY", "NOCASE", "RTRIM"].iter().any(|name| collations.get_custom(name).is_some())
-        || !write.applies(table, key)
+        || !write.applies(table, key, db_set)
     {
         return None;
     }
