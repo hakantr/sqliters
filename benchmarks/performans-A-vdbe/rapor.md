@@ -737,3 +737,8 @@ Yazma kısıtlarının C sırası ve NOT NULL REPLACE sonrası generated hesapla
 ## V6b.86 — INDEXED BY ve kalıcı şema indeksleri
 
 V1/V2 ve OFF/ON dört grubun her birinde 93/93 ham ve fiziksel C eşliği. Yazma sırası, reset ve yeniden açılış ölçüldü. OFF 1186/1/337, ON 1177/10/337. DML OFF 387/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,251 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_86.md).
+
+
+## V6b.87 — TRUE ve FALSE adlı gerçek kaynak sütunları
+
+Bilinen tek normal tabloda gerçek sütun önceliği C ile hizalandı. 114 hedef akış ve 24 yazma dosyası iki kipte C ile eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 387/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,261 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_87.md).
