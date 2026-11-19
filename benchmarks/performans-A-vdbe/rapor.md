@@ -1177,3 +1177,8 @@ Stock Unix gerçek VFS yolu C kilit sırası ve V2 kodlarıyla eş. V1 ilk step 
 ## V6b.174 — Eşitlikle aranan ikinci indeks anahtarının güncellenmesi
 
 Uyumlu aramada adaylar toplanır ve artan rowid sırasıyla bir kez yazılır. 576 native, 1.152 rollback, 1.728 açılış ve önceki 20 fiziksel fark doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,264 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_174.md).
+
+
+## V6b.175 — Salt okunur journal_mode setter hazırlığı
+
+Soğuk salt okunur NamedDisk setter, EXPLAIN ve reprepare mevcut şema yolunu C zamanında kullanır. 534 akış, 216 hazırlık sınırı ve 696 C açılışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,251 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_175.md).

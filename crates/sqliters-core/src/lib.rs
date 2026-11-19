@@ -1932,14 +1932,14 @@ impl ConnectionInner {
         self.db_set.rebind_all_collations(&self.collations);
     }
 
-    // The read-only journal-mode query reads the unloaded main schema in
-    // sqlite3Pragma(), including when the program is only being explained.
-    fn readonly_journal_query_needs_schema(&self, stmt: &Stmt) -> bool {
+    // sqlite3Pragma() reads the unloaded main schema for journal_mode,
+    // including setters and EXPLAIN.
+    fn readonly_journal_mode_needs_schema(&self, stmt: &Stmt) -> bool {
         let stmt = match stmt {
             Stmt::Explain { stmt, .. } => stmt.as_ref(),
             stmt => stmt,
         };
-        if !matches!(stmt, Stmt::Pragma { schema, name, value: None }
+        if !matches!(stmt, Stmt::Pragma { schema, name, .. }
             if name.eq_ignore_ascii_case("journal_mode")
                 && schema.as_deref().is_none_or(|name| name.eq_ignore_ascii_case("main")))
         {
@@ -8310,7 +8310,7 @@ impl Statement {
         // C reads the schema at prepare for more statements than the engine loads it for
         // (pragmas with PragFlg_NeedSchema, the query form of PRAGMA encoding).
         let readonly_journal_schema = stmt_opt.as_ref()
-            .is_some_and(|stmt| inner.readonly_journal_query_needs_schema(stmt));
+            .is_some_and(|stmt| inner.readonly_journal_mode_needs_schema(stmt));
         let c_reads_schema = needs_schema || readonly_journal_schema
             || stmt_opt.as_ref().is_some_and(crate::engine::c_pragma_reads_schema);
         let c_first_load = c_reads_schema && inner.db_set.c_any_schema_unloaded();
@@ -9277,7 +9277,7 @@ impl Statement {
                 inner.refresh_open_tx_schemas()?;
             }
             let readonly_journal_schema = parsed_stmt.as_ref()
-                .is_some_and(|stmt| inner.readonly_journal_query_needs_schema(stmt));
+                .is_some_and(|stmt| inner.readonly_journal_mode_needs_schema(stmt));
             if readonly_journal_schema
                 || (needs_schema && inner.db_set.slots().iter().any(|s| s.btree.is_some() && !s.schema.loaded))
             {
