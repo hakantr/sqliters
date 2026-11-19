@@ -486,12 +486,12 @@ pub(crate) fn c_prepare_quiet(inner: &ConnectionInner, sql: &str) -> (PrepareRes
 /// Run C's parser and code generator over one statement (`sqlite3Prepare`).
 /// The third value: C's `sqlite3Init()` loaded the schemas during this prepare.
 pub(crate) fn c_prepare(inner: &ConnectionInner, sql: &str) -> (PrepareResult, usize, bool) {
-    c_prepare_impl(inner, sql, false, None, None)
+    c_prepare_impl(inner, sql, false, None, None, false)
 }
 
 /// Recompile with the old statement's parameter values (pParse->pReprepare).
 pub(crate) fn c_prepare_bound(inner: &ConnectionInner, sql: &str, values: &[Value]) -> (PrepareResult, usize, bool) {
-    c_prepare_impl(inner, sql, false, Some(values), None)
+    c_prepare_impl(inner, sql, false, Some(values), None, false)
 }
 
 pub(crate) fn c_explain_bound(inner: &ConnectionInner, sql: &str, values: &[Value]) -> CExplain {
@@ -553,6 +553,11 @@ pub(crate) fn c_prepare_while_interrupted(inner: &ConnectionInner, sql: &str) ->
     }
 }
 
+/// Probe the current schema without running optimizer callbacks or publishing prepare effects.
+pub(crate) fn c_prepare_diagnostic(inner: &ConnectionInner, sql: &str) -> PrepareResult {
+    c_prepare_probe(inner, sql, false, None).0
+}
+
 fn c_prepare_probe(
     inner: &ConnectionInner,
     sql: &str,
@@ -563,7 +568,7 @@ fn c_prepare_probe(
     let temp = take_c_temp_opened();
     let rowest = take_c_rowest_clamped();
     let quiet = C_QUIET.with(|c| c.replace(true));
-    let (result, _, reads_schema) = c_prepare_impl(inner, sql, schema_probe, None, deferred_vtab_connect);
+    let (result, _, reads_schema) = c_prepare_impl(inner, sql, schema_probe, None, deferred_vtab_connect, true);
     C_QUIET.with(|c| c.set(quiet));
     C_PRAGMA_EFFECTS.with(|c| *c.borrow_mut() = effects);
     C_TEMP_OPENED.with(|c| c.set(temp));
@@ -577,6 +582,7 @@ fn c_prepare_impl(
     schema_probe: bool,
     bound_values: Option<&[Value]>,
     deferred_vtab_connect: Option<&std::cell::Cell<bool>>,
+    suppress_vtab_callbacks: bool,
 ) -> (PrepareResult, usize, bool) {
     let interrupted = deferred_vtab_connect.is_some();
     let host = EngineHost {
@@ -588,7 +594,7 @@ fn c_prepare_impl(
         wal_autocheckpoint: inner.wal_autocheckpoint_threshold,
         default_locking_mode: i64::from(inner.default_locking_mode == sqliters_pager::LockingMode::Exclusive),
         schema_loaded: std::cell::Cell::new(false),
-        suppress_vtab_callbacks: schema_probe || interrupted,
+        suppress_vtab_callbacks,
         deferred_vtab_connect,
         vtabs: std::cell::RefCell::new(Vec::new()),
     };

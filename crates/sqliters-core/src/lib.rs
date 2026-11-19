@@ -6188,21 +6188,36 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) -> Result<()> {
 }
 
 #[allow(non_upper_case_globals)]
-/// sqlite3StartTable uses the input token for an existing table or view, including
-/// its quote characters and byte offset. Reuse that parser diagnostic after schema refresh.
-fn c_create_name_error(
+/// Reuse C's parser diagnostics when legacy preparation has already rejected a statement.
+fn refine_prepare_error(
     inner: &mut ConnectionInner,
     stmt: Option<&Stmt>,
     sql: &str,
     error: SqliteError,
 ) -> SqliteError {
-    if !matches!(stmt, Some(Stmt::CreateTable(_) | Stmt::CreateTableAs { .. } | Stmt::CreateView(_)))
-        || inner.authorizer.is_some()
-        || error.code != ErrorCode::Error
-        || !(error.message.starts_with("unknown database ")
-            || (error.message.ends_with(" already exists")
-                && (error.message.starts_with("table ") || error.message.starts_with("view "))))
-    {
+    if error.code != ErrorCode::Error {
+        return error;
+    }
+    if matches!(stmt, Some(Stmt::Select(_))) {
+        return select_function_error_offset(inner, sql, error);
+    }
+    if inner.authorizer.is_some() {
+        return error;
+    }
+    // sqlite3StartTable uses the original input token and its byte offset.
+    let create_name = matches!(
+        stmt,
+        Some(Stmt::CreateTable(_) | Stmt::CreateTableAs { .. } | Stmt::CreateView(_))
+    ) && (error.message.starts_with("unknown database ")
+        || (error.message.ends_with(" already exists")
+            && (error.message.starts_with("table ") || error.message.starts_with("view "))));
+    // sqlite3Insert checks view writability and the INSERT source before rejecting UPSERT.
+    let view_upsert = error.message == "cannot UPSERT a view"
+        && matches!(stmt, Some(Stmt::Insert(ins))
+            if !ins.upsert_clauses.is_empty()
+                && ins.returning.is_empty()
+                && inner.db_set.find_view_in_set(&ins.table).is_some());
+    if !create_name && !view_upsert {
         return error;
     }
     let (result, _, loaded) = cgen::c_prepare_quiet(inner, sql);
@@ -6217,6 +6232,31 @@ fn c_create_name_error(
     }
     SqliteError::with_extended(code, message)
         .with_offset(usize::try_from(offset).unwrap_or(SqliteError::NO_OFFSET))
+}
+
+/// The legacy resolver has a function name but no token location. Use C's
+/// byte offset when both resolvers report the same function diagnostic.
+fn select_function_error_offset(
+    inner: &ConnectionInner,
+    sql: &str,
+    error: SqliteError,
+) -> SqliteError {
+    if error.offset.is_some()
+        || !(error.message.starts_with("wrong number of arguments to function ")
+            || error.message.starts_with("no such function: "))
+    {
+        return error;
+    }
+    if let sqliters_codegen::PrepareResult::Error { code, message, offset } =
+        cgen::c_prepare_diagnostic(inner, sql)
+        && code == error.extended_code
+        && message.eq_ignore_ascii_case(&error.message)
+        && let Ok(offset) = usize::try_from(offset)
+    {
+        SqliteError::with_extended(code, message).with_offset(offset)
+    } else {
+        error
+    }
 }
 
 /// The parser actions for generated columns reject constraints in SQL order,
@@ -8195,6 +8235,7 @@ impl Statement {
         // machine. `err` stays when the generator leaves the statement to the engine.
         let schema_free_fallback = std::cell::RefCell::new(None);
         let c_read_decides = |inner: &mut ConnectionInner, stmt: Option<Stmt>, err: SqliteError| -> Result<CompiledArtifacts> {
+            let err = refine_prepare_error(inner, stmt.as_ref(), &raw_sql, err);
             if err.code == ErrorCode::Error && err.message.starts_with("no such table:")
                 && select_schema_use.as_ref().is_some_and(|usage| usage.btree_mask == Some(0))
                 && let Some((artifacts, program)) = schema_free_read_fallback(inner, stmt.clone(), &raw_sql)?
@@ -8203,7 +8244,7 @@ impl Statement {
                 return Ok(artifacts);
             }
             if !vdbe_host::exec_switch_on() || !matches!(stmt, Some(Stmt::Select(_))) {
-                return Err(c_create_name_error(inner, stmt.as_ref(), &raw_sql, err));
+                return Err(err);
             }
             let probe = read_artifacts(stmt.clone(), Vec::new());
             match vdbe_host::machine_program(inner, stmt.as_ref(), &raw_sql, probe.max_param) {
@@ -9014,12 +9055,12 @@ impl Statement {
                 {
                     if inner.ensure_schemas_loaded_for_prepare(true)? {
                         try_compile(inner, &parsed_stmt)
-                            .map_err(|e| c_create_name_error(inner, parsed_stmt.as_ref(), &self.raw_sql, e))?
+                            .map_err(|e| refine_prepare_error(inner, parsed_stmt.as_ref(), &self.raw_sql, e))?
                     } else {
-                        return Err(c_create_name_error(inner, parsed_stmt.as_ref(), &self.raw_sql, err));
+                        return Err(refine_prepare_error(inner, parsed_stmt.as_ref(), &self.raw_sql, err));
                     }
                 }
-                Err(err) => return Err(c_create_name_error(inner, parsed_stmt.as_ref(), &self.raw_sql, err)),
+                Err(err) => return Err(refine_prepare_error(inner, parsed_stmt.as_ref(), &self.raw_sql, err)),
             };
             apply_prepare_auto_vacuum_pragma(inner, &mut artifacts, c_prepared_auto_vacuum);
             if let Some(out) = &c_prepared_pragma {

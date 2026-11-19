@@ -687,3 +687,8 @@ Varsayılan TEXT/BLOB bağlama sınırı C gibi uygulanıyor. Bind rc18 ve NULL 
 ## V6b.76 — CTE aynı FROM ve scalar UPDATE ömrü
 
 Aynı lexical CTE'nin iki alias'ı ölçülen FROM şekillerinde C gibi tek sonucu kullanıyor. Korelasyonsuz scalar UPDATE de statement başına bir kez hesaplanıyor. 153 disk grubu ve C ile açılan 1.530 DB. Önceki 93 grupta iki kipte tam fiziksel eşlik ve iki odak başarılı. OFF 1181/1/337, ON 1171/11/337. DML ve ayrışma bulucu V6b.75 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,242 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_76.md).
+
+
+## V6b.77 — Skaler hata ofseti ve view UPSERT tanısı
+
+Skaler SELECT legacy hazırlamasında C ile aynı tanının eksik bayt ofseti taşınıyor. View UPSERT yazılabilirlik ve kaynak denetimini C sırasıyla bildiriyor. İki kip 468 skaler, 234 view ve altı view yeniden hazırlama vakasında C eş. OFF 1181/1/337, ON 1172/10/337. DML ve ayrışma bulucu V6b.76 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,240 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_77.md).

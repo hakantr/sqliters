@@ -614,11 +614,14 @@ VACUUM aux INTO 'aux_vac.db';
         // Re-enable views
         assert!(conn.db_config_enable_view(Some(true)));
 
-        // Verify `cannot UPSERT a view` and `UPDATE ... FROM` `sameSrcAlias` error parity
-        let ups_view_err = conn
-            .execute("INSERT INTO main.v_items VALUES(1,'X','Y',2) ON CONFLICT DO NOTHING;")
-            .unwrap_err();
-        assert!(ups_view_err.to_string().contains("cannot UPSERT a view"));
+        // A view without an INSTEAD OF INSERT trigger fails the writability check first.
+        let view_upsert = "INSERT INTO main.v_items VALUES(1,'X','Y',2) ON CONFLICT DO NOTHING;";
+        let (ok, _, c_error) = run_c_sqlite_in_dir(&c_dir, "main.db", view_upsert);
+        let ups_view_err = conn.execute(view_upsert).unwrap_err();
+        assert_eq!(ups_view_err.code, ErrorCode::Error);
+        assert_eq!(ups_view_err.c_offset(), -1);
+        assert_eq!(ups_view_err.message, "cannot modify v_items because it is a view");
+        assert!(!ok && c_error.contains(&ups_view_err.message), "C reported {c_error}");
 
         let same_alias_err = conn
             .execute("UPDATE main.catalog_items SET qty = 1 FROM main.catalog_items;")
