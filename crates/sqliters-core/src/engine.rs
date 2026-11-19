@@ -31099,6 +31099,30 @@ enum ViewDmlIndexPredicate {
     DeleteRange,
 }
 
+fn view_dml_index_term(term: &Expr) -> Option<(&ColumnRef, BinaryOp, &Expr)> {
+    let Expr::Binary { left, op, right } = term else {
+        return None;
+    };
+    let Expr::Column(column) = left.as_ref() else {
+        return None;
+    };
+    if column.schema.is_some() || column.table.is_some() {
+        return None;
+    }
+    Some((column, *op, right))
+}
+
+fn view_dml_range_is_lower(op: BinaryOp, bound: &Expr) -> Option<bool> {
+    if !matches!(bound, Expr::Integer(_) | Expr::Float(_)) {
+        return None;
+    }
+    match op {
+        BinaryOp::Gt | BinaryOp::Ge => Some(true),
+        BinaryOp::Lt | BinaryOp::Le => Some(false),
+        _ => None,
+    }
+}
+
 // sqlite3MaterializeView copies the UPDATE or DELETE predicate into the
 // ephemeral SELECT. Its scan order becomes the INSTEAD OF trigger input order.
 // Push only a proven index term over a directly projected column. For a
@@ -31120,21 +31144,23 @@ fn view_dml_indexed_select(
         return None;
     }
     let max_eq = predicate == ViewDmlIndexPredicate::UpdateMax;
-    let Expr::Binary { left, op, right } = selection? else {
-        return None;
+    let (term, second_term) = match selection? {
+        Expr::Binary { left, op: BinaryOp::And, right }
+            if predicate == ViewDmlIndexPredicate::UpdateRange =>
+        {
+            (left.as_ref(), Some(view_dml_index_term(right)?))
+        }
+        term => (term, None),
     };
-    let Expr::Column(target_col) = left.as_ref() else {
-        return None;
-    };
-    if target_col.schema.is_some()
-        || target_col.table.is_some()
-        || (!max_eq
-            && (!matches!(
-                op,
-                BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
-            ) || !matches!(right.as_ref(), Expr::Integer(_) | Expr::Float(_))))
-    {
-        return None;
+    let (target_col, op, bound) = view_dml_index_term(term)?;
+    if !max_eq {
+        let is_lower = view_dml_range_is_lower(op, bound)?;
+        if let Some((other_col, other_op, other_bound)) = second_term
+            && (!target_col.column.eq_ignore_ascii_case(&other_col.column)
+                || is_lower == view_dml_range_is_lower(other_op, other_bound)?)
+        {
+            return None;
+        }
     }
 
     let (projection, name, alias) = single_table_select_projection(&view.select)?;
@@ -31149,7 +31175,8 @@ fn view_dml_indexed_select(
     let schema = &ctx.db_set.main_slot().schema;
     let table = schema.find_user_table(&name.name)?;
     if (max_eq && !table.without_rowid)
-        || (table.without_rowid && predicate == ViewDmlIndexPredicate::DeleteRange)
+        || (table.without_rowid
+            && (predicate == ViewDmlIndexPredicate::DeleteRange || second_term.is_some()))
         || table.stat1.has_stat1
         || !table.foreign_keys.is_empty()
         || table
@@ -31248,17 +31275,27 @@ fn view_dml_indexed_select(
         return None;
     }
 
+    let make_term = |op, bound: &Expr| Expr::Binary {
+        left: Box::new(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some(alias.unwrap_or(&name.name).to_owned()),
+            column: column.name.clone(),
+            double_quoted: false,
+        })),
+        op,
+        right: Box::new(bound.clone()),
+    };
+    let first = make_term(op, bound);
     let mut narrowed = view.clone();
     if let SelectCore::Select { selection, .. } = &mut narrowed.select.body.head {
-        *selection = Some(Expr::Binary {
-            left: Box::new(Expr::Column(ColumnRef {
-                schema: None,
-                table: Some(alias.unwrap_or(&name.name).to_owned()),
-                column: column.name.clone(),
-                double_quoted: false,
-            })),
-            op: *op,
-            right: right.clone(),
+        *selection = Some(if let Some((_, other_op, other_bound)) = second_term {
+            Expr::Binary {
+                left: Box::new(first),
+                op: BinaryOp::And,
+                right: Box::new(make_term(other_op, other_bound)),
+            }
+        } else {
+            first
         });
     }
     Some(narrowed)
