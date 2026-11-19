@@ -24950,13 +24950,18 @@ fn mixed_index_write_root<'a>(
             && mixed.columns[0].col_idx != Some(column)
         {
             let key = &ordinary.columns[0];
-            let scan_index = (table.columns[column].affinity == TypeAffinity::Text
-                && mixed_index_key_equality(table, key, write.selection()).is_some())
+            let selection = write.selection();
+            let ordinary_scan = (table.columns[column].affinity == TypeAffinity::Text
+                && mixed_index_key_equality(table, key, selection).is_some())
             .then_some((ordinary.root_pgno, key.sort_order.collation));
             let mixed_key = &mixed.columns[0];
-            let writes_scan_key = scan_index.is_some()
+            let mixed_scan = (mixed_index_table_equality(table, key, selection)
+                && mixed_index_key_equality(table, mixed_key, selection).is_some())
+            .then_some((mixed.root_pgno, declared));
+            let scan_index = ordinary_scan.or(mixed_scan);
+            let writes_scan_key = ordinary_scan.is_some()
                 && matches!(write, MixedIndexWrite::Update(_))
-                && mixed_index_table_equality(table, mixed_key, write.selection())
+                && mixed_index_table_equality(table, mixed_key, selection)
                 && write.applies(table, ordinary, key, db_set);
             if (scan_index.is_some() || write.applies_with_second_index(table))
                 && (write.applies(table, mixed, mixed_key, db_set) || writes_scan_key)
