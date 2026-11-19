@@ -2534,6 +2534,28 @@ impl Pager {
         Ok((active, defer && self.pending_sql_journal_mode.is_some()))
     }
 
+    /// Releases resources of a failed, not-yet-owned multi-slot preparation.
+    /// The WAL close can leave a database lock even with no btree transaction.
+    #[doc(hidden)]
+    pub fn cleanup_failed_sql_journal_mode(&mut self, previous_mode: JournalMode) -> Result<()> {
+        self.rollback_retaining_read(false)?;
+        if self.wal.is_none() {
+            self.journal_mode = previous_mode;
+            self.suppress_auto_wal = false;
+            self.header_loaded = false;
+            self.pcache_reset();
+            self.invalidate_mapping();
+            self.bump_data_version();
+            self.notify_backup_restart();
+            if self.file.as_deref().is_some_and(|file| file.lock_level() != LockLevel::NoLock) {
+                let result = self.unlock_db_file(LockLevel::NoLock);
+                self.error_lock_unknown = result.is_err();
+                result?;
+            }
+        }
+        Ok(())
+    }
+
     fn change_journal_mode(&mut self, mode: JournalMode, defer: bool) -> Result<JournalMode> {
         self.ensure_not_closed()?;
 

@@ -45,6 +45,7 @@ use crate::compiler::{
     explain_query_plan_in_db_set, expr_column_label, expr_contains_aggregate,
     expr_contains_subquery, expr_implies_partial_where,
 };
+use crate::SmallInstVec;
 use crate::db_set::{DatabaseSet, ResolvedRelation, SchemaInstanceId, TempStoreMode};
 use crate::execution_context::{
     CollationRegistry, CommitCoordinatorHooks, ExecutionContext, FunctionRegistry, MutationContext,
@@ -146,8 +147,12 @@ pub struct StmtTxTracker {
     pub delete_idx_no_seek: Option<Pgno>,
     /// Hold a prepared legacy DML change count while its returned rows are being stepped.
     pub(crate) defer_returning_changes: bool,
-    /// Single-target SQL journal transition owned by this result-producing statement.
-    pub(crate) staged_journal_mode: Option<SchemaInstanceId>,
+    /// SQL journal transitions prepared by this result-producing statement.
+    pub(crate) staged_journal_modes: SmallInstVec,
+    /// All participants passed the preflight for a shared journal-mode transition.
+    pub(crate) coordinated_journal_mode: bool,
+    /// A preparation whose cleanup failed must not be retried or leave the connection usable.
+    pub(crate) journal_mode_cleanup_error: Option<SqliteError>,
     /// Inner schema token from an automatic PRAGMA table filter, for legacy sqlite3_step.
     pub(crate) pragma_schema_error_offset: Option<usize>,
     /// A real xConnect reached during preparation with a pending default interrupt.
@@ -43027,6 +43032,35 @@ pub(crate) fn exec_vacuum_checked(
     Ok(QueryOutput::default())
 }
 
+fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bool {
+    if !is_in_autocommit(ctx) || ctx.activity.other_readers != 0 {
+        return false;
+    }
+    let previous = match target {
+        JournalMode::Wal => JournalMode::Delete,
+        JournalMode::Delete => JournalMode::Wal,
+        _ => return false,
+    };
+    let mut participants = 0;
+    for bt in ctx.db_set.slots().iter().filter_map(|slot| slot.btree.as_ref()) {
+        let pager = bt.pager();
+        if pager.db_kind() != DatabaseKind::NamedDisk
+            || pager.locking_mode() != LockingMode::Normal
+            || pager.transaction_state() != TransactionState::Open
+            || !pager.is_header_loaded()
+            || pager.page_count() == 0
+            || pager.is_readonly()
+            || !pager.ok_to_change_journal_mode()
+            || pager.journal_mode() != previous
+            || pager.effective_journal_mode_target(target) != target
+        {
+            return false;
+        }
+        participants += 1;
+    }
+    matches!(participants, 2 | 3)
+}
+
 fn apply_journal_mode_on_slot(
     ctx: &mut ExecContext<'_>,
     db_id: DatabaseId,
@@ -43102,12 +43136,31 @@ fn apply_journal_mode_on_slot(
             ));
         }
     }
-    if single_target && !disallow_wal_transition {
-        let (active, staged) = ctx
-            .busy_policy
-            .retry_btree(bt, |b| b.pager_mut().stage_sql_journal_mode(target))?;
+    let coordinated = ctx.stmt_tx.coordinated_journal_mode;
+    if (single_target || coordinated) && !disallow_wal_transition {
+        let (active, staged) = if coordinated {
+            let previous = bt.journal_mode();
+            let mut cleanup_error = None;
+            let outcome = ctx.busy_policy.retry_btree(bt, |b| {
+                let pager = b.pager_mut();
+                let result = pager.stage_sql_journal_mode(target);
+                if let Err(error) = &result
+                    && let Err(cleanup) = pager.cleanup_failed_sql_journal_mode(previous)
+                {
+                    cleanup_error = Some(cleanup);
+                    // A failed cleanup is terminal even when the original operation was BUSY.
+                    return Ok(Err(error.clone()));
+                }
+                result.map(Ok)
+            })?;
+            ctx.stmt_tx.journal_mode_cleanup_error = cleanup_error;
+            outcome?
+        } else {
+            ctx.busy_policy
+                .retry_btree(bt, |b| b.pager_mut().stage_sql_journal_mode(target))?
+        };
         if staged {
-            ctx.stmt_tx.staged_journal_mode = Some(instance);
+            ctx.stmt_tx.staged_journal_modes.push_unique(instance);
         }
         Ok(active)
     } else {
@@ -44647,6 +44700,8 @@ fn exec_pragma(
                             .iter()
                             .filter(|slot| slot.btree.is_some())
                             .count() == 1;
+                        ctx.stmt_tx.coordinated_journal_mode =
+                            !single_target && can_coordinate_journal_mode(ctx, target);
                         for idx in (0..ctx.db_set.slot_count()).rev() {
                             if ctx.db_set.slots()[idx].btree.is_none() {
                                 continue;

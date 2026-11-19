@@ -10214,9 +10214,25 @@ impl Statement {
                     inner.advisory_expire_generation += 1;
                 }
                 inner.end_autocommit_started_reads(stmt_tx.started_read_mask, summary);
-                if expire_self_only {
+                if expire_self_only || stmt_tx.coordinated_journal_mode {
                     self.expired = true;
                 }
+                let staged = std::mem::take(&mut stmt_tx.staged_journal_modes);
+                let journal_mode_snapshot = (!staged.is_empty()
+                    || (stmt_tx.coordinated_journal_mode && res.is_err()))
+                    .then(|| WriteAbortSnapshot {
+                        stmt_sp_slot: None,
+                        touched_write_instances: staged.clone(),
+                        started_read_instances: staged,
+                        fk_before: inner.deferred_fk_suspects.clone(),
+                        rt_before: inner.runtime,
+                        is_dml: false,
+                        mutation_len_before: inner.mutation_pipeline.len(),
+                        schemas_before: inner.snapshot_open_schemas(),
+                        schema_gen_before: inner.schema_generation,
+                        v1_expire_gen_before: inner.v1_expire_generation,
+                        schema_changed_before: inner.schema_changed_in_tx,
+                    });
                 match res {
                     Ok(out) => {
                         if !out.column_names.is_empty() {
@@ -10224,26 +10240,17 @@ impl Statement {
                         }
                         let mut iter = out.rows.into_iter();
                         if let Some(first_row) = iter.next() {
-                            self.lifecycle = if let Some(instance) = stmt_tx.staged_journal_mode {
+                            self.lifecycle = if let Some(abort_snapshot) = journal_mode_snapshot {
                                 // sqlite3Pragma marks its program run-only-once.
                                 self.expired = true;
-                                let owners = SmallInstVec::single(instance);
-                                inner.activity.update_instances(hid, &owners, &owners);
+                                inner.activity.update_instances(
+                                    hid,
+                                    &abort_snapshot.started_read_instances,
+                                    &abort_snapshot.touched_write_instances,
+                                );
                                 StatementLifecycle::Running(RunningExec::ReturningWrite {
                                     rows: iter,
-                                    abort_snapshot: WriteAbortSnapshot {
-                                        stmt_sp_slot: None,
-                                        touched_write_instances: owners.clone(),
-                                        started_read_instances: owners,
-                                        fk_before: inner.deferred_fk_suspects.clone(),
-                                        rt_before: inner.runtime,
-                                        is_dml: false,
-                                        mutation_len_before: inner.mutation_pipeline.len(),
-                                        schemas_before: inner.snapshot_open_schemas(),
-                                        schema_gen_before: inner.schema_generation,
-                                        v1_expire_gen_before: inner.v1_expire_generation,
-                                        schema_changed_before: inner.schema_changed_in_tx,
-                                    },
+                                    abort_snapshot,
                                     pending_changes: None,
                                 })
                             } else {
@@ -10270,7 +10277,20 @@ impl Statement {
                         }
                     }
                     Err(e) => {
-                        let _ = inner.finish_activity(hid, ActivityFinish::NoLock, shared);
+                        let e = if let Some(snapshot) = journal_mode_snapshot {
+                            // OP_JournalMode errors halt the autocommit writer and roll back
+                            // across all slots, even after a partial preparation.
+                            let rollback = e.clone().with_conflict_effect(ConflictResolutionEffect::Rollback);
+                            let aborted = inner.abort_write_statement(hid, &rollback, snapshot, shared);
+                            if let Some(cleanup) = stmt_tx.journal_mode_cleanup_error {
+                                inner.poison_with(cleanup);
+                                inner.publish(shared);
+                            }
+                            if aborted == rollback { e } else { aborted }
+                        } else {
+                            let _ = inner.finish_activity(hid, ActivityFinish::NoLock, shared);
+                            e
+                        };
                         self.lifecycle = StatementLifecycle::Halted {
                             last_error: Some(e.clone()),
                         };
