@@ -7290,7 +7290,8 @@ fn exec_single_select_core_inner(
                             single_qinfo.allow_wr_autoindex_covering = !*distinct
                                 && selection.is_none()
                                 && limit.is_none();
-                            single_qinfo.allow_reverse_index_order = !*distinct && !has_proj_aliases;
+                            single_qinfo.allow_reverse_index_order =
+                                !*distinct && (order_by.is_empty() || !has_proj_aliases);
                             eval_table_or_subquery(
                                 ctx,
                                 &fc.head,
@@ -14372,7 +14373,7 @@ fn read_table_with_plan_ctx(
                         Some(Expr::InList { expr, list, negated: false })
                             if matches!(expr.as_ref(), Expr::Column(_))
                                 && list.iter().all(is_in_order_literal));
-                let reverse_ordered_scan = plain_named_scan
+                let reverse_full_scan = plain_named_scan
                     && where_hint.is_none()
                     && query_info.is_some_and(|info| info.allow_reverse_index_order)
                     && matches!(&plan, AccessPlan::IndexFullScan { index, .. }
@@ -14386,11 +14387,17 @@ fn read_table_with_plan_ctx(
                         projection.iter().all(|rc| match rc {
                             ResultColumn::Expr { expr, .. } => is_simple_covering_expr(expr),
                             _ => true,
-                        }) && crate::compiler::index_order_by_direction(
-                            &idx, tbl, &slot_name, alias, None, order_by, true,
-                        ) == Some(true)
+                        }) && if order_by.is_empty() {
+                            // where.c applies the connection flag when there is no ORDER BY.
+                            ctx.db_set.c_flags_toggled()
+                                & sqliters_codegen::consts::SQLITE_ReverseOrder != 0
+                        } else {
+                            crate::compiler::index_order_by_direction(
+                                &idx, tbl, &slot_name, alias, None, order_by, true,
+                            ) == Some(true)
+                        }
                     });
-                let scan_order = if reverse_ordered_scan {
+                let scan_order = if reverse_full_scan {
                     IndexScanOrder::Reverse
                 } else if order_literal_in {
                     IndexScanOrder::LiteralIn

@@ -837,3 +837,8 @@ Filtrelenmemiş tek kaynakta indeksin sağladığı doğal ORDER BY yönü korun
 ## V6b.106 — Nitelemesiz WAL checkpoint ve bağlı şemalar
 
 PRAGMA bütün açık şemaları işliyor, busy sonuçları birleşiyor ve sayaçlar MAIN sonucunu izliyor. 756 normal ATTACH ve 72 iki-WAL okur akışı C eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,260 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_106.md).
+
+
+## V6b.107 — Zorlanmış sırasız indeks ve reverse PRAGMA
+
+Bağlantı ayarı, filtresiz ve sırasız zorlanmış ikincil indeksin tam tarama yönünü belirliyor. Her API ve kipte 198/198 dosya, kalıcı satır ve C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_107.md).
