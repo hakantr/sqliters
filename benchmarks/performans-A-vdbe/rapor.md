@@ -1157,3 +1157,8 @@ V1 READONLY dış step için genel C tanısını, reset ve finalize için asıl 
 ## V6b.170 — İşlem içi journal_mode V1 dış tanısı
 
 V1 işlem içi journal_mode dış step için genel C tanısını, reset ve finalize için asıl kodu taşır. 24 native grup, 24 V2 kontrolü ve 72 C açılışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_170.md).
+
+
+## V6b.171 — Salt okunur journal_mode sorgusu hazırlığı
+
+Soğuk salt okunur NamedDisk sorgusu prepare sırasında mevcut şema yükleme yolunu kullanır. 148 profil, 444 akış ve 531 C açılışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,247 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_171.md).

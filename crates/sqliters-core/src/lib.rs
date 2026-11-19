@@ -1932,6 +1932,28 @@ impl ConnectionInner {
         self.db_set.rebind_all_collations(&self.collations);
     }
 
+    // The read-only journal-mode query reads the unloaded main schema in
+    // sqlite3Pragma(), including when the program is only being explained.
+    fn readonly_journal_query_needs_schema(&self, stmt: &Stmt) -> bool {
+        let stmt = match stmt {
+            Stmt::Explain { stmt, .. } => stmt.as_ref(),
+            stmt => stmt,
+        };
+        if !matches!(stmt, Stmt::Pragma { schema, name, value: None }
+            if name.eq_ignore_ascii_case("journal_mode")
+                && schema.as_deref().is_none_or(|name| name.eq_ignore_ascii_case("main")))
+        {
+            return false;
+        }
+
+        let main = self.db_set.main_slot();
+        !main.schema.loaded
+            && main.btree.as_ref().is_some_and(|bt| {
+                let pager = bt.pager();
+                pager.is_readonly() && pager.db_kind() == DatabaseKind::NamedDisk
+            })
+    }
+
     /// Ensures `sqlite_schema` catalogs across open database slots are loaded for `prepare`,
     /// releasing any temporary `Read` transaction immediately if no user/statement B-tree
     /// transaction was active (`sqlite3InitOne.openedTransaction`).
@@ -8286,8 +8308,11 @@ impl Statement {
             }
         }
         // C reads the schema at prepare for more statements than the engine loads it for
-        // (pragmas with PragFlg_NeedSchema, the query form of PRAGMA encoding): C's state only.
-        let c_reads_schema = needs_schema || stmt_opt.as_ref().is_some_and(crate::engine::c_pragma_reads_schema);
+        // (pragmas with PragFlg_NeedSchema, the query form of PRAGMA encoding).
+        let readonly_journal_schema = stmt_opt.as_ref()
+            .is_some_and(|stmt| inner.readonly_journal_query_needs_schema(stmt));
+        let c_reads_schema = needs_schema || readonly_journal_schema
+            || stmt_opt.as_ref().is_some_and(crate::engine::c_pragma_reads_schema);
         let c_first_load = c_reads_schema && inner.db_set.c_any_schema_unloaded();
         if needs_schema
             && !matches!(stmt_opt, Some(Stmt::Explain { .. } | Stmt::AttachDatabase { .. }))
@@ -8309,14 +8334,11 @@ impl Statement {
         }
         if needs_schema {
             inner.refresh_open_tx_schemas()?;
-            let any_unloaded = inner
-                .db_set
-                .slots()
-                .iter()
-                .any(|s| s.btree.is_some() && !s.schema.loaded);
-            if any_unloaded {
-                let _ = inner.ensure_schemas_loaded_for_prepare(false)?;
-            }
+        }
+        if readonly_journal_schema
+            || (needs_schema && inner.db_set.slots().iter().any(|s| s.btree.is_some() && !s.schema.loaded))
+        {
+            let _ = inner.ensure_schemas_loaded_for_prepare(false)?;
         }
 
         let prepared_vtab =
@@ -9254,15 +9276,12 @@ impl Statement {
             if needs_schema || select_schema_use.is_none() {
                 inner.refresh_open_tx_schemas()?;
             }
-            if needs_schema {
-                let any_unloaded = inner
-                    .db_set
-                    .slots()
-                    .iter()
-                    .any(|s| s.btree.is_some() && !s.schema.loaded);
-                if any_unloaded {
-                    let _ = inner.ensure_schemas_loaded_for_prepare(false)?;
-                }
+            let readonly_journal_schema = parsed_stmt.as_ref()
+                .is_some_and(|stmt| inner.readonly_journal_query_needs_schema(stmt));
+            if readonly_journal_schema
+                || (needs_schema && inner.db_set.slots().iter().any(|s| s.btree.is_some() && !s.schema.loaded))
+            {
+                let _ = inner.ensure_schemas_loaded_for_prepare(false)?;
             }
             let prepared_vtab = check_c_prepare_error(
                 inner, parsed_stmt.as_ref(), select_schema_use.as_ref(), &self.raw_sql,
