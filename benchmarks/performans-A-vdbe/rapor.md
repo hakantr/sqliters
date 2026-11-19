@@ -692,3 +692,8 @@ Aynı lexical CTE'nin iki alias'ı ölçülen FROM şekillerinde C gibi tek sonu
 ## V6b.77 — Skaler hata ofseti ve view UPSERT tanısı
 
 Skaler SELECT legacy hazırlamasında C ile aynı tanının eksik bayt ofseti taşınıyor. View UPSERT yazılabilirlik ve kaynak denetimini C sırasıyla bildiriyor. İki kip 468 skaler, 234 view ve altı view yeniden hazırlama vakasında C eş. OFF 1181/1/337, ON 1172/10/337. DML ve ayrışma bulucu V6b.76 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,240 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_77.md).
+
+
+## V6b.78 — Üretilen sütun kullanım maskesi ve örtücü indeks
+
+Legacy planlayıcı üretilen sütunun C kullanım maskesini ve örtücü ifade kararını izliyor. REPLACE SELECT C ile aynı son satırları ve DB baytlarını yazıyor. 415 dosya grubunda iki kipte C yeniden açılışı ve SHA eş. OFF 1181/1/337, ON 1172/10/337. DML OFF 382/400 ve ON 400/400. Ayrışma bulucu V6b.77 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,251 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_78.md).

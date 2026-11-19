@@ -1835,11 +1835,21 @@ fn index_is_covering_for_query(
         return false;
     };
 
+    let Some(require_direct) =
+        generated_index_coverage(idx, tbl, schema_name, alias, selection, ctx, proj)
+    else {
+        return false;
+    };
+    let column_covered = |ci| index_query_column_covered(idx, tbl, ci, require_direct);
+    let expr_covered = |expr| {
+        expr_covered_by_index_with_mode(expr, idx, tbl, schema_name, alias, require_direct)
+    };
+
     for rc in proj {
         match rc {
             ResultColumn::Star => {
                 for (ci, _) in tbl.columns.iter().enumerate() {
-                    if !index_provides_table_col(idx, tbl, ci) {
+                    if !column_covered(ci) {
                         return false;
                     }
                 }
@@ -1850,40 +1860,148 @@ fn index_is_covering_for_query(
                     || table.eq_ignore_ascii_case(&tbl.name)
                 {
                     for (ci, _) in tbl.columns.iter().enumerate() {
-                        if !index_provides_table_col(idx, tbl, ci) {
+                        if !column_covered(ci) {
                             return false;
                         }
                     }
                 }
             }
             ResultColumn::Expr { expr, .. } => {
-                if !expr_covered_by_index(expr, idx, tbl, schema_name, alias) {
+                if !expr_covered(expr) {
                     return false;
                 }
             }
         }
     }
     if let Some(w) = selection
-        && !expr_covered_by_index(w, idx, tbl, schema_name, alias)
+        && !expr_covered(w)
     {
         return false;
     }
     for g in ctx.group_by {
-        if !expr_covered_by_index(g, idx, tbl, schema_name, alias) {
+        if !expr_covered(g) {
             return false;
         }
     }
     if let Some(h) = ctx.having
-        && !expr_covered_by_index(h, idx, tbl, schema_name, alias)
+        && !expr_covered(h)
     {
         return false;
     }
     for ob in ctx.order_by {
-        if !expr_covered_by_index(&ob.expr, idx, tbl, schema_name, alias) {
+        if !expr_covered(&ob.expr) {
             return false;
         }
     }
     true
+}
+
+/// With a generated column reference C marks every table column as used.
+/// Return whether the fallback covering walker must require a direct index
+/// slot for each column, or None when C cannot claim an index-only scan.
+fn generated_index_coverage(
+    idx: &IndexSchema,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+    selection: Option<&Expr>,
+    ctx: &QueryPlanContext<'_>,
+    projection: &[ResultColumn],
+) -> Option<bool> {
+    use crate::dml_c::{Walk, walk_expr};
+
+    if !tbl.columns.iter().any(|col| col.generated.is_some()) {
+        return Some(false);
+    }
+    let references_generated = |expr: &Expr| {
+        let mut found = false;
+        walk_expr(expr, &mut |node| {
+            if let Expr::Column(reference) = node
+                && cref_matches_single_table(reference, tbl, schema_name, alias)
+                && tbl
+                    .find_column(&reference.column)
+                    .is_some_and(|(_, col)| col.generated.is_some())
+            {
+                found = true;
+            }
+            Walk::Shallow
+        });
+        found
+    };
+    let projected = projection.iter().any(|result| match result {
+        ResultColumn::Star => true,
+        ResultColumn::TableStar { table, .. } => {
+            table.eq_ignore_ascii_case(alias.unwrap_or(&tbl.name))
+                || table.eq_ignore_ascii_case(&tbl.name)
+        }
+        ResultColumn::Expr { expr, .. } => references_generated(expr),
+    });
+    if !projected
+        && !selection
+            .into_iter()
+            .chain(ctx.group_by)
+            .chain(ctx.having)
+            .chain(ctx.order_by.iter().map(|term| &term.expr))
+            .any(references_generated)
+    {
+        return Some(false);
+    }
+
+    // build.c marks an explicit index that contains the whole table covering
+    // before considering the generated-column mask.
+    if !idx.is_autoindex
+        && tbl.columns.iter().enumerate().all(|(ci, _)| {
+            tbl.rowid_alias_col == Some(ci) || index_slot_for_table_col(idx, tbl, ci).is_some()
+        })
+    {
+        return Some(false);
+    }
+
+    const TOPBIT: u64 = 1 << 63;
+    let used = u64::MAX >> (64 - tbl.columns.len().min(64));
+    let mut covered = 0;
+    let mut indexes_virtual = false;
+    let mut indexes_high_column = false;
+    for col in idx.columns.iter().chain(&idx.trailing_pk_cols) {
+        if let Some(ci) = col.col_idx {
+            let is_virtual = tbl.columns[ci]
+                .generated
+                .as_ref()
+                .is_some_and(|(_, stored)| !stored);
+            indexes_virtual |= is_virtual;
+            indexes_high_column |= ci >= 63;
+            if !is_virtual && ci < 63 {
+                covered |= 1 << ci;
+            }
+        }
+    }
+    let missing = used & !covered;
+    if missing == 0 {
+        return Some(false);
+    }
+
+    // The walker checks complete indexed expressions before their children.
+    // For TOPBIT without expression terms, C requires an indexed high column
+    // before trying a walk.
+    let has_expression = idx.columns.iter().any(|col| col.expr.is_some());
+    let can_walk = (missing == TOPBIT
+        && (indexes_high_column || has_expression || indexes_virtual))
+        || (has_expression && !indexes_virtual);
+    can_walk.then_some(true)
+}
+
+fn index_query_column_covered(
+    idx: &IndexSchema,
+    tbl: &TableSchema,
+    ci: usize,
+    require_direct: bool,
+) -> bool {
+    if require_direct {
+        (!tbl.without_rowid && tbl.rowid_alias_col == Some(ci))
+            || index_slot_for_table_col(idx, tbl, ci).is_some()
+    } else {
+        index_provides_table_col(idx, tbl, ci)
+    }
 }
 
 pub fn index_provides_table_col(idx: &IndexSchema, tbl: &TableSchema, col_idx: usize) -> bool {
@@ -1952,9 +2070,23 @@ fn expr_covered_by_index(
     schema_name: &str,
     alias: Option<&str>,
 ) -> bool {
+    expr_covered_by_index_with_mode(expr, idx, tbl, schema_name, alias, false)
+}
+
+fn expr_covered_by_index_with_mode(
+    expr: &Expr,
+    idx: &IndexSchema,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+    require_direct: bool,
+) -> bool {
     if index_slot_for_expr(idx, expr, tbl, schema_name, alias).is_some() {
         return true;
     }
+    let covered = |subexpr| {
+        expr_covered_by_index_with_mode(subexpr, idx, tbl, schema_name, alias, require_direct)
+    };
     match expr {
         Expr::Null
         | Expr::Bool(_)
@@ -1971,7 +2103,7 @@ fn expr_covered_by_index(
                 return true;
             }
             if let Some((ci, _)) = tbl.find_column(&cref.column) {
-                index_provides_table_col(idx, tbl, ci)
+                index_query_column_covered(idx, tbl, ci, require_direct)
             } else if tbl.is_implicit_rowid_name(&cref.column) {
                 !tbl.without_rowid
             } else {
@@ -1982,24 +2114,24 @@ fn expr_covered_by_index(
         | Expr::Collate { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
         | Expr::Cast { expr: inner, .. } => {
-            expr_covered_by_index(inner, idx, tbl, schema_name, alias)
+            covered(inner)
         }
         Expr::Binary { left, right, .. } => {
-            expr_covered_by_index(left, idx, tbl, schema_name, alias)
-                && expr_covered_by_index(right, idx, tbl, schema_name, alias)
+            covered(left)
+                && covered(right)
         }
         Expr::Between {
             expr: e, low, high, ..
         } => {
-            expr_covered_by_index(e, idx, tbl, schema_name, alias)
-                && expr_covered_by_index(low, idx, tbl, schema_name, alias)
-                && expr_covered_by_index(high, idx, tbl, schema_name, alias)
+            covered(e)
+                && covered(low)
+                && covered(high)
         }
         Expr::InList { expr: e, list, .. } => {
-            expr_covered_by_index(e, idx, tbl, schema_name, alias)
+            covered(e)
                 && list
                     .iter()
-                    .all(|item| expr_covered_by_index(item, idx, tbl, schema_name, alias))
+                    .all(|item| covered(item))
         }
         Expr::Like {
             expr: e,
@@ -2007,11 +2139,11 @@ fn expr_covered_by_index(
             escape,
             ..
         } => {
-            expr_covered_by_index(e, idx, tbl, schema_name, alias)
-                && expr_covered_by_index(pattern, idx, tbl, schema_name, alias)
+            covered(e)
+                && covered(pattern)
                 && escape
                     .as_deref()
-                    .is_none_or(|esc| expr_covered_by_index(esc, idx, tbl, schema_name, alias))
+                    .is_none_or(|esc| covered(esc))
         }
         Expr::Case {
             operand,
@@ -2020,18 +2152,18 @@ fn expr_covered_by_index(
         } => {
             operand
                 .as_deref()
-                .is_none_or(|op| expr_covered_by_index(op, idx, tbl, schema_name, alias))
+                .is_none_or(|op| covered(op))
                 && branches.iter().all(|(w, t)| {
-                    expr_covered_by_index(w, idx, tbl, schema_name, alias)
-                        && expr_covered_by_index(t, idx, tbl, schema_name, alias)
+                    covered(w)
+                        && covered(t)
                 })
                 && else_expr
                     .as_deref()
-                    .is_none_or(|el| expr_covered_by_index(el, idx, tbl, schema_name, alias))
+                    .is_none_or(|el| covered(el))
         }
         Expr::RowValue(elems) => elems
             .iter()
-            .all(|e| expr_covered_by_index(e, idx, tbl, schema_name, alias)),
+            .all(|e| covered(e)),
         Expr::FunctionCall {
             args, filter, over, ..
         } => {
@@ -2043,11 +2175,11 @@ fn expr_covered_by_index(
                         && ws
                             .partition_by
                             .iter()
-                            .all(|e| expr_covered_by_index(e, idx, tbl, schema_name, alias))
+                            .all(|e| covered(e))
                         && ws
                             .order_by
                             .iter()
-                            .all(|ob| expr_covered_by_index(&ob.expr, idx, tbl, schema_name, alias))
+                            .all(|ob| covered(&ob.expr))
                 }
             };
             if !over_ok {
@@ -2057,14 +2189,14 @@ fn expr_covered_by_index(
                 FunctionArgs::Star => true,
                 FunctionArgs::Exprs(es) => es
                     .iter()
-                    .all(|e| expr_covered_by_index(e, idx, tbl, schema_name, alias)),
+                    .all(|e| covered(e)),
             };
             let filter_ok = filter
                 .as_deref()
-                .is_none_or(|f| expr_covered_by_index(f, idx, tbl, schema_name, alias));
+                .is_none_or(|f| covered(f));
             args_ok && filter_ok
         }
-        Expr::InTable { expr: e, .. } => expr_covered_by_index(e, idx, tbl, schema_name, alias),
+        Expr::InTable { expr: e, .. } => covered(e),
         Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => false,
     }
 }
