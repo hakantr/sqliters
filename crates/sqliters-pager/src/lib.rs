@@ -2712,8 +2712,9 @@ impl Pager {
                     && let Some(wal_path) = self.wal_path.as_deref()
                     && self.vfs.exists(wal_path)?
                 {
-                    // pagerOpenWalIfPresent reattaches a non-empty retained WAL while BtreeSetVersion
-                    // suppresses reopening from the page-one format bytes alone.
+                    // sqlite3PagerSharedLock attempts to reduce the lock to SHARED before
+                    // pagerOpenWalIfPresent. The VFS retains the stronger lock on failure.
+                    let _ = self.unlock_db_file(LockLevel::Shared);
                     self.open_wal_under_shared_lock()?;
                 }
                 self.begin_read()?;
