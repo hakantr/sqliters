@@ -2351,8 +2351,23 @@ pub fn index_satisfies_order_by(
     selection: Option<&Expr>,
     order_by: &[OrderByTerm],
 ) -> bool {
+    index_order_by_direction(idx, tbl, schema_name, alias, selection, order_by, false).is_some()
+}
+
+/// Returns whether all terms can use the index and whether the cursor runs
+/// backwards. Explicit WITHOUT ROWID secondary indexes can also use the
+/// physical PRIMARY KEY trailer. The existing planner uses only declared keys.
+pub(crate) fn index_order_by_direction(
+    idx: &IndexSchema,
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+    selection: Option<&Expr>,
+    order_by: &[OrderByTerm],
+    include_trailing_pk: bool,
+) -> Option<bool> {
     if order_by.is_empty() {
-        return true;
+        return Some(false);
     }
     let mut conjuncts = Vec::new();
     if let Some(w) = selection {
@@ -2376,7 +2391,7 @@ pub fn index_satisfies_order_by(
         })
         .collect();
     if remaining_ob.is_empty() {
-        return true;
+        return Some(false);
     }
 
     // Skip leading index columns that are constrained by equality (`col = const`) in `WHERE`
@@ -2393,15 +2408,20 @@ pub fn index_satisfies_order_by(
         }
     }
 
-    let rem_idx_cols = &idx.columns[first_non_eq..];
-    if remaining_ob.len() > rem_idx_cols.len() {
-        return false;
+    let remaining_keys = &idx.columns[first_non_eq..];
+    let key_trailer = if include_trailing_pk && idx.table_without_rowid && !idx.is_autoindex {
+        idx.trailing_pk_cols.as_slice()
+    } else {
+        &[]
+    };
+    if remaining_ob.len() > remaining_keys.len() + key_trailer.len() {
+        return None;
     }
 
     // Check forward or reverse scan direction
     for &reverse in &[false, true] {
         let mut ok = true;
-        for (ob, ic) in remaining_ob.iter().zip(rem_idx_cols.iter()) {
+        for (ob, ic) in remaining_ob.iter().zip(remaining_keys.iter().chain(key_trailer)) {
             let ob_desc = ob.desc;
             let ob_nulls_last = ob.nulls_last.unwrap_or(ob_desc);
             let idx_desc = if reverse {
@@ -2424,10 +2444,10 @@ pub fn index_satisfies_order_by(
             }
         }
         if ok {
-            return true;
+            return Some(reverse);
         }
     }
-    false
+    None
 }
 
 fn cref_matches_single_table(

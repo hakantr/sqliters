@@ -611,6 +611,7 @@ impl ExecContext<'_> {
         db_id: DatabaseId,
         root_pgno: Pgno,
         orders: Vec<KeySortOrder>,
+        reverse: bool,
     ) -> Result<Vec<Vec<u8>>> {
         if root_pgno == 0 {
             return Ok(Vec::new());
@@ -631,7 +632,7 @@ impl ExecContext<'_> {
             progress: self.progress,
             strict_subtype: self.strict_subtype,
         };
-        scan_index_incremental_with_services(bt, root_pgno, orders, &mut svc)
+        scan_index_incremental_with_services(bt, root_pgno, orders, reverse, &mut svc)
     }
 
     /// Ensures `db_id` has at least a `Read` transaction open (`OP_Transaction` `P2 = 0`),
@@ -7289,6 +7290,7 @@ fn exec_single_select_core_inner(
                             single_qinfo.allow_wr_autoindex_covering = !*distinct
                                 && selection.is_none()
                                 && limit.is_none();
+                            single_qinfo.allow_reverse_index_order = !*distinct && !has_proj_aliases;
                             eval_table_or_subquery(
                                 ctx,
                                 &fc.head,
@@ -9529,6 +9531,7 @@ struct SingleVtabQueryInfo<'a> {
     plan_ctx: Option<(&'a [ResultColumn], &'a [OrderByTerm])>,
     allow_local_exists_covering: bool,
     allow_wr_autoindex_covering: bool,
+    allow_reverse_index_order: bool,
 }
 
 impl<'a> SingleVtabQueryInfo<'a> {
@@ -14167,8 +14170,7 @@ fn eval_table_or_subquery(
                     alias.as_deref(),
                     indexed_by.as_ref(),
                     plan_where_hint,
-                    vtab_query_info.and_then(|q| q.plan_ctx),
-                    false,
+                    vtab_query_info,
                     params,
                     outer_scopes,
                     ctes,
@@ -14192,8 +14194,7 @@ fn eval_table_or_subquery(
                 alias.as_deref(),
                 indexed_by.as_ref(),
                 plan_where_hint,
-                vtab_query_info.and_then(|q| q.plan_ctx),
-                vtab_query_info.is_some_and(|q| q.allow_wr_autoindex_covering),
+                vtab_query_info,
                 params,
                 outer_scopes,
                 ctes,
@@ -14277,7 +14278,6 @@ fn read_table_with_plan_scan(
         indexed_by,
         where_hint,
         None,
-        false,
         params,
         outer_scopes,
         ctes,
@@ -14294,8 +14294,7 @@ fn read_table_with_plan_ctx(
     alias: Option<&str>,
     indexed_by: Option<&IndexHint>,
     where_hint: Option<&Expr>,
-    query_ctx: Option<(&[ResultColumn], &[OrderByTerm])>,
-    allow_wr_autoindex_covering: bool,
+    query_info: Option<&SingleVtabQueryInfo<'_>>,
     params: &[Value],
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
@@ -14311,6 +14310,7 @@ fn read_table_with_plan_ctx(
     let db_page_count = bt_ref.pager().page_count();
     let db_enc = bt_ref.encoding();
     let slot_name = slot_ref.name.clone();
+    let query_ctx = query_info.and_then(|info| info.plan_ctx);
 
     if let Some(hint) = indexed_by {
         match hint {
@@ -14355,8 +14355,7 @@ fn read_table_with_plan_ctx(
                 if db_page_count == 0 {
                     return Ok((Vec::new(), scan));
                 }
-                let order_literal_in = db_id == DatabaseId::MAIN
-                    && query_ctx.is_some_and(|(_, order_by)| order_by.is_empty())
+                let plain_named_scan = db_id == DatabaseId::MAIN
                     && outer_scopes.is_empty()
                     && ctes.scopes.is_empty()
                     && !ctx.in_trigger_program()
@@ -14364,13 +14363,40 @@ fn read_table_with_plan_ctx(
                     && !idx.stat1.as_ref().is_some_and(|stat| stat.has_stat1)
                     && idx.where_clause.is_none()
                     && tbl.foreign_keys.is_empty()
-                    && tbl.columns.iter().all(|col| col.generated.is_none())
+                    && tbl.columns.iter().all(|col| col.generated.is_none());
+                let order_literal_in = plain_named_scan
+                    && query_ctx.is_some_and(|(_, order_by)| order_by.is_empty())
                     && ctx.db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder
                         == 0
                     && matches!(where_hint,
                         Some(Expr::InList { expr, list, negated: false })
                             if matches!(expr.as_ref(), Expr::Column(_))
                                 && list.iter().all(is_in_order_literal));
+                let reverse_ordered_scan = plain_named_scan
+                    && where_hint.is_none()
+                    && query_info.is_some_and(|info| info.allow_reverse_index_order)
+                    && matches!(&plan, AccessPlan::IndexFullScan { index, .. }
+                        if index.root_pgno == idx.root_pgno && index.root_pgno != tbl.root_pgno)
+                    && idx.columns.iter().chain(&idx.trailing_pk_cols).all(|key| {
+                        key.col_idx.is_some()
+                            && key.sort_order.custom_collation.is_none()
+                            && ctx.collations.get_custom(key.sort_order.collation_name()).is_none()
+                    })
+                    && query_ctx.is_some_and(|(projection, order_by)| {
+                        projection.iter().all(|rc| match rc {
+                            ResultColumn::Expr { expr, .. } => is_simple_covering_expr(expr),
+                            _ => true,
+                        }) && crate::compiler::index_order_by_direction(
+                            &idx, tbl, &slot_name, alias, None, order_by, true,
+                        ) == Some(true)
+                    });
+                let scan_order = if reverse_ordered_scan {
+                    IndexScanOrder::Reverse
+                } else if order_literal_in {
+                    IndexScanOrder::LiteralIn
+                } else {
+                    IndexScanOrder::Forward
+                };
                 return execute_access_plan(
                     ctx,
                     db_id,
@@ -14380,7 +14406,7 @@ fn read_table_with_plan_ctx(
                     params,
                     outer_scopes,
                     ctes,
-                    order_literal_in,
+                    scan_order,
                 )
                 .map(|r| (r, scan));
             }
@@ -14398,7 +14424,7 @@ fn read_table_with_plan_ctx(
             order_by: query_ctx.map_or(&[], |(_, o)| o),
             ..Default::default()
         },
-        allow_wr_autoindex_covering
+        query_info.is_some_and(|info| info.allow_wr_autoindex_covering)
             && db_id == DatabaseId::MAIN
             && outer_scopes.is_empty()
             && ctes.scopes.is_empty()
@@ -14420,7 +14446,9 @@ fn read_table_with_plan_ctx(
     if db_page_count == 0 {
         return Ok((Vec::new(), scan));
     }
-    execute_access_plan(ctx, db_id, db_enc, tbl, &plan, params, outer_scopes, ctes, false)
+    execute_access_plan(
+        ctx, db_id, db_enc, tbl, &plan, params, outer_scopes, ctes, IndexScanOrder::Forward,
+    )
         .map(|r| (r, scan))
 }
 
@@ -14506,6 +14534,13 @@ fn is_in_order_literal(expr: &Expr) -> bool {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexScanOrder {
+    Forward,
+    Reverse,
+    LiteralIn,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_access_plan(
     ctx: &mut ExecContext<'_>,
@@ -14516,7 +14551,7 @@ fn execute_access_plan(
     params: &[Value],
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
-    order_literal_in: bool,
+    scan_order: IndexScanOrder,
 ) -> Result<Vec<(TableRowKey, Vec<u8>)>> {
     match plan {
         AccessPlan::FullScan => scan_table_raw_entries(ctx, db_id, tbl),
@@ -14524,7 +14559,9 @@ fn execute_access_plan(
             if tbl.without_rowid && index.origin == "pk" && index.root_pgno == tbl.root_pgno {
                 return scan_table_raw_entries(ctx, db_id, tbl);
             }
-            let entries = ctx.scan_index_in_db(db_id, index.root_pgno, index.key_sort_orders())?;
+            let entries = ctx.scan_index_in_db(
+                db_id, index.root_pgno, index.key_sort_orders(), scan_order == IndexScanOrder::Reverse,
+            )?;
             let mut decoded_hits = Vec::with_capacity(entries.len());
             for rec_bytes in entries {
                 decoded_hits.push(decode_record_with_encoding(&rec_bytes, db_enc)?);
@@ -14781,7 +14818,7 @@ fn execute_access_plan(
                 }
                 // wherecode.c:codeINTerm walks the ephemeral literal keys in
                 // index direction, after expr.c has applied the IN affinity.
-                if order_literal_in
+                if scan_order == IndexScanOrder::LiteralIn
                     && *col_pos == 0
                     && *skip_scan_cols == 0
                     && prefix_exprs.is_empty()
@@ -14878,7 +14915,9 @@ fn execute_access_plan(
             let mut combined = Vec::new();
             for bp in branches {
                 let branch_rows =
-                    execute_access_plan(ctx, db_id, db_enc, tbl, bp, params, outer_scopes, ctes, false)?;
+                    execute_access_plan(
+                        ctx, db_id, db_enc, tbl, bp, params, outer_scopes, ctes, IndexScanOrder::Forward,
+                    )?;
                 for (rkey, payload) in branch_rows {
                     if !combined.iter().any(|(existing_k, _)| *existing_k == rkey) {
                         combined.push((rkey, payload));
@@ -19906,7 +19945,7 @@ fn scan_table_raw_entries(
         .and_then(|s| s.btree.as_ref())
         .map(Btree::encoding)
         .unwrap_or_else(|| ctx.encoding());
-    let entries = ctx.scan_index_in_db(db_id, tbl.root_pgno, tbl.without_rowid_pk_orders())?;
+    let entries = ctx.scan_index_in_db(db_id, tbl.root_pgno, tbl.without_rowid_pk_orders(), false)?;
     let n_pk = tbl.without_rowid_pk_cols.len();
     let mut out = Vec::with_capacity(entries.len());
     for rec in entries {
@@ -34494,7 +34533,7 @@ fn refill_without_rowid_primary_key(
     };
     let pk_orders = tbl.without_rowid_pk_orders();
     let n_key = pk_orders.len();
-    let entries = ctx.scan_index_in_db(db_id, tbl.root_pgno, pk_orders)?;
+    let entries = ctx.scan_index_in_db(db_id, tbl.root_pgno, pk_orders, false)?;
     let mut arena: Vec<u8> = Vec::with_capacity(entries.iter().map(Vec::len).sum());
     let mut descriptors: Vec<SorterKey> = Vec::with_capacity(entries.len());
     for rec in &entries {
@@ -35072,7 +35111,7 @@ fn analyze_one_table(
             }
             sqliters_types::dtrace!("TR|stat|idx|tbl={} idx={}", tbl.name, tbl.name);
             let pk_orders = tbl.without_rowid_pk_orders();
-            let raw_entries = ctx.scan_index_in_db(db_id, tbl.root_pgno, pk_orders.clone())?;
+            let raw_entries = ctx.scan_index_in_db(db_id, tbl.root_pgno, pk_orders.clone(), false)?;
             let mut entries = Vec::with_capacity(raw_entries.len());
             for raw in &raw_entries {
                 entries.push(decode_record_with_encoding(raw, enc)?);
@@ -35099,7 +35138,7 @@ fn analyze_one_table(
         }
         sqliters_types::dtrace!("TR|stat|idx|tbl={} idx={}", tbl.name, idx.name);
         let orders = idx.key_sort_orders();
-        let raw_entries = ctx.scan_index_in_db(db_id, idx.root_pgno, orders.clone())?;
+        let raw_entries = ctx.scan_index_in_db(db_id, idx.root_pgno, orders.clone(), false)?;
         let mut entries = Vec::with_capacity(raw_entries.len());
         for raw in &raw_entries {
             entries.push(decode_record_with_encoding(raw, enc)?);

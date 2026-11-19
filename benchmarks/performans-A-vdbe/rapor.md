@@ -827,3 +827,8 @@ Yalın SELECT ve INSERT SELECT planı C maskesine göre otomatik UNIQUE kapsamas
 ## V6b.104 — Zorlanmış indeks ve literal IN sıra anahtarları
 
 Mevcut indeks aramaları, affinity uygulanmış anahtarları C yönünde dolaşıyor. Her API ve kipte 177/177 dosya, kalıcı satır ve C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_104.md).
+
+
+## V6b.105 — Zorlanmış indeks ve ORDER BY yönü
+
+Filtrelenmemiş tek kaynakta indeksin sağladığı doğal ORDER BY yönü korunuyor. Her API ve kipte 195/195 dosya, kalıcı satır ve C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_105.md).
