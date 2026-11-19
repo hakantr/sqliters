@@ -9795,7 +9795,7 @@ impl Statement {
         if self.mode == PrepareMode::V1
             && self.is_journal_mode_pragma()
             && result.as_ref().is_err_and(|error| {
-                matches!(error.code, ErrorCode::Busy | ErrorCode::Schema | ErrorCode::ReadOnly)
+                matches!(error.code, ErrorCode::Error | ErrorCode::Busy | ErrorCode::Schema | ErrorCode::ReadOnly)
             })
         {
             // Legacy OP_JournalMode step callers see SQLITE_ERROR. Reset and finalize
