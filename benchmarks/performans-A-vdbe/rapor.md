@@ -757,3 +757,8 @@ C ilk sonuç konumunu izliyor, yıldız açılımı ve explicit alias sırası �
 ## V6b.90 — Normal SELECT sütun adları
 
 Sütun adı bayrakları ve reprepare metadata'sı C ile hizalandı. 168 ham normal ve 30 yaşam metadata akışı iki kipte C eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 387/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,256 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_90.md).
+
+
+## V6b.91 — ORDER BY +TRUE ve +FALSE
+
+Unary artı altındaki ad çözümlemesi ve kolasyon C ile hizalandı. 132 hedef ve 48 ad bayrağı ham eş, 4.500 fiziksel C açılışı doğrulandı. OFF 1186/1/337, ON 1177/10/337. DML OFF 387/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,257 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_91.md).

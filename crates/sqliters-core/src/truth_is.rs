@@ -87,6 +87,11 @@ pub(crate) fn resolve_simple_truth_tests(stmt: &mut Stmt, db_set: &DatabaseSet) 
             }
             if aliases.iter().all(Option::is_none) {
                 for term in &mut select.order_by {
+                    if select.ctes.is_empty()
+                        && let Some(table) = scope.table
+                    {
+                        resolve_unary_order_truth_name(&mut term.expr, scope, table);
+                    }
                     resolve_expr(&mut term.expr, scope);
                 }
             } else if select.ctes.is_empty()
@@ -121,6 +126,8 @@ pub(crate) fn resolve_simple_truth_tests(stmt: &mut Stmt, db_set: &DatabaseSet) 
                             }
                         }
                         term.expr = Expr::Integer(ordinal as i64);
+                    } else {
+                        resolve_unary_order_truth_name(&mut term.expr, scope, table);
                     }
                 }
             }
@@ -156,6 +163,82 @@ fn scalar_where_alias(expr: &Expr, table: &TableSchema) -> bool {
         | Expr::String(_)
         | Expr::Blob(_) => true,
         _ => false,
+    }
+}
+
+/// Resolve a wrapped ORDER BY name with source-column precedence.
+fn resolve_unary_order_truth_name(
+    order_expr: &mut Expr,
+    scope: TruthScope<'_>,
+    table: &TableSchema,
+) {
+    let mut operand = &mut *order_expr;
+    let mut unary_plus = false;
+    let mut explicit_collation = None;
+    loop {
+        match operand {
+            Expr::Collate { expr, collation } => {
+                explicit_collation.get_or_insert_with(|| collation.clone());
+                operand = expr;
+            }
+            Expr::Unary {
+                op: UnaryOp::Plus,
+                expr,
+            } => {
+                unary_plus = true;
+                operand = expr;
+            }
+            _ => break,
+        }
+    }
+    if !unary_plus {
+        return;
+    }
+    let Expr::Bool(value) = operand else { return };
+    let resolved = if let Some(name) = scope.for_keyword(*value) {
+        Expr::Column(ColumnRef::unqualified(name))
+    } else if let Some(alias) = scope.where_aliases[usize::from(*value)] {
+        let supported = match alias {
+            Expr::Unary {
+                op: UnaryOp::Negate,
+                expr,
+            }
+            | Expr::Collate { expr, .. } => scalar_where_alias(expr, table),
+            Expr::Binary {
+                op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply,
+                left,
+                right,
+            } => scalar_where_alias(left, table) && scalar_where_alias(right, table),
+            _ => scalar_where_alias(alias, table),
+        };
+        if !supported {
+            return;
+        }
+        if let Expr::Collate { collation, .. } = alias {
+            explicit_collation.get_or_insert_with(|| collation.clone());
+        }
+        alias.clone()
+    } else {
+        return;
+    };
+    let collation = explicit_collation.or_else(|| {
+        let Expr::Column(column) = &resolved else {
+            return None;
+        };
+        let (_, definition) = table.find_column(&column.column)?;
+        let name = definition.collation_name();
+        (!name.eq_ignore_ascii_case("BINARY")).then(|| name.to_owned())
+    });
+    // The plus wrapper keeps the substituted integer on the expression path.
+    *operand = resolved;
+    // The compiled sorter reads the effective collation from the ORDER BY root.
+    if let Some(collation) = collation
+        && !matches!(order_expr, Expr::Collate { .. })
+    {
+        *order_expr = Expr::Collate {
+            expr: Box::new(std::mem::replace(order_expr, Expr::Null)),
+            collation,
+        };
     }
 }
 
