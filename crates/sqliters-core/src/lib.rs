@@ -5559,14 +5559,15 @@ fn check_c_prepare_error(
 }
 
 /// The error-checking prepare already generated the machine program for this
-/// simple scan of a connected virtual table. Reuse it within this prepare
-/// attempt so the module's planning callback runs only once.
+/// scan of a connected virtual table. Reuse it within this prepare attempt
+/// so the module sees one set of planning callbacks.
 fn is_single_vtab_scan_select(
     stmt: Option<&Stmt>,
     prog: &sqliters_vdbe::vdbeaux::Program,
 ) -> bool {
     use sqliters_syntax::ast::{BinaryOp, Expr, ResultColumn, SelectCore, TableOrSubquery};
-    use sqliters_vdbe::opcodes::{OP_VFilter, OP_VOpen};
+    use sqliters_vdbe::opcodes::{OP_VFilter, OP_VInitIn, OP_VNext, OP_VOpen};
+    use sqliters_vdbe::vdbeaux::P4;
 
     let Some(Stmt::Select(select)) = stmt else {
         return false;
@@ -5585,6 +5586,21 @@ fn is_single_vtab_scan_select(
     let operand = |expr: &Expr| {
         matches!(expr, Expr::Column(_) | Expr::Integer(_) | Expr::Bool(_) | Expr::Null)
     };
+    let column_equals_integer = |expr: &Expr| {
+        matches!(expr, Expr::Binary { left, op: BinaryOp::Eq, right }
+            if matches!(&**left, Expr::Column(_)) && matches!(&**right, Expr::Integer(_)))
+    };
+    let max_scan_ops = match selection {
+        None => 1,
+        Some(Expr::Binary { left, op: BinaryOp::Eq | BinaryOp::Is | BinaryOp::IsNot, right })
+            if operand(left) && operand(right) => 1,
+        Some(Expr::Binary { left, op: BinaryOp::Or, right })
+            if column_equals_integer(left) && column_equals_integer(right) => 2,
+        Some(Expr::InList { expr, list, negated: false })
+            if matches!(&**expr, Expr::Column(_))
+                && matches!(&list[..], [Expr::Integer(_), Expr::Integer(_)]) => 1,
+        _ => return false,
+    };
     select.ctes.is_empty()
         && select.body.compounds.is_empty()
         && select.limit.is_none()
@@ -5596,16 +5612,29 @@ fn is_single_vtab_scan_select(
         && projection.iter().all(|rc| {
             matches!(rc, ResultColumn::Expr { expr, .. } if operand(expr))
         })
-        && selection.as_ref().is_none_or(|expr| {
-            matches!(expr, Expr::Binary { left, op: BinaryOp::Eq | BinaryOp::Is | BinaryOp::IsNot, right }
-                if operand(left) && operand(right))
-        })
         && select.order_by.iter().all(|term| {
             matches!(term.expr, Expr::Column(_)) && term.nulls_last.is_none()
         })
         && prog.n_var == 0
-        && prog.a_op.iter().filter(|op| op.opcode == OP_VOpen).count() == 1
-        && prog.a_op.iter().filter(|op| op.opcode == OP_VFilter).count() == 1
+        && {
+            let mut opens = prog.a_op.iter().filter(|op| op.opcode == OP_VOpen);
+            let Some(open) = opens.next() else { return false };
+            let P4::Vtab(vtab) = &open.p4 else { return false };
+            let mut filters = prog.a_op.iter().filter(|op| op.opcode == OP_VFilter);
+            // The two OR arms may emit VOpen for the same cursor and table.
+            // Both VDBEs reuse that cursor without a second xOpen call.
+            opens.next().is_none_or(|second| {
+                max_scan_ops == 2 && second.p1 == open.p1
+                    && matches!(&second.p4, P4::Vtab(other) if vtab == other)
+                    && opens.next().is_none()
+            })
+                && filters.clone().count() <= max_scan_ops
+                && filters.next().is_some_and(|filter| filter.p1 == open.p1)
+                && filters.all(|filter| filter.p1 == open.p1)
+                && !prog.a_op.iter().any(|op| {
+                    op.opcode == OP_VInitIn || (op.opcode == OP_VNext && op.p1 != open.p1)
+                })
+        }
 }
 
 fn apply_select_schema_use(artifacts: &mut CompiledArtifacts, usage: Option<&cgen::SelectSchemaUse>) {

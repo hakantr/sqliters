@@ -722,3 +722,8 @@ Default değerlerle tek satır yazan INSERT, C'nin immediate FOREIGN KEY kararı
 ## V6b.83 — Sanal tablo SELECT hazırlığı
 
 UTF-8 ON tek sanal tablo SELECT hazırlığında program yeniden kullanılıyor. Çağrı sayısı değişen 32 akışın tamamında callback sırası ve argümanları C ile eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 383/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,267 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_83.md).
+
+
+## V6b.84 — Sanal tablo OR ve IN hazırlığı
+
+Seçilen UTF-8 ON OR ve IN programlarında hazırlama callback tekrarı kalktı. 1.080 odak dosyası ve 792 önceki kapsam dosyası C ile salt okunur açıldı. OFF 1186/1/337, ON 1177/10/337. DML OFF 383/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_84.md).
