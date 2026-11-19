@@ -573,8 +573,8 @@ pub(crate) fn machine_write_program(inner: &ConnectionInner, stmt: Option<&Stmt>
         trace("fallback: authorizer", raw_sql);
         return (WriteRoute::Engine, false);
     }
-    if stmt.and_then(crate::engine::PointWrite::from_stmt).is_some_and(|write| {
-        crate::engine::mixed_point_write(write, &inner.db_set, &inner.collations)
+    if stmt.and_then(crate::engine::MixedIndexWrite::from_stmt).is_some_and(|write| {
+        crate::engine::mixed_index_write(write, &inner.db_set, &inner.collations)
     }) {
         trace("fallback: mixed index write snapshot", raw_sql);
         return (WriteRoute::Engine, false);

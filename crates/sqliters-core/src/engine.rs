@@ -24372,13 +24372,13 @@ fn resolve_create_table_target(
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum PointWrite<'a> {
+pub(crate) enum MixedIndexWrite<'a> {
     Insert(&'a InsertStmt),
     Update(&'a UpdateStmt),
     Delete(&'a DeleteStmt),
 }
 
-impl<'a> PointWrite<'a> {
+impl<'a> MixedIndexWrite<'a> {
     pub(crate) fn from_stmt(stmt: &'a Stmt) -> Option<Self> {
         match stmt {
             Stmt::Insert(insert) => Some(Self::Insert(insert)),
@@ -24396,20 +24396,11 @@ impl<'a> PointWrite<'a> {
         }
     }
 
-    fn applies(self, table: &TableSchema, key: &IndexedColSchema) -> bool {
+    fn applies(self, table: &TableSchema, key: &IndexedColSchema, allow_ranges: bool) -> bool {
         let literal = |expr: &Expr| matches!(
             expr, Expr::Null | Expr::Bool(_) | Expr::Integer(_) | Expr::Float(_)
                 | Expr::String(_) | Expr::Blob(_) | Expr::Bind(_)
         );
-        let rowid_equals = |selection: Option<&Expr>| {
-            let Some(Expr::Binary { op: BinaryOp::Eq, left, right }) = selection else {
-                return false;
-            };
-            let rowid = |expr: &Expr| matches!(expr, Expr::Column(column)
-                if resolve_target_col_ref(table, "main", None, column) == Some(TargetColRef::Rowid));
-            let bound = |expr: &Expr| matches!(expr, Expr::Integer(_) | Expr::Bind(_));
-            (rowid(left) && bound(right)) || (bound(left) && rowid(right))
-        };
         match self {
             Self::Insert(insert) => insert.ctes.is_empty()
                 && insert.alias.is_none()
@@ -24424,7 +24415,7 @@ impl<'a> PointWrite<'a> {
                 && update.or_conflict.is_none()
                 && update.from.is_none()
                 && update.returning.is_empty()
-                && rowid_equals(update.selection.as_ref())
+                && mixed_index_rowid_selection(table, update.selection.as_ref(), allow_ranges)
                 && matches!(update.assignments.as_slice(), [assignment]
                     if !assignment.row_value
                         && matches!(assignment.columns.as_slice(), [column]
@@ -24434,18 +24425,70 @@ impl<'a> PointWrite<'a> {
                 && delete.alias.is_none()
                 && delete.indexed_by.is_none()
                 && delete.returning.is_empty()
-                && rowid_equals(delete.selection.as_ref()),
+                && mixed_index_rowid_selection(table, delete.selection.as_ref(), allow_ranges),
         }
     }
 }
 
-fn mixed_point_write_collation(
-    write: PointWrite<'_>,
+fn mixed_index_rowid_selection(
+    table: &TableSchema,
+    selection: Option<&Expr>,
+    allow_ranges: bool,
+) -> bool {
+    let rowid = |expr: &Expr| matches!(expr, Expr::Column(column)
+        if resolve_target_col_ref(table, "main", None, column) == Some(TargetColRef::Rowid));
+    let equality_bound = |expr: &Expr| matches!(expr, Expr::Integer(_) | Expr::Bind(_));
+    if let Some(Expr::Binary { op: BinaryOp::Eq, left, right }) = selection {
+        return (rowid(left) && equality_bound(right)) || (equality_bound(left) && rowid(right));
+    }
+    if !allow_ranges {
+        return false;
+    }
+    let range_bound = |expr: &Expr| match expr {
+        Expr::Null | Expr::Integer(_) | Expr::Float(_) | Expr::Bind(_) => true,
+        Expr::Unary { op: UnaryOp::Plus | UnaryOp::Negate, expr } => {
+            matches!(expr.as_ref(), Expr::Integer(_) | Expr::Float(_))
+        }
+        _ => false,
+    };
+    // true denotes a lower bound. Swap the direction for a right-hand rowid.
+    let inequality = |expr: &Expr| {
+        let Expr::Binary { op, left, right } = expr else {
+            return None;
+        };
+        let lower = match op {
+            BinaryOp::Gt | BinaryOp::Ge => true,
+            BinaryOp::Lt | BinaryOp::Le => false,
+            _ => return None,
+        };
+        if rowid(left) && range_bound(right) {
+            Some(lower)
+        } else if range_bound(left) && rowid(right) {
+            Some(!lower)
+        } else {
+            None
+        }
+    };
+    match selection {
+        Some(Expr::Between { expr, low, high, negated: false }) => {
+            rowid(expr) && range_bound(low) && range_bound(high)
+        }
+        Some(Expr::Binary { op: BinaryOp::And, left, right }) => {
+            matches!((inequality(left), inequality(right)), (Some(a), Some(b)) if a != b)
+        }
+        Some(expr) => inequality(expr).is_some(),
+        None => false,
+    }
+}
+
+fn mixed_index_write_collation(
+    write: MixedIndexWrite<'_>,
     db_id: DatabaseId,
     db_set: &DatabaseSet,
     table: &TableSchema,
     index: &IndexSchema,
     collations: &CollationRegistry,
+    allow_ranges: bool,
 ) -> Option<Collation> {
     let [key] = index.columns.as_slice() else {
         return None;
@@ -24467,7 +24510,7 @@ fn mixed_point_write_collation(
             slot.schema.tables.iter().any(|table| !table.foreign_keys.is_empty())
         })
         || ["BINARY", "NOCASE", "RTRIM"].iter().any(|name| collations.get_custom(name).is_some())
-        || !write.applies(table, key)
+        || !write.applies(table, key, allow_ranges)
     {
         return None;
     }
@@ -24479,8 +24522,8 @@ fn mixed_point_write_collation(
     (declared != key.sort_order.collation).then_some(declared)
 }
 
-pub(crate) fn mixed_point_write(
-    write: PointWrite<'_>,
+pub(crate) fn mixed_index_write(
+    write: MixedIndexWrite<'_>,
     db_set: &DatabaseSet,
     collations: &CollationRegistry,
 ) -> bool {
@@ -24496,10 +24539,14 @@ pub(crate) fn mixed_point_write(
     let (Some(index), None) = (indexes.next(), indexes.next()) else {
         return false;
     };
-    mixed_point_write_collation(write, db_id, db_set, table, index, collations).is_some()
+    // The existing relational DML range walk visits rowids in ascending order.
+    let allow_ranges = db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder == 0;
+    mixed_index_write_collation(
+        write, db_id, db_set, table, index, collations, allow_ranges,
+    ).is_some()
 }
 
-fn physical_point_write_collation(
+fn physical_index_write_collation(
     ctx: &mut ExecContext<'_>,
     db_id: DatabaseId,
     table: &TableSchema,
@@ -24583,7 +24630,7 @@ fn physical_point_write_collation(
 fn prepare_dml_write_slot(
     ctx: &mut ExecContext<'_>,
     db_id: DatabaseId,
-    write: PointWrite<'_>,
+    write: MixedIndexWrite<'_>,
     is_catalog: bool,
     fallback_tbl: TableSchema,
 ) -> Result<(TableSchema, Vec<IndexSchema>, String)> {
@@ -24622,11 +24669,11 @@ fn prepare_dml_write_slot(
     // `sqlite3GenerateRowIndexDelete`).
     let mut indexes = dml_ordered_indexes(&tbl, &slot.schema.indexes_for_table(&tbl.name));
     if let [index] = indexes.as_mut_slice()
-        && let Some(declared) = mixed_point_write_collation(
-            write, db_id, ctx.db_set, &tbl, index, ctx.collations,
+        && let Some(declared) = mixed_index_write_collation(
+            write, db_id, ctx.db_set, &tbl, index, ctx.collations, true,
         )
     {
-        let comparator = physical_point_write_collation(ctx, db_id, &tbl, index, declared)?;
+        let comparator = physical_index_write_collation(ctx, db_id, &tbl, index, declared)?;
         index.columns[0].sort_order.collation = comparator;
     }
     Ok((tbl, indexes, sname))
@@ -27319,7 +27366,7 @@ fn prepare_insert_exec<'a>(
             };
 
             let (tbl, indexes, schema_name) =
-                prepare_dml_write_slot(ctx, db_id, PointWrite::Insert(ins), is_catalog, *initial_tbl)?;
+                prepare_dml_write_slot(ctx, db_id, MixedIndexWrite::Insert(ins), is_catalog, *initial_tbl)?;
             let (enc, _) = slot_encoding_and_name(ctx, db_id);
             let ordered_uniques = ordered_unique_indexes(&tbl, &indexes);
             let (upsert_steps, resolved_do_updates) = if ins.upsert_clauses.is_empty() {
@@ -29902,7 +29949,7 @@ fn prepare_update_exec<'a>(
             };
 
             let (tbl, indexes, schema_name) =
-                prepare_dml_write_slot(ctx, db_id, PointWrite::Update(upd), is_catalog, *initial_tbl)?;
+                prepare_dml_write_slot(ctx, db_id, MixedIndexWrite::Update(upd), is_catalog, *initial_tbl)?;
             let (enc, _) = slot_encoding_and_name(ctx, db_id);
             let resolved_assigns = resolve_set_assignments_for_table(&tbl, &upd.assignments)?;
             let modified_col_mask = build_table_modified_col_mask(&tbl, &resolved_assigns);
@@ -31640,7 +31687,7 @@ fn prepare_delete_exec(
             ..
         } => {
             let (tbl, indexes, schema_name) =
-                prepare_dml_write_slot(ctx, db_id, PointWrite::Delete(del), is_catalog, *initial_tbl)?;
+                prepare_dml_write_slot(ctx, db_id, MixedIndexWrite::Delete(del), is_catalog, *initial_tbl)?;
             let has_del_triggers = !is_catalog
                 && ctx.db_set.has_active_triggers_for_event(
                     db_id,

@@ -5824,8 +5824,8 @@ fn compile_parsed_stmt(
     }
 
     let category = Some(classify_stmt_category(&stmt));
-    let mixed_point_write = engine::PointWrite::from_stmt(&stmt)
-        .is_some_and(|write| engine::mixed_point_write(write, db_set, collations));
+    let mixed_index_write = engine::MixedIndexWrite::from_stmt(&stmt)
+        .is_some_and(|write| engine::mixed_index_write(write, db_set, collations));
     let mut compiled_vdbe = None;
     let mut compiled_fast_read = None;
     // Only use fast-path `VdbeVm` when all `DatabaseId` slots are `0` (`main`) or `1` (`temp`),
@@ -5845,21 +5845,21 @@ fn compile_parsed_stmt(
                 compiled_vdbe = Some(Arc::new(prog));
             }
         }
-        Stmt::Insert(ins) if !count_changes && !mixed_point_write => {
+        Stmt::Insert(ins) if !count_changes && !mixed_index_write => {
             if let Some(prog) = compiler::try_compile_insert_in_db_set(ins, db_set, functions)?
                 && (prog.referenced_db_mask() & !0b11) == 0
             {
                 compiled_vdbe = Some(Arc::new(prog));
             }
         }
-        Stmt::Update(upd) if !count_changes && !mixed_point_write => {
+        Stmt::Update(upd) if !count_changes && !mixed_index_write => {
             if let Some(prog) = compiler::try_compile_update_in_db_set(upd, db_set, functions)?
                 && (prog.referenced_db_mask() & !0b11) == 0
             {
                 compiled_vdbe = Some(Arc::new(prog));
             }
         }
-        Stmt::Delete(del) if !count_changes && !mixed_point_write => {
+        Stmt::Delete(del) if !count_changes && !mixed_index_write => {
             if let Some(prog) = compiler::try_compile_delete_in_db_set(del, db_set, functions)?
                 && (prog.referenced_db_mask() & !0b11) == 0
             {
@@ -7068,7 +7068,7 @@ impl ConnectionInner {
             let Ok((Some(Stmt::Insert(ins)), _)) = parse_one(&synth) else {
                 return None;
             };
-            if engine::mixed_point_write(engine::PointWrite::Insert(&ins), &self.db_set, &self.collations) {
+            if engine::mixed_index_write(engine::MixedIndexWrite::Insert(&ins), &self.db_set, &self.collations) {
                 return None;
             }
             if !temp_open

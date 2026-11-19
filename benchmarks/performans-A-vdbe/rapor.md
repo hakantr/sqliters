@@ -997,3 +997,8 @@ Normal izinli geçişte ilk ROW fiziksel başlığı koruyor ve Defensive kipi m
 ## V6b.138 — Mevcut izinli OFF kipinden WAL geçişi
 
 Bekleyen statement önceki ve hedef kipi ayırarak C ROW ve bitiş sınırını kullanıyor. 1.782 normal ve koruma akışı ile 12.150 C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_138.md).
+
+
+## V6b.139 — Karma indeksli rowid aralık DML
+
+Normal ileri rowid aralığı fiziksel karşılaştırıcıyı aynı aktif yazma görüntüsünden seçiyor. 108 C/Rust tam dosya çifti, 216 rollback ve 300 bağlı sınır eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,263 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_139.md).
