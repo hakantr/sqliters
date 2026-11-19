@@ -20896,6 +20896,52 @@ fn generated_col_eval_order(tbl: &TableSchema) -> Vec<usize> {
     order
 }
 
+fn apply_row_column_affinity(tbl: &TableSchema, col: &ColumnSchema, value: Value) -> Value {
+    let value = col.affinity.apply(value);
+    if tbl.strict
+        && col.type_name.trim().eq_ignore_ascii_case("REAL")
+        && let Value::Integer(integer) = value
+    {
+        return Value::real(integer as f64);
+    }
+    value
+}
+
+fn compute_write_generated_columns(
+    ctx: &mut ExecContext<'_>,
+    tbl: &TableSchema,
+    schema_name: &str,
+    rowid: i64,
+    raw_vals: &mut [Value],
+    params: &[Value],
+    check_types: bool,
+) -> Result<()> {
+    let order = generated_col_eval_order(tbl);
+    let strict = check_types && tbl.strict;
+    if strict && !order.is_empty() {
+        // sqlite3ComputeGeneratedColumns emits OP_TypeCheck before the expression,
+        // with P3=1 when there are STORED columns that are still uninitialized.
+        for (column, value) in tbl.columns.iter().zip(raw_vals.iter()) {
+            if column.generated.is_none() {
+                check_strict_column_type(&tbl.name, column, value)?;
+            }
+        }
+    }
+    for i in order {
+        let column = &tbl.columns[i];
+        if let Some((expression, stored)) = &column.generated {
+            let scope = make_single_table_scope(tbl, schema_name, None, rowid, raw_vals);
+            let value = eval_expr(ctx, expression, params, &[scope], &CteStore::default(), None)?;
+            raw_vals[i] = apply_row_column_affinity(tbl, column, value);
+            if strict && !stored {
+                // VIRTUAL strict affinity checks the computed register (P3 = column + 2).
+                check_strict_column_type(&tbl.name, column, &raw_vals[i])?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn apply_table_affinities_and_generated(
     ctx: &mut ExecContext<'_>,
     tbl: &TableSchema,
@@ -20903,6 +20949,7 @@ fn apply_table_affinities_and_generated(
     rowid: i64,
     raw_vals: &mut [Value],
     params: &[Value],
+    check_types: bool,
 ) -> Result<()> {
     for (i, col) in tbl.columns.iter().enumerate() {
         if col.generated.is_some() {
@@ -20911,30 +20958,94 @@ fn apply_table_affinities_and_generated(
         if tbl.rowid_alias_col == Some(i) {
             raw_vals[i] = Value::Integer(rowid);
         } else {
-            raw_vals[i] = col.affinity.apply(raw_vals[i].clone());
-            if tbl.strict
-                && col.type_name.trim().eq_ignore_ascii_case("REAL")
-                && let Value::Integer(iv) = raw_vals[i]
-            {
-                raw_vals[i] = Value::real(iv as f64);
-            }
+            raw_vals[i] = apply_row_column_affinity(tbl, col, raw_vals[i].clone());
         }
     }
-    for i in generated_col_eval_order(tbl) {
-        if let Some((ref gexpr, _)) = tbl.columns[i].generated {
-            let scope = make_single_table_scope(tbl, schema_name, None, rowid, raw_vals);
-            let gv = eval_expr(ctx, gexpr, params, &[scope], &CteStore::default(), None)?;
-            let mut coerced = tbl.columns[i].affinity.apply(gv);
-            if tbl.strict
-                && tbl.columns[i].type_name.trim().eq_ignore_ascii_case("REAL")
-                && let Value::Integer(iv) = coerced
-            {
-                coerced = Value::real(iv as f64);
-            }
-            raw_vals[i] = coerced;
+    compute_write_generated_columns(ctx, tbl, schema_name, rowid, raw_vals, params, check_types)
+}
+
+fn check_strict_record(tbl: &TableSchema, raw_vals: &[Value]) -> Result<()> {
+    for (column, value) in tbl.columns.iter().zip(raw_vals) {
+        if column.generated.as_ref().is_none_or(|(_, stored)| *stored) {
+            check_strict_column_type(&tbl.name, column, value)?;
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_write_not_null(
+    ctx: &mut ExecContext<'_>,
+    tbl: &TableSchema,
+    schema_name: &str,
+    rowid: i64,
+    raw_vals: &mut [Value],
+    stmt_conflict: Option<ConflictAction>,
+    modified_cols: Option<&[bool]>,
+    params: &[Value],
+) -> Result<bool> {
+    let fail = |column: &ColumnSchema, action| {
+        if action == ConflictAction::Ignore {
+            return Ok(false);
+        }
+        Err(SqliteError::constraint(
+            extended::SQLITE_CONSTRAINT_NOTNULL,
+            format!("NOT NULL constraint failed: {}.{}", tbl.name, column.name),
+        )
+        .with_conflict_effect(conflict_action_to_effect(action)))
+    };
+    let checks_regular = |i: usize| {
+        tbl.rowid_alias_col != Some(i) && modified_cols.is_none_or(|changed| changed[i])
+    };
+    let mut has_replace_default = false;
+
+    // sqlite3GenerateConstraintChecks checks ordinary columns before generated ones.
+    // A REPLACE default may still be NULL, so leave its final check for the second pass.
+    for (i, column) in tbl.columns.iter().enumerate() {
+        let Some(conflict) = column.not_null else {
+            continue;
+        };
+        if column.generated.is_some() || !checks_regular(i) {
+            continue;
+        }
+        let action = stmt_conflict.unwrap_or(conflict);
+        if action == ConflictAction::Replace
+            && let Some(default) = &column.default_expr
+        {
+            has_replace_default = true;
+            if raw_vals[i].is_null() {
+                let value = eval_expr(ctx, default, params, &[], &CteStore::default(), None)?;
+                raw_vals[i] = apply_row_column_affinity(tbl, column, value);
+            }
+        } else if raw_vals[i].is_null() {
+            return fail(column, action);
+        }
+    }
+
+    if has_replace_default {
+        compute_write_generated_columns(ctx, tbl, schema_name, rowid, raw_vals, params, true)?;
+    }
+
+    for (i, column) in tbl.columns.iter().enumerate() {
+        let Some(conflict) = column.not_null else {
+            continue;
+        };
+        if !raw_vals[i].is_null() {
+            continue;
+        }
+        let mut action = stmt_conflict.unwrap_or(conflict);
+        let checks_replaced = action == ConflictAction::Replace
+            && column.default_expr.is_some()
+            && checks_regular(i);
+        if column.generated.is_none() && !checks_replaced {
+            continue;
+        }
+        if action == ConflictAction::Replace {
+            action = ConflictAction::Abort;
+        }
+        return fail(column, action);
+    }
+    Ok(true)
 }
 
 struct TriggerBatchState {
@@ -21303,6 +21414,7 @@ fn validate_and_write_row(
     raw_vals: Vec<Value>,
     stmt_conflict: Option<ConflictAction>,
     existing_self_key: Option<&TableRowKey>,
+    modified_cols: Option<&[bool]>,
     params: &[Value],
     bump_last_rowid: bool,
     mutation_dispatch: Option<(MutationOrigin, Option<MutationRow>)>,
@@ -21324,6 +21436,7 @@ fn validate_and_write_row(
         raw_vals,
         stmt_conflict,
         existing_self_key,
+        modified_cols,
         params,
         bump_last_rowid,
         mutation_dispatch,
@@ -21343,6 +21456,7 @@ fn validate_and_write_row_inner(
     mut raw_vals: Vec<Value>,
     stmt_conflict: Option<ConflictAction>,
     existing_self_key: Option<&TableRowKey>,
+    modified_cols: Option<&[bool]>,
     params: &[Value],
     bump_last_rowid: bool,
     mutation_dispatch: Option<(MutationOrigin, Option<MutationRow>)>,
@@ -21383,74 +21497,38 @@ fn validate_and_write_row_inner(
         final_rowid.unwrap()
     };
 
-    apply_table_affinities_and_generated(ctx, tbl, &schema_name, rowid, &mut raw_vals, params)?;
+    apply_table_affinities_and_generated(
+        ctx,
+        tbl,
+        &schema_name,
+        rowid,
+        &mut raw_vals,
+        params,
+        true,
+    )?;
 
-    // 2. STRICT type check (`OP_TypeCheck`). It is not a constraint with a conflict clause: the
-    // error is raised by the opcode itself, so the statement's OR clause does not apply and the
-    // action is always ABORT. Where it runs is where `sqlite3TableAffinity` is first coded for
-    // the row (`bAffinityDone` in `sqlite3GenerateConstraintChecks`): with generated columns
-    // before everything (`sqlite3ComputeGeneratedColumns`), else before the first CHECK, else
-    // before the first index of the index loop (after the rowid check), else when the table
-    // record is built.
+    // OP_TypeCheck raises ABORT itself. Stored records are checked at the first
+    // applicable CHECK, index, or MakeRecord. Generated expression affinity
+    // has already checked the regular input columns and computed VIRTUAL values.
     let mut strict_pending = tbl.strict;
-    let strict_check = |raw_vals: &[Value]| -> Result<()> {
-        for (i, col) in tbl.columns.iter().enumerate() {
-            check_strict_column_type(&tbl.name, col, &raw_vals[i])?;
-        }
-        Ok(())
-    };
-    if strict_pending && tbl.columns.iter().any(|c| c.generated.is_some()) {
-        strict_check(&raw_vals)?;
-        strict_pending = false;
-    }
 
-    // 3. NOT NULL constraint check
-    for (i, col) in tbl.columns.iter().enumerate() {
-        if let Some(col_conflict) = col.not_null
-            && raw_vals[i].is_null()
-        {
-            let eff = stmt_conflict.unwrap_or(col_conflict);
-            match eff {
-                ConflictAction::Ignore => return Ok(None),
-                ConflictAction::Replace if col.default_expr.is_some() => {
-                    let dv = eval_expr(
-                        ctx,
-                        col.default_expr.as_ref().unwrap(),
-                        params,
-                        &[],
-                        &CteStore::default(),
-                        None,
-                    )?;
-                    if dv.is_null() {
-                        return Err(SqliteError::constraint(
-                            extended::SQLITE_CONSTRAINT_NOTNULL,
-                            format!("NOT NULL constraint failed: {}.{}", tbl.name, col.name),
-                        ));
-                    }
-                    let mut coerced = col.affinity.apply(dv);
-                    if tbl.strict
-                        && col.type_name.trim().eq_ignore_ascii_case("REAL")
-                        && let Value::Integer(iv) = coerced
-                    {
-                        coerced = Value::real(iv as f64);
-                    }
-                    raw_vals[i] = coerced;
-                }
-                _ => {
-                    return Err(SqliteError::constraint(
-                        extended::SQLITE_CONSTRAINT_NOTNULL,
-                        format!("NOT NULL constraint failed: {}.{}", tbl.name, col.name),
-                    )
-                    .with_conflict_effect(conflict_action_to_effect(eff)));
-                }
-            }
-        }
+    if !check_write_not_null(
+        ctx,
+        tbl,
+        &schema_name,
+        rowid,
+        &mut raw_vals,
+        stmt_conflict,
+        modified_cols,
+        params,
+    )? {
+        return Ok(None);
     }
 
     // 4. CHECK constraints (`NULL` or `true` passes in SQL; only `false` fails!)
     if !tbl.checks.is_empty() && !ctx.prepared_ignore_checks() {
         if strict_pending {
-            strict_check(&raw_vals)?;
+            check_strict_record(tbl, &raw_vals)?;
             strict_pending = false;
         }
         let eff = stmt_conflict.unwrap_or(ConflictAction::Abort);
@@ -21557,7 +21635,7 @@ fn validate_and_write_row_inner(
     }
 
     if strict_pending && (tbl.without_rowid || !indexes.is_empty()) {
-        strict_check(&raw_vals)?;
+        check_strict_record(tbl, &raw_vals)?;
         strict_pending = false;
     }
 
@@ -21703,7 +21781,7 @@ fn validate_and_write_row_inner(
     }
 
     if strict_pending {
-        strict_check(&raw_vals)?;
+        check_strict_record(tbl, &raw_vals)?;
     }
 
     // `addrRecheck` (`insert.c:2707-2725`): when `OR REPLACE` ran and `DELETE` triggers or FK actions
@@ -22361,6 +22439,7 @@ fn prepare_update_before_scope(
         pre_before_rowid,
         &mut before_new_vals,
         params,
+        false,
     )?;
     Ok(Some(make_runtime_table_pseudo_scope(
         tbl,
@@ -22437,6 +22516,7 @@ where
         new_vals,
         or_conflict,
         Some(old_key),
+        Some(modified_col_mask),
         params,
         false,
         mutation_dispatch,
@@ -25015,55 +25095,22 @@ fn prepare_proposed_insert_row(
         final_rowid.unwrap()
     };
 
-    apply_table_affinities_and_generated(ctx, tbl, schema_name, rowid, &mut raw_vals, params)?;
+    apply_table_affinities_and_generated(ctx, tbl, schema_name, rowid, &mut raw_vals, params, true)?;
 
-    if tbl.strict {
-        // `OP_TypeCheck` raises its error itself: no conflict clause applies (always ABORT).
-        for (i, col) in tbl.columns.iter().enumerate() {
-            check_strict_column_type(&tbl.name, col, &raw_vals[i])?;
-        }
+    if !check_write_not_null(
+        ctx,
+        tbl,
+        schema_name,
+        rowid,
+        &mut raw_vals,
+        stmt_conflict,
+        None,
+        params,
+    )? {
+        return Ok(None);
     }
-
-    for (i, col) in tbl.columns.iter().enumerate() {
-        if let Some(col_conflict) = col.not_null
-            && raw_vals[i].is_null()
-        {
-            let eff = stmt_conflict.unwrap_or(col_conflict);
-            match eff {
-                ConflictAction::Ignore => return Ok(None),
-                ConflictAction::Replace if col.default_expr.is_some() => {
-                    let dv = eval_expr(
-                        ctx,
-                        col.default_expr.as_ref().unwrap(),
-                        params,
-                        &[],
-                        &CteStore::default(),
-                        None,
-                    )?;
-                    if dv.is_null() {
-                        return Err(SqliteError::constraint(
-                            extended::SQLITE_CONSTRAINT_NOTNULL,
-                            format!("NOT NULL constraint failed: {}.{}", tbl.name, col.name),
-                        ));
-                    }
-                    let mut coerced = col.affinity.apply(dv);
-                    if tbl.strict
-                        && col.type_name.trim().eq_ignore_ascii_case("REAL")
-                        && let Value::Integer(iv) = coerced
-                    {
-                        coerced = Value::real(iv as f64);
-                    }
-                    raw_vals[i] = coerced;
-                }
-                _ => {
-                    return Err(SqliteError::constraint(
-                        extended::SQLITE_CONSTRAINT_NOTNULL,
-                        format!("NOT NULL constraint failed: {}.{}", tbl.name, col.name),
-                    )
-                    .with_conflict_effect(conflict_action_to_effect(eff)));
-                }
-            }
-        }
+    if tbl.strict {
+        check_strict_record(tbl, &raw_vals)?;
     }
 
     if !tbl.checks.is_empty() {
@@ -27202,6 +27249,7 @@ fn prepare_table_insert_row_before(
             before_rowid,
             &mut before_vals,
             params,
+            false,
         )?;
         Some(make_runtime_table_pseudo_scope(
             &p.tbl,
@@ -27236,6 +27284,7 @@ fn write_plain_table_insert_and_build_after_scope(
         explicit_rowid,
         col_vals,
         effective_or_conflict,
+        None,
         None,
         params,
         true,
@@ -31945,6 +31994,7 @@ fn exec_create_table_as(
             &[],
             None,
             row,
+            None,
             None,
             None,
             params,

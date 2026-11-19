@@ -727,3 +727,8 @@ UTF-8 ON tek sanal tablo SELECT hazırlığında program yeniden kullanılıyor.
 ## V6b.84 — Sanal tablo OR ve IN hazırlığı
 
 Seçilen UTF-8 ON OR ve IN programlarında hazırlama callback tekrarı kalktı. 1.080 odak dosyası ve 792 önceki kapsam dosyası C ile salt okunur açıldı. OFF 1186/1/337, ON 1177/10/337. DML OFF 383/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_84.md).
+
+
+## V6b.85 — STRICT ve NOT NULL kısıt sırası
+
+Yazma kısıtlarının C sırası ve NOT NULL REPLACE sonrası generated hesaplama uygulandı. Fiziksel dosya ve C açılışı her API ve kipte 162/162 eş. OFF DML dört vaka iyileşti. OFF 1186/1/337, ON 1177/10/337. DML OFF 387/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,256 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_85.md).
