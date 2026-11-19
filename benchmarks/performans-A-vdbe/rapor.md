@@ -1007,3 +1007,8 @@ Normal ileri rowid aralığı fiziksel karşılaştırıcıyı aynı aktif yazma
 ## V6b.140 — Karma indeksli rowid aralık DML ters sırası
 
 Hazırlanmış yönle ters aralık C Seek ve Prev davranışını kullanıyor. Her yönde 216 yazıcı ve 108 C/Rust tam dosya çifti eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,263 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_140.md).
+
+
+## V6b.141 — Tek hedefli SQL WAL çıkışında PERSIST_WAL
+
+WAL kapanışı VFS kararını ve boyut sınırını C gibi uyguluyor. 1.296 SQL geçişi, 72 bağlantı kapanışı ve 5.130 C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,281 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_141.md).

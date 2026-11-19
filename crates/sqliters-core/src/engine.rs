@@ -43477,7 +43477,7 @@ fn apply_journal_mode_on_slot(
             outcome?
         } else {
             ctx.busy_policy
-                .retry_btree(bt, |b| b.pager_mut().stage_sql_journal_mode(target))?
+                .retry_btree(bt, |b| b.pager_mut().stage_single_target_sql_journal_mode(target))?
         };
         if staged {
             ctx.stmt_tx.staged_journal_modes.push_unique(instance);

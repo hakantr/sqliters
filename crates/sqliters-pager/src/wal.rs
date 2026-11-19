@@ -2731,7 +2731,15 @@ impl Wal {
         sync_flags: Option<SyncFlags>,
         persist_wal: bool,
     ) -> Result<()> {
-        self.close_inner(db_file, sync_flags, persist_wal, None)
+        self.close_inner(db_file, sync_flags, persist_wal, WalClosePurpose::Internal)
+    }
+
+    pub(super) fn close_for_mode_switch(
+        self,
+        db_file: &dyn VfsFile,
+        sync_flags: Option<SyncFlags>,
+    ) -> Result<()> {
+        self.close_inner(db_file, sync_flags, false, WalClosePurpose::SqlModeSwitch)
     }
 
     pub(super) fn close_for_database(
@@ -2741,7 +2749,7 @@ impl Wal {
         persist_wal: bool,
         checkpoint_on_close: bool,
     ) -> Result<()> {
-        self.close_inner(db_file, sync_flags, persist_wal, Some(checkpoint_on_close))
+        self.close_inner(db_file, sync_flags, persist_wal, WalClosePurpose::Database { checkpoint: checkpoint_on_close })
     }
 
     fn close_inner(
@@ -2749,17 +2757,17 @@ impl Wal {
         db_file: &dyn VfsFile,
         sync_flags: Option<SyncFlags>,
         persist_wal: bool,
-        checkpoint_on_database_close: Option<bool>,
+        purpose: WalClosePurpose,
     ) -> Result<()> {
         let _ = self.end_read_transaction();
 
         let mut is_delete = false;
         let mut first_err: Option<SqliteError> = None;
 
-        if checkpoint_on_database_close.unwrap_or(true)
+        if !matches!(purpose, WalClosePurpose::Database { checkpoint: false })
             && self.read_only_flags == WAL_RDWR && !self.immutable
         {
-            let database_close = checkpoint_on_database_close.is_some();
+            let database_close = matches!(purpose, WalClosePurpose::Database { .. });
             let prev_lock = db_file.lock_level();
             let got_exclusive = if prev_lock >= sqliters_vfs::LockLevel::Exclusive {
                 true
@@ -2788,7 +2796,8 @@ impl Wal {
                 match self.checkpoint(db_file, WalCheckpointMode::Passive, None, sync_flags, None) {
                     Ok((res, _)) if !res.busy => {
                         let mut mode = -1;
-                        let persist_wal = if database_close && db_file.persist_wal_mode(&mut mode).is_some() {
+                        let persist_wal = if !matches!(purpose, WalClosePurpose::Internal)
+                            && db_file.persist_wal_mode(&mut mode).is_some() {
                             mode == 1
                         } else {
                             persist_wal
@@ -2838,4 +2847,11 @@ impl Wal {
             None => Ok(()),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum WalClosePurpose {
+    Internal,
+    Database { checkpoint: bool },
+    SqlModeSwitch,
 }

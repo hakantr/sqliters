@@ -3728,7 +3728,8 @@ impl Vfs for OsVfs {
         }
         #[cfg(not(unix))]
         match fs::metadata(path) {
-            Ok(_) => Ok(true),
+            // winAccess (os_win.c:4655–4663) uses the reported size for EXISTS.
+            Ok(meta) => Ok(meta.len() != 0),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
             Err(e) => Err(SqliteError::with_extended(
                 extended::SQLITE_IOERR_ACCESS,

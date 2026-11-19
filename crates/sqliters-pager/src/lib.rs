@@ -2435,7 +2435,7 @@ impl Pager {
     ///
     /// If `LockLevel::Exclusive` cannot be obtained due to active readers/writers, returns
     /// `ErrorCode::Busy` WITHOUT closing `self.wal`!
-    fn close_wal_for_mode_switch(&mut self) -> Result<()> {
+    fn close_wal_for_mode_switch(&mut self, honor_persistence: bool) -> Result<()> {
         let acquired_shared = self.wal.is_none() && self.db_file()?.lock_level() == LockLevel::NoLock;
         if self.wal.is_none() {
             self.lock_db_file(LockLevel::Shared)?;
@@ -2466,7 +2466,11 @@ impl Pager {
             let wal = self.wal.take().expect("checked Some");
             let close_res = {
                 let db_f = self.db_file()?;
-                wal.close(db_f, ckpt_sync, false)
+                if honor_persistence {
+                    wal.close_for_mode_switch(db_f, ckpt_sync)
+                } else {
+                    wal.close(db_f, ckpt_sync, false)
+                }
             };
             if let Err(e) = close_res {
                 if self.locking_mode == LockingMode::Normal {
@@ -2521,13 +2525,23 @@ impl Pager {
     /// in `pager.c:7437`), performing rollback-journaled Page 1 `(1, 1) <-> (2, 2)` transitions
     /// when switching into or out of [`JournalMode::Wal`].
     pub fn set_journal_mode(&mut self, mode: JournalMode) -> Result<JournalMode> {
-        self.change_journal_mode(mode, false)
+        self.change_journal_mode(mode, false, false)
     }
 
     /// Prepares a SQL mode change whose page-one transaction
     /// is completed by the statement's normal commit outcome.
     #[doc(hidden)]
     pub fn stage_sql_journal_mode(&mut self, mode: JournalMode) -> Result<(JournalMode, bool)> {
+        self.stage_journal_mode(mode, false)
+    }
+
+    /// Stages a mode change targeting one SQL database, including its WAL persistence policy.
+    #[doc(hidden)]
+    pub fn stage_single_target_sql_journal_mode(&mut self, mode: JournalMode) -> Result<(JournalMode, bool)> {
+        self.stage_journal_mode(mode, true)
+    }
+
+    fn stage_journal_mode(&mut self, mode: JournalMode, single_target: bool) -> Result<(JournalMode, bool)> {
         let touches_volatile_journal = matches!(mode, JournalMode::Memory | JournalMode::Off)
             || matches!(self.journal_mode, JournalMode::Memory | JournalMode::Off);
         let defer = self.state == TransactionState::Open
@@ -2542,7 +2556,9 @@ impl Pager {
                     | (JournalMode::Wal, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate
                         | JournalMode::Memory | JournalMode::Off)
             );
-        let active = self.change_journal_mode(mode, defer)?;
+        let honor_persistence = single_target && defer && self.locking_mode == LockingMode::Normal
+            && matches!(mode, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate);
+        let active = self.change_journal_mode(mode, defer, honor_persistence)?;
         Ok((active, defer && self.pending_sql_journal_mode.is_some()))
     }
 
@@ -2568,7 +2584,7 @@ impl Pager {
         Ok(())
     }
 
-    fn change_journal_mode(&mut self, mode: JournalMode, defer: bool) -> Result<JournalMode> {
+    fn change_journal_mode(&mut self, mode: JournalMode, defer: bool, honor_persistence: bool) -> Result<JournalMode> {
         self.ensure_not_closed()?;
 
         if !self.ok_to_change_journal_mode() {
@@ -2670,7 +2686,7 @@ impl Pager {
                 ));
             }
 
-            self.close_wal_for_mode_switch()?;
+            self.close_wal_for_mode_switch(honor_persistence)?;
             if std::mem::take(&mut self.dv_wal_page1_written) {
                 // `sqlite3PagerSharedLock` of the header rewrite below: the database file now
                 // carries the page 1 this connection committed through the WAL, which is not
@@ -2692,6 +2708,14 @@ impl Pager {
             self.pcache_reset();
 
             let step_res: Result<()> = (|| {
+                if honor_persistence
+                    && let Some(wal_path) = self.wal_path.as_deref()
+                    && self.vfs.exists(wal_path)?
+                {
+                    // pagerOpenWalIfPresent reattaches a non-empty retained WAL while BtreeSetVersion
+                    // suppresses reopening from the page-one format bytes alone.
+                    self.open_wal_under_shared_lock()?;
+                }
                 self.begin_read()?;
                 if self.page_count > 0
                     && (self.header.write_version != 1 || self.header.read_version != 1)
@@ -5280,8 +5304,10 @@ impl Pager {
                 if must_write_p1 {
                     self.dv_wal_page1_written = true;
                     let p1_slot = self.mark_page_writable(1)?;
-                    self.header.write_version = 2;
-                    self.header.read_version = 2;
+                    if !self.pending_sql_journal_mode.is_some_and(|transition| transition.previous == JournalMode::Wal) {
+                        self.header.write_version = 2;
+                        self.header.read_version = 2;
+                    }
                     self.header.database_size_pages = self.page_count;
                     if !self.change_counter_bumped {
                         // `pagerWalFrames` → `pager_write_changecounter`: `dbFileVers + 1`.
@@ -5544,6 +5570,10 @@ impl Pager {
             TransactionState::Write => {
                 if self.use_wal() {
                     self.wal.as_mut().expect("use_wal checked").end_write_transaction()?;
+                    if let Some(transition) = self.pending_sql_journal_mode.take() {
+                        self.journal_mode = transition.target;
+                        self.suppress_auto_wal = false;
+                    }
                     self.cache.clean_all();
                     self.cache.truncate(self.page_count);
                     self.set_super = false;
