@@ -2570,8 +2570,10 @@ impl Pager {
                 self.commit_phase_one(None)?;
                 // OP_JournalMode publishes WAL before the header commit is finalized.
                 // The rollback journal protects the page writes and is then removed.
-                let remove_transition_journal = saved_mode == JournalMode::Delete
-                    && self.locking_mode == LockingMode::Exclusive;
+                let remove_transition_journal = matches!(
+                    saved_mode,
+                    JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate
+                ) && self.locking_mode == LockingMode::Exclusive;
                 self.commit_phase_two_with_journal_cleanup(false, false, remove_transition_journal)
             })();
 

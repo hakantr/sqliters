@@ -767,3 +767,8 @@ Unary artı altındaki ad çözümlemesi ve kolasyon C ile hizalandı. 132 hedef
 ## V6b.92 — EXCLUSIVE DELETE→WAL journal sonlandırması
 
 EXCLUSIVE geçişinde rollback journalı commit sonunda C ile aynı sınırda kaldırıldı. 240 sağlıklı geçiş ve 54 normal RESTART guard doğrulandı. OFF 1186/1/337, ON 1177/10/337. DML OFF 387/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,257 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_92.md).
+
+
+## V6b.93 — EXCLUSIVE PERSIST ve TRUNCATE→WAL sonlandırması
+
+Geçiş commit'i rollback journalı C ile aynı sınırda kaldırıyor. 240 sağlıklı geçiş, 120 DELETE/WAL koruması ve C yeniden açılışları eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 387/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 0,844 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_93.md).
