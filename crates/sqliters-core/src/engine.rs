@@ -29011,7 +29011,21 @@ fn prepare_update_exec<'a>(
                 None
             };
 
-            let (view_out, _, _) = eval_view_query_output(ctx, db_id, &view, &CteStore::default())?;
+            let selection = upd.selection.as_ref().filter(|_| {
+                upd.from.is_none()
+                    && upd.alias.is_none()
+                    && upd.indexed_by.is_none()
+                    && upd.ctes.is_empty()
+                    && upd.returning.is_empty()
+            });
+            let narrowed =
+                view_dml_range_select(ctx, db_id, &view, selection, outer_scopes, &col_specs);
+            let (view_out, _, _) = eval_view_query_output(
+                ctx,
+                db_id,
+                narrowed.as_ref().unwrap_or(&view),
+                &CteStore::default(),
+            )?;
             let rows = if let Some(ref from_rows) = from_rows_opt {
                 if has_set_agg {
                     let mut matched_old: Vec<Vec<Value>> = Vec::new();
@@ -30587,21 +30601,22 @@ struct PreparedVTabDelete {
     ret_expanded: Vec<(Expr, String, Option<String>)>,
 }
 
-// delete.c:sqlite3MaterializeView copies the DELETE predicate into its
+// sqlite3MaterializeView copies the UPDATE or DELETE predicate into the
 // ephemeral SELECT. Its scan order becomes the INSTEAD OF trigger input order.
 // Copy a side-effect-free range over a directly projected column to the view's
 // existing SELECT so the normal access planner can choose the range scan.
-fn view_delete_range_select(
-    db_set: &DatabaseSet,
+fn view_dml_range_select(
+    ctx: &ExecContext<'_>,
+    db_id: DatabaseId,
     view: &ViewSchema,
-    del: &DeleteStmt,
+    selection: Option<&Expr>,
+    outer_scopes: &[EvalRow],
     col_specs: &[(String, Collation, Option<TypeAffinity>)],
 ) -> Option<ViewSchema> {
-    if del.alias.is_some()
-        || del.indexed_by.is_some()
-        || !del.ctes.is_empty()
-        || !del.returning.is_empty()
-        || db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0
+    if db_id != DatabaseId::MAIN
+        || !outer_scopes.is_empty()
+        || ctx.in_trigger_program()
+        || ctx.db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0
         || !view.select.ctes.is_empty()
         || !view.select.body.compounds.is_empty()
         || !view.select.order_by.is_empty()
@@ -30613,7 +30628,7 @@ fn view_delete_range_select(
         left,
         op: op @ (BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge),
         right,
-    } = del.selection.as_ref()?
+    } = selection?
     else {
         return None;
     };
@@ -30659,7 +30674,7 @@ fn view_delete_range_select(
         return None;
     }
 
-    let schema = &db_set.main_slot().schema;
+    let schema = &ctx.db_set.main_slot().schema;
     let table = schema.find_user_table(&name.name)?;
     if table.without_rowid
         || table.stat1.has_stat1
@@ -30782,14 +30797,14 @@ fn prepare_delete_exec(
                 ctx.functions,
                 &mut Vec::new(),
             )?;
-            let narrowed = if db_id == DatabaseId::MAIN
-                && outer_scopes.is_empty()
-                && !ctx.in_trigger_program()
-            {
-                view_delete_range_select(ctx.db_set, &view, del, &col_specs)
-            } else {
-                None
-            };
+            let selection = del.selection.as_ref().filter(|_| {
+                del.alias.is_none()
+                    && del.indexed_by.is_none()
+                    && del.ctes.is_empty()
+                    && del.returning.is_empty()
+            });
+            let narrowed =
+                view_dml_range_select(ctx, db_id, &view, selection, outer_scopes, &col_specs);
             let (view_out, _, _) = eval_view_query_output(
                 ctx,
                 db_id,

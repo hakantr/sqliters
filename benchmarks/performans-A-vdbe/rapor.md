@@ -787,3 +787,8 @@ WAL çıkışında geçici DELETE journal commit sonunda kaldırılıyor. 480 te
 ## V6b.96 — Görünüm DELETE INSTEAD OF trigger sırası
 
 Basit sayısal aralık C görünüm materialization sırasıyla hizalandı. OFF DML bir vaka daha eş ve ana tablo içerikleri korundu. OFF 1186/1/337, ON 1177/10/337. DML OFF 388/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,260 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_96.md).
+
+
+## V6b.97 — Görünüm UPDATE INSTEAD OF trigger sırası
+
+Görünüm aralık denetimi ortaktır, ana tablo ve trigger log dosyaları C ile hizalandı. 288 UPDATE ve 282 önceki DELETE grubu doğrulandı. OFF 1186/1/337, ON 1177/10/337. DML OFF 388/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_97.md).
