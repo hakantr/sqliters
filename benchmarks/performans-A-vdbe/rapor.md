@@ -1067,3 +1067,8 @@ Açık WAL veya disk journal olmadan NORMAL NamedDisk kapanışı C gibi termina
 ## V6b.152 — Karma indeksli sıralı INSERT SELECT
 
 Açık hedef sütunlarıyla ayrı MAIN tablosundan rowid sıralı normal ekleme mevcut fiziksel düzeni korur. 144 yazıcı rollback ve 432 C/OFF/ON açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_152.md).
+
+
+## V6b.153 — OFF kapanışında terminal NO_LOCK
+
+İzinli OFF NamedDisk normal kapanışında C terminal NO_LOCK sırası korunur. 180 OFF, 1.026 koruma ve 4.752 salt okunur açılış eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_153.md).
