@@ -55,7 +55,7 @@ pub use sqliters_types::{
 };
 use sqliters_types::{
     ConflictResolutionEffect, DatabaseKind, ErrorCode, LockGeometry, Pgno, RawFieldSpan,
-    RecordPart, Result, SQLITE_DEFAULT_PAGE_SIZE, SqliteError, TextEncoding, TypeAffinity, Value,
+    RecordPart, Result, SQLITE_DEFAULT_PAGE_SIZE, SQLITE_MAX_LENGTH, SqliteError, TextEncoding, TypeAffinity, Value,
     encode_record_parts_into, encode_value_refs_record_into, extended,
     locate_roundtrip_stable_fields,
 };
@@ -8559,14 +8559,7 @@ impl Statement {
         Ok(())
     }
 
-    fn bind_one_in_session(
-        &mut self,
-        inner: &ConnectionInner,
-        index_1_based: usize,
-        value: Value,
-    ) -> Result<()> {
-        inner.ensure_usable()?;
-        self.ensure_ready_for_bind()?;
+    fn bind_slot(&mut self, index_1_based: usize) -> Result<&mut Value> {
         if index_1_based == 0 || index_1_based > self.params.len() {
             return Err(SqliteError::new(
                 ErrorCode::Range,
@@ -8574,12 +8567,39 @@ impl Statement {
             ));
         }
         self.expire_for_binding(index_1_based);
-        self.params[index_1_based - 1] = value;
+        Ok(&mut self.params[index_1_based - 1])
+    }
+
+    fn check_bind_size(slot: &mut Value, len: usize) -> Result<()> {
+        if len > SQLITE_MAX_LENGTH {
+            // C vdbeUnbind clears the old value before validating the new payload.
+            *slot = Value::Null;
+            return Err(SqliteError::new(ErrorCode::TooBig, "string or blob too big"));
+        }
         Ok(())
     }
 
-    fn bind_all_in_session(&mut self, inner: &ConnectionInner, values: &[Value]) -> Result<()> {
-        inner.ensure_usable()?;
+    fn set_bound_value(&mut self, index_1_based: usize, value: impl Into<Value>) -> Result<()> {
+        let slot = self.bind_slot(index_1_based)?;
+        let value = value.into();
+        Self::check_bind_size(slot, value.as_bytes().map_or(0, <[u8]>::len))?;
+        *slot = value;
+        Ok(())
+    }
+
+    fn set_bound_text(&mut self, index_1_based: usize, text: &str) -> Result<()> {
+        let slot = self.bind_slot(index_1_based)?;
+        Self::check_bind_size(slot, text.len())?;
+        if let Value::Text(buffer) = slot {
+            buffer.clear();
+            buffer.push_str(text);
+        } else {
+            *slot = Value::Text(text.to_owned());
+        }
+        Ok(())
+    }
+
+    fn set_bound_values(&mut self, values: &[Value]) -> Result<()> {
         self.ensure_ready_for_bind()?;
         if values.len() > self.params.len() {
             return Err(SqliteError::new(
@@ -8593,9 +8613,16 @@ impl Statement {
         }
         for (i, v) in values.iter().enumerate() {
             self.expire_for_binding(i + 1);
-            self.params[i] = v.clone();
+            let slot = &mut self.params[i];
+            Self::check_bind_size(slot, v.as_bytes().map_or(0, <[u8]>::len))?;
+            *slot = v.clone();
         }
         Ok(())
+    }
+
+    fn bind_all_in_session(&mut self, inner: &ConnectionInner, values: &[Value]) -> Result<()> {
+        inner.ensure_usable()?;
+        self.set_bound_values(values)
     }
 
     #[inline]
@@ -8612,19 +8639,14 @@ impl Statement {
     pub fn bind(&mut self, index_1_based: usize, value: impl Into<Value>) -> Result<&mut Self> {
         if self.can_fast_bind() {
             self.ensure_ready_for_bind()?;
-            if index_1_based == 0 || index_1_based > self.params.len() {
-                return Err(SqliteError::new(
-                    ErrorCode::Range,
-                    format!("column/bind index {index_1_based} out of range"),
-                ));
-            }
-            self.expire_for_binding(index_1_based);
-            self.params[index_1_based - 1] = value.into();
+            self.set_bound_value(index_1_based, value)?;
             return Ok(self);
         }
         let shared = Arc::clone(&self.shared);
         let session = shared.enter()?;
-        self.bind_one_in_session(session.inner(), index_1_based, value.into())?;
+        session.inner().ensure_usable()?;
+        self.ensure_ready_for_bind()?;
+        self.set_bound_value(index_1_based, value)?;
         drop(session);
         Ok(self)
     }
@@ -8635,23 +8657,16 @@ impl Statement {
     pub fn bind_text(&mut self, index_1_based: usize, text: &str) -> Result<&mut Self> {
         if self.can_fast_bind() {
             self.ensure_ready_for_bind()?;
-            if index_1_based == 0 || index_1_based > self.params.len() {
-                return Err(SqliteError::new(
-                    ErrorCode::Range,
-                    format!("column/bind index {index_1_based} out of range"),
-                ));
-            }
-            self.expire_for_binding(index_1_based);
-            let slot = &mut self.params[index_1_based - 1];
-            if let Value::Text(s) = slot {
-                s.clear();
-                s.push_str(text);
-            } else {
-                *slot = Value::Text(text.to_owned());
-            }
+            self.set_bound_text(index_1_based, text)?;
             return Ok(self);
         }
-        self.bind(index_1_based, text)
+        let shared = Arc::clone(&self.shared);
+        let session = shared.enter()?;
+        session.inner().ensure_usable()?;
+        self.ensure_ready_for_bind()?;
+        self.set_bound_text(index_1_based, text)?;
+        drop(session);
+        Ok(self)
     }
 
     /// Binds a named parameter (`:name`, `@name`, or `$name`).
@@ -8666,8 +8681,7 @@ impl Statement {
                     format!("unknown bind parameter: {name}"),
                 ));
             };
-            self.expire_for_binding(idx);
-            self.params[idx - 1] = value.into();
+            self.set_bound_value(idx, value)?;
             return Ok(self);
         }
         let shared = Arc::clone(&self.shared);
@@ -8680,8 +8694,7 @@ impl Statement {
                 format!("unknown bind parameter: {name}"),
             ));
         };
-        self.expire_for_binding(idx);
-        self.params[idx - 1] = value.into();
+        self.set_bound_value(idx, value)?;
         drop(session);
         Ok(self)
     }
@@ -8691,21 +8704,7 @@ impl Statement {
     #[inline]
     pub fn bind_all(&mut self, values: &[Value]) -> Result<&mut Self> {
         if self.can_fast_bind() {
-            self.ensure_ready_for_bind()?;
-            if values.len() > self.params.len() {
-                return Err(SqliteError::new(
-                    ErrorCode::Range,
-                    format!(
-                        "bind_all supplied {} values for {} parameters",
-                        values.len(),
-                        self.params.len()
-                    ),
-                ));
-            }
-            for (i, v) in values.iter().enumerate() {
-                self.expire_for_binding(i + 1);
-                self.params[i] = v.clone();
-            }
+            self.set_bound_values(values)?;
             return Ok(self);
         }
         let shared = Arc::clone(&self.shared);

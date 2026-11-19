@@ -2322,7 +2322,12 @@ fn bind_tcl_sql_parameters(stmt: &mut Statement, interp: &TclInterp) -> Result<(
                 } else {
                     tcl_string_to_sqlite_value(&tcl_str)
                 };
-                stmt.bind(pidx, bound_val)?;
+                // dbPrepareAndBind continues with NULL after sqlite3_bind_* returns TOOBIG.
+                if let Err(err) = stmt.bind(pidx, bound_val)
+                    && err.code != ErrorCode::TooBig
+                {
+                    return Err(err);
+                }
             } else {
                 stmt.bind(pidx, Value::Null)?;
             }

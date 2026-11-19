@@ -677,3 +677,8 @@ Legacy yazma ve bütünlük denetimi, C gibi CHECK bayrağını hazırlamada al�
 ## V6b.74 — E28 Pager ERROR sözleşmesi
 
 F14 ve F15 testleri C'nin kayıtlı genişletilmiş hata kodlarını, aynı bağlantıdan tekrar okuma ve yazılabilir yeniden açılışta kalıcı değeri denetliyor. Üretim kaynakları aynı. OFF 1181/1/337, ON 1169/13/337. DML ve ayrışma bulucu V6b.73 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,260 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_74.md).
+
+
+## V6b.75 — D50 bağlama boyutu ve SQL source-id
+
+Varsayılan TEXT/BLOB bağlama sınırı C gibi uygulanıyor. Bind rc18 ve NULL parametre bırakıyor. Aynı Tcl testi ve SQL source-id iki kipte C ile aynı. 24 küçük sınır dosyası, 18 source-id yazma ve C yeniden açılışı eş. OFF 1181/1/337, ON 1170/12/337. DML ve ayrışma bulucu V6b.74 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,254 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_75.md).

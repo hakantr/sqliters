@@ -950,7 +950,10 @@ fn eval_scalar_function_plain(
         }
         "SQLITE_SOURCE_ID" => {
             check_arity(name, args, 0, 0)?;
-            Ok(Value::Text(SQLITE_SOURCE_ID.to_owned()))
+            let source_id = SQLITE_SOURCE_ID
+                .strip_suffix(" (sqliters)")
+                .unwrap_or(SQLITE_SOURCE_ID);
+            Ok(Value::Text(source_id.to_owned()))
         }
         "LAST_INSERT_ROWID" => {
             check_arity(name, args, 0, 0)?;

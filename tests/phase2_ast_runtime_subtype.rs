@@ -1508,8 +1508,8 @@ fn group46_65_inline_shortcircuit_star_arg_and_custom_collation_regressions() {
         }
     }
     for sql in [
-        "SELECT typeof(random(*)), sqlite_version(*);",
-        "WITH c AS (SELECT 1) SELECT typeof(random(*)), sqlite_version(*) FROM c;",
+        "SELECT typeof(random(*)), sqlite_version(*), sqlite_source_id(*), sqlite_source_id();",
+        "WITH c AS (SELECT 1) SELECT typeof(random(*)), sqlite_version(*), sqlite_source_id(*), sqlite_source_id() FROM c;",
     ] {
         let expected = run_c_sql(sql).expect(sql);
         let actual = run_rust_script(&conn, sql).expect(sql);
