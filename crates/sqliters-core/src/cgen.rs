@@ -735,6 +735,11 @@ fn schema_dump_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("SQLITERS_CG_SCHEMADUMP").is_some())
 }
 
+/// Keep the regular codegen path when a prepare diagnostic dump was requested.
+pub(crate) fn prepare_dump_requested(sql: &str) -> bool {
+    where_dump_on() || (schema_dump_on() && sql.contains("/*#schemadump*/"))
+}
+
 /// True if the `SQLITERS_CG_WHEREDUMP` environment variable is set.
 fn where_dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

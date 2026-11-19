@@ -5525,22 +5525,87 @@ fn select_schema_use_of(inner: &ConnectionInner, stmt: &Stmt, sql: &str) -> Opti
 /// Preserve C's missing-collation and function diagnostics that legacy validation
 /// can defer or lose, including the original operator spelling and byte offset.
 fn check_c_prepare_error(
-    inner: &mut ConnectionInner, usage: Option<&cgen::SelectSchemaUse>, sql: &str,
-) -> Result<()> {
-    if !usage.is_some_and(|u| u.btree_mask.is_none()) { return Ok(()); }
+    inner: &mut ConnectionInner,
+    stmt: Option<&Stmt>,
+    usage: Option<&cgen::SelectSchemaUse>,
+    sql: &str,
+) -> Result<Option<Box<sqliters_vdbe::vdbeaux::Program>>> {
+    if !usage.is_some_and(|u| u.btree_mask.is_none()) {
+        return Ok(None);
+    }
     let (result, _, _) = cgen::c_prepare_quiet(inner, sql);
     apply_codegen_pragma_effects(inner)?;
-    if let sqliters_codegen::PrepareResult::Error { code, message, offset } = result
-        && (code == sqliters_types::extended::SQLITE_ERROR_MISSING_COLLSEQ
-            || message.eq_ignore_ascii_case("wrong number of arguments to function sqlite_compileoption_get()")
-            || message.eq_ignore_ascii_case("wrong number of arguments to function sqlite_compileoption_used()")
-            || message.eq_ignore_ascii_case("no such function: regexp")
-            || message.eq_ignore_ascii_case("wrong number of arguments to function regexp()"))
-    {
-        return Err(SqliteError::with_extended(code, message)
-            .with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }));
+    match result {
+        sqliters_codegen::PrepareResult::Error { code, message, offset }
+            if code == sqliters_types::extended::SQLITE_ERROR_MISSING_COLLSEQ
+                || message.eq_ignore_ascii_case("wrong number of arguments to function sqlite_compileoption_get()")
+                || message.eq_ignore_ascii_case("wrong number of arguments to function sqlite_compileoption_used()")
+                || message.eq_ignore_ascii_case("no such function: regexp")
+                || message.eq_ignore_ascii_case("wrong number of arguments to function regexp()") =>
+        {
+            Err(SqliteError::with_extended(code, message)
+                .with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }))
+        }
+        sqliters_codegen::PrepareResult::Program(prog)
+            if vdbe_host::exec_switch_on()
+                && inner.effective_encoding() == TextEncoding::Utf8
+                && !cgen::prepare_dump_requested(sql)
+                && is_single_vtab_scan_select(stmt, &prog) =>
+        {
+            Ok(Some(prog))
+        }
+        _ => Ok(None),
     }
-    Ok(())
+}
+
+/// The error-checking prepare already generated the machine program for this
+/// simple scan of a connected virtual table. Reuse it within this prepare
+/// attempt so the module's planning callback runs only once.
+fn is_single_vtab_scan_select(
+    stmt: Option<&Stmt>,
+    prog: &sqliters_vdbe::vdbeaux::Program,
+) -> bool {
+    use sqliters_syntax::ast::{BinaryOp, Expr, ResultColumn, SelectCore, TableOrSubquery};
+    use sqliters_vdbe::opcodes::{OP_VFilter, OP_VOpen};
+
+    let Some(Stmt::Select(select)) = stmt else {
+        return false;
+    };
+    let SelectCore::Select {
+        distinct: false,
+        from: Some(from),
+        projection,
+        selection,
+        group_by,
+        having,
+        windows,
+    } = &select.body.head else {
+        return false;
+    };
+    let operand = |expr: &Expr| {
+        matches!(expr, Expr::Column(_) | Expr::Integer(_) | Expr::Bool(_) | Expr::Null)
+    };
+    select.ctes.is_empty()
+        && select.body.compounds.is_empty()
+        && select.limit.is_none()
+        && from.joins.is_empty()
+        && matches!(from.head, TableOrSubquery::Table { table_args: None, indexed_by: None, .. })
+        && group_by.is_empty()
+        && having.is_none()
+        && windows.is_empty()
+        && projection.iter().all(|rc| {
+            matches!(rc, ResultColumn::Expr { expr, .. } if operand(expr))
+        })
+        && selection.as_ref().is_none_or(|expr| {
+            matches!(expr, Expr::Binary { left, op: BinaryOp::Eq | BinaryOp::Is | BinaryOp::IsNot, right }
+                if operand(left) && operand(right))
+        })
+        && select.order_by.iter().all(|term| {
+            matches!(term.expr, Expr::Column(_)) && term.nulls_last.is_none()
+        })
+        && prog.n_var == 0
+        && prog.a_op.iter().filter(|op| op.opcode == OP_VOpen).count() == 1
+        && prog.a_op.iter().filter(|op| op.opcode == OP_VFilter).count() == 1
 }
 
 fn apply_select_schema_use(artifacts: &mut CompiledArtifacts, usage: Option<&cgen::SelectSchemaUse>) {
@@ -7858,6 +7923,7 @@ impl Statement {
         is_explain: bool,
         has_like: bool,
         bound_values: Option<&[Value]>,
+        prepared_vtab: Option<Box<sqliters_vdbe::vdbeaux::Program>>,
     ) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
         if is_explain || artifacts.category != Some(StmtCategory::Read) {
             return Ok(None);
@@ -7865,7 +7931,9 @@ impl Statement {
         let result = if has_like {
             vdbe_host::like_machine_program(inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param, bound_values)
         } else if vdbe_host::exec_switch_on() {
-            vdbe_host::machine_program(inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param)
+            vdbe_host::machine_program_with_prepare(
+                inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param, prepared_vtab,
+            )
         } else {
             vdbe_host::locking_mode_table_read_program(
                 inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param,
@@ -8114,7 +8182,8 @@ impl Statement {
             }
         }
 
-        check_c_prepare_error(inner, select_schema_use.as_ref(), &raw_sql)?;
+        let prepared_vtab =
+            check_c_prepare_error(inner, stmt_opt.as_ref(), select_schema_use.as_ref(), &raw_sql)?;
 
         if c_first_load {
             // sqlite3Init() -> sqlite3AnalysisLoad() on fresh schema objects
@@ -8367,7 +8436,7 @@ impl Statement {
             apply_data_free_program(&mut artifacts, &program);
             Some(program)
         } else {
-            Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some(), select_schema_use.as_ref().is_some_and(|u| u.has_like), None)?
+            Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some(), select_schema_use.as_ref().is_some_and(|u| u.has_like), None, prepared_vtab)?
                 .or_else(|| schema_free_fallback.into_inner())
         };
         if let Some(out) = &c_prepared_pragma {
@@ -9053,7 +9122,9 @@ impl Statement {
                     let _ = inner.ensure_schemas_loaded_for_prepare(false)?;
                 }
             }
-            check_c_prepare_error(inner, select_schema_use.as_ref(), &self.raw_sql)?;
+            let prepared_vtab = check_c_prepare_error(
+                inner, parsed_stmt.as_ref(), select_schema_use.as_ref(), &self.raw_sql,
+            )?;
             let (parsed_stmt, c_explain) = match parsed_stmt {
                 None if cgen::is_explain(&self.raw_sql) => match cgen::c_explain_bound(inner, &self.raw_sql, &self.params) {
                     cgen::CExplain::Program(prog) => {
@@ -9149,7 +9220,7 @@ impl Statement {
                 apply_data_free_program(&mut artifacts, &program);
                 Some(program)
             } else {
-                Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some(), select_schema_use.as_ref().is_some_and(|u| u.has_like), Some(&self.params))?
+                Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some(), select_schema_use.as_ref().is_some_and(|u| u.has_like), Some(&self.params), prepared_vtab)?
                     .or(schema_free_fallback)
             };
             if let Some(prog) = &c_write

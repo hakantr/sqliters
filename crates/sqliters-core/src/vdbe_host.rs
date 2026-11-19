@@ -95,10 +95,20 @@ pub(crate) fn machine_program(
     raw_sql: &str,
     n_param: usize,
 ) -> Result<Option<Arc<Program>>> {
+    machine_program_with_prepare(inner, stmt, raw_sql, n_param, None)
+}
+
+pub(crate) fn machine_program_with_prepare(
+    inner: &ConnectionInner,
+    stmt: Option<&Stmt>,
+    raw_sql: &str,
+    n_param: usize,
+    prepared: Option<Box<Program>>,
+) -> Result<Option<Arc<Program>>> {
     if !exec_switch_on() {
         return Ok(None);
     }
-    read_machine_program(inner, stmt, raw_sql, n_param, false, false, None)
+    read_machine_program(inner, stmt, raw_sql, n_param, false, false, None, prepared)
 }
 
 /// A materialized legacy read cannot hold the page that C has at ResultRow. Use the
@@ -186,7 +196,7 @@ pub(crate) fn mapped_table_read_program(
 pub(crate) fn like_machine_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, bound_values: Option<&[Value]>,
 ) -> Result<Option<Arc<Program>>> {
-    read_machine_program(inner, stmt, raw_sql, n_param, false, true, bound_values)
+    read_machine_program(inner, stmt, raw_sql, n_param, false, true, bound_values, None)
 }
 
 /// A read rejected by legacy validation despite C eliminating its table source.
@@ -196,7 +206,7 @@ pub(crate) fn like_machine_program(
 pub(crate) fn schema_free_read_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize,
 ) -> Result<Option<Arc<Program>>> {
-    read_machine_program(inner, stmt, raw_sql, n_param, true, false, None)
+    read_machine_program(inner, stmt, raw_sql, n_param, true, false, None, None)
 }
 
 /// The C planner orders explicit WHERE terms before implicit table-function
@@ -229,7 +239,7 @@ pub(crate) fn locking_mode_table_read_program(
     {
         return Ok(None);
     }
-    Ok(read_machine_program(inner, stmt, sql, n_param, false, false, None)?.filter(|program| {
+    Ok(read_machine_program(inner, stmt, sql, n_param, false, false, None, None)?.filter(|program| {
         use sqliters_vdbe::opcodes::{OP_OpenRead, OP_ReopenIdx, OP_VOpen};
 
         !program.a_op.iter().any(|op| {
@@ -243,8 +253,10 @@ pub(crate) fn locking_mode_table_read_program(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_machine_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, schema_free: bool, like_only: bool, bound_values: Option<&[Value]>,
+    precompiled: Option<Box<Program>>,
 ) -> Result<Option<Arc<Program>>> {
     if !matches!(stmt, Some(Stmt::Select(_))) {
         return Ok(None);
@@ -276,7 +288,7 @@ fn read_machine_program(
             result => Some(result),
         }
     } else {
-        None
+        precompiled.map(PrepareResult::Program)
     };
     if inner.effective_encoding() != TextEncoding::Utf8 && !like_only {
         trace("fallback: UTF-16 database", raw_sql);

@@ -717,3 +717,8 @@ Dar aday, ölçülen STORED WITHOUT ROWID taramasında C'nin eş maliyet sıras�
 ## V6b.82 — DEFAULT VALUES ve tek satırlı FOREIGN KEY
 
 Default değerlerle tek satır yazan INSERT, C'nin immediate FOREIGN KEY kararıyla uyumlu. 216 fiziksel karşılaştırma her kipte eş. 36 işlem kapanışında hatalı kayıt kalıcı dosyaya geçmiyor. OFF DML bir vaka daha eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 383/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,262 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_82.md).
+
+
+## V6b.83 — Sanal tablo SELECT hazırlığı
+
+UTF-8 ON tek sanal tablo SELECT hazırlığında program yeniden kullanılıyor. Çağrı sayısı değişen 32 akışın tamamında callback sırası ve argümanları C ile eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 383/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,267 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_83.md).
