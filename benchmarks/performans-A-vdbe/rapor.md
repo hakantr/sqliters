@@ -807,3 +807,8 @@ C'nin geçici tarama ve özgün filtre için bağımsız MAX değerlendirme ömr
 ## V6b.100 — Görünüm MAX eşitliği ve ek indeksler
 
 Tek ilgili bileşik anahtar ve ek bağımsız indeksle C trigger sırası izleniyor. OFF DML bir vaka daha eş, gerçek plan ve cache kapsamı ayrık doğrulandı. OFF 1186/1/337, ON 1177/10/337. DML OFF 389/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,255 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_100.md).
+
+
+## V6b.101 — Bağımsız EXISTS covering taraması
+
+Dış covering taramada bağımsız EXISTS kaynak sırası C eş. OFF DML bir vaka daha iyileşti, ham sayaç ve DB dosyası doğrulandı. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_101.md).

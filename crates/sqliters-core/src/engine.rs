@@ -7270,7 +7270,7 @@ fn exec_single_select_core_inner(
                             FastSingleVtabOutcome::Completed(out) => return Ok(out),
                             FastSingleVtabOutcome::FallbackRows(rows) => rows,
                             FastSingleVtabOutcome::NotApplicable => {
-                            let single_qinfo = SingleVtabQueryInfo::from_single_select(
+                            let mut single_qinfo = SingleVtabQueryInfo::from_single_select(
                                 projection,
                                 selection.as_ref(),
                                 pre_where_selection.as_deref(),
@@ -7280,6 +7280,15 @@ fn exec_single_select_core_inner(
                                 order_by,
                                 limit,
                             );
+                            single_qinfo.allow_local_exists_covering = !*distinct
+                                && !has_proj_aliases
+                                && order_by.is_empty()
+                                && limit.is_none()
+                                && matches!(selection, Some(Expr::Exists { negated: false, .. }))
+                                && projection.iter().all(|p| {
+                                    matches!(p, ResultColumn::Expr { expr, .. }
+                                        if covering_exists_expr_is_simple(expr))
+                                });
                             eval_table_or_subquery(
                                 ctx,
                                 &fc.head,
@@ -9518,6 +9527,7 @@ struct SingleVtabQueryInfo<'a> {
     /// gives the planner (covering-index scans, ORDER BY through an index) — i.e. the rows come
     /// in the order C's plan produces them.
     plan_ctx: Option<(&'a [ResultColumn], &'a [OrderByTerm])>,
+    allow_local_exists_covering: bool,
 }
 
 impl<'a> SingleVtabQueryInfo<'a> {
@@ -13445,6 +13455,127 @@ fn try_exec_fast_single_vtab_select(
     }))
 }
 
+fn covering_exists_expr_is_simple(expr: &Expr) -> bool {
+    use crate::dml_c::{Walk, walk_expr};
+    let mut simple = true;
+    walk_expr(expr, &mut |node| {
+        simple &= matches!(
+            node,
+            Expr::Column(_)
+                | Expr::Null
+                | Expr::Integer(_)
+                | Expr::Float(_)
+                | Expr::String(_)
+                | Expr::Binary {
+                    op: BinaryOp::Eq
+                        | BinaryOp::Add
+                        | BinaryOp::Subtract
+                        | BinaryOp::Multiply
+                        | BinaryOp::Divide
+                        | BinaryOp::Remainder,
+                    ..
+                }
+        );
+        Walk::Shallow
+    });
+    simple
+}
+
+// select.c:existsToJoin binds the inner SELECT to its own cursor. A bare
+// EXISTS with no outer column use contributes no column to the outer scan.
+fn local_exists_allows_covering(
+    ctx: &ExecContext<'_>,
+    db_id: DatabaseId,
+    table: &TableSchema,
+    selection: Option<&Expr>,
+    ctes: &CteStore,
+) -> bool {
+    let Some(Expr::Exists {
+        subquery,
+        negated: false,
+    }) = selection
+    else {
+        return false;
+    };
+    if db_id != DatabaseId::MAIN
+        || table.without_rowid
+        || table.stat1.has_stat1
+        || !table.foreign_keys.is_empty()
+        || table
+            .columns
+            .iter()
+            .any(|col| col.generated.is_some() || col.custom_collation.is_some())
+        || !ctes.scopes.is_empty()
+        || ctx.in_trigger_program()
+        || ctx.progress.is_enabled()
+        || ctx.collations.get_custom("BINARY").is_some()
+        || ctx.db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0
+        || !subquery.ctes.is_empty()
+        || !subquery.body.compounds.is_empty()
+        || !subquery.order_by.is_empty()
+        || subquery.limit.is_some()
+    {
+        return false;
+    }
+    let SelectCore::Select {
+        distinct: false,
+        projection,
+        from: Some(from),
+        selection: Some(predicate),
+        group_by,
+        having: None,
+        windows,
+    } = &subquery.body.head
+    else {
+        return false;
+    };
+    let TableOrSubquery::Table {
+        name,
+        table_args: None,
+        indexed_by: None,
+        ..
+    } = &from.head
+    else {
+        return false;
+    };
+    if !from.joins.is_empty()
+        || !group_by.is_empty()
+        || !windows.is_empty()
+        || !matches!(
+            projection.as_slice(),
+            [ResultColumn::Expr {
+                expr: Expr::Integer(1),
+                ..
+            }]
+        )
+        || !matches!(
+            predicate,
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                ..
+            }
+        )
+        || !covering_exists_expr_is_simple(predicate)
+    {
+        return false;
+    }
+
+    let Ok(Some((inner_db, inner))) = ctx.db_set.find_table_in_set(name) else {
+        return false;
+    };
+    if inner_db != db_id
+        || inner.root_pgno != table.root_pgno
+        || !crate::dml_c::select_is_self_contained(ctx.db_set, subquery)
+    {
+        return false;
+    }
+    let indexes = ctx.db_set.main_slot().schema.indexes_for_table(&table.name);
+    matches!(indexes.as_slice(), [index] if index.where_clause.is_none()
+        && index.stat1.is_none()
+        && matches!(index.columns.as_slice(), [key] if key.col_idx.is_some()
+            && key.sort_order.custom_collation.is_none()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn eval_table_or_subquery(
     ctx: &mut ExecContext<'_>,
@@ -13728,6 +13859,18 @@ fn eval_table_or_subquery(
                 return Ok(Vec::new());
             }
 
+            // Keep the original WHERE in the SELECT evaluator and in the column
+            // mask. Only the outer table's access planner can disregard it.
+            let plan_where_hint = if indexed_by.is_none()
+                && outer_scopes.is_empty()
+                && vtab_query_info.is_some_and(|q| q.allow_local_exists_covering && q.plan_ctx.is_some())
+                && local_exists_allows_covering(ctx, db_id, &tbl, where_hint, ctes)
+            {
+                None
+            } else {
+                where_hint
+            };
+
             let can_selective_raw = !tbl.without_rowid
                 && tbl.columns.len() <= 63
                 && tbl.columns.iter().all(|c| {
@@ -13843,7 +13986,7 @@ fn eval_table_or_subquery(
                                 &tbl,
                                 &slot_ref.name,
                                 alias.as_deref(),
-                                where_hint,
+                                plan_where_hint,
                                 &slot_ref.schema,
                                 QueryPlanContext {
                                     projection: query_ctx.map(|(p, _)| p),
@@ -13940,7 +14083,7 @@ fn eval_table_or_subquery(
                     &tbl,
                     alias.as_deref(),
                     indexed_by.as_ref(),
-                    where_hint,
+                    plan_where_hint,
                     vtab_query_info.and_then(|q| q.plan_ctx),
                     params,
                     outer_scopes,
@@ -13964,7 +14107,7 @@ fn eval_table_or_subquery(
                 &tbl,
                 alias.as_deref(),
                 indexed_by.as_ref(),
-                where_hint,
+                plan_where_hint,
                 vtab_query_info.and_then(|q| q.plan_ctx),
                 params,
                 outer_scopes,
