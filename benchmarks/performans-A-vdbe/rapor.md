@@ -902,3 +902,8 @@ Doğrudan sütundaki aynı yerleşik collation zincirinin dış yazımı C eş. 
 ## V6b.119 — Çoklu retained journal WAL giriş sırası
 
 İki veya üç normal disk hedefinde DELETE/PERSIST/TRUNCATE hazırlıkları ortak sonlandırılıyor. 180 yeni akış C eş, önceki sekiz PERSIST fiziksel sıra ayrımı kapandı. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,264 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_119.md).
+
+
+## V6b.120 — Açık SELECT sırası ve fiziksel indeks kolasyonu
+
+Doğrulanan tek kaynakta planner ve fiziksel indeks farklı collation kullanırsa mevcut ilişkisel sıralama çalışıyor. Dört mantıksal sıra farkı kapandı, altı dosya SHA sabit. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,255 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_120.md).

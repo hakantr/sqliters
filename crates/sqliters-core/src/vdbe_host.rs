@@ -253,6 +253,114 @@ pub(crate) fn locking_mode_table_read_program(
     }))
 }
 
+/// A simple ordered index scan can omit its sorter only when the planner and the
+/// engine agree on the collation of the key it reads.
+#[allow(non_upper_case_globals)]
+fn ordered_index_collation_mismatch(
+    inner: &ConnectionInner,
+    select: &sqliters_syntax::SelectStmt,
+    program: &Program,
+) -> bool {
+    use sqliters_syntax::{Expr, IndexHint, ResultColumn, SelectCore, TableOrSubquery};
+    use sqliters_types::Collation;
+    use sqliters_vdbe::opcodes::{OP_OpenEphemeral, OP_OpenRead, OP_SorterOpen};
+
+    let [order] = select.order_by.as_slice() else {
+        return false;
+    };
+    let Expr::Collate { expr, collation } = &order.expr else {
+        return false;
+    };
+    let (Expr::Column(order_column), Some(requested)) =
+        (expr.as_ref(), Collation::from_name(collation))
+    else {
+        return false;
+    };
+    let SelectCore::Select {
+        distinct: false,
+        projection,
+        from: Some(from),
+        selection: None,
+        group_by,
+        having: None,
+        windows,
+    } = &select.body.head
+    else {
+        return false;
+    };
+    let [ResultColumn::Expr { expr: Expr::Column(projected), alias: None, .. }] =
+        projection.as_slice()
+    else {
+        return false;
+    };
+    let TableOrSubquery::Table {
+        name,
+        table_args: None,
+        alias: None,
+        indexed_by: Some(IndexHint::IndexedBy(index_name)),
+    } = &from.head
+    else {
+        return false;
+    };
+    if !select.ctes.is_empty()
+        || !select.body.compounds.is_empty()
+        || select.limit.is_some()
+        || order.nulls_last.is_some()
+        || !from.joins.is_empty()
+        || !group_by.is_empty()
+        || !windows.is_empty()
+        || order_column.schema.is_some()
+        || order_column.table.is_some()
+        || projected.schema.is_some()
+        || projected.table.is_some()
+        || !projected.column.eq_ignore_ascii_case(&order_column.column)
+        || program.a_op.iter().any(|op| matches!(op.opcode, OP_OpenEphemeral | OP_SorterOpen))
+    {
+        return false;
+    }
+    let Ok(Some((db_id, crate::db_set::RelationRef::Table(table)))) =
+        inner.db_set.find_relation_ref_in_set(name)
+    else {
+        return false;
+    };
+    let Some(index) = inner.db_set.slot(db_id).and_then(|slot| slot.schema.find_index(index_name))
+    else {
+        return false;
+    };
+    let [key] = index.columns.as_slice() else {
+        return false;
+    };
+    if db_id != DatabaseId::MAIN
+        || table.without_rowid
+        || index.is_autoindex
+        || index.where_clause.is_some()
+        || !index.table_name.eq_ignore_ascii_case(&table.name)
+        || key.col_idx.is_none()
+        || !key.name.eq_ignore_ascii_case(&order_column.column)
+        || key.sort_order.custom_collation.is_some()
+        || inner.collations.get_custom(collation).is_some()
+        || inner.collations.get_custom(key.sort_order.collation_name()).is_some()
+        || key.sort_order.collation == requested
+    {
+        return false;
+    }
+
+    program.a_op.iter().any(|op| {
+        let P4::KeyInfo(key_info) = &op.p4 else {
+            return false;
+        };
+        op.opcode == OP_OpenRead
+            && op.p2 == index.root_pgno as i32
+            && op.p3 == db_id.index() as i32
+            && key_info.a_coll.first().is_some_and(|collation| {
+                let compiled = collation.as_ref().map_or(Some(Collation::Binary), |collation| {
+                    Collation::from_name(&collation.name)
+                });
+                compiled == Some(requested)
+            })
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn read_machine_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, schema_free: bool, like_only: bool, bound_values: Option<&[Value]>,
@@ -315,6 +423,10 @@ fn read_machine_program(
             }
             if p.n_var as usize != n_param {
                 trace("fallback: parameter numbering", raw_sql);
+                return Ok(None);
+            }
+            if matches!(stmt, Some(Stmt::Select(select)) if ordered_index_collation_mismatch(inner, select, &p)) {
+                trace("fallback: index collation mismatch", raw_sql);
                 return Ok(None);
             }
             trace("machine", raw_sql);
