@@ -43058,7 +43058,7 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
         }
         participants += 1;
     }
-    matches!(participants, 2 | 3)
+    participants >= 2
 }
 
 fn apply_journal_mode_on_slot(
