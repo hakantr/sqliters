@@ -45506,9 +45506,17 @@ fn exec_pragma(
                         .unwrap_or(WalCheckpointMode::Passive)
                 }
             };
-            let res = if db_id == DatabaseId::TEMP {
-                WalCheckpointResult::not_wal()
+            let all_schemas = schema.is_none();
+            let targets = if all_schemas {
+                0..ctx.db_set.slot_count()
             } else {
+                db_id.index()..db_id.index() + 1
+            };
+            let mut res = WalCheckpointResult::not_wal();
+            for db_id in targets.map(DatabaseId) {
+                if db_id == DatabaseId::TEMP {
+                    continue;
+                }
                 let bit = 1u16.checked_shl(db_id.index() as u32).unwrap_or(0);
                 let bt_state = ctx
                     .db_set
@@ -45524,11 +45532,12 @@ fn exec_pragma(
                         "database table is locked",
                     ));
                 }
-                let bt = ctx
-                    .db_set
-                    .slot_mut(db_id)
-                    .and_then(|s| s.btree.as_mut())
-                    .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+                let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) else {
+                    if all_schemas {
+                        continue;
+                    }
+                    return Err(SqliteError::misuse("database slot closed"));
+                };
                 if bt.pager().db_kind() == DatabaseKind::NamedDisk
                     && (!bt.pager().is_header_loaded()
                         || (bt.pager().journal_mode() == JournalMode::Wal
@@ -45537,12 +45546,18 @@ fn exec_pragma(
                     ctx.busy_policy.retry_btree(bt, |b| b.begin_read())?;
                     bt.end_read_if_unused()?;
                 }
-                if bt.pager().wal().is_none() {
+                let checkpoint = if bt.pager().wal().is_none() {
                     WalCheckpointResult::not_wal()
                 } else {
                     ctx.busy_policy.checkpoint_btree(bt, mode)?
+                };
+                res.busy |= checkpoint.busy;
+                // sqlite3Checkpoint reports the first schema's counters for an unqualified PRAGMA.
+                if !all_schemas || db_id == DatabaseId::MAIN {
+                    res.n_log = checkpoint.n_log;
+                    res.n_ckpt = checkpoint.n_ckpt;
                 }
-            };
+            }
             Ok(QueryOutput {
                 column_names: vec![
                     "busy".to_owned(),

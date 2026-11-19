@@ -832,3 +832,8 @@ Mevcut indeks aramaları, affinity uygulanmış anahtarları C yönünde dolaş�
 ## V6b.105 — Zorlanmış indeks ve ORDER BY yönü
 
 Filtrelenmemiş tek kaynakta indeksin sağladığı doğal ORDER BY yönü korunuyor. Her API ve kipte 195/195 dosya, kalıcı satır ve C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_105.md).
+
+
+## V6b.106 — Nitelemesiz WAL checkpoint ve bağlı şemalar
+
+PRAGMA bütün açık şemaları işliyor, busy sonuçları birleşiyor ve sayaçlar MAIN sonucunu izliyor. 756 normal ATTACH ve 72 iki-WAL okur akışı C eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,260 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_106.md).
