@@ -24526,10 +24526,13 @@ impl<'a> MixedIndexWrite<'a> {
             expr, Expr::Null | Expr::Bool(_) | Expr::Integer(_) | Expr::Float(_)
                 | Expr::String(_) | Expr::Blob(_) | Expr::Bind(_)
         );
+        let no_statistics =
+            !table.stat1.has_stat1 && index.stat1.as_ref().is_none_or(|stat| !stat.has_stat1);
         let key_equality = |selection| {
-            !table.stat1.has_stat1
-                && index.stat1.as_ref().is_none_or(|stat| !stat.has_stat1)
-                && mixed_index_key_equality(table, key, selection).is_some()
+            no_statistics && mixed_index_key_equality(table, key, selection).is_some()
+        };
+        let range_and_equality = |selection| {
+            no_statistics && mixed_index_range_and_equality(table, key, selection)
         };
         match self {
             Self::Insert(insert) => insert.ctes.is_empty()
@@ -24553,7 +24556,8 @@ impl<'a> MixedIndexWrite<'a> {
                 && (update.selection.is_none()
                     || mixed_index_rowid_selection(table, update.selection.as_ref())
                     || mixed_index_table_equality(table, key, update.selection.as_ref())
-                    || key_equality(update.selection.as_ref()))
+                    || key_equality(update.selection.as_ref())
+                    || range_and_equality(update.selection.as_ref()))
                 && matches!(update.assignments.as_slice(), [assignment]
                     if !assignment.row_value
                         && matches!(assignment.columns.as_slice(), [column]
@@ -24566,6 +24570,7 @@ impl<'a> MixedIndexWrite<'a> {
                 && (mixed_index_rowid_selection(table, delete.selection.as_ref())
                     || mixed_index_table_equality(table, key, delete.selection.as_ref())
                     || key_equality(delete.selection.as_ref())
+                    || range_and_equality(delete.selection.as_ref())
                     || (allow_where_one && mixed_index_all_rows_filter(delete.selection.as_ref()))),
         }
     }
@@ -24701,12 +24706,54 @@ fn mixed_index_rowid_selection(
     table: &TableSchema,
     selection: Option<&Expr>,
 ) -> bool {
-    let rowid = |expr: &Expr| matches!(expr, Expr::Column(column)
-        if resolve_target_col_ref(table, "main", None, column) == Some(TargetColRef::Rowid));
+    let rowid = |expr: &Expr| mixed_index_is_rowid(table, expr);
     let equality_bound = |expr: &Expr| matches!(expr, Expr::Integer(_) | Expr::Bind(_));
     if let Some(Expr::Binary { op: BinaryOp::Eq, left, right }) = selection {
         return (rowid(left) && equality_bound(right)) || (equality_bound(left) && rowid(right));
     }
+    match selection {
+        Some(Expr::InList { expr, list, negated: false }) => {
+            rowid(expr)
+                && !list.is_empty()
+                && list.iter().all(|item| {
+                    is_in_order_literal(item) || matches!(item, Expr::Bind(_) | Expr::Blob(_))
+                })
+        }
+        Some(Expr::Binary { op: BinaryOp::And, left, right }) => {
+            mixed_index_rowid_range(table, &[left, right])
+        }
+        Some(expr) => mixed_index_rowid_range(table, &[expr]),
+        None => false,
+    }
+}
+
+fn mixed_index_is_rowid(table: &TableSchema, expr: &Expr) -> bool {
+    matches!(expr, Expr::Column(column)
+        if resolve_target_col_ref(table, "main", None, column) == Some(TargetColRef::Rowid))
+}
+
+fn mixed_index_range_and_equality(
+    table: &TableSchema,
+    key: &IndexedColSchema,
+    selection: Option<&Expr>,
+) -> bool {
+    let Some(selection @ Expr::Binary { op: BinaryOp::And, .. }) = selection else {
+        return false;
+    };
+    let mut terms = Vec::with_capacity(3);
+    split_where_conjuncts(selection, &mut terms);
+    if !matches!(terms.len(), 2 | 3) {
+        return false;
+    }
+    let Some(i) = terms.iter().position(|term| mixed_index_table_equality(table, key, Some(term))) else {
+        return false;
+    };
+    terms.remove(i);
+    mixed_index_rowid_range(table, &terms)
+}
+
+fn mixed_index_rowid_range(table: &TableSchema, terms: &[&Expr]) -> bool {
+    let rowid = |expr: &Expr| mixed_index_is_rowid(table, expr);
     let range_bound = |expr: &Expr| match expr {
         Expr::Null | Expr::Integer(_) | Expr::Float(_) | Expr::Bind(_) => true,
         Expr::Unary { op: UnaryOp::Plus | UnaryOp::Negate, expr } => {
@@ -24732,22 +24779,15 @@ fn mixed_index_rowid_selection(
             None
         }
     };
-    match selection {
-        Some(Expr::InList { expr, list, negated: false }) => {
-            rowid(expr)
-                && !list.is_empty()
-                && list.iter().all(|item| {
-                    is_in_order_literal(item) || matches!(item, Expr::Bind(_) | Expr::Blob(_))
-                })
-        }
-        Some(Expr::Between { expr, low, high, negated: false }) => {
+    match terms {
+        [Expr::Between { expr, low, high, negated: false }] => {
             rowid(expr) && range_bound(low) && range_bound(high)
         }
-        Some(Expr::Binary { op: BinaryOp::And, left, right }) => {
+        [left, right] => {
             matches!((inequality(left), inequality(right)), (Some(a), Some(b)) if a != b)
         }
-        Some(expr) => inequality(expr).is_some(),
-        None => false,
+        [expr] => inequality(expr).is_some(),
+        _ => false,
     }
 }
 

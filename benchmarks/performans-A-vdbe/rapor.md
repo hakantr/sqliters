@@ -1127,3 +1127,8 @@ Açık WHERE 1 DELETE, uygun normal deyimde hazırlanmış yönü ve mevcut fizi
 ## V6b.164 — Koordineli PERSIST TRUNCATE ve MEMORY BUSY sonu
 
 Erken başlık okumasından önce C gibi hedef kip ve fiziksel geri alma korunur. 576 akışta 1.152 son ana dosya çifti ve 1.728 C açılışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,246 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_164.md).
+
+
+## V6b.165 — Karma indeksli rowid aralığı ve sütun filtresi
+
+Uygun AND bileşiminde C rowid aralığı ve mevcut fiziksel karşılaştırıcı korunur. 144 yazma, 288 rollback ile 432 C açılışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,098 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_165.md).
