@@ -5370,6 +5370,8 @@ pub struct Statement {
     compiled_slot_cookies: Vec<(SchemaInstanceId, u32, bool)>,
     expired: bool,
     column_names: Vec<String>,
+    /// Names from the current prepare of an ordinary SELECT using column-name flags.
+    preserve_prepared_column_names: bool,
     params: Vec<Value>,
     named_params: HashMap<String, usize>,
     ignored_fk_parent_tables: Vec<(DatabaseId, String)>,
@@ -5646,6 +5648,53 @@ fn apply_select_schema_use(artifacts: &mut CompiledArtifacts, usage: Option<&cge
         }
         artifacts.compiled_fast_read = None;
     }
+}
+
+/// Use C's result names without changing the execution plan of a legacy read.
+fn apply_select_column_names(
+    inner: &ConnectionInner,
+    artifacts: &mut CompiledArtifacts,
+    sql: &str,
+    machine: Option<&sqliters_vdbe::vdbeaux::Program>,
+) -> bool {
+    use sqliters_codegen::consts::{SQLITE_FullColNames, SQLITE_ShortColNames};
+    use sqliters_syntax::{SelectCore, TableOrSubquery};
+
+    if inner.db_set.c_flags_toggled() & (SQLITE_FullColNames | SQLITE_ShortColNames) == 0
+        || artifacts.category != Some(StmtCategory::Read)
+        || inner.authorizer.is_some()
+    {
+        return false;
+    }
+    let Some(Stmt::Select(select)) = artifacts.stmt.as_ref() else {
+        return false;
+    };
+    let SelectCore::Select { from: Some(from), .. } = &select.body.head else {
+        return false;
+    };
+    let TableOrSubquery::Table { name, table_args: None, .. } = &from.head else {
+        return false;
+    };
+    if !select.ctes.is_empty() || !select.body.compounds.is_empty() || !from.joins.is_empty()
+        || inner.db_set.find_user_table_in_set(name).is_none()
+    {
+        return false;
+    }
+
+    let names = if let Some(program) = machine {
+        vdbe_host::column_names(program)
+    } else if let sqliters_codegen::PrepareResult::Program(program) = cgen::c_prepare_diagnostic(inner, sql) {
+        vdbe_host::column_names(&program)
+    } else {
+        None
+    };
+    if let Some(names) = names
+        && names.len() == artifacts.column_names.len()
+    {
+        artifacts.column_names = names;
+        return true;
+    }
+    false
 }
 
 fn schema_free_read_fallback(
@@ -8480,6 +8529,8 @@ impl Statement {
 
         let hid = inner.register_handle(HandleKind::Statement);
         apply_select_schema_use(&mut artifacts, select_schema_use.as_ref());
+        let preserve_prepared_column_names =
+            apply_select_column_names(inner, &mut artifacts, &raw_sql, c_machine.as_deref());
         let c_is_reader = c_explain.as_ref().or(c_machine.as_ref()).or(c_write.as_ref())
             .map(|p| p.b_is_reader).or_else(|| select_schema_use.as_ref().and_then(|u| u.is_reader))
             .unwrap_or(artifacts.category.is_some_and(|c| c != StmtCategory::NoLockPragma));
@@ -8511,6 +8562,7 @@ impl Statement {
             compiled_slot_cookies: inner.snapshot_slot_cookies(),
             expired: false,
             column_names: artifacts.column_names,
+            preserve_prepared_column_names,
             params: vec![Value::Null; artifacts.max_param],
             named_params: artifacts.named_params,
             ignored_fk_parent_tables: artifacts.ignored_fk_parent_tables,
@@ -9259,6 +9311,8 @@ impl Statement {
             }
             let mut transferred = vec![Value::Null; artifacts.max_param];
             apply_select_schema_use(&mut artifacts, select_schema_use.as_ref());
+            self.preserve_prepared_column_names =
+                apply_select_column_names(inner, &mut artifacts, &self.raw_sql, c_machine.as_deref());
             let copy_len = self.params.len().min(artifacts.max_param);
             transferred[..copy_len].clone_from_slice(&self.params[..copy_len]);
 
@@ -10797,7 +10851,7 @@ impl Statement {
                 };
                 match exec_res {
                     Ok(out) => {
-                        if !out.column_names.is_empty() {
+                        if !self.preserve_prepared_column_names && !out.column_names.is_empty() {
                             self.column_names = out.column_names;
                         }
                         let mut iter = out.rows.into_iter();
