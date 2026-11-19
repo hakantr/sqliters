@@ -5321,6 +5321,7 @@ pub struct Statement {
     /// C bIsReader, independently of the selected execution strategy.
     c_is_reader: bool,
     compiled_defer_fks: bool,
+    compiled_ignore_checks: bool,
     category: Option<StmtCategory>,
     compiled_vdbe: Option<Arc<VdbeProgram>>,
     compiled_fast_read: Option<Arc<fast_read::FastReadPlan>>,
@@ -8335,6 +8336,7 @@ impl Statement {
             read_io_during_prepare: false,
             c_is_reader,
             compiled_defer_fks: inner.db_set.c_defer_foreign_keys(),
+            compiled_ignore_checks: inner.db_set.c_ignore_checks(),
             category: artifacts.category,
             compiled_vdbe: artifacts.compiled_vdbe,
             compiled_fast_read: artifacts.compiled_fast_read,
@@ -9049,6 +9051,7 @@ impl Statement {
             transferred[..copy_len].clone_from_slice(&self.params[..copy_len]);
 
             self.compiled_defer_fks = inner.db_set.c_defer_foreign_keys();
+            self.compiled_ignore_checks = inner.db_set.c_ignore_checks();
             self.c_is_reader = c_explain.as_ref().or(c_machine.as_ref()).or(c_write.as_ref())
                 .map(|p| p.b_is_reader).or_else(|| select_schema_use.as_ref().and_then(|u| u.is_reader))
                 .unwrap_or(artifacts.category.is_some_and(|c| c != StmtCategory::NoLockPragma));
@@ -10526,7 +10529,10 @@ impl Statement {
                     );
                 }
                 let mut expire_self_only = false;
-                let mut stmt_tx = StmtTxTracker::default();
+                let mut stmt_tx = StmtTxTracker {
+                    prepared_ignore_checks: Some(self.compiled_ignore_checks),
+                    ..StmtTxTracker::default()
+                };
                 let exec_res = inner.with_exec_ctx(
                     shared,
                     summary,
@@ -11048,6 +11054,7 @@ impl Statement {
                 let top_level_sql = inner.trace_hook.is_some().then(|| self.raw_sql.clone());
                 let mut stmt_tx = StmtTxTracker {
                     prepared_defer_fks: Some(self.compiled_defer_fks),
+                    prepared_ignore_checks: Some(self.compiled_ignore_checks),
                     stmt_sp_slot,
                     top_level_sql,
                     ignored_fk_parent_tables: self.ignored_fk_parent_tables.clone(),
@@ -14926,6 +14933,87 @@ mod tests {
             stmt.reset().unwrap();
             while matches!(stmt.step().unwrap(), StepResult::Row(_)) {}
             assert!(cached(&conn).iter().all(|&n| (n == 0) == !sql.starts_with("EXPLAIN")), "{sql}: reset");
+        }
+    }
+
+    #[test]
+    fn ignore_check_constraints_is_frozen_for_prepared_writes() {
+        for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}';
+                 CREATE TABLE ck(
+                     id INTEGER PRIMARY KEY, v INT CONSTRAINT positive CHECK(v > 0),
+                     label TEXT NOT NULL UNIQUE
+                 ) STRICT;
+                 INSERT INTO ck VALUES(1, 1, 'a'), (2, 2, 'b');"
+            ))
+            .unwrap();
+            let mut checked = conn.prepare("UPDATE ck SET v = -1 WHERE id = 1").unwrap();
+            let enable = conn.prepare("PRAGMA ignore_check_constraints = ON").unwrap();
+            let mut unchecked = conn.prepare("INSERT INTO ck VALUES(3, -3, 'c')").unwrap();
+            assert_eq!(
+                checked.step().unwrap_err().extended_code,
+                extended::SQLITE_CONSTRAINT_CHECK
+            );
+            let _ = checked.finalize();
+            assert_eq!(conn.execute("UPDATE ck SET v = -1 WHERE id = 1").unwrap(), 1);
+
+            for (sql, expected) in [
+                ("INSERT INTO ck VALUES(4, -4, NULL)", extended::SQLITE_CONSTRAINT_NOTNULL),
+                ("UPDATE ck SET v = -2, label = 'a' WHERE id = 2", extended::SQLITE_CONSTRAINT_UNIQUE),
+                ("INSERT INTO ck VALUES(4, 'bad', 'd')", extended::SQLITE_CONSTRAINT_DATATYPE),
+            ] {
+                assert_eq!(conn.execute(sql).unwrap_err().extended_code, expected);
+            }
+
+            let disable = conn.prepare("PRAGMA ignore_check_constraints = OFF").unwrap();
+            assert_eq!(unchecked.step().unwrap(), StepResult::Done);
+            unchecked.finalize().unwrap();
+            assert_eq!(
+                conn.execute("UPDATE ck SET v = -2 WHERE id = 2").unwrap_err().extended_code,
+                extended::SQLITE_CONSTRAINT_CHECK
+            );
+            enable.finalize().unwrap();
+            disable.finalize().unwrap();
+        }
+    }
+
+    #[test]
+    fn ignore_check_constraints_is_frozen_for_prepared_integrity_checks() {
+        for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}';
+                 CREATE TABLE ck(v INTEGER CHECK(v > 0));
+                 PRAGMA ignore_check_constraints = ON;
+                 INSERT INTO ck VALUES(-1);"
+            ))
+            .unwrap();
+            let mut full = conn.prepare("PRAGMA integrity_check").unwrap();
+            let mut quick = conn.prepare("PRAGMA quick_check").unwrap();
+            let disable = conn.prepare("PRAGMA ignore_check_constraints = OFF").unwrap();
+            for stmt in [&mut full, &mut quick] {
+                let StepResult::Row(row) = stmt.step().unwrap() else {
+                    panic!("expected integrity diagnostic row");
+                };
+                assert_eq!(row.get_str(0), Some("ok"));
+                assert_eq!(stmt.step().unwrap(), StepResult::Done);
+                stmt.reset().unwrap();
+            }
+            for sql in ["PRAGMA integrity_check", "PRAGMA quick_check"] {
+                let result = conn.query(sql, &[]).unwrap();
+                assert_eq!(result.rows[0].get_str(0), Some("CHECK constraint failed in ck"));
+            }
+            disable.finalize().unwrap();
+            conn.execute("PRAGMA ignore_check_constraints = OFF").unwrap();
+            for stmt in [&mut full, &mut quick] {
+                let StepResult::Row(row) = stmt.step().unwrap() else {
+                    panic!("expected integrity diagnostic row after reprepare");
+                };
+                assert_eq!(row.get_str(0), Some("CHECK constraint failed in ck"));
+                assert_eq!(stmt.step().unwrap(), StepResult::Done);
+            }
         }
     }
 

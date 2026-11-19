@@ -117,6 +117,8 @@ pub struct ActivitySummary {
 pub struct StmtTxTracker {
     /// Compile-time DeferFKs for legacy FK code decisions; counters use the live flag.
     pub prepared_defer_fks: Option<bool>,
+    /// CHECK elision is decided when the statement is prepared.
+    pub(crate) prepared_ignore_checks: Option<bool>,
     /// Bitmask of `DatabaseId` slots whose `Read` transaction was started from `Open` by this statement.
     pub started_read_mask: u16,
     /// Bitmask of `DatabaseId` slots whose `Write` transaction (and optional `stmt_sp_slot`) was entered in this statement.
@@ -485,6 +487,12 @@ impl ExecContext<'_> {
     #[inline]
     fn prepared_defer_fks(&self) -> bool {
         self.stmt_tx.prepared_defer_fks.unwrap_or_else(|| self.db_set.c_defer_foreign_keys())
+    }
+
+    fn prepared_ignore_checks(&self) -> bool {
+        self.stmt_tx
+            .prepared_ignore_checks
+            .unwrap_or_else(|| self.db_set.c_ignore_checks())
     }
 
     #[inline]
@@ -21336,7 +21344,7 @@ fn validate_and_write_row_inner(
     }
 
     // 4. CHECK constraints (`NULL` or `true` passes in SQL; only `false` fails!)
-    if !tbl.checks.is_empty() {
+    if !tbl.checks.is_empty() && !ctx.prepared_ignore_checks() {
         if strict_pending {
             strict_check(&raw_vals)?;
             strict_pending = false;
@@ -42912,7 +42920,7 @@ fn integrity_check_table_rows(
     } else {
         Vec::new()
     };
-    let needs_scope = !tbl.checks.is_empty();
+    let needs_scope = !tbl.checks.is_empty() && !ctx.prepared_ignore_checks();
     // The right-most stored column (`mxCol`): the rowid alias has no slot of its own.
     let mx_col: Option<usize> = if tbl.without_rowid {
         (tbl.without_rowid_pk_cols.len() + tbl.without_rowid_extra_cols.len()).checked_sub(1)

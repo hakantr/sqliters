@@ -1632,7 +1632,8 @@ fn test_gate2_5_multidb_pragmas_and_vacuum_into() {
             Some("reserved" | "exclusive")
         ));
         assert_eq!(ls_tx.rows[1].get_str(0), Some("temp"));
-        assert_eq!(ls_tx.rows[1].get_str(1), Some("unlocked"));
+        // The small FILE temp database has not spilled. Its VFS lock state is unknown.
+        assert_eq!(ls_tx.rows[1].get_str(1), Some("unknown"));
         assert_eq!(ls_tx.rows[2].get_str(0), Some("aux"));
         assert!(matches!(
             ls_tx.rows[2].get_str(1),

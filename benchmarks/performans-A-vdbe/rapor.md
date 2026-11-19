@@ -667,3 +667,8 @@ Legacy skaler doğrulama yıldızla gelen fonksiyon çağrısını sıfır argü
 ## V6b.72 — Kesinti yaşamı, token ve sanal tablo sırası
 
 Bağlantı boşken başlayan varsayılan kesinti sonraki hazırlama/step'te temizleniyor. Etkin ifade, V1/V2 hata dönüşü ve prepare token sırası C ile hizalandı. 566 native yeniden koşu, 276 lexical ve 12 vtab örneğini içeriyor. Eski V1 hata metni açık. OFF 1176/4/337, ON 1164/16/337. DML ve ayrışma bulucu V6b.71 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,248 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_72.md).
+
+
+## V6b.73 — CHECK hazırlama ayarı ve TEMP tanısı
+
+Legacy yazma ve bütünlük denetimi, C gibi CHECK bayrağını hazırlamada alıyor. Yalnızca hazırlanan setter önceki ifadeyi süresi dolmuş duruma getirmiyor. İki yeni CHECK testi iki kipte geçti. DEBUG C ile karşılaştırılan 18 TEMP vakasında tanı satırları ve kalıcı DB özetleri iki kipte eşit. OFF 1179/3/337, ON 1167/15/337. DML ve ayrışma bulucu V6b.72 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_73.md).
