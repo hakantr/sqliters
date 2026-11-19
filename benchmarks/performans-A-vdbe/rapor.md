@@ -1052,3 +1052,8 @@ Doğrudan anahtar kolonunda C gibi bildirimdeki kolasyon yazımı korunur. 15 es
 ## V6b.149 — WAL MEMORY çıkışında PERSIST_WAL kararı
 
 Tek hedefte sağlıklı WAL çıkışının ilk ROW ve retained yan dosya durumu C ile hizalanır. 708 doğrudan, 738 koruma ve 132 canlı C peer akışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,257 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_149.md).
+
+
+## V6b.150 — Karma indeksli doğrudan rowid IN yazımı
+
+Uygun UPDATE ve DELETE hazırlanan rowid IN yönüyle mevcut fiziksel karşılaştırıcıyı korur. 144 normal yazıcı ve rollback, 432 salt okunur açılış ve 4.608 satır ziyareti eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_150.md).

@@ -14477,8 +14477,11 @@ fn read_table_with_plan_ctx(
     }
     let reverse = reverse_rowid_scan
         && match scan.shape {
-            crate::dml_c::ScanShape::RowidRange => true,
-            crate::dml_c::ScanShape::FullTable => where_hint.is_none(),
+            crate::dml_c::ScanShape::RowidRange | crate::dml_c::ScanShape::RowidIn => true,
+            crate::dml_c::ScanShape::FullTable => {
+                where_hint.is_none()
+                    || matches!(where_hint, Some(Expr::InList { negated: false, .. }))
+            }
             _ => false,
         };
     let order = if reverse {
@@ -14716,6 +14719,9 @@ fn execute_access_plan(
             }
             rids.sort_unstable();
             rids.dedup();
+            if scan_order == IndexScanOrder::Reverse {
+                rids.reverse();
+            }
             // (the values C's loop seeks, in the order of its ephemeral index — `cscan.rs`)
             ctx.stmt_tx.c_rowid_in = Some(rids.clone());
             let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree else {
@@ -24528,6 +24534,13 @@ fn mixed_index_rowid_selection(
         }
     };
     match selection {
+        Some(Expr::InList { expr, list, negated: false }) => {
+            rowid(expr)
+                && !list.is_empty()
+                && list.iter().all(|item| {
+                    is_in_order_literal(item) || matches!(item, Expr::Bind(_) | Expr::Blob(_))
+                })
+        }
         Some(Expr::Between { expr, low, high, negated: false }) => {
             rowid(expr) && range_bound(low) && range_bound(high)
         }
