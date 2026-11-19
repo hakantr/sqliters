@@ -43038,7 +43038,7 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
     }
     let previous_modes: &[JournalMode] = match target {
         JournalMode::Wal => &[JournalMode::Delete, JournalMode::Persist, JournalMode::Truncate],
-        JournalMode::Delete => &[JournalMode::Wal],
+        JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate => &[JournalMode::Wal],
         _ => return false,
     };
     let mut participants = 0;
