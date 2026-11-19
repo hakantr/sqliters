@@ -45212,16 +45212,57 @@ fn exec_pragma(
                 if clauses == 0 || create.columns.len() != idx.columns.len() {
                     return None;
                 }
-                // IndexedColumn retains one name per term. Extra COLLATE tokens in the
-                // key list may be nested or repeated, so spelling cannot be recovered here.
                 let tokens = tokenize(sql).ok()?;
                 let open = tokens.iter().position(|token| token.kind == TokenKind::Lp)?;
                 let close = find_matching_rparen(&tokens, open)?;
-                let collate_tokens = tokens[open + 1..close]
+                let key_tokens = &tokens[open + 1..close];
+                let collate_tokens = key_tokens
                     .iter()
                     .filter(|token| token.kind == TokenKind::Collate)
                     .count();
-                (collate_tokens == clauses).then_some(create.columns)
+                if collate_tokens == clauses {
+                    return Some(create.columns.into_iter().map(|col| col.collation).collect());
+                }
+
+                // IndexedColumn retains only one name. For a direct column wrapped in
+                // equivalent postfix clauses, C keeps the last (outermost) spelling.
+                let mut depth = 0usize;
+                let mut terms = key_tokens.split(|token| match token.kind {
+                    TokenKind::Lp => {
+                        depth += 1;
+                        false
+                    }
+                    TokenKind::Rp => {
+                        depth = depth.saturating_sub(1);
+                        false
+                    }
+                    TokenKind::Comma => depth == 0,
+                    _ => false,
+                });
+                let mut names = Vec::with_capacity(create.columns.len());
+                for column in create.columns {
+                    let term = terms.next()?;
+                    let mut name = None;
+                    if let Some(canonical) = column.collation.as_deref()
+                        && column.expr.is_none()
+                    {
+                        let spellings: Vec<_> = term
+                            .windows(2)
+                            .filter(|pair| pair[0].kind == TokenKind::Collate)
+                            .map(|pair| dequote(pair[1].text))
+                            .collect();
+                        if spellings.len() > 1
+                            && spellings.iter().all(|s| s.eq_ignore_ascii_case(canonical))
+                        {
+                            name = spellings.into_iter().last();
+                        }
+                    }
+                    names.push(name);
+                }
+                if terms.next().is_some() {
+                    return None;
+                }
+                Some(names)
             });
             let mut rows = Vec::new();
             for (seqno, ic) in idx.columns.iter().enumerate() {
@@ -45232,7 +45273,7 @@ fn exec_pragma(
                 let coll = explicit_collations
                     .as_ref()
                     .and_then(|columns| columns.get(seqno))
-                    .and_then(|column| column.collation.as_deref())
+                    .and_then(Option::as_deref)
                     .filter(|name| {
                         ic.sort_order.custom_collation.is_none()
                             && Collation::from_name(name) == Some(ic.sort_order.collation)
