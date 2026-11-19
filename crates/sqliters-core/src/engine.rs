@@ -43041,8 +43041,15 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
         return false;
     }
     let mut has_wal_transition = false;
-    for bt in ctx.db_set.slots().iter().filter_map(|slot| slot.btree.as_ref()) {
+    for (index, slot) in ctx.db_set.slots().iter().enumerate() {
+        let Some(bt) = slot.btree.as_ref() else {
+            continue;
+        };
         let pager = bt.pager();
+        // The anonymous TEMP pager cannot cross the WAL boundary.
+        if index == DatabaseId::TEMP.index() && pager.db_kind() == DatabaseKind::PrivateTemporary {
+            continue;
+        }
         let previous = pager.journal_mode();
         if pager.db_kind() != DatabaseKind::NamedDisk
             || pager.locking_mode() != LockingMode::Normal
@@ -43087,7 +43094,7 @@ fn apply_journal_mode_on_slot(
         }
     }
 
-    let Some(mut target) = target_opt else {
+    let Some(target) = target_opt else {
         let cur = ctx
             .db_set
             .slot(db_id)
@@ -43096,21 +43103,13 @@ fn apply_journal_mode_on_slot(
         return Ok(cur);
     };
 
-    if db_id == DatabaseId::TEMP {
-        match target {
-            JournalMode::Wal => {
-                let cur = ctx
-                    .db_set
-                    .slot(db_id)
-                    .and_then(|s| s.btree.as_ref())
-                    .map_or(JournalMode::Delete, |bt| bt.pager().journal_mode());
-                return Ok(cur);
-            }
-            JournalMode::Truncate | JournalMode::Persist => {
-                target = JournalMode::Delete;
-            }
-            _ => {}
-        }
+    if db_id == DatabaseId::TEMP && target == JournalMode::Wal {
+        let cur = ctx
+            .db_set
+            .slot(db_id)
+            .and_then(|s| s.btree.as_ref())
+            .map_or(JournalMode::Delete, |bt| bt.pager().journal_mode());
+        return Ok(cur);
     }
 
     let disallow_wal_transition = !is_in_autocommit(ctx) || ctx.activity.other_readers > 0;

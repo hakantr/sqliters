@@ -942,3 +942,8 @@ Yalnız WAL sınırını geçen diskler ortak statement bitişine katılıyor. 2
 ## V6b.127 — Karma indeks kolasyonunun INDEX_XINFO gösterimi
 
 Basit doğrudan anahtarda dış yerleşik kolasyonun SQL yazımı korunuyor. Her kipte 254 metadata ölçümü C ile eş ve 91 veritabanı görüntüsü korunuyor. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 0,937 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_127.md).
+
+
+## V6b.128 — Açık TEMP ile WAL geçişi ve journal kipi
+
+Yalnız gerçek NamedDisk geçişleri ortak bitişe katılıyor ve TEMP FILE PERSIST/TRUNCATE kipini kullanabiliyor. 1.026 normal akış ve 5.508 C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,264 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_128.md).
