@@ -43044,6 +43044,8 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
     let mut participants = 0;
     for bt in ctx.db_set.slots().iter().filter_map(|slot| slot.btree.as_ref()) {
         let pager = bt.pager();
+        let previous = pager.journal_mode();
+        let needs_transition = previous != target;
         if pager.db_kind() != DatabaseKind::NamedDisk
             || pager.locking_mode() != LockingMode::Normal
             || pager.transaction_state() != TransactionState::Open
@@ -43051,14 +43053,14 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
             || pager.page_count() == 0
             || pager.is_readonly()
             || !pager.ok_to_change_journal_mode()
-            || !previous_modes.contains(&pager.journal_mode())
+            || (needs_transition && !previous_modes.contains(&previous))
             || pager.effective_journal_mode_target(target) != target
         {
             return false;
         }
-        participants += 1;
+        participants += usize::from(needs_transition);
     }
-    participants >= 2
+    participants > 0
 }
 
 fn apply_journal_mode_on_slot(
