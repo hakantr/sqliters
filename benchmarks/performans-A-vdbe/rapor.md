@@ -742,3 +742,8 @@ V1/V2 ve OFF/ON dört grubun her birinde 93/93 ham ve fiziksel C eşliği. Yazma
 ## V6b.87 — TRUE ve FALSE adlı gerçek kaynak sütunları
 
 Bilinen tek normal tabloda gerçek sütun önceliği C ile hizalandı. 114 hedef akış ve 24 yazma dosyası iki kipte C ile eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 387/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,261 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_87.md).
+
+
+## V6b.88 — WHERE TRUE/FALSE sonuç takma adları
+
+Tek normal tabloda gerçek sütun bulunmadığında C'nin uygun sonuç takma adı seçimi uygulanıyor. 108 hedef ve 1.545 fiziksel dosyada C kanıtı doğrulandı. OFF 1186/1/337, ON 1177/10/337. DML OFF 387/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,251 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_88.md).
