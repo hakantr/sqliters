@@ -28637,8 +28637,13 @@ fn try_exec_fast_vtab_insert(
 /// recurse through `exec_insert_internal`, whose frame must stay small.)
 #[inline(never)]
 fn decide_insert_fk_halts_immediately(ctx: &mut ExecContext<'_>, ins: &InsertStmt) {
+    let single_row = match &ins.source {
+        InsertSource::DefaultValues => true,
+        InsertSource::Values(rows) => rows.len() == 1,
+        InsertSource::Select(_) => false,
+    };
     if !ctx.prepared_defer_fks()
-        && matches!(&ins.source, InsertSource::Values(rows) if rows.len() == 1)
+        && single_row
         && ins.returning.is_empty()
         && ctx
             .db_set

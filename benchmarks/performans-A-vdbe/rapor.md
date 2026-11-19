@@ -712,3 +712,8 @@ Varsayılan okuma kesintisinde V1 step, bağlantıda saklanan mesaj ve ofsetle r
 ## V6b.81 — WITHOUT ROWID STORED tam tarama
 
 Dar aday, ölçülen STORED WITHOUT ROWID taramasında C'nin eş maliyet sırasını izliyor. 712 fiziksel dosya grubu ve 48 INSERT/REPLACE ölçümü iki kipte C eş. Önceki geniş adayın yeni sıra farkı dar kapsamda kapandı. OFF 1186/1/337, ON 1177/10/337. DML OFF 382/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 0,992 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_81.md).
+
+
+## V6b.82 — DEFAULT VALUES ve tek satırlı FOREIGN KEY
+
+Default değerlerle tek satır yazan INSERT, C'nin immediate FOREIGN KEY kararıyla uyumlu. 216 fiziksel karşılaştırma her kipte eş. 36 işlem kapanışında hatalı kayıt kalıcı dosyaya geçmiyor. OFF DML bir vaka daha eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 383/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,262 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_82.md).
