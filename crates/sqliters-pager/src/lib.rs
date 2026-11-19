@@ -6088,7 +6088,7 @@ impl Pager {
                 let result = (|| {
                     if self.journal_off != 0 && let Some(journal) = self.journal_file.as_deref() {
                         journal.truncate(0)?;
-                        if self.synchronous >= 2 {
+                        if self.synchronous >= 2 && !self.pager_no_sync() {
                             journal.sync(self.file_sync_flags())?;
                         }
                     }

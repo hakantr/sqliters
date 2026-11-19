@@ -957,3 +957,8 @@ Yalnız gerçek NamedDisk geçişleri ortak bitişe katılıyor ve TEMP FILE PER
 ## V6b.130 — Bağlantı kapanışında WAL disk sırası
 
 Normal, Drop ve son statement ile tamamlanan kapanışta Btree slotları C sırasında kapanıyor. 846 akış ve 2.376 C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_130.md).
+
+
+## V6b.131 — TEMP FILE TRUNCATE senkronizasyonu
+
+Geçici pager normal COMMIT ve ROLLBACK sonrasında journalı sıfıra indiriyor ve C noSync kararını izliyor. 144 normal akış ve 48 retained journal C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_131.md).
