@@ -1042,3 +1042,8 @@ C'nin ifade kökündeki açık kolasyon adı doğrudan ve tablo değerli metadat
 ## V6b.147 — Tek tırnaklı COLLATE adı
 
 C'nin COLLATE adı kabul ettiği dört konumda tek tırnaklı diziler mevcut ad akışından geçer. 12 C dosyası iki kipte açıldı, 84/84 SELECT ve 11 parser kontrolü eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,263 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_147.md).
+
+
+## V6b.148 — Miras INDEX_XINFO kolasyon yazımı
+
+Doğrudan anahtar kolonunda C gibi bildirimdeki kolasyon yazımı korunur. 15 eski dosyada 24 metadata farkı iki kipte kapandı ve iki yeni kapsam eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,274 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_148.md).

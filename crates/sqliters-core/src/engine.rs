@@ -44791,6 +44791,78 @@ fn index_xinfo_expression_collation(
         .flatten()
 }
 
+fn index_xinfo_inherited_collations(
+    db_id: DatabaseId,
+    index: &IndexSchema,
+    table: &TableSchema,
+    collations: &CollationRegistry,
+) -> Option<Vec<Option<String>>> {
+    if db_id != DatabaseId::MAIN
+        || index.table_without_rowid
+        || index.is_autoindex
+        || index.unique
+        || index.where_clause.is_some()
+    {
+        return None;
+    }
+    let (Some(Stmt::CreateIndex(create)), _) = parse_one(index.raw_sql.as_deref()?).ok()? else {
+        return None;
+    };
+    if create.columns.len() != index.columns.len()
+        || !create.table_name.eq_ignore_ascii_case(&table.name)
+        || !create
+            .columns
+            .iter()
+            .any(|key| key.expr.is_none() && key.collation.is_none())
+    {
+        return None;
+    }
+    let (Some(Stmt::CreateTable(declaration)), _) = parse_one(&table.raw_sql).ok()? else {
+        return None;
+    };
+    if declaration.columns.len() != table.columns.len() {
+        return None;
+    }
+    Some(
+        create
+            .columns
+            .iter()
+            .zip(&index.columns)
+            .map(|(term, key)| {
+                if term.expr.is_some()
+                    || term.collation.is_some()
+                    || key.sort_order.custom_collation.is_some()
+                {
+                    return None;
+                }
+                let column_index = key.col_idx?;
+                let column = table.columns.get(column_index)?;
+                let declared_column = declaration.columns.get(column_index)?;
+                if column.custom_collation.is_some()
+                    || !column.name.eq_ignore_ascii_case(&term.name)
+                    || !column.name.eq_ignore_ascii_case(&declared_column.name)
+                {
+                    return None;
+                }
+                // sqlite3CreateIndex copies the column's last declared collation name.
+                let name = declared_column
+                    .constraints
+                    .iter()
+                    .rev()
+                    .find_map(|constraint| match constraint {
+                        sqliters_syntax::ColumnConstraint::Collate(name) => Some(name),
+                        _ => None,
+                    })?;
+                let declared_collation = Collation::from_name(name)?;
+                (column.collation == declared_collation
+                    && key.sort_order.collation == declared_collation
+                    && collations.get_custom(name).is_none())
+                    .then(|| name.clone())
+            })
+            .collect(),
+    )
+}
+
 /// Returns the table and secondary index roots for a simple read whose two schema
 /// representations disagree about the index collation.
 pub(crate) fn mixed_collation_table_scan(
@@ -45858,6 +45930,9 @@ fn exec_pragma(
             let explicit_collations = index_xinfo_collations(idx_db_id, &idx, ctx.collations);
             let expression_collation =
                 index_xinfo_expression_collation(idx_db_id, &idx, ctx.collations);
+            let inherited_collations = tbl_opt.as_ref().and_then(|table| {
+                index_xinfo_inherited_collations(idx_db_id, &idx, table, ctx.collations)
+            });
             let mut rows = Vec::new();
             for (seqno, ic) in idx.columns.iter().enumerate() {
                 let (cid, name_val) = match ic.col_idx {
@@ -45878,6 +45953,7 @@ fn exec_pragma(
                             })
                             .map(|(name, _)| name)
                     })
+                    .or_else(|| inherited_collations.as_ref()?.get(seqno)?.as_ref())
                     .cloned()
                     .unwrap_or_else(|| kso_coll(&ic.sort_order));
                 rows.push(vec![
