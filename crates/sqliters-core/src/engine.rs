@@ -176,7 +176,7 @@ pub struct StmtTxTracker {
     /// The upper seek bound for a backwards rowid loop. `Some(None)` means `OP_Last`.
     pub(crate) c_rowid_hi: Option<Option<(i64, bool)>>,
     /// Set only for a simple mixed-index write after validating the active snapshot.
-    pub(crate) reverse_mixed_range: bool,
+    pub(crate) reverse_mixed_scan: bool,
     /// Set when REPLACE resolved a rowid conflict by keeping the table row (only its index
     /// entries are deleted, `insert.c` `case OE_Replace`) on a table without any index:
     /// `(table root, rowid)`. C's data cursor was then only positioned by `OP_NotExists` and
@@ -2786,7 +2786,7 @@ pub(crate) fn c_statement_halt(ctx: &mut ExecContext<'_>) {
         ctx.stmt_tx.c_rowid_seek = None;
         ctx.stmt_tx.c_rowid_lo = None;
         ctx.stmt_tx.c_rowid_hi = None;
-        ctx.stmt_tx.reverse_mixed_range = false;
+        ctx.stmt_tx.reverse_mixed_scan = false;
         for slot in ctx.db_set.slots_mut() {
             if let Some(ref mut bt) = slot.btree {
                 bt.statement_end();
@@ -14290,7 +14290,7 @@ fn read_table_with_plan_scan(
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
 ) -> Result<(Vec<(TableRowKey, Vec<u8>)>, crate::dml_c::ScanInfo)> {
-    let reverse_rowid_range = ctx.stmt_tx.reverse_mixed_range;
+    let reverse_rowid_scan = ctx.stmt_tx.reverse_mixed_scan;
     read_table_with_plan_ctx(
         ctx,
         db_id,
@@ -14299,7 +14299,7 @@ fn read_table_with_plan_scan(
         indexed_by,
         where_hint,
         None,
-        reverse_rowid_range,
+        reverse_rowid_scan,
         params,
         outer_scopes,
         ctes,
@@ -14317,7 +14317,7 @@ fn read_table_with_plan_ctx(
     indexed_by: Option<&IndexHint>,
     where_hint: Option<&Expr>,
     query_info: Option<&SingleVtabQueryInfo<'_>>,
-    reverse_rowid_range: bool,
+    reverse_rowid_scan: bool,
     params: &[Value],
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
@@ -14475,7 +14475,13 @@ fn read_table_with_plan_ctx(
     if db_page_count == 0 {
         return Ok((Vec::new(), scan));
     }
-    let order = if reverse_rowid_range && scan.shape == crate::dml_c::ScanShape::RowidRange {
+    let reverse = reverse_rowid_scan
+        && match scan.shape {
+            crate::dml_c::ScanShape::RowidRange => true,
+            crate::dml_c::ScanShape::FullTable => where_hint.is_none(),
+            _ => false,
+        };
+    let order = if reverse {
         IndexScanOrder::Reverse
     } else {
         IndexScanOrder::Forward
@@ -14605,7 +14611,14 @@ fn execute_access_plan(
     scan_order: IndexScanOrder,
 ) -> Result<Vec<(TableRowKey, Vec<u8>)>> {
     match plan {
-        AccessPlan::FullScan => scan_table_raw_entries(ctx, db_id, tbl),
+        AccessPlan::FullScan => {
+            let mut entries = scan_table_raw_entries(ctx, db_id, tbl)?;
+            if scan_order == IndexScanOrder::Reverse {
+                ctx.stmt_tx.c_rowid_hi = Some(None);
+                entries.reverse();
+            }
+            Ok(entries)
+        }
         AccessPlan::IndexFullScan { index, .. } => {
             if tbl.without_rowid && index.origin == "pk" && index.root_pgno == tbl.root_pgno {
                 return scan_table_raw_entries(ctx, db_id, tbl);
@@ -24463,7 +24476,8 @@ impl<'a> MixedIndexWrite<'a> {
                 && update.or_conflict.is_none()
                 && update.from.is_none()
                 && update.returning.is_empty()
-                && mixed_index_rowid_selection(table, update.selection.as_ref())
+                && (update.selection.is_none()
+                    || mixed_index_rowid_selection(table, update.selection.as_ref()))
                 && matches!(update.assignments.as_slice(), [assignment]
                     if !assignment.row_value
                         && matches!(assignment.columns.as_slice(), [column]
@@ -24714,7 +24728,7 @@ fn prepare_dml_write_slot(
     {
         let comparator = physical_index_write_collation(ctx, db_id, &tbl, index, declared)?;
         index.columns[0].sort_order.collation = comparator;
-        ctx.stmt_tx.reverse_mixed_range = ctx.stmt_tx.prepared_reverse_order;
+        ctx.stmt_tx.reverse_mixed_scan = ctx.stmt_tx.prepared_reverse_order;
     }
     Ok((tbl, indexes, sname))
 }

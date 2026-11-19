@@ -123,7 +123,12 @@ impl CScan {
             return None;
         }
         let (kind, root) = if scan.shape == ScanShape::FullTable {
-            (Kind::Table(Start::Rewind), table_root)
+            let start = if rowid_hi == Some(None) && !is_delete {
+                Start::Last
+            } else {
+                Start::Rewind
+            };
+            (Kind::Table(start), table_root)
         } else if scan.shape == ScanShape::RowidIn {
             (Kind::RowidList(ctx.stmt_tx.c_rowid_in.take()?, 0, 0), table_root)
         } else if scan.shape == ScanShape::RowidRange {
