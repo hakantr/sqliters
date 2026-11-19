@@ -5296,19 +5296,26 @@ impl Pager {
 
             if needs_db_flush && self.page_count > 0 {
                 let p1_already_dirty = self.cache.is_dirty(1);
-                // Match `pager.c:6565-6571` (Ticket `2d1a5c67dfc2`) & `pager.c:3272`:
-                // Only dirty Page 1 on WAL commit when Page 1 was already modified, all
-                // dirty pages were spilled earlier (`!has_dirty_pages`), the database page
-                // count changed (`btree.c:6808`), or Page 1 header versions are not `(2, 2)`.
+                // A persistent WAL may remain attached after the SQL mode
+                // changes to rollback. pagerWalFrames preserves the page-one
+                // rollback format and writes only the dirty pages.
+                let retained_rollback_header = self.journal_mode != JournalMode::Wal
+                    && self.header.write_version == 1
+                    && self.header.read_version == 1;
+                let needs_wal_header = !retained_rollback_header
+                    && (self.header.write_version != 2 || self.header.read_version != 2);
+                // Ticket 2d1a5c67dfc2 requires a commit frame when every dirty
+                // page spilled before commit. A size change updates page one too.
                 let must_write_p1 = p1_already_dirty
                     || !has_dirty_pages
                     || self.page_count != self.tx_orig_page_count
-                    || self.header.write_version != 2
-                    || self.header.read_version != 2;
+                    || needs_wal_header;
                 if must_write_p1 {
                     self.dv_wal_page1_written = true;
                     let p1_slot = self.mark_page_writable(1)?;
-                    if !self.pending_sql_journal_mode.is_some_and(|transition| transition.previous == JournalMode::Wal) {
+                    if !retained_rollback_header
+                        && !self.pending_sql_journal_mode.is_some_and(|transition| transition.previous == JournalMode::Wal)
+                    {
                         self.header.write_version = 2;
                         self.header.read_version = 2;
                     }

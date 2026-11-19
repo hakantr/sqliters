@@ -1092,3 +1092,8 @@ Uygun UPDATE ve DELETE doğrudan indekslenmeyen sütun eşitliğinde aktif fizik
 ## V6b.157 — V1 journal_mode kilit ve yeniden adım
 
 V1 dış SQLITE_ERROR sonucuyla dahili BUSY veya SCHEMA kodunu C sırasıyla taşır. 72 çekişme ve 24 sağlıklı pragma grubunda 192 C/Rust native ve DB çifti eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_157.md).
+
+
+## V6b.158 — Retained WAL takip yazısında rollback başlığı
+
+Fiziksel WAL ve mantıksal rollback kipinde sayfa 1 biçimi korunur. 96 retained akış, 64 eski format farkı ve 1.008 C açılışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,225 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_158.md).
