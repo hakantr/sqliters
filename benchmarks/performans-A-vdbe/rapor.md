@@ -1032,3 +1032,8 @@ Uygun parent UPDATE hazırlığında değişmeyen gelen FK de C oldmask kararın
 ## V6b.145 — Kalıcı WAL yeniden açılırken SHARED kilidi
 
 Tek hedefli normal D/P/T SQL çıkışı C gibi WAL yeniden açılmadan önce SHARED kilidine iner. 1.296 normal ve 216 canlı C peer akışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,290 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_145.md).
+
+
+## V6b.146 — İfade indeksi INDEX_XINFO kolasyon adı
+
+C'nin ifade kökündeki açık kolasyon adı doğrudan ve tablo değerli metadata için korunuyor. 18 eski fark kapandı ve her kipte 726 yeni grup eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,257 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_146.md).

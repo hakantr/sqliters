@@ -48,6 +48,22 @@ pub fn parse_one_with_spans(sql: &str) -> Result<(Option<Stmt>, IdentSpanMap, &s
     parse_one_inner(sql, true)
 }
 
+/// Returns the collation named by the root of one CREATE INDEX term.
+pub fn parse_index_term_outer_collation(sql: &str) -> Result<Option<String>> {
+    let mut tokens = tokenize(sql)?;
+    disambiguate_window_keywords(&mut tokens);
+    let mut parser = Parser::new(sql, &tokens, false);
+    let expr = parser.parse_expr()?;
+    if !parser.eat(TokenKind::Asc) {
+        parser.eat(TokenKind::Desc);
+    }
+    parser.expect(TokenKind::Eof)?;
+    Ok(match expr {
+        Expr::Collate { collation, .. } => Some(collation),
+        _ => None,
+    })
+}
+
 fn parse_one_inner(sql: &str, track_spans: bool) -> Result<(Option<Stmt>, IdentSpanMap, &str)> {
     let prefix_end = first_statement_end_offset(sql);
     let prefix = &sql[..prefix_end];

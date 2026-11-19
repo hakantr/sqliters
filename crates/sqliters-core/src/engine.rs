@@ -44749,6 +44749,48 @@ fn index_xinfo_collations(
     })
 }
 
+fn index_xinfo_expression_collation(
+    db_id: DatabaseId,
+    index: &IndexSchema,
+    collations: &CollationRegistry,
+) -> Option<String> {
+    let [key] = index.columns.as_slice() else {
+        return None;
+    };
+    if db_id != DatabaseId::MAIN
+        || index.table_without_rowid
+        || index.unique
+        || index.is_autoindex
+        || index.where_clause.is_some()
+        || key.col_idx.is_some()
+        || key.sort_order.custom_collation.is_some()
+    {
+        return None;
+    }
+    let sql = index.raw_sql.as_deref()?;
+    let tokens = tokenize(sql).ok()?;
+    let open = tokens.iter().position(|token| token.kind == TokenKind::Lp)?;
+    let close = find_matching_rparen(&tokens, open)?;
+    let term = &tokens[open + 1..close];
+    if !term.iter().any(|token| token.kind == TokenKind::Collate)
+        || !term
+            .windows(2)
+            .filter(|pair| pair[0].kind == TokenKind::Collate)
+            .all(|pair| {
+                let name = dequote(pair[1].text);
+                Collation::from_name(&name).is_some() && collations.get_custom(&name).is_none()
+            })
+    {
+        return None;
+    }
+    // sqlite3CreateIndex copies the root TK_COLLATE token into azColl.
+    let start = tokens[open].offset + tokens[open].text.len();
+    let end = tokens[close].offset;
+    sqliters_syntax::parser::parse_index_term_outer_collation(&sql[start..end])
+        .ok()
+        .flatten()
+}
+
 /// Returns the table and secondary index roots for a simple read whose two schema
 /// representations disagree about the index collation.
 pub(crate) fn mixed_collation_table_scan(
@@ -45814,22 +45856,30 @@ fn exec_pragma(
                 }
             };
             let explicit_collations = index_xinfo_collations(idx_db_id, &idx, ctx.collations);
+            let expression_collation =
+                index_xinfo_expression_collation(idx_db_id, &idx, ctx.collations);
             let mut rows = Vec::new();
             for (seqno, ic) in idx.columns.iter().enumerate() {
                 let (cid, name_val) = match ic.col_idx {
                     Some(ci) => (ci as i64, Value::Text(ic.name.clone())),
                     None => (-2i64, Value::Null),
                 };
-                let coll = explicit_collations
+                let coll = expression_collation
                     .as_ref()
-                    .and_then(|columns| columns.get(seqno))
-                    .and_then(Option::as_ref)
-                    .filter(|(name, mixed_builtin)| {
-                        ic.sort_order.custom_collation.is_none()
-                            && (*mixed_builtin
-                                || Collation::from_name(name) == Some(ic.sort_order.collation))
+                    .or_else(|| {
+                        explicit_collations
+                            .as_ref()
+                            .and_then(|columns| columns.get(seqno))
+                            .and_then(Option::as_ref)
+                            .filter(|(name, mixed_builtin)| {
+                                ic.sort_order.custom_collation.is_none()
+                                    && (*mixed_builtin
+                                        || Collation::from_name(name) == Some(ic.sort_order.collation))
+                            })
+                            .map(|(name, _)| name)
                     })
-                    .map_or_else(|| kso_coll(&ic.sort_order), |(name, _)| name.clone());
+                    .cloned()
+                    .unwrap_or_else(|| kso_coll(&ic.sort_order));
                 rows.push(vec![
                     Value::Integer(seqno as i64),
                     Value::Integer(cid),
