@@ -43264,7 +43264,7 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
         return false;
     }
     let supported = [JournalMode::Delete, JournalMode::Persist, JournalMode::Truncate, JournalMode::Wal];
-    if !supported.contains(&target) && target != JournalMode::Memory {
+    if !supported.contains(&target) && !matches!(target, JournalMode::Memory | JournalMode::Off) {
         return false;
     }
     let mut has_wal_transition = false;
@@ -43279,7 +43279,9 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
         }
         let previous = pager.journal_mode();
         let supported_previous = supported.contains(&previous)
-            || (previous == JournalMode::Memory && matches!(target, JournalMode::Memory | JournalMode::Wal));
+            || (previous == JournalMode::Memory
+                && matches!(target, JournalMode::Memory | JournalMode::Wal | JournalMode::Off))
+            || (previous == JournalMode::Off && target == JournalMode::Off);
         if pager.db_kind() != DatabaseKind::NamedDisk
             || pager.locking_mode() != LockingMode::Normal
             || pager.transaction_state() != TransactionState::Open

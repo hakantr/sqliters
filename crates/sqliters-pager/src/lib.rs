@@ -2526,12 +2526,14 @@ impl Pager {
             && self.db_kind == DatabaseKind::NamedDisk
             && self.page_count > 0
             && self.pending_sql_journal_mode.is_none()
-            && (!(mode == JournalMode::Memory || self.journal_mode == JournalMode::Memory)
+            && (!(matches!(mode, JournalMode::Memory | JournalMode::Off)
+                || self.journal_mode == JournalMode::Memory)
                 || self.locking_mode == LockingMode::Normal)
             && matches!(
                 (self.journal_mode, mode),
                 (JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate | JournalMode::Memory, JournalMode::Wal)
-                    | (JournalMode::Wal, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate | JournalMode::Memory)
+                    | (JournalMode::Wal, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate
+                        | JournalMode::Memory | JournalMode::Off)
             );
         let active = self.change_journal_mode(mode, defer)?;
         Ok((active, defer && self.pending_sql_journal_mode.is_some()))
@@ -2668,11 +2670,10 @@ impl Pager {
 
             // `.db` currently holds `LockLevel::Exclusive`, and `self.wal` is `None`.
             // Suppress automatic WAL re-open while rewriting Page 1 `(2, 2) -> (1, 1)` under a
-            // rollback journal. OP_JournalMode selects MEMORY before staging page one
-            // in the statement. Inline MEMORY and OFF rewrites use a DELETE journal.
+            // journal mode selected by OP_JournalMode before staging page one. Inline
+            // MEMORY and OFF rewrites use a DELETE journal.
             let tx_rb_mode = match target_mode {
-                JournalMode::Memory if !defer => JournalMode::Delete,
-                JournalMode::Off => JournalMode::Delete,
+                JournalMode::Memory | JournalMode::Off if !defer => JournalMode::Delete,
                 other => other,
             };
             self.journal_mode = tx_rb_mode;
@@ -2721,6 +2722,9 @@ impl Pager {
             self.suppress_auto_wal = false;
             if let Err(e) = step_res {
                 let _ = self.rollback_retaining_read(false);
+                if defer && tx_rb_mode == JournalMode::Off {
+                    self.journal_mode = old_mode;
+                }
                 if self.locking_mode == LockingMode::Normal {
                     let _ = self.unlock_db_file(LockLevel::NoLock);
                 }
