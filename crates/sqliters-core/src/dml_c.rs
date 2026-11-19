@@ -10,6 +10,7 @@
 
 use crate::compiler::AccessPlan;
 use crate::db_set::DatabaseSet;
+use crate::engine::{CteStore, scalar_self_join_cte_columns};
 use crate::schema::{IndexSchema, TableSchema};
 use crate::trigger::{TriggerEventKind, TriggerSchema};
 use sqliters_syntax::ast::*;
@@ -649,12 +650,12 @@ fn walk_select_shallow_subs<'a>(sel: &'a SelectStmt, out: &mut Vec<&'a SelectStm
 
 /// Registers (address, no value yet) every scalar sub-select of `e` that provably does not
 /// refer to anything outside itself — the ones C evaluates once per statement (`OP_Once`, no
-/// `EP_VarSelect`). The test is deliberately narrow: a FROM clause of plain base tables only,
-/// no CTEs, no nested sub-selects, and every column reference names a column of one of those
-/// tables. Anything else is left to per-row evaluation.
+/// `EP_VarSelect`). Accept plain base tables and, when supplied, the lexical scope of
+/// an eligible CTE self-join. Column references must resolve inside the scalar SELECT.
 pub(crate) fn collect_uncorrelated_scalar_subqueries(
     db_set: &DatabaseSet,
     e: &Expr,
+    ctes: Option<&CteStore>,
     out: &mut Vec<(usize, Option<sqliters_types::Value>)>,
 ) {
     let mut found: Vec<&SelectStmt> = Vec::new();
@@ -712,7 +713,7 @@ pub(crate) fn collect_uncorrelated_scalar_subqueries(
     }
     top_subs(e, &mut found);
     for sel in found {
-        if select_is_self_contained(db_set, sel) {
+        if select_is_self_contained_with_ctes(db_set, sel, ctes, true, 0) {
             let key = sel as *const SelectStmt as usize;
             if !out.iter().any(|(k, _)| *k == key) {
                 out.push((key, None));
@@ -722,6 +723,16 @@ pub(crate) fn collect_uncorrelated_scalar_subqueries(
 }
 
 pub(crate) fn select_is_self_contained(db_set: &DatabaseSet, sel: &SelectStmt) -> bool {
+    select_is_self_contained_with_ctes(db_set, sel, None, false, 0)
+}
+
+fn select_is_self_contained_with_ctes(
+    db_set: &DatabaseSet,
+    sel: &SelectStmt,
+    ctes: Option<&CteStore>,
+    allow_cte_self_join: bool,
+    nested_scalar_depth: usize,
+) -> bool {
     if !sel.ctes.is_empty() || !sel.body.compounds.is_empty() {
         return false;
     }
@@ -741,7 +752,29 @@ pub(crate) fn select_is_self_contained(db_set: &DatabaseSet, sel: &SelectStmt) -
     {
         return false;
     }
-    // inner tables: (name or alias, column names)
+    // inner tables: (name or alias, column names, has implicit rowid)
+    let cte_columns = if allow_cte_self_join {
+        ctes.and_then(|scope| scalar_self_join_cte_columns(db_set, fc, scope))
+    } else {
+        None
+    };
+    // A pair of lexical CTE references cannot be certified using base-table
+    // columns. Mixed FROM statements keep the previous classification.
+    let binds_cte = |source: &TableOrSubquery| {
+        matches!(
+            source,
+            TableOrSubquery::Table { name, table_args: None, .. }
+                if name.schema.is_none()
+                    && ctes.is_some_and(|scope| scope.locate(&name.name).is_some())
+        )
+    };
+    let ctes = if allow_cte_self_join
+        && !matches!(fc.joins.as_slice(), [join] if binds_cte(&fc.head) && binds_cte(&join.right))
+    {
+        None
+    } else {
+        ctes
+    };
     let mut inner: Vec<(String, Vec<String>, bool)> = Vec::new();
     for t in std::iter::once(&fc.head).chain(fc.joins.iter().map(|j| &j.right)) {
         let TableOrSubquery::Table {
@@ -753,14 +786,22 @@ pub(crate) fn select_is_self_contained(db_set: &DatabaseSet, sel: &SelectStmt) -
         else {
             return false;
         };
-        let Ok(Some((_, tbl))) = db_set.find_table_in_set(name) else {
-            return false;
+        let (columns, has_rowid) = if name.schema.is_none()
+            && ctes.is_some_and(|scope| scope.locate(&name.name).is_some())
+        {
+            // A lexical CTE shadows a same-named base table even if it is
+            // ineligible for reuse across UPDATE rows.
+            let Some(columns) = &cte_columns else {
+                return false;
+            };
+            (columns.clone(), false)
+        } else {
+            let Ok(Some((_, tbl))) = db_set.find_table_in_set(name) else {
+                return false;
+            };
+            (tbl.columns.iter().map(|c| c.name.clone()).collect(), !tbl.without_rowid)
         };
-        inner.push((
-            alias.clone().unwrap_or_else(|| name.name.clone()),
-            tbl.columns.iter().map(|c| c.name.clone()).collect(),
-            !tbl.without_rowid,
-        ));
+        inner.push((alias.clone().unwrap_or_else(|| name.name.clone()), columns, has_rowid));
     }
     if fc
         .joins
@@ -769,30 +810,59 @@ pub(crate) fn select_is_self_contained(db_set: &DatabaseSet, sel: &SelectStmt) -
     {
         return false;
     }
-    let mut ok = true;
-    walk_select(sel, &mut |x| {
-        match x {
-            Expr::Subquery(_)
-            | Expr::Exists { .. }
-            | Expr::InSubquery { .. }
-            | Expr::InTable { .. }
-            | Expr::Raise { .. }
-            | Expr::Bind(_) => ok = false,
-            Expr::Column(c) => {
-                let is_rowid_name = |n: &str| {
-                    ["rowid", "oid", "_rowid_"].iter().any(|r| n.eq_ignore_ascii_case(r))
-                };
-                let hit = inner.iter().any(|(tname, cols, has_rowid)| {
+    select_exprs_are_local(
+        sel,
+        |sub| {
+            nested_scalar_depth.checked_sub(1).is_some_and(|depth| {
+                select_is_self_contained_with_ctes(db_set, sub, ctes, false, depth)
+            })
+        },
+        |c| {
+            let is_rowid_name = |n: &str| {
+                ["rowid", "oid", "_rowid_"].iter().any(|r| n.eq_ignore_ascii_case(r))
+            };
+            c.schema.is_none()
+                && inner.iter().any(|(tname, cols, has_rowid)| {
                     c.table.as_ref().is_none_or(|t| t.eq_ignore_ascii_case(tname))
                         && (cols.iter().any(|n| n.eq_ignore_ascii_case(&c.column))
                             || (*has_rowid && is_rowid_name(&c.column)))
-                });
-                if !hit || c.schema.is_some() {
-                    ok = false;
-                }
-            }
-            _ => {}
-        }
+                })
+        },
+    )
+}
+
+pub(crate) fn cte_body_is_self_contained(
+    db_set: &DatabaseSet,
+    sel: &SelectStmt,
+    ctes: &CteStore,
+) -> bool {
+    // A FROM-less CTE can contain up to two levels of independent scalar
+    // reads of base tables, including the table being updated. Check name
+    // shadowing at each level and keep deeper reads out of this proof.
+    select_exprs_are_local(
+        sel,
+        |sub| select_is_self_contained_with_ctes(db_set, sub, Some(ctes), false, 1),
+        |_| false,
+    )
+}
+
+fn select_exprs_are_local(
+    sel: &SelectStmt,
+    mut scalar_subquery_is_local: impl FnMut(&SelectStmt) -> bool,
+    mut column_is_local: impl FnMut(&ColumnRef) -> bool,
+) -> bool {
+    let mut ok = true;
+    walk_select(sel, &mut |x| {
+        ok &= match x {
+            Expr::Subquery(sub) => scalar_subquery_is_local(sub),
+            Expr::Exists { .. }
+            | Expr::InSubquery { .. }
+            | Expr::InTable { .. }
+            | Expr::Raise { .. }
+            | Expr::Bind(_) => false,
+            Expr::Column(c) => column_is_local(c),
+            _ => true,
+        };
         Walk::Shallow
     });
     ok

@@ -871,8 +871,8 @@ fn with_recursive_materialized_soft_keyword_priority_queue_and_interrupt() {
     assert_eq!(not_mat_res, vec!["1|1", "2|2"]);
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        4,
-        "AS NOT MATERIALIZED must re-evaluate the 2-row CTE body per reference"
+        2,
+        "SQLite materializes this AS NOT MATERIALIZED self-join once"
     );
 
     // 6. Forbidden recursive CTE constructs & nested CTE expansion depth limit

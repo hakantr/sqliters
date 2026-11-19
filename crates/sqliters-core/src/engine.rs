@@ -2224,7 +2224,7 @@ impl CteStore {
         }
     }
 
-    fn locate(&self, name: &str) -> Option<(usize, usize)> {
+    pub(crate) fn locate(&self, name: &str) -> Option<(usize, usize)> {
         for (s_idx, scope) in self.scopes.iter().enumerate().rev() {
             for (c_idx, cte) in scope.iter().enumerate() {
                 if cte.name.eq_ignore_ascii_case(name) {
@@ -7306,6 +7306,7 @@ fn exec_single_select_core_inner(
                                 ctes,
                                 &mut omitted_vtab_conjuncts,
                                 Some(&single_qinfo),
+                                None,
                             )?
                             }
                         },
@@ -8497,6 +8498,77 @@ fn tos_is_vtab_or_tvf(db_set: &DatabaseSet, tos: &TableOrSubquery, ctes: &CteSto
     }
 }
 
+struct FromCteMaterialization {
+    identity: (usize, usize),
+    output: Option<QueryOutput>,
+}
+
+fn from_cte_self_join(fc: &FromClause, ctes: &CteStore) -> Option<(usize, usize)> {
+    let (identity, cte) = nonflattened_cte_self_join(fc, ctes)?;
+    (cte.materialized == Some(false)).then_some(identity)
+}
+
+fn nonflattened_cte_self_join<'a>(
+    fc: &FromClause,
+    ctes: &'a CteStore,
+) -> Option<((usize, usize), &'a CommonTableExpr)> {
+    if ctes.limit_hint.is_some() {
+        return None;
+    }
+    let [join] = fc.joins.as_slice() else {
+        return None;
+    };
+    let cte_identity = |source: &TableOrSubquery| match source {
+        TableOrSubquery::Table {
+            name,
+            table_args: None,
+            indexed_by: None,
+            ..
+        } if name.schema.is_none() => ctes.locate(&name.name),
+        _ => None,
+    };
+    let identity = cte_identity(&fc.head)?;
+    // A caller row in a scalar subquery does not by itself correlate a CTE
+    // defined at the top level.
+    if cte_identity(&join.right) != Some(identity) || ctes.scope_outer_depths[identity.0] != 0 {
+        return None;
+    }
+
+    let cte = &ctes.scopes[identity.0][identity.1];
+    let select_without_from = |core: &SelectCore| matches!(core, SelectCore::Select { from: None, .. });
+    let body = &cte.query.body;
+    // C's flattenSubquery rules (7) and (17c) leave these SELECTs as
+    // subqueries. Both aliases bind the same CteUse, so C also skips
+    // predicate push-down (nUse >= 2) and rejects a coroutine for the first.
+    (cte.query.ctes.is_empty()
+        && cte.query.order_by.is_empty()
+        && cte.query.limit.is_none()
+        && select_without_from(&body.head)
+        && body
+            .compounds
+            .iter()
+            .all(|(op, core)| *op == CompoundOp::UnionAll && select_without_from(core)))
+    .then_some((identity, cte))
+}
+
+/// Column names of a lexical CTE that cannot depend on an outer row.
+/// This is the same direct self-join supported by FROM materialization, with
+/// an additional body check for reuse across multiple UPDATE rows.
+pub(crate) fn scalar_self_join_cte_columns(
+    db_set: &DatabaseSet,
+    from: &FromClause,
+    ctes: &CteStore,
+) -> Option<Vec<String>> {
+    let (_, cte) = nonflattened_cte_self_join(from, ctes)?;
+    if !crate::dml_c::cte_body_is_self_contained(db_set, &cte.query, ctes) {
+        return None;
+    }
+    let columns = cte.columns.clone().unwrap_or_else(|| {
+        static_select_col_names(&cte.query.body, &[], db_set, ctes, &mut Vec::new())
+    });
+    Some(disambiguate_view_column_names(&columns))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn eval_from_clause(
     ctx: &mut ExecContext<'_>,
@@ -8788,6 +8860,11 @@ fn eval_from_clause_inner(
         (None, None)
     };
 
+    let mut from_materialization =
+        from_cte_self_join(fc, ctes).map(|identity| FromCteMaterialization {
+            identity,
+            output: None,
+        });
     // If `fc.head` is a virtual table or table-valued function whose required arguments depend
     // on a subsequent INNER/CROSS table, rotate `fc.head` past the INNER/CROSS prefix if needed.
     let mut left_rows = match eval_table_or_subquery(
@@ -8805,6 +8882,7 @@ fn eval_from_clause_inner(
         ctes,
         omitted_conjuncts,
         None,
+        from_materialization.as_mut(),
     ) {
         Ok(rows) => rows,
         Err(head_err) if head_is_vtab && vtab_rotations_left > 0 => {
@@ -9029,6 +9107,7 @@ fn eval_from_clause_inner(
                     ctes,
                     omitted_conjuncts,
                     None,
+                    None,
                 )?;
             } else {
                 let mut combined_out = Vec::new();
@@ -9044,6 +9123,7 @@ fn eval_from_clause_inner(
                         &sc,
                         ctes,
                         omitted_conjuncts,
+                        None,
                         None,
                     )?;
                     let r_cols_actual = if !right_cols_fallback.is_empty() {
@@ -9098,6 +9178,7 @@ fn eval_from_clause_inner(
                 ctes,
                 omitted_conjuncts,
                 None,
+                from_materialization.as_mut(),
             )?;
             let right_cols_actual: Vec<ScopedColumn> = right_rows
                 .first()
@@ -13376,6 +13457,7 @@ fn eval_table_or_subquery(
     ctes: &CteStore,
     omitted_conjuncts: &mut Vec<Expr>,
     vtab_query_info: Option<&SingleVtabQueryInfo<'_>>,
+    from_materialization: Option<&mut FromCteMaterialization>,
 ) -> Result<Vec<EvalRow>> {
     match tos {
         TableOrSubquery::TableFunction {
@@ -13470,9 +13552,22 @@ fn eval_table_or_subquery(
                 );
             }
             let eff_alias = alias.clone().unwrap_or_else(|| name.name.clone());
-            if name.schema.is_none()
-                && let Some(cte_out) = resolve_cte(ctx, ctes, &name.name, params, outer_scopes)?
-            {
+            let cte_out = if name.schema.is_none() {
+                let materialization = from_materialization
+                    .filter(|entry| ctes.locate(&name.name) == Some(entry.identity));
+                if let Some(out) = materialization.as_ref().and_then(|entry| entry.output.as_ref()) {
+                    Some(out.clone())
+                } else {
+                    let out = resolve_cte(ctx, ctes, &name.name, params, outer_scopes)?;
+                    if let Some(entry) = materialization {
+                        entry.output.clone_from(&out);
+                    }
+                    out
+                }
+            } else {
+                None
+            };
+            if let Some(cte_out) = cte_out {
                 if let Some(hint) = indexed_by {
                     return Err(SqliteError::new(
                         ErrorCode::Error,
@@ -15034,9 +15129,18 @@ fn schema_cols_preview(
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
 ) -> Option<Vec<ScopedColumn>> {
-    let mut cols = schema_cols_for_tos(ctx, &fc.head, params, outer_scopes, ctes)?;
+    let shared_cte = from_cte_self_join(fc, ctes).is_some();
+    let mut source_columns = |source: &TableOrSubquery| {
+        if shared_cte {
+            // Planning the scans of a shared CTE must not run its expressions.
+            static_schema_cols_for_tos(source, outer_scopes, ctx.db_set, ctes, &mut Vec::new())
+        } else {
+            schema_cols_for_tos(ctx, source, params, outer_scopes, ctes)
+        }
+    };
+    let mut cols = source_columns(&fc.head)?;
     for j in &fc.joins {
-        if let Some(rcols) = schema_cols_for_tos(ctx, &j.right, params, outer_scopes, ctes) {
+        if let Some(rcols) = source_columns(&j.right) {
             cols = merge_join_scoped_columns(&cols, &rcols, j);
         }
     }
@@ -29891,10 +29995,12 @@ fn run_table_update_loop(
             let keys = keys.into_boxed_slice();
             // (see `StmtTxTracker::once_subqueries`; an enclosing statement's entries are kept)
             let once_base = ctx.stmt_tx.once_subqueries.len();
+            let ctes = ctx.stmt_tx.subprogram_stack.is_empty().then_some(&p.dml_ctes);
             for sa in &upd.assignments {
                 crate::dml_c::collect_uncorrelated_scalar_subqueries(
                     ctx.db_set,
                     &sa.expr,
+                    ctes,
                     &mut ctx.stmt_tx.once_subqueries,
                 );
             }
@@ -30035,6 +30141,7 @@ fn run_view_update_loop(
                 crate::dml_c::collect_uncorrelated_scalar_subqueries(
                     ctx.db_set,
                     &sa.expr,
+                    None,
                     &mut ctx.stmt_tx.once_subqueries,
                 );
             }
