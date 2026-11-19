@@ -892,3 +892,8 @@ Normal açık built-in COLLATE yazımı C gibi gösteriliyor. 336 metadata fark�
 ## V6b.117 — İndeks metadata aynı collation zinciri
 
 Doğrudan sütundaki aynı yerleşik collation zincirinin dış yazımı C eş. 192 metadata farkı kapandı, 72 fiziksel dosya byte eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_117.md).
+
+
+## V6b.118 — Tek hedefli PERSIST/TRUNCATE WAL yaşamı
+
+İlk ROW eski journal inode ve biçimini tutuyor, normal bitiş WAL'ı tamamlıyor. 288 retained ve 288 önceki DELETE/WAL akışı C eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_118.md).

@@ -2518,7 +2518,7 @@ impl Pager {
         self.change_journal_mode(mode, false)
     }
 
-    /// Prepares a single-target SQL mode change whose page-one transaction
+    /// Prepares a SQL mode change whose page-one transaction
     /// is completed by the statement's normal commit outcome.
     #[doc(hidden)]
     pub fn stage_sql_journal_mode(&mut self, mode: JournalMode) -> Result<(JournalMode, bool)> {
@@ -2528,7 +2528,8 @@ impl Pager {
             && self.pending_sql_journal_mode.is_none()
             && matches!(
                 (self.journal_mode, mode),
-                (JournalMode::Delete, JournalMode::Wal) | (JournalMode::Wal, JournalMode::Delete)
+                (JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate, JournalMode::Wal)
+                    | (JournalMode::Wal, JournalMode::Delete)
             );
         let active = self.change_journal_mode(mode, defer)?;
         Ok((active, defer && self.pending_sql_journal_mode.is_some()))
@@ -2599,13 +2600,15 @@ impl Pager {
             }
 
             let saved_mode = self.journal_mode;
-            if let Some(mut jfd) = self.journal_file.take() {
-                let _ = jfd.close();
+            if !(defer && self.uses_persistent_rollback_journal()) {
+                if let Some(mut jfd) = self.journal_file.take() {
+                    let _ = jfd.close();
+                }
+                self.journal_mode = JournalMode::Delete;
             }
+            // A staged PERSIST/TRUNCATE write reuses the previous rollback
+            // journal. Pending WAL mode removes it at statement completion.
             self.journal_off = 0;
-            // Always protect Page 1 `(1, 1) -> (2, 2)` with an on-disk rollback journal (`Delete`),
-            // which also unlinks `<db>-journal` upon `commit()`.
-            self.journal_mode = JournalMode::Delete;
 
             let step_res: Result<()> = (|| {
                 self.begin_exclusive()?;
@@ -5699,11 +5702,10 @@ impl Pager {
             && let Some(target) = self.pending_sql_journal_mode.take()
         {
             self.suppress_auto_wal = false;
-            self.journal_mode = if target == JournalMode::Wal {
-                JournalMode::Delete
-            } else {
-                JournalMode::Wal
-            };
+            // Entry kept the old rollback mode while preparing page one.
+            if target != JournalMode::Wal {
+                self.journal_mode = JournalMode::Wal;
+            }
         }
         if was_write && let Err(ref error) = result {
             self.latch_pager_error(error);
