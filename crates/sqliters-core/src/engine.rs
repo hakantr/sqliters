@@ -43036,16 +43036,14 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
     if !is_in_autocommit(ctx) || ctx.activity.other_readers != 0 {
         return false;
     }
-    let previous_modes: &[JournalMode] = match target {
-        JournalMode::Wal => &[JournalMode::Delete, JournalMode::Persist, JournalMode::Truncate],
-        JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate => &[JournalMode::Wal],
-        _ => return false,
-    };
-    let mut participants = 0;
+    let supported = [JournalMode::Delete, JournalMode::Persist, JournalMode::Truncate, JournalMode::Wal];
+    if !supported.contains(&target) {
+        return false;
+    }
+    let mut has_wal_transition = false;
     for bt in ctx.db_set.slots().iter().filter_map(|slot| slot.btree.as_ref()) {
         let pager = bt.pager();
         let previous = pager.journal_mode();
-        let needs_transition = previous != target;
         if pager.db_kind() != DatabaseKind::NamedDisk
             || pager.locking_mode() != LockingMode::Normal
             || pager.transaction_state() != TransactionState::Open
@@ -43053,14 +43051,15 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
             || pager.page_count() == 0
             || pager.is_readonly()
             || !pager.ok_to_change_journal_mode()
-            || (needs_transition && !previous_modes.contains(&previous))
+            || !supported.contains(&previous)
             || pager.effective_journal_mode_target(target) != target
         {
             return false;
         }
-        participants += usize::from(needs_transition);
+        // OP_JournalMode writes page one only when crossing the WAL boundary.
+        has_wal_transition |= (previous == JournalMode::Wal) != (target == JournalMode::Wal);
     }
-    participants > 0
+    has_wal_transition
 }
 
 fn apply_journal_mode_on_slot(
@@ -43138,10 +43137,12 @@ fn apply_journal_mode_on_slot(
             ));
         }
     }
-    let coordinated = ctx.stmt_tx.coordinated_journal_mode;
+    // Rollback-only mode changes use the pager's ordinary mode update.
+    let previous = bt.journal_mode();
+    let coordinated = ctx.stmt_tx.coordinated_journal_mode
+        && ((previous == JournalMode::Wal) != (target == JournalMode::Wal));
     if (single_target || coordinated) && !disallow_wal_transition {
         let (active, staged) = if coordinated {
-            let previous = bt.journal_mode();
             let mut cleanup_error = None;
             let outcome = ctx.busy_policy.retry_btree(bt, |b| {
                 let pager = b.pager_mut();

@@ -932,3 +932,8 @@ WAL checkpoint ve ilk ROW aktif journal sınırını C gibi izliyor. 288 yeni ak
 ## V6b.125 — Çoklu WAL→PERSIST/TRUNCATE ve ortak journal
 
 Koordinatör retained hedeflerde C ile aynı katılımcıları ve bitiş sırasını kullanıyor. 216 yeni ve 414 önceki kontrol, 4.662 salt okunur C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,270 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_125.md).
+
+
+## V6b.126 — Karma rollback kipli disklerde WAL çıkışı
+
+Yalnız WAL sınırını geçen diskler ortak statement bitişine katılıyor. 216 yeni, 396 koruma ve 6.048 salt okunur C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,249 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_126.md).
