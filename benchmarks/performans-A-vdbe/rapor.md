@@ -772,3 +772,8 @@ EXCLUSIVE geçişinde rollback journalı commit sonunda C ile aynı sınırda ka
 ## V6b.93 — EXCLUSIVE PERSIST ve TRUNCATE→WAL sonlandırması
 
 Geçiş commit'i rollback journalı C ile aynı sınırda kaldırıyor. 240 sağlıklı geçiş, 120 DELETE/WAL koruması ve C yeniden açılışları eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 387/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 0,844 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_93.md).
+
+
+## V6b.94 — EXCLUSIVE MEMORY ve OFF→WAL sonlandırması
+
+Başarılı geçiş commit'i rollback journal ömrünü C ile hizalıyor. 240 sağlıklı geçiş ve 240 önceki kip koruması eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 387/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,254 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_94.md).
