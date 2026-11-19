@@ -817,3 +817,8 @@ Dış covering taramada bağımsız EXISTS kaynak sırası C eş. OFF DML bir va
 ## V6b.102 — Nitelikli korelasyonlu EXISTS sırası
 
 C dış covering taraması, kanıtlanan dış sütun bağımlılığı için uygulanıyor. Kalıcı self-REPLACE çıktısı ve son rowid C eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,272 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_102.md).
+
+
+## V6b.103 — WITHOUT ROWID otomatik UNIQUE ve PK eki
+
+Yalın SELECT ve INSERT SELECT planı C maskesine göre otomatik UNIQUE kapsamasını seçiyor. Her API ve kipte 165/165 kalıcı dosya ve C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,246 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_103.md).

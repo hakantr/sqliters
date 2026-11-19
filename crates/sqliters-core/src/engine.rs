@@ -7285,10 +7285,10 @@ fn exec_single_select_core_inner(
                                 && order_by.is_empty()
                                 && limit.is_none()
                                 && matches!(selection, Some(Expr::Exists { negated: false, .. }))
-                                && projection.iter().all(|p| {
-                                    matches!(p, ResultColumn::Expr { expr, .. }
-                                        if covering_exists_expr_is_simple(expr))
-                                });
+                                && is_simple_covering_projection(projection);
+                            single_qinfo.allow_wr_autoindex_covering = !*distinct
+                                && selection.is_none()
+                                && limit.is_none();
                             eval_table_or_subquery(
                                 ctx,
                                 &fc.head,
@@ -9528,6 +9528,7 @@ struct SingleVtabQueryInfo<'a> {
     /// in the order C's plan produces them.
     plan_ctx: Option<(&'a [ResultColumn], &'a [OrderByTerm])>,
     allow_local_exists_covering: bool,
+    allow_wr_autoindex_covering: bool,
 }
 
 impl<'a> SingleVtabQueryInfo<'a> {
@@ -13455,7 +13456,13 @@ fn try_exec_fast_single_vtab_select(
     }))
 }
 
-fn covering_exists_expr_is_simple(expr: &Expr) -> bool {
+pub(crate) fn is_simple_covering_projection(projection: &[ResultColumn]) -> bool {
+    projection.iter().all(|p| {
+        matches!(p, ResultColumn::Expr { expr, .. } if is_simple_covering_expr(expr))
+    })
+}
+
+fn is_simple_covering_expr(expr: &Expr) -> bool {
     use crate::dml_c::{Walk, walk_expr};
     let mut simple = true;
     walk_expr(expr, &mut |node| {
@@ -13574,7 +13581,7 @@ fn local_exists_allows_covering(
                 ..
             }]
         )
-        || !covering_exists_expr_is_simple(predicate)
+        || !is_simple_covering_expr(predicate)
     {
         return false;
     }
@@ -14161,6 +14168,7 @@ fn eval_table_or_subquery(
                     indexed_by.as_ref(),
                     plan_where_hint,
                     vtab_query_info.and_then(|q| q.plan_ctx),
+                    false,
                     params,
                     outer_scopes,
                     ctes,
@@ -14185,6 +14193,7 @@ fn eval_table_or_subquery(
                 indexed_by.as_ref(),
                 plan_where_hint,
                 vtab_query_info.and_then(|q| q.plan_ctx),
+                vtab_query_info.is_some_and(|q| q.allow_wr_autoindex_covering),
                 params,
                 outer_scopes,
                 ctes,
@@ -14268,6 +14277,7 @@ fn read_table_with_plan_scan(
         indexed_by,
         where_hint,
         None,
+        false,
         params,
         outer_scopes,
         ctes,
@@ -14285,6 +14295,7 @@ fn read_table_with_plan_ctx(
     indexed_by: Option<&IndexHint>,
     where_hint: Option<&Expr>,
     query_ctx: Option<(&[ResultColumn], &[OrderByTerm])>,
+    allow_wr_autoindex_covering: bool,
     params: &[Value],
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
@@ -14359,7 +14370,7 @@ fn read_table_with_plan_ctx(
         }
     }
 
-    let plan = choose_access_plan_with_context(
+    let plan = crate::compiler::choose_plain_table_plan(
         tbl,
         &slot_name,
         alias,
@@ -14370,6 +14381,12 @@ fn read_table_with_plan_ctx(
             order_by: query_ctx.map_or(&[], |(_, o)| o),
             ..Default::default()
         },
+        allow_wr_autoindex_covering
+            && db_id == DatabaseId::MAIN
+            && outer_scopes.is_empty()
+            && ctes.scopes.is_empty()
+            && !ctx.in_trigger_program()
+            && ctx.db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder == 0,
     );
     let mut scan = crate::dml_c::scan_info(&plan, tbl, false);
     if query_ctx.is_none()

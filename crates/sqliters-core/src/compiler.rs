@@ -362,7 +362,7 @@ fn choose_single_term_plan(
         && ctx.order_by.is_empty()
         && ctx.group_by.is_empty()
         && ctx.having.is_none()
-        && let Some(plan) = choose_unordered_without_rowid_scan(tbl, schema_name, alias, schema, &ctx)
+        && let Some(plan) = choose_unordered_without_rowid_scan(tbl, schema_name, alias, schema, &ctx, None)
     {
         return plan;
     }
@@ -907,6 +907,33 @@ fn choose_single_term_plan(
     best_plan
 }
 
+pub(crate) fn choose_plain_table_plan(
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+    selection: Option<&Expr>,
+    schema: &Schema,
+    ctx: QueryPlanContext<'_>,
+    allow_wr_autoindex_covering: bool,
+) -> AccessPlan {
+    let plan = choose_access_plan_with_context(tbl, schema_name, alias, selection, schema, ctx);
+    if allow_wr_autoindex_covering
+        && tbl.without_rowid
+        && selection.is_none()
+        && ctx.indexed_by.is_none()
+        && ctx.order_by.is_empty()
+        && ctx.group_by.is_empty()
+        && ctx.having.is_none()
+        && ctx.projection.is_some_and(crate::engine::is_simple_covering_projection)
+        && let AccessPlan::IndexFullScan { index, is_covering: true } = &plan
+    {
+        choose_unordered_without_rowid_scan(tbl, schema_name, alias, schema, &ctx, Some(index))
+            .unwrap_or(plan)
+    } else {
+        plan
+    }
+}
+
 /// Compare full scans of the primary and secondary B-trees when there is
 /// no predicate, ordering requirement, or ANALYZE estimate to price.
 fn choose_unordered_without_rowid_scan(
@@ -915,8 +942,39 @@ fn choose_unordered_without_rowid_scan(
     alias: Option<&str>,
     schema: &Schema,
     ctx: &QueryPlanContext<'_>,
+    covering_autoindex: Option<&IndexSchema>,
 ) -> Option<AccessPlan> {
     let indexes = schema.indexes_for_table(&tbl.name);
+    let index_is_covering = |idx: &IndexSchema| {
+        if covering_autoindex.is_some() && idx.is_autoindex && idx.origin == "u" {
+            // build.c fills colNotIdxed before convertToWithoutRowidTable
+            // appends the PRIMARY KEY trailer to an automatic UNIQUE index.
+            let mut mask = idx.clone();
+            mask.trailing_pk_cols.clear();
+            index_is_covering_for_query(&mask, tbl, schema_name, alias, None, ctx)
+        } else {
+            index_is_covering_for_query(idx, tbl, schema_name, alias, None, ctx)
+        }
+    };
+    if let Some(index) = covering_autoindex
+        && (!tbl.without_rowid
+            || !index.is_autoindex
+            || index.origin != "u"
+            || index.trailing_pk_cols.is_empty()
+            || !tbl.foreign_keys.is_empty()
+            || tbl.columns.len() > 63
+            || tbl.columns.iter().any(|col| {
+                col.generated.is_some() || col.custom_collation.is_some()
+            })
+            || indexes.iter().any(|idx| {
+                idx.columns.iter().any(|key| {
+                    key.col_idx.is_none() || key.sort_order.custom_collation.is_some()
+                })
+            })
+            || index_is_covering(index))
+    {
+        return None;
+    }
     if tbl.stat1.has_stat1
         || tbl.without_rowid_pk_stat1.is_some()
         || indexes.iter().any(|idx| idx.stat1.is_some())
@@ -945,8 +1003,7 @@ fn choose_unordered_without_rowid_scan(
             continue;
         }
         let is_primary = idx.origin == "pk" && idx.root_pgno == tbl.root_pgno;
-        let is_covering =
-            is_primary || index_is_covering_for_query(&idx, tbl, schema_name, alias, None, ctx);
+        let is_covering = is_primary || index_is_covering(&idx);
         let index_size = if is_primary {
             primary_size
         } else {
@@ -2864,7 +2921,7 @@ pub fn try_compile_select_with_functions(
     schema: &Schema,
     functions: &FunctionRegistry,
 ) -> Result<Option<VdbeProgram>> {
-    try_compile_select_core(stmt, functions, |name| {
+    try_compile_select_core(stmt, functions, true, |name| {
         let Some(tbl) = resolve_main_table_for_compiler(name, schema)? else {
             return Ok(None);
         };
@@ -2880,7 +2937,9 @@ pub fn try_compile_select_in_db_set(
     db_set: &DatabaseSet,
     functions: &FunctionRegistry,
 ) -> Result<Option<VdbeProgram>> {
-    let res = try_compile_select_core(stmt, functions, |name| {
+    let allow_wr_autoindex_covering =
+        db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder == 0;
+    let res = try_compile_select_core(stmt, functions, allow_wr_autoindex_covering, |name| {
         resolve_db_set_table_for_compiler(name, db_set)
     })?;
     if let Some(ref prog) = res
@@ -4421,6 +4480,7 @@ pub fn try_compile_update_in_db_set(
 fn try_compile_select_core<'a, F>(
     stmt: &SelectStmt,
     functions: &FunctionRegistry,
+    allow_wr_autoindex_covering: bool,
     resolve_table: F,
 ) -> Result<Option<VdbeProgram>>
 where
@@ -4517,6 +4577,9 @@ where
                     tbl: &tbl,
                     alias: alias.as_deref(),
                     indexed_by: indexed_by.as_ref(),
+                    allow_wr_autoindex_covering: allow_wr_autoindex_covering
+                        && db_id == DatabaseId::MAIN
+                        && stmt.limit.is_none(),
                 },
                 projection,
                 selection.as_ref(),
@@ -4616,6 +4679,7 @@ struct SingleTableSource<'a> {
     tbl: &'a TableSchema,
     alias: Option<&'a str>,
     indexed_by: Option<&'a IndexHint>,
+    allow_wr_autoindex_covering: bool,
 }
 
 fn compile_single_table_select(
@@ -4633,6 +4697,7 @@ fn compile_single_table_select(
         tbl,
         alias,
         indexed_by,
+        allow_wr_autoindex_covering,
     } = source;
     let mut prog = VdbeProgram::new();
     let init_addr = prog.emit(Instruction::new(Opcode::Init, 0, 0, 0));
@@ -4728,7 +4793,7 @@ fn compile_single_table_select(
     {
         return Ok(None);
     }
-    let plan = choose_access_plan_with_context(
+    let plan = choose_plain_table_plan(
         tbl,
         schema_name,
         alias,
@@ -4742,6 +4807,7 @@ fn compile_single_table_select(
             indexed_by,
             is_count_star_only: false,
         },
+        allow_wr_autoindex_covering,
     );
 
     // Delegate range scans, IN-list seeks, and MULTI-INDEX OR to the relational engine with B-Tree range seeks
