@@ -672,3 +672,8 @@ Bağlantı boşken başlayan varsayılan kesinti sonraki hazırlama/step'te temi
 ## V6b.73 — CHECK hazırlama ayarı ve TEMP tanısı
 
 Legacy yazma ve bütünlük denetimi, C gibi CHECK bayrağını hazırlamada alıyor. Yalnızca hazırlanan setter önceki ifadeyi süresi dolmuş duruma getirmiyor. İki yeni CHECK testi iki kipte geçti. DEBUG C ile karşılaştırılan 18 TEMP vakasında tanı satırları ve kalıcı DB özetleri iki kipte eşit. OFF 1179/3/337, ON 1167/15/337. DML ve ayrışma bulucu V6b.72 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_73.md).
+
+
+## V6b.74 — E28 Pager ERROR sözleşmesi
+
+F14 ve F15 testleri C'nin kayıtlı genişletilmiş hata kodlarını, aynı bağlantıdan tekrar okuma ve yazılabilir yeniden açılışta kalıcı değeri denetliyor. Üretim kaynakları aynı. OFF 1181/1/337, ON 1169/13/337. DML ve ayrışma bulucu V6b.73 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,260 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_74.md).

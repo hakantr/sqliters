@@ -2492,22 +2492,28 @@ fn test_audit3_autocommit_commit_ioerr_clean_rollback_no_false_poison_and_vacuum
         Some("ok_after_ioerr")
     );
 
-    // 4. Conversely, when BOTH `commit_retaining_read` AND `rollback_with_trip` fail with `IoErr`,
-    //    safe state cannot be restored -> `Connection` transitions to `ConnectionState::Poisoned(IoErr)`!
+    // 4. A failed COMMIT and failed rollback report an I/O error. Once writes
+    //    resume, the connection can read and recover the hot journal.
     vfs.state
         .fail_all_main_db_writes
         .store(true, Ordering::SeqCst);
-    let poison_err = conn
+    let double_error = conn
         .execute("INSERT INTO ft VALUES (99, 'double_fault');")
         .unwrap_err();
-    assert_eq!(poison_err.code, ErrorCode::IoErr);
+    assert_eq!(double_error.code, ErrorCode::IoErr);
+    assert!(conn.is_autocommit());
     vfs.state
         .fail_all_main_db_writes
         .store(false, Ordering::SeqCst);
-    assert_eq!(
-        conn.query("SELECT 1;", &[]).unwrap_err().code,
-        ErrorCode::IoErr
-    );
+    let sentinel = conn.query_row("SELECT 1;", &[]).unwrap().unwrap();
+    assert_eq!(sentinel.get_i64(0), Some(1));
+    let recovered = conn.query("SELECT id, val FROM ft ORDER BY id;", &[]).unwrap();
+    let rows: Vec<_> = recovered
+        .rows
+        .iter()
+        .map(|row| (row.get_i64(0).unwrap(), row.get_str(1).unwrap()))
+        .collect();
+    assert_eq!(rows, [(1, "seed"), (3, "ok_after_ioerr")]);
     conn.try_close().unwrap();
 }
 

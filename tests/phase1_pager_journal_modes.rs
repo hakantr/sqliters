@@ -2017,19 +2017,7 @@ fn test_journal_finalization_fault_injection_and_readonly_mode_transitions() {
     pager.write_page(p2).unwrap()[0..4].copy_from_slice(b"BASE");
     pager.commit().unwrap();
 
-    let assert_ro_and_rw_see = |expected: &[u8; 4]| {
-        let mut ro = Pager::open_with_options(
-            vfs.clone(),
-            Some(db_path),
-            OpenFlags::READONLY | OpenFlags::MAIN_DB,
-            PagerOpenOptions::default(),
-        )
-        .unwrap();
-        ro.begin_read()
-            .expect("READONLY begin_read must NOT fail with SQLITE_READONLY_ROLLBACK");
-        assert_eq!(&ro.read_page(2).unwrap()[0..4], expected);
-        ro.close().unwrap();
-
+    let assert_recovered_data = |expected: &[u8; 4]| {
         let mut rw = Pager::open_with_options(
             vfs.clone(),
             Some(db_path),
@@ -2040,125 +2028,124 @@ fn test_journal_finalization_fault_injection_and_readonly_mode_transitions() {
         rw.begin_read().unwrap();
         assert_eq!(&rw.read_page(2).unwrap()[0..4], expected);
         rw.close().unwrap();
+
+        // The writable open has completed any required hot-journal recovery.
+        let mut ro = Pager::open_with_options(
+            vfs.clone(),
+            Some(db_path),
+            OpenFlags::READONLY | OpenFlags::MAIN_DB,
+            PagerOpenOptions::default(),
+        )
+        .unwrap();
+        ro.begin_read().unwrap();
+        assert_eq!(&ro.read_page(2).unwrap()[0..4], expected);
+        ro.close().unwrap();
     };
 
-    // ------------------------------------------------------------------------
-    // Part A: Fault during `commit()` followed by `rollback()`
-    // ------------------------------------------------------------------------
+    // The first group rolls back directly. The second retries COMMIT while
+    // the pager still holds the error, then rolls back to release references.
+    for (mode, fault, code, written, visible, retry) in [
+        (
+            JournalMode::Truncate,
+            JournalFault::Truncate,
+            extended::SQLITE_IOERR_TRUNCATE,
+            b"MOD1",
+            b"BASE",
+            false,
+        ),
+        (
+            JournalMode::Persist,
+            JournalFault::ZeroHeaderWrite,
+            extended::SQLITE_IOERR_WRITE,
+            b"MOD2",
+            b"BASE",
+            false,
+        ),
+        (
+            JournalMode::Persist,
+            JournalFault::Sync,
+            extended::SQLITE_IOERR_FSYNC,
+            b"SYNC",
+            b"SYNC",
+            false,
+        ),
+        (
+            JournalMode::Delete,
+            JournalFault::Delete,
+            extended::SQLITE_IOERR_DELETE,
+            b"MOD3",
+            b"SYNC",
+            false,
+        ),
+        (
+            JournalMode::Truncate,
+            JournalFault::Truncate,
+            extended::SQLITE_IOERR_TRUNCATE,
+            b"RT_T",
+            b"SYNC",
+            true,
+        ),
+        (
+            JournalMode::Persist,
+            JournalFault::ZeroHeaderWrite,
+            extended::SQLITE_IOERR_WRITE,
+            b"RT_Z",
+            b"SYNC",
+            true,
+        ),
+        (
+            JournalMode::Persist,
+            JournalFault::Sync,
+            extended::SQLITE_IOERR_FSYNC,
+            b"RT_S",
+            b"RT_S",
+            true,
+        ),
+        (
+            JournalMode::Delete,
+            JournalFault::Delete,
+            extended::SQLITE_IOERR_DELETE,
+            b"RT_D",
+            b"RT_S",
+            true,
+        ),
+    ] {
+        pager.set_journal_mode(mode).unwrap();
+        pager.begin_write().unwrap();
+        pager.write_page(2).unwrap()[0..4].copy_from_slice(written);
+        fvfs.set_fault(fault);
 
-    // A1) `Truncate` mode `truncate(0)` fault -> `rollback()` restores `BASE` & truncates journal!
-    pager.set_journal_mode(JournalMode::Truncate).unwrap();
-    pager.begin_write().unwrap();
-    pager.write_page(2).unwrap()[0..4].copy_from_slice(b"MOD1");
-    fvfs.set_fault(JournalFault::Truncate);
-    assert_eq!(pager.commit().unwrap_err().code, ErrorCode::IoErr);
-    assert_eq!(pager.transaction_state(), TransactionState::Write);
-    fvfs.set_fault(JournalFault::None);
-    pager.rollback().unwrap();
-    assert_ro_and_rw_see(b"BASE");
+        let error = pager.commit().unwrap_err();
+        assert_eq!(error.code, ErrorCode::IoErr);
+        assert_eq!(error.extended_code, code);
+        assert_eq!(pager.transaction_state(), TransactionState::Write);
+        if mode == JournalMode::Delete {
+            assert!(vfs.exists(j_path).unwrap());
+        }
 
-    // A2) `Persist` mode 28-byte `zeroJournalHdr` write fault -> `rollback()` restores `BASE` & zeroes header!
-    pager.set_journal_mode(JournalMode::Persist).unwrap();
-    pager.begin_write().unwrap();
-    pager.write_page(2).unwrap()[0..4].copy_from_slice(b"MOD2");
-    fvfs.set_fault(JournalFault::ZeroHeaderWrite);
-    assert_eq!(pager.commit().unwrap_err().code, ErrorCode::IoErr);
-    assert_eq!(pager.transaction_state(), TransactionState::Write);
-    fvfs.set_fault(JournalFault::None);
-    pager.rollback().unwrap();
-    assert_ro_and_rw_see(b"BASE");
+        fvfs.set_fault(JournalFault::None);
+        if retry {
+            assert_eq!(pager.commit().unwrap_err(), error);
+            if fault == JournalFault::Sync {
+                let mut jf = vfs.open(Some(j_path), OpenFlags::READONLY).unwrap();
+                let mut hdr28 = [0xFFu8; JOURNAL_HEADER_CORE_BYTES];
+                jf.read_at(&mut hdr28, 0).unwrap();
+                jf.close().unwrap();
+                assert_eq!(hdr28, [0u8; JOURNAL_HEADER_CORE_BYTES]);
+            }
+        }
 
-    // A3) `Persist` mode `DataOnly` sync fault -> `rollback()` restores `BASE` & zeroes header!
-    pager.begin_write().unwrap();
-    pager.write_page(2).unwrap()[0..4].copy_from_slice(b"SYNC");
-    fvfs.set_fault(JournalFault::Sync);
-    assert_eq!(pager.commit().unwrap_err().code, ErrorCode::IoErr);
-    assert_eq!(pager.transaction_state(), TransactionState::Write);
-    fvfs.set_fault(JournalFault::None);
-    pager.rollback().unwrap();
-    assert_ro_and_rw_see(b"BASE");
-
-    // A4) `Delete` mode `vfs.delete` fault -> `journal_file` was already closed, yet `rollback()`
-    // MUST still unlink `<db>-journal` so a subsequent `READONLY` reader never hits `SQLITE_READONLY_ROLLBACK`!
-    pager.set_journal_mode(JournalMode::Delete).unwrap();
-    pager.begin_write().unwrap();
-    pager.write_page(2).unwrap()[0..4].copy_from_slice(b"MOD3");
-    fvfs.set_fault(JournalFault::Delete);
-    assert_eq!(pager.commit().unwrap_err().code, ErrorCode::IoErr);
-    assert_eq!(pager.transaction_state(), TransactionState::Write);
-    assert!(
-        vfs.exists(j_path).unwrap(),
-        "hot journal remains while delete is faulted"
-    );
-    fvfs.set_fault(JournalFault::None);
-    pager.rollback().unwrap();
-    assert!(
-        !vfs.exists(j_path).unwrap(),
-        "rollback() after failed Delete commit MUST unlink <db>-journal"
-    );
-    assert_ro_and_rw_see(b"BASE");
-
-    // ------------------------------------------------------------------------
-    // Part B: Fault during `commit()` Phase 2 followed by direct `commit()` RETRY (`commit_phase_one_done`)
-    // ------------------------------------------------------------------------
-
-    // B1) `Truncate` fault -> direct `commit()` retry preserves `"RT_T"` and truncates journal to 0!
-    pager.set_journal_mode(JournalMode::Truncate).unwrap();
-    pager.begin_write().unwrap();
-    pager.write_page(2).unwrap()[0..4].copy_from_slice(b"RT_T");
-    fvfs.set_fault(JournalFault::Truncate);
-    assert_eq!(pager.commit().unwrap_err().code, ErrorCode::IoErr);
-    assert_eq!(pager.transaction_state(), TransactionState::Write);
-    fvfs.set_fault(JournalFault::None);
-    pager.commit().unwrap();
-    assert_eq!(pager.transaction_state(), TransactionState::Open);
-    assert_ro_and_rw_see(b"RT_T");
-
-    // B2) `Persist` `ZeroHeaderWrite` fault -> direct `commit()` retry zeroes 28B & preserves `"RT_Z"`!
-    pager.set_journal_mode(JournalMode::Persist).unwrap();
-    pager.begin_write().unwrap();
-    pager.write_page(2).unwrap()[0..4].copy_from_slice(b"RT_Z");
-    fvfs.set_fault(JournalFault::ZeroHeaderWrite);
-    assert_eq!(pager.commit().unwrap_err().code, ErrorCode::IoErr);
-    assert_eq!(pager.transaction_state(), TransactionState::Write);
-    fvfs.set_fault(JournalFault::None);
-    pager.commit().unwrap();
-    assert_ro_and_rw_see(b"RT_Z");
-
-    // B3) `Persist` `Sync` (`DataOnly`) fault (after 28B were zeroed!) -> direct `commit()` retry
-    // MUST NOT re-enter Phase 1 (`sync_journal_before_db_write`) or rewrite `JOURNAL_MAGIC` at offset 0!
-    pager.begin_write().unwrap();
-    pager.write_page(2).unwrap()[0..4].copy_from_slice(b"RT_S");
-    fvfs.set_fault(JournalFault::Sync);
-    assert_eq!(pager.commit().unwrap_err().code, ErrorCode::IoErr);
-    assert_eq!(pager.transaction_state(), TransactionState::Write);
-    fvfs.set_fault(JournalFault::None);
-    pager.commit().unwrap();
-    {
-        let mut jf = vfs.open(Some(j_path), OpenFlags::READONLY).unwrap();
-        let mut hdr28 = [0xFFu8; JOURNAL_HEADER_CORE_BYTES];
-        jf.read_at(&mut hdr28, 0).unwrap();
-        jf.close().unwrap();
-        assert_eq!(hdr28, [0u8; JOURNAL_HEADER_CORE_BYTES]);
+        assert_eq!(pager.rollback().unwrap_err(), error);
+        // This fixture holds no external page references.
+        assert_eq!(pager.transaction_state(), TransactionState::Open);
+        if mode == JournalMode::Delete {
+            assert!(vfs.exists(j_path).unwrap());
+        }
+        assert_recovered_data(visible);
+        if mode == JournalMode::Delete {
+            assert!(!vfs.exists(j_path).unwrap());
+        }
     }
-    assert_ro_and_rw_see(b"RT_S");
-
-    // B4) `Delete` fault -> direct `commit()` retry unlinks `<db>-journal` even though `journal_file`
-    // was already closed on the first attempt, preventing the next reader from rolling back `"RT_D"`!
-    pager.set_journal_mode(JournalMode::Delete).unwrap();
-    pager.begin_write().unwrap();
-    pager.write_page(2).unwrap()[0..4].copy_from_slice(b"RT_D");
-    fvfs.set_fault(JournalFault::Delete);
-    assert_eq!(pager.commit().unwrap_err().code, ErrorCode::IoErr);
-    assert_eq!(pager.transaction_state(), TransactionState::Write);
-    assert!(vfs.exists(j_path).unwrap());
-    fvfs.set_fault(JournalFault::None);
-    pager.commit().unwrap();
-    assert!(
-        !vfs.exists(j_path).unwrap(),
-        "commit() retry after failed Delete MUST unlink <db>-journal"
-    );
-    assert_ro_and_rw_see(b"RT_D");
 
     // ------------------------------------------------------------------------
     // Part C: Readonly handle mode transitions (`Persist -> Delete` in both `Open` and `Read`)
