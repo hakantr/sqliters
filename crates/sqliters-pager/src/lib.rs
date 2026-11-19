@@ -6622,6 +6622,15 @@ impl Pager {
             && !self.readonly
             && self.pager_error.is_none()
             && self.use_wal();
+        let idle_memory_journal = self.state == TransactionState::Open
+            && self.locking_mode == LockingMode::Normal
+            && self.db_kind == DatabaseKind::NamedDisk
+            && !self.uses_temp_file_semantics()
+            && self.pager_error.is_none()
+            && !self.journal_started_in_tx
+            && self.journal_file.is_none()
+            && !self.use_wal()
+            && self.journal_mode == JournalMode::Memory;
         let mut first_err: Option<SqliteError> = None;
         self.release_mapped_pages();
 
@@ -6669,7 +6678,8 @@ impl Pager {
         }
         self.journal_off = 0;
 
-        if idle_wal {
+        if idle_wal || idle_memory_journal {
+            // sqlite3PagerClose calls pager_unlock before closing the database handle.
             let _ = self.unlock_db_file(LockLevel::NoLock);
         }
         if let Some(mut fd) = self.file.take()
