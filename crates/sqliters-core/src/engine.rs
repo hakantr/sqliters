@@ -30587,6 +30587,163 @@ struct PreparedVTabDelete {
     ret_expanded: Vec<(Expr, String, Option<String>)>,
 }
 
+// delete.c:sqlite3MaterializeView copies the DELETE predicate into its
+// ephemeral SELECT. Its scan order becomes the INSTEAD OF trigger input order.
+// Copy a side-effect-free range over a directly projected column to the view's
+// existing SELECT so the normal access planner can choose the range scan.
+fn view_delete_range_select(
+    db_set: &DatabaseSet,
+    view: &ViewSchema,
+    del: &DeleteStmt,
+    col_specs: &[(String, Collation, Option<TypeAffinity>)],
+) -> Option<ViewSchema> {
+    if del.alias.is_some()
+        || del.indexed_by.is_some()
+        || !del.ctes.is_empty()
+        || !del.returning.is_empty()
+        || db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0
+        || !view.select.ctes.is_empty()
+        || !view.select.body.compounds.is_empty()
+        || !view.select.order_by.is_empty()
+        || view.select.limit.is_some()
+    {
+        return None;
+    }
+    let Expr::Binary {
+        left,
+        op: op @ (BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge),
+        right,
+    } = del.selection.as_ref()?
+    else {
+        return None;
+    };
+    let Expr::Column(target_col) = left.as_ref() else {
+        return None;
+    };
+    if target_col.schema.is_some()
+        || target_col.table.is_some()
+        || !matches!(right.as_ref(), Expr::Integer(_) | Expr::Float(_))
+    {
+        return None;
+    }
+
+    let SelectCore::Select {
+        distinct: false,
+        projection,
+        from: Some(from),
+        selection: None,
+        group_by,
+        having: None,
+        windows,
+    } = &view.select.body.head
+    else {
+        return None;
+    };
+    let TableOrSubquery::Table {
+        name,
+        table_args: None,
+        alias,
+        indexed_by: None,
+    } = &from.head
+    else {
+        return None;
+    };
+    if !from.joins.is_empty()
+        || !group_by.is_empty()
+        || !windows.is_empty()
+        || name
+            .schema
+            .as_ref()
+            .is_some_and(|s| !s.eq_ignore_ascii_case("main"))
+    {
+        return None;
+    }
+
+    let schema = &db_set.main_slot().schema;
+    let table = schema.find_user_table(&name.name)?;
+    if table.without_rowid
+        || table.stat1.has_stat1
+        || !table.foreign_keys.is_empty()
+        || table
+            .columns
+            .iter()
+            .any(|c| c.generated.as_ref().is_some_and(|(_, stored)| !stored))
+    {
+        return None;
+    }
+    let output_column = col_specs
+        .iter()
+        .position(|(name, _, _)| name.eq_ignore_ascii_case(&target_col.column))?;
+    let column_name = if matches!(projection.as_slice(), [ResultColumn::Star]) {
+        &table.columns.get(output_column)?.name
+    } else {
+        if projection.len() != col_specs.len()
+            || !projection.iter().all(|item| {
+                matches!(
+                    item,
+                    ResultColumn::Expr {
+                        expr: Expr::Column(_),
+                        ..
+                    }
+                )
+            })
+        {
+            return None;
+        }
+        let ResultColumn::Expr {
+            expr: Expr::Column(mapped),
+            ..
+        } = projection.get(output_column)?
+        else {
+            return None;
+        };
+        &mapped.column
+    };
+    let column_index = table
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(column_name))?;
+    let column = &table.columns[column_index];
+    if !matches!(
+        column.affinity,
+        TypeAffinity::Integer | TypeAffinity::Numeric | TypeAffinity::Real
+    ) || column.collation != Collation::Binary
+        || column.custom_collation.is_some()
+    {
+        return None;
+    }
+    let indexes = schema.indexes_for_table(&table.name);
+    let [index] = indexes.as_slice() else {
+        return None;
+    };
+    if index.where_clause.is_some()
+        || index.is_unordered()
+        || !matches!(
+            index.columns.as_slice(),
+            [key] if key.col_idx == Some(column_index)
+                && key.sort_order.collation == Collation::Binary
+                && key.sort_order.custom_collation.is_none()
+        )
+    {
+        return None;
+    }
+
+    let mut narrowed = view.clone();
+    if let SelectCore::Select { selection, .. } = &mut narrowed.select.body.head {
+        *selection = Some(Expr::Binary {
+            left: Box::new(Expr::Column(ColumnRef {
+                schema: None,
+                table: Some(alias.as_ref().unwrap_or(&name.name).clone()),
+                column: column.name.clone(),
+                double_quoted: false,
+            })),
+            op: *op,
+            right: right.clone(),
+        });
+    }
+    Some(narrowed)
+}
+
 #[inline(never)]
 fn prepare_delete_exec(
     ctx: &mut ExecContext<'_>,
@@ -30625,7 +30782,20 @@ fn prepare_delete_exec(
                 ctx.functions,
                 &mut Vec::new(),
             )?;
-            let (view_out, _, _) = eval_view_query_output(ctx, db_id, &view, &CteStore::default())?;
+            let narrowed = if db_id == DatabaseId::MAIN
+                && outer_scopes.is_empty()
+                && !ctx.in_trigger_program()
+            {
+                view_delete_range_select(ctx.db_set, &view, del, &col_specs)
+            } else {
+                None
+            };
+            let (view_out, _, _) = eval_view_query_output(
+                ctx,
+                db_id,
+                narrowed.as_ref().unwrap_or(&view),
+                &CteStore::default(),
+            )?;
             let mut target_rows = Vec::new();
             for old_vals in view_out.rows {
                 let scope = make_single_view_scope(
