@@ -937,3 +937,8 @@ Koordinatör retained hedeflerde C ile aynı katılımcıları ve bitiş sıras�
 ## V6b.126 — Karma rollback kipli disklerde WAL çıkışı
 
 Yalnız WAL sınırını geçen diskler ortak statement bitişine katılıyor. 216 yeni, 396 koruma ve 6.048 salt okunur C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,249 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_126.md).
+
+
+## V6b.127 — Karma indeks kolasyonunun INDEX_XINFO gösterimi
+
+Basit doğrudan anahtarda dış yerleşik kolasyonun SQL yazımı korunuyor. Her kipte 254 metadata ölçümü C ile eş ve 91 veritabanı görüntüsü korunuyor. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 0,937 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_127.md).

@@ -45207,6 +45207,12 @@ fn exec_pragma(
             };
             // build.c preserves the spelling of an explicit index COLLATE token.
             // Use the catalog SQL only for display; KeySortOrder is the comparison rule.
+            let mixed_builtin_key = idx_db_id == DatabaseId::MAIN
+                && !idx.table_without_rowid
+                && !idx.unique
+                && !idx.is_autoindex
+                && idx.where_clause.is_none()
+                && matches!(idx.columns.as_slice(), [key] if key.col_idx.is_some());
             let explicit_collations = idx.raw_sql.as_deref().and_then(|sql| {
                 let (Some(Stmt::CreateIndex(create)), _) = parse_one(sql).ok()? else {
                     return None;
@@ -45224,11 +45230,15 @@ fn exec_pragma(
                     .filter(|token| token.kind == TokenKind::Collate)
                     .count();
                 if collate_tokens == clauses {
-                    return Some(create.columns.into_iter().map(|col| col.collation).collect());
+                    return Some(
+                        create.columns.into_iter()
+                            .map(|col| col.collation.map(|name| (name, false)))
+                            .collect(),
+                    );
                 }
 
                 // IndexedColumn retains only one name. For a direct column wrapped in
-                // equivalent postfix clauses, C keeps the last (outermost) spelling.
+                // postfix COLLATE clauses, C reports the last (outermost) spelling.
                 let mut depth = 0usize;
                 let mut terms = key_tokens.split(|token| match token.kind {
                     TokenKind::Lp => {
@@ -45254,10 +45264,16 @@ fn exec_pragma(
                             .filter(|pair| pair[0].kind == TokenKind::Collate)
                             .map(|pair| dequote(pair[1].text))
                             .collect();
-                        if spellings.len() > 1
-                            && spellings.iter().all(|s| s.eq_ignore_ascii_case(canonical))
-                        {
-                            name = spellings.into_iter().last();
+                        if spellings.len() > 1 {
+                            let equivalent = spellings.iter().all(|s| s.eq_ignore_ascii_case(canonical));
+                            let mixed_builtin = !equivalent && mixed_builtin_key
+                                && spellings.iter().all(|s| {
+                                    Collation::from_name(s).is_some()
+                                        && ctx.collations.get_custom(s).is_none()
+                                });
+                            if equivalent || mixed_builtin {
+                                name = spellings.into_iter().last().map(|name| (name, mixed_builtin));
+                            }
                         }
                     }
                     names.push(name);
@@ -45276,12 +45292,13 @@ fn exec_pragma(
                 let coll = explicit_collations
                     .as_ref()
                     .and_then(|columns| columns.get(seqno))
-                    .and_then(Option::as_deref)
-                    .filter(|name| {
+                    .and_then(Option::as_ref)
+                    .filter(|(name, mixed_builtin)| {
                         ic.sort_order.custom_collation.is_none()
-                            && Collation::from_name(name) == Some(ic.sort_order.collation)
+                            && (*mixed_builtin
+                                || Collation::from_name(name) == Some(ic.sort_order.collation))
                     })
-                    .map_or_else(|| kso_coll(&ic.sort_order), str::to_owned);
+                    .map_or_else(|| kso_coll(&ic.sort_order), |(name, _)| name.clone());
                 rows.push(vec![
                     Value::Integer(seqno as i64),
                     Value::Integer(cid),
