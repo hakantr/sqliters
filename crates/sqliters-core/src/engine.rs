@@ -44156,6 +44156,48 @@ fn integrity_check_table_rows(
     res
 }
 
+fn find_pragma_index(
+    ctx: &mut ExecContext<'_>,
+    schema_db: Option<DatabaseId>,
+    name: &str,
+) -> Result<Option<(DatabaseId, IndexSchema)>> {
+    let search_order = if let Some(db_id) = schema_db {
+        if db_id == DatabaseId::TEMP {
+            let enc = ctx.encoding();
+            ctx.db_set.ensure_temp_open(enc, *ctx.writable_schema)?;
+        }
+        vec![db_id]
+    } else {
+        ctx.db_set.unqualified_search_order()
+    };
+
+    // pragma.c searches every visible index before trying the argument as a table name.
+    for &db_id in &search_order {
+        ctx.ensure_read_db(db_id, true)?;
+        if let Some(index) = ctx
+            .db_set
+            .slot(db_id)
+            .and_then(|slot| slot.schema.find_index_including_without_rowid_pk(name))
+        {
+            return Ok(Some((db_id, index)));
+        }
+    }
+
+    for db_id in search_order {
+        let Some(slot) = ctx.db_set.slot(db_id) else {
+            continue;
+        };
+        if let Some(table) = slot.schema.find_user_table(name) {
+            return Ok(table.without_rowid_pk_as_index().map(|index| (db_id, index)));
+        }
+        if slot.schema.find_view(name).is_some() || slot.schema.find_virtual_table(name).is_some() {
+            break;
+        }
+    }
+
+    Ok(None)
+}
+
 fn exec_pragma(
     ctx: &mut ExecContext<'_>,
     schema: Option<&str>,
@@ -45041,31 +45083,8 @@ fn exec_pragma(
             };
             let iname = pragma_to_string(pv);
             let cols = vec!["seqno".to_owned(), "cid".to_owned(), "name".to_owned()];
-            let found_idx = if schema.is_some() {
-                if db_id == DatabaseId::TEMP {
-                    let enc = ctx.encoding();
-                    ctx.db_set.ensure_temp_open(enc, *ctx.writable_schema)?;
-                }
-                ctx.ensure_read_db(db_id, true)?;
-                ctx.db_set
-                    .slot(db_id)
-                    .and_then(|s| s.schema.find_index_including_without_rowid_pk(&iname))
-            } else {
-                let mut hit = None;
-                for cand_id in ctx.db_set.unqualified_search_order() {
-                    ctx.ensure_read_db(cand_id, true)?;
-                    if let Some(idx) = ctx
-                        .db_set
-                        .slot(cand_id)
-                        .and_then(|s| s.schema.find_index_including_without_rowid_pk(&iname))
-                    {
-                        hit = Some(idx);
-                        break;
-                    }
-                }
-                hit
-            };
-            let Some(idx) = found_idx else {
+            let found_idx = find_pragma_index(ctx, schema.map(|_| db_id), &iname)?;
+            let Some((_, idx)) = found_idx else {
                 return Ok(QueryOutput {
                     column_names: cols,
                     rows: Vec::new(),
@@ -45106,31 +45125,7 @@ fn exec_pragma(
                 "coll".to_owned(),
                 "key".to_owned(),
             ];
-            let found_idx = if schema.is_some() {
-                if db_id == DatabaseId::TEMP {
-                    let enc = ctx.encoding();
-                    ctx.db_set.ensure_temp_open(enc, *ctx.writable_schema)?;
-                }
-                ctx.ensure_read_db(db_id, true)?;
-                ctx.db_set
-                    .slot(db_id)
-                    .and_then(|s| s.schema.find_index_including_without_rowid_pk(&iname))
-                    .map(|idx| (db_id, idx))
-            } else {
-                let mut hit = None;
-                for cand_id in ctx.db_set.unqualified_search_order() {
-                    ctx.ensure_read_db(cand_id, true)?;
-                    if let Some(idx) = ctx
-                        .db_set
-                        .slot(cand_id)
-                        .and_then(|s| s.schema.find_index_including_without_rowid_pk(&iname))
-                    {
-                        hit = Some((cand_id, idx));
-                        break;
-                    }
-                }
-                hit
-            };
+            let found_idx = find_pragma_index(ctx, schema.map(|_| db_id), &iname)?;
             let Some((idx_db_id, idx)) = found_idx else {
                 return Ok(QueryOutput {
                     column_names: cols,
