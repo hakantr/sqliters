@@ -14355,6 +14355,22 @@ fn read_table_with_plan_ctx(
                 if db_page_count == 0 {
                     return Ok((Vec::new(), scan));
                 }
+                let order_literal_in = db_id == DatabaseId::MAIN
+                    && query_ctx.is_some_and(|(_, order_by)| order_by.is_empty())
+                    && outer_scopes.is_empty()
+                    && ctes.scopes.is_empty()
+                    && !ctx.in_trigger_program()
+                    && !tbl.stat1.has_stat1
+                    && !idx.stat1.as_ref().is_some_and(|stat| stat.has_stat1)
+                    && idx.where_clause.is_none()
+                    && tbl.foreign_keys.is_empty()
+                    && tbl.columns.iter().all(|col| col.generated.is_none())
+                    && ctx.db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder
+                        == 0
+                    && matches!(where_hint,
+                        Some(Expr::InList { expr, list, negated: false })
+                            if matches!(expr.as_ref(), Expr::Column(_))
+                                && list.iter().all(is_in_order_literal));
                 return execute_access_plan(
                     ctx,
                     db_id,
@@ -14364,6 +14380,7 @@ fn read_table_with_plan_ctx(
                     params,
                     outer_scopes,
                     ctes,
+                    order_literal_in,
                 )
                 .map(|r| (r, scan));
             }
@@ -14403,7 +14420,7 @@ fn read_table_with_plan_ctx(
     if db_page_count == 0 {
         return Ok((Vec::new(), scan));
     }
-    execute_access_plan(ctx, db_id, db_enc, tbl, &plan, params, outer_scopes, ctes)
+    execute_access_plan(ctx, db_id, db_enc, tbl, &plan, params, outer_scopes, ctes, false)
         .map(|r| (r, scan))
 }
 
@@ -14479,6 +14496,16 @@ fn materialize_index_hits(
     Ok(rows)
 }
 
+fn is_in_order_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Null | Expr::Integer(_) | Expr::Float(_) | Expr::String(_) => true,
+        Expr::Unary { op: UnaryOp::Plus | UnaryOp::Negate, expr } => {
+            matches!(expr.as_ref(), Expr::Integer(_) | Expr::Float(_))
+        }
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_access_plan(
     ctx: &mut ExecContext<'_>,
@@ -14489,6 +14516,7 @@ fn execute_access_plan(
     params: &[Value],
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
+    order_literal_in: bool,
 ) -> Result<Vec<(TableRowKey, Vec<u8>)>> {
     match plan {
         AccessPlan::FullScan => scan_table_raw_entries(ctx, db_id, tbl),
@@ -14751,6 +14779,22 @@ fn execute_access_plan(
                 if distinct_vals.is_empty() {
                     return Ok(Vec::new());
                 }
+                // wherecode.c:codeINTerm walks the ephemeral literal keys in
+                // index direction, after expr.c has applied the IN affinity.
+                if order_literal_in
+                    && *col_pos == 0
+                    && *skip_scan_cols == 0
+                    && prefix_exprs.is_empty()
+                    && prefix_in_lists.len() == 1
+                    && let Some(order) = orders.first()
+                    && order.custom_collation.is_none()
+                    && ctx.collations.get_custom(order.collation_name()).is_none()
+                {
+                    distinct_vals.sort_by(|a, b| {
+                        let cmp = a.cmp_sqlite_with_encoding(b, coll, db_enc);
+                        if order.desc { cmp.reverse() } else { cmp }
+                    });
+                }
                 let mut next_prefixes = Vec::with_capacity(eq_prefixes.len() * distinct_vals.len());
                 for p in &eq_prefixes {
                     for dv in &distinct_vals {
@@ -14834,7 +14878,7 @@ fn execute_access_plan(
             let mut combined = Vec::new();
             for bp in branches {
                 let branch_rows =
-                    execute_access_plan(ctx, db_id, db_enc, tbl, bp, params, outer_scopes, ctes)?;
+                    execute_access_plan(ctx, db_id, db_enc, tbl, bp, params, outer_scopes, ctes, false)?;
                 for (rkey, payload) in branch_rows {
                     if !combined.iter().any(|(existing_k, _)| *existing_k == rkey) {
                         combined.push((rkey, payload));

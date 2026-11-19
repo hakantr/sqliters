@@ -822,3 +822,8 @@ C dış covering taraması, kanıtlanan dış sütun bağımlılığı için uyg
 ## V6b.103 — WITHOUT ROWID otomatik UNIQUE ve PK eki
 
 Yalın SELECT ve INSERT SELECT planı C maskesine göre otomatik UNIQUE kapsamasını seçiyor. Her API ve kipte 165/165 kalıcı dosya ve C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,246 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_103.md).
+
+
+## V6b.104 — Zorlanmış indeks ve literal IN sıra anahtarları
+
+Mevcut indeks aramaları, affinity uygulanmış anahtarları C yönünde dolaşıyor. Her API ve kipte 177/177 dosya, kalıcı satır ve C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_104.md).
