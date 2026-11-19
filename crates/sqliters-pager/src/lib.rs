@@ -310,6 +310,9 @@ pub struct Pager {
     default_wal_synchronous: u8,
     locking_mode: LockingMode,
     journal_mode: JournalMode,
+    // The SQL mode is visible while page one is still protected by its
+    // rollback journal and the statement is paused at its result row.
+    pending_sql_journal_mode: Option<JournalMode>,
     journal_size_limit: i64,
 
     header: DatabaseHeader,
@@ -646,6 +649,7 @@ impl Pager {
                 LockingMode::Exclusive
             } else { LockingMode::Normal },
             journal_mode,
+            pending_sql_journal_mode: None,
             journal_size_limit: -1,
             header: candidate_header,
             header_loaded: false,
@@ -939,7 +943,7 @@ impl Pager {
             && self.synchronous > 0
             && !self.use_wal()
             && matches!(
-                self.journal_mode,
+                self.journal_mode(),
                 JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate
             )
             && !self.is_pager_memdb()
@@ -1279,7 +1283,10 @@ impl Pager {
 
     #[inline]
     pub const fn journal_mode(&self) -> JournalMode {
-        self.journal_mode
+        match self.pending_sql_journal_mode {
+            Some(mode) => mode,
+            None => self.journal_mode,
+        }
     }
 
     #[inline]
@@ -2508,10 +2515,30 @@ impl Pager {
     /// in `pager.c:7437`), performing rollback-journaled Page 1 `(1, 1) <-> (2, 2)` transitions
     /// when switching into or out of [`JournalMode::Wal`].
     pub fn set_journal_mode(&mut self, mode: JournalMode) -> Result<JournalMode> {
+        self.change_journal_mode(mode, false)
+    }
+
+    /// Prepares a single-target SQL mode change whose page-one transaction
+    /// is completed by the statement's normal commit outcome.
+    #[doc(hidden)]
+    pub fn stage_sql_journal_mode(&mut self, mode: JournalMode) -> Result<(JournalMode, bool)> {
+        let defer = self.state == TransactionState::Open
+            && self.db_kind == DatabaseKind::NamedDisk
+            && self.page_count > 0
+            && self.pending_sql_journal_mode.is_none()
+            && matches!(
+                (self.journal_mode, mode),
+                (JournalMode::Delete, JournalMode::Wal) | (JournalMode::Wal, JournalMode::Delete)
+            );
+        let active = self.change_journal_mode(mode, defer)?;
+        Ok((active, defer && self.pending_sql_journal_mode.is_some()))
+    }
+
+    fn change_journal_mode(&mut self, mode: JournalMode, defer: bool) -> Result<JournalMode> {
         self.ensure_not_closed()?;
 
         if !self.ok_to_change_journal_mode() {
-            return Ok(self.journal_mode);
+            return Ok(self.journal_mode());
         }
 
         let old_mode = self.journal_mode;
@@ -2567,6 +2594,10 @@ impl Pager {
                 if let Some(p1) = self.cache.get_data_mut(1) {
                     hdr_copy.write_into(&mut p1[0..DB_HEADER_SIZE]);
                 }
+                if defer {
+                    self.pending_sql_journal_mode = Some(JournalMode::Wal);
+                    return Ok(());
+                }
                 self.commit_phase_one(None)?;
                 // OP_JournalMode publishes WAL before the header commit is finalized.
                 // The rollback journal protects the page writes and is then removed.
@@ -2580,8 +2611,10 @@ impl Pager {
                 return Err(e);
             }
 
-            self.journal_mode = JournalMode::Wal;
-            self.apply_default_wal_synchronous_if_unset();
+            if !defer {
+                self.journal_mode = JournalMode::Wal;
+                self.apply_default_wal_synchronous_if_unset();
+            }
             return Ok(JournalMode::Wal);
         }
 
@@ -2626,6 +2659,10 @@ impl Pager {
                     if let Some(p1) = self.cache.get_data_mut(1) {
                         hdr_copy.write_into(&mut p1[0..DB_HEADER_SIZE]);
                     }
+                    if defer {
+                        self.pending_sql_journal_mode = Some(target_mode);
+                        return Ok(());
+                    }
                     self.commit_phase_one(None)?;
                     // MEMORY and OFF use a temporary DELETE journal for the header rewrite.
                     let remove_transition_journal =
@@ -2644,6 +2681,9 @@ impl Pager {
                 Ok(())
             })();
 
+            if defer && self.pending_sql_journal_mode.is_some() {
+                return Ok(target_mode);
+            }
             self.suppress_auto_wal = false;
             if let Err(e) = step_res {
                 let _ = self.rollback_retaining_read(false);
@@ -5043,6 +5083,11 @@ impl Pager {
         }
         self.error_unlock_pending = false;
         self.pager_error = None;
+        if self.pending_sql_journal_mode.take().is_some() {
+            // The next shared-lock acquisition reads the authoritative header
+            // after the existing pager error and rollback-journal cleanup.
+            self.suppress_auto_wal = false;
+        }
         if self.journal_mode == JournalMode::Memory && self.journal_started_in_tx {
             // An in-memory journal cannot be recovered after it is discarded.
             self.state = TransactionState::Write;
@@ -5530,6 +5575,16 @@ impl Pager {
             self.finalize_journal_after_tx(self.set_super)?;
         }
 
+        if let Some(target) = self.pending_sql_journal_mode.take() {
+            // The rollback journal is finalized. Later notification or unlock
+            // failures must keep the mode committed to page one.
+            self.journal_mode = target;
+            self.suppress_auto_wal = false;
+            if target == JournalMode::Wal {
+                self.apply_default_wal_synchronous_if_unset();
+            }
+        }
+
         if self.pending_byte_copy.is_none() {
             // `pager_end_transaction`: "else if( rc==SQLITE_OK && bCommit &&
             // pPager->dbFileSize>pPager->dbSize ) rc = pager_truncate(pPager, dbSize)" —
@@ -5618,6 +5673,16 @@ impl Pager {
         self.ensure_not_closed()?;
         let was_write = self.state == TransactionState::Write;
         let result = self.rollback_inner(retain_read);
+        if result.is_ok()
+            && let Some(target) = self.pending_sql_journal_mode.take()
+        {
+            self.suppress_auto_wal = false;
+            self.journal_mode = if target == JournalMode::Wal {
+                JournalMode::Delete
+            } else {
+                JournalMode::Wal
+            };
+        }
         if was_write && let Err(ref error) = result {
             self.latch_pager_error(error);
             if self.pager_error.is_some() {
@@ -5977,6 +6042,9 @@ impl Pager {
 
     /// pager_end_transaction (pager.c:2117–2161).
     fn finalize_journal_after_tx(&mut self, has_super: bool) -> Result<()> {
+        if self.pending_sql_journal_mode == Some(JournalMode::Wal) {
+            return self.remove_delete_journal();
+        }
         if self.keeps_delete_journal() || self.journal_mode == JournalMode::Persist {
             let result = self.zero_journal_header(has_super);
             self.journal_off = 0;
@@ -6525,6 +6593,8 @@ impl Pager {
         self.set_super = false;
         self.commit_phase_one_done = false;
         self.journal_started_in_tx = false;
+        self.pending_sql_journal_mode = None;
+        self.suppress_auto_wal = false;
         self.set_state(TransactionState::Open);
         self.pager_error = None;
         self.error_unlock_pending = false;

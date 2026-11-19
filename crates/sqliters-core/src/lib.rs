@@ -10224,11 +10224,34 @@ impl Statement {
                         }
                         let mut iter = out.rows.into_iter();
                         if let Some(first_row) = iter.next() {
-                            self.lifecycle =
+                            self.lifecycle = if let Some(instance) = stmt_tx.staged_journal_mode {
+                                // sqlite3Pragma marks its program run-only-once.
+                                self.expired = true;
+                                let owners = SmallInstVec::single(instance);
+                                inner.activity.update_instances(hid, &owners, &owners);
+                                StatementLifecycle::Running(RunningExec::ReturningWrite {
+                                    rows: iter,
+                                    abort_snapshot: WriteAbortSnapshot {
+                                        stmt_sp_slot: None,
+                                        touched_write_instances: owners.clone(),
+                                        started_read_instances: owners,
+                                        fk_before: inner.deferred_fk_suspects.clone(),
+                                        rt_before: inner.runtime,
+                                        is_dml: false,
+                                        mutation_len_before: inner.mutation_pipeline.len(),
+                                        schemas_before: inner.snapshot_open_schemas(),
+                                        schema_gen_before: inner.schema_generation,
+                                        v1_expire_gen_before: inner.v1_expire_generation,
+                                        schema_changed_before: inner.schema_changed_in_tx,
+                                    },
+                                    pending_changes: None,
+                                })
+                            } else {
                                 StatementLifecycle::Running(RunningExec::MaterializedNoLock {
                                     rows: iter,
                                     explain: self.c_explain.clone(),
-                                });
+                                })
+                            };
                             Ok(StepResult::Row(Row::new(first_row)))
                         } else if self.c_explain.is_some() {
                             // Even an empty EQP remains VDBE_RUN_STATE (vdbeaux.c:2288).

@@ -146,6 +146,8 @@ pub struct StmtTxTracker {
     pub delete_idx_no_seek: Option<Pgno>,
     /// Hold a prepared legacy DML change count while its returned rows are being stepped.
     pub(crate) defer_returning_changes: bool,
+    /// Single-target SQL journal transition owned by this result-producing statement.
+    pub(crate) staged_journal_mode: Option<SchemaInstanceId>,
     /// Inner schema token from an automatic PRAGMA table filter, for legacy sqlite3_step.
     pub(crate) pragma_schema_error_offset: Option<usize>,
     /// A real xConnect reached during preparation with a pending default interrupt.
@@ -43029,6 +43031,7 @@ fn apply_journal_mode_on_slot(
     ctx: &mut ExecContext<'_>,
     db_id: DatabaseId,
     target_opt: Option<JournalMode>,
+    single_target: bool,
 ) -> Result<JournalMode> {
     if db_id == DatabaseId::TEMP && !ctx.db_set.is_temp_open() {
         let enc = ctx.encoding();
@@ -43076,11 +43079,12 @@ fn apply_journal_mode_on_slot(
     }
 
     let disallow_wal_transition = !is_in_autocommit(ctx) || ctx.activity.other_readers > 0;
-    let bt = ctx
+    let slot = ctx
         .db_set
         .slot_mut(db_id)
-        .and_then(|s| s.btree.as_mut())
         .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+    let instance = slot.schema_instance_id;
+    let bt = slot.btree.as_mut().ok_or_else(|| SqliteError::misuse("database slot closed"))?;
     if bt.pager().ok_to_change_journal_mode() {
         let old_mode = bt.pager().journal_mode();
         let target_mode = bt.pager().effective_journal_mode_target(target);
@@ -43098,8 +43102,18 @@ fn apply_journal_mode_on_slot(
             ));
         }
     }
-    ctx.busy_policy
-        .retry_btree(bt, |b| b.set_journal_mode(target))
+    if single_target && !disallow_wal_transition {
+        let (active, staged) = ctx
+            .busy_policy
+            .retry_btree(bt, |b| b.pager_mut().stage_sql_journal_mode(target))?;
+        if staged {
+            ctx.stmt_tx.staged_journal_mode = Some(instance);
+        }
+        Ok(active)
+    } else {
+        ctx.busy_policy
+            .retry_btree(bt, |b| b.set_journal_mode(target))
+    }
 }
 
 /// `sqlite3GetInt32` as `PRAGMA integrity_check` applies it to its argument (the hexadecimal
@@ -44585,12 +44599,19 @@ fn exec_pragma(
                         .filter(|t| !(ctx.db_set.defensive() && *t == JournalMode::Off));
                     if let Some(target) = target_opt {
                         let mut main_mode = JournalMode::Delete;
+                        let single_target = ctx
+                            .db_set
+                            .slots()
+                            .iter()
+                            .filter(|slot| slot.btree.is_some())
+                            .count() == 1;
                         for idx in (0..ctx.db_set.slot_count()).rev() {
                             if ctx.db_set.slots()[idx].btree.is_none() {
                                 continue;
                             }
-                            let res_mode =
-                                apply_journal_mode_on_slot(ctx, DatabaseId(idx), Some(target))?;
+                            let res_mode = apply_journal_mode_on_slot(
+                                ctx, DatabaseId(idx), Some(target), single_target,
+                            )?;
                             if idx == 0 {
                                 main_mode = res_mode;
                             }
@@ -44601,7 +44622,7 @@ fn exec_pragma(
                         ));
                     }
                 }
-                let active = apply_journal_mode_on_slot(ctx, DatabaseId::MAIN, None)?;
+                let active = apply_journal_mode_on_slot(ctx, DatabaseId::MAIN, None, false)?;
                 return Ok(single_col(
                     "journal_mode",
                     Value::Text(active.as_str().to_owned()),
@@ -44613,7 +44634,7 @@ fn exec_pragma(
                 JournalMode::from_pragma_str(s.trim())
                     .filter(|t| !(defensive && *t == JournalMode::Off))
             });
-            let active = apply_journal_mode_on_slot(ctx, db_id, target_opt)?;
+            let active = apply_journal_mode_on_slot(ctx, db_id, target_opt, true)?;
             return Ok(single_col(
                 "journal_mode",
                 Value::Text(active.as_str().to_owned()),

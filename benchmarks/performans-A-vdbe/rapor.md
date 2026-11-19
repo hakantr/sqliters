@@ -867,3 +867,8 @@ Tek ikincil indeksin iki sayısal literal sınırı C gibi kaynak materyalizasyo
 ## V6b.112 — Foreign key PRAGMA id ve sıra
 
 Metadata son bildirilen kısıttan başlayan C sıra numarasını kullanıyor. 72 çıktı farkı kapandı, 27 ek salt okunur kontrol C eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,251 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_112.md).
+
+
+## V6b.113 — Tek hedefli journal modu ilk ROW ve commit
+
+Journal geçişi ilk ROW sırasında eski başlığı ve aktif journalı koruyor. 180 native, 48 sahiplik ve 12 doğrudan Pager/Btree kontrolü C eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,254 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_113.md).
