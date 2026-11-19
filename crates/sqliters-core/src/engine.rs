@@ -29353,7 +29353,11 @@ fn prepare_update_exec<'a>(
                 selection,
                 outer_scopes,
                 &col_specs,
-                scalar_max.is_some(),
+                if scalar_max.is_some() {
+                    ViewDmlIndexPredicate::UpdateMax
+                } else {
+                    ViewDmlIndexPredicate::UpdateRange
+                },
             );
             // C's copy of WHERE has its own scalar SELECT and Once lifetime.
             if let (Some(candidate), Some((_, rhs))) = (&mut narrowed, scalar_max)
@@ -31086,6 +31090,13 @@ fn eval_view_max_literal(
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewDmlIndexPredicate {
+    UpdateRange,
+    UpdateMax,
+    DeleteRange,
+}
+
 // sqlite3MaterializeView copies the UPDATE or DELETE predicate into the
 // ephemeral SELECT. Its scan order becomes the INSTEAD OF trigger input order.
 // Push only a proven index term over a directly projected column. For a
@@ -31097,7 +31108,7 @@ fn view_dml_indexed_select(
     selection: Option<&Expr>,
     outer_scopes: &[EvalRow],
     col_specs: &[(String, Collation, Option<TypeAffinity>)],
-    max_eq: bool,
+    predicate: ViewDmlIndexPredicate,
 ) -> Option<ViewSchema> {
     if db_id != DatabaseId::MAIN
         || !outer_scopes.is_empty()
@@ -31106,6 +31117,7 @@ fn view_dml_indexed_select(
     {
         return None;
     }
+    let max_eq = predicate == ViewDmlIndexPredicate::UpdateMax;
     let Expr::Binary { left, op, right } = selection? else {
         return None;
     };
@@ -31134,7 +31146,8 @@ fn view_dml_indexed_select(
 
     let schema = &ctx.db_set.main_slot().schema;
     let table = schema.find_user_table(&name.name)?;
-    if table.without_rowid != max_eq
+    if (max_eq && !table.without_rowid)
+        || (table.without_rowid && predicate == ViewDmlIndexPredicate::DeleteRange)
         || table.stat1.has_stat1
         || !table.foreign_keys.is_empty()
         || table
@@ -31209,6 +31222,7 @@ fn view_dml_indexed_select(
         return None;
     };
     let key = index.columns.first()?;
+    let without_rowid_range = table.without_rowid && predicate == ViewDmlIndexPredicate::UpdateRange;
     let expected_keys = if max_eq { 2 } else { 1 };
     if index.where_clause.is_some()
         || index.is_unordered()
@@ -31216,6 +31230,14 @@ fn view_dml_indexed_select(
         || key.col_idx != Some(column_index)
         || key.sort_order.collation != Collation::Binary
         || key.sort_order.custom_collation.is_some()
+        || (without_rowid_range
+            && (index.is_autoindex
+                || index.stat1.is_some()
+                || column.is_primary_key
+                || table
+                    .without_rowid_pk_cols
+                    .iter()
+                    .any(|key| key.sort_order.custom_collation.is_some())))
         || (max_eq
             && (column.is_primary_key
                 || index.columns[1].col_idx.is_none()
@@ -31291,7 +31313,7 @@ fn prepare_delete_exec(
                 selection,
                 outer_scopes,
                 &col_specs,
-                false,
+                ViewDmlIndexPredicate::DeleteRange,
             );
             let (view_out, _, _) = eval_view_query_output(
                 ctx,
