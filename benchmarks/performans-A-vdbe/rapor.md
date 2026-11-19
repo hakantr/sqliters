@@ -697,3 +697,8 @@ Skaler SELECT legacy hazırlamasında C ile aynı tanının eksik bayt ofseti ta
 ## V6b.78 — Üretilen sütun kullanım maskesi ve örtücü indeks
 
 Legacy planlayıcı üretilen sütunun C kullanım maskesini ve örtücü ifade kararını izliyor. REPLACE SELECT C ile aynı son satırları ve DB baytlarını yazıyor. 415 dosya grubunda iki kipte C yeniden açılışı ve SHA eş. OFF 1181/1/337, ON 1172/10/337. DML OFF 382/400 ve ON 400/400. Ayrışma bulucu V6b.77 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,251 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_78.md).
+
+
+## V6b.79 — TRUE/FALSE adları ve IS truth testi
+
+C'nin ad çözümü ve truth testi ölçülen SELECT ve DML kapsamlarında hizalandı. 480 değer, 72 DML ve 648 yeniden açılış iki kipte C eş. Dört yeni test iki kipte geçti. OFF 1185/1/337, ON 1176/10/337. DML ve ayrışma bulucu V6b.78 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,247 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_79.md).

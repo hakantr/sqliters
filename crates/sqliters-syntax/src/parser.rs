@@ -372,6 +372,8 @@ impl<'a> Parser<'a> {
             kind,
             TokenKind::Id
                 | TokenKind::QuotedId
+                | TokenKind::True
+                | TokenKind::False
                 | TokenKind::Abort
                 | TokenKind::Action
                 | TokenKind::After
@@ -460,6 +462,7 @@ impl<'a> Parser<'a> {
             kind,
             TokenKind::Current
                 | TokenKind::Exclude
+                | TokenKind::False
                 | TokenKind::Following
                 | TokenKind::Groups
                 | TokenKind::Others
@@ -469,6 +472,7 @@ impl<'a> Parser<'a> {
                 | TokenKind::Row
                 | TokenKind::Rows
                 | TokenKind::Ties
+                | TokenKind::True
                 | TokenKind::Unbounded
         )
     }
@@ -3242,13 +3246,11 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(Expr::Null)
             }
-            TokenKind::True => {
+            TokenKind::True | TokenKind::False
+                if !matches!(self.peek_n(1).kind, TokenKind::Dot | TokenKind::Lp) =>
+            {
                 self.advance();
-                Ok(Expr::Bool(true))
-            }
-            TokenKind::False => {
-                self.advance();
-                Ok(Expr::Bool(false))
+                Ok(Expr::Bool(tok.kind == TokenKind::True))
             }
             TokenKind::CurrentDate => {
                 self.advance();

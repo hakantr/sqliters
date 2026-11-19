@@ -15,6 +15,7 @@ pub mod execution_context;
 pub mod fast_read;
 pub mod schema;
 pub mod trigger;
+mod truth_is;
 pub(crate) mod vdbe_host;
 pub mod vtab;
 pub mod window;
@@ -5595,7 +5596,7 @@ fn compile_parsed_stmt(
     authorizer: &mut AuthorizerSlot,
 ) -> Result<CompiledArtifacts> {
     let _tf_guard = TestFunctionsScope::enter(enable_test_functions);
-    let Some(stmt) = stmt_opt else {
+    let Some(mut stmt) = stmt_opt else {
         return Ok(CompiledArtifacts {
             stmt: None,
             requires_schema: false,
@@ -5613,6 +5614,7 @@ fn compile_parsed_stmt(
     let mut max_param = 0usize;
     let mut named_params = HashMap::new();
     collect_stmt_params(&stmt, &mut max_param, &mut named_params);
+    truth_is::resolve_simple_truth_tests(&mut stmt, db_set);
 
     let column_names = validate_and_infer_columns(
         &stmt,

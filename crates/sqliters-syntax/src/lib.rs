@@ -117,6 +117,51 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_true_and_false_as_sql_names() {
+        let Some(Stmt::Select(stmt)) = parse_one(
+            "SELECT TRUE AS false, true.false, main.true.true, false(), FALSE true FROM true false;",
+        )
+        .unwrap()
+        .0
+        else {
+            panic!("expected SELECT");
+        };
+        let SelectCore::Select {
+            projection, from, ..
+        } = stmt.body.head
+        else {
+            panic!("expected SELECT core");
+        };
+        assert!(matches!(
+            &projection[0],
+            ResultColumn::Expr { expr: Expr::Bool(true), alias: Some(alias), .. } if alias == "false"
+        ));
+        assert!(matches!(
+            &projection[1],
+            ResultColumn::Expr { expr: Expr::Column(column), .. }
+                if *column == ColumnRef::table_qualified("true", "false")
+        ));
+        assert!(matches!(
+            &projection[2],
+            ResultColumn::Expr { expr: Expr::Column(column), .. }
+                if *column == ColumnRef::schema_table_qualified("main", "true", "true")
+        ));
+        assert!(matches!(
+            &projection[3],
+            ResultColumn::Expr { expr: Expr::FunctionCall { name, .. }, .. } if name == "false"
+        ));
+        assert!(matches!(
+            &projection[4],
+            ResultColumn::Expr { expr: Expr::Bool(false), alias: Some(alias), .. } if alias == "true"
+        ));
+        assert!(matches!(
+            from.unwrap().head,
+            TableOrSubquery::Table { name, alias: Some(alias), .. }
+                if name == QualifiedName::unqualified("true") && alias == "false"
+        ));
+    }
+
+    #[test]
     fn test_parse_vacuum_all_forms() {
         // 1. Bare `VACUUM`
         assert_eq!(
