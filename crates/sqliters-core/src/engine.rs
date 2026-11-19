@@ -45147,18 +45147,48 @@ fn exec_pragma(
                     }
                 }
             };
+            // build.c preserves the spelling of an explicit index COLLATE token.
+            // Use the catalog SQL only for display; KeySortOrder is the comparison rule.
+            let explicit_collations = idx.raw_sql.as_deref().and_then(|sql| {
+                let (Some(Stmt::CreateIndex(create)), _) = parse_one(sql).ok()? else {
+                    return None;
+                };
+                let clauses = create.columns.iter().filter(|col| col.collation.is_some()).count();
+                if clauses == 0 || create.columns.len() != idx.columns.len() {
+                    return None;
+                }
+                // IndexedColumn retains one name per term. Extra COLLATE tokens in the
+                // key list may be nested or repeated, so spelling cannot be recovered here.
+                let tokens = tokenize(sql).ok()?;
+                let open = tokens.iter().position(|token| token.kind == TokenKind::Lp)?;
+                let close = find_matching_rparen(&tokens, open)?;
+                let collate_tokens = tokens[open + 1..close]
+                    .iter()
+                    .filter(|token| token.kind == TokenKind::Collate)
+                    .count();
+                (collate_tokens == clauses).then_some(create.columns)
+            });
             let mut rows = Vec::new();
             for (seqno, ic) in idx.columns.iter().enumerate() {
                 let (cid, name_val) = match ic.col_idx {
                     Some(ci) => (ci as i64, Value::Text(ic.name.clone())),
                     None => (-2i64, Value::Null),
                 };
+                let coll = explicit_collations
+                    .as_ref()
+                    .and_then(|columns| columns.get(seqno))
+                    .and_then(|column| column.collation.as_deref())
+                    .filter(|name| {
+                        ic.sort_order.custom_collation.is_none()
+                            && Collation::from_name(name) == Some(ic.sort_order.collation)
+                    })
+                    .map_or_else(|| kso_coll(&ic.sort_order), str::to_owned);
                 rows.push(vec![
                     Value::Integer(seqno as i64),
                     Value::Integer(cid),
                     name_val,
                     Value::Integer(i64::from(ic.sort_order.desc)),
-                    Value::Text(kso_coll(&ic.sort_order)),
+                    Value::Text(coll),
                     Value::Integer(1),
                 ]);
             }

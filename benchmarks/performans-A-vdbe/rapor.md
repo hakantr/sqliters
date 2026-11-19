@@ -877,3 +877,8 @@ Journal geçişi ilk ROW sırasında eski başlığı ve aktif journalı koruyor
 ## V6b.114 — İndeks PRAGMA WITHOUT ROWID tablo adı
 
 Gerçek indeks araması sonrasında WITHOUT ROWID tablo birincil indeksi C gibi bulunuyor. 456 metadata bölümü düzeldi, 36 fiziksel dosya eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,262 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_114.md).
+
+
+## V6b.115 — index_xinfo açık collation yazımı
+
+Normal açık built-in COLLATE yazımı C gibi gösteriliyor. 336 metadata farkı kapandı ve 54 dosya byte eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,250 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_115.md).
