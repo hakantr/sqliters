@@ -3278,6 +3278,10 @@ fn dbconfig_access(p: &mut ShellState, ii: usize, set: Option<i32>) -> i32 {
     match A_DBCONFIG[ii] {
         "defensive" => i32::from(p.db().db_config_defensive(b)),
         "dqs_dml" => i32::from(p.db().db_config_dqs_dml(b)),
+        "no_ckpt_on_close" => {
+            let enabled = set.filter(|&v| v >= 0).map(|v| v > 0);
+            i32::from(p.db().db_config_no_ckpt_on_close(enabled))
+        }
         "enable_trigger" => i32::from(p.db().db_config_enable_trigger(b)),
         "enable_view" => i32::from(p.db().db_config_enable_view(b)),
         "trusted_schema" => {

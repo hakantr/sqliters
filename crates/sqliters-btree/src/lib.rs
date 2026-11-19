@@ -564,8 +564,14 @@ impl Btree {
     }
 
     pub fn close(&mut self) -> Result<()> {
+        self.close_with_wal_checkpoint(true)
+    }
+
+    /// Closes this handle using the connection's WAL checkpoint-on-close policy.
+    #[doc(hidden)]
+    pub fn close_with_wal_checkpoint(&mut self, checkpoint: bool) -> Result<()> {
         self.close_all_cursors();
-        self.pager.close()
+        self.pager.close_with_wal_checkpoint(checkpoint)
     }
 
     #[inline]

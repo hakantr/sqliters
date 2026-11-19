@@ -6651,6 +6651,12 @@ impl Pager {
     /// releases OS locks (and deletes `PrivateTemporary` files via `DELETEONCLOSE`), surfacing the
     /// first error encountered.
     pub fn close(&mut self) -> Result<()> {
+        self.close_with_wal_checkpoint(true)
+    }
+
+    /// Closes the pager using the connection's WAL checkpoint-on-close policy.
+    #[doc(hidden)]
+    pub fn close_with_wal_checkpoint(&mut self, checkpoint: bool) -> Result<()> {
         if self.closed {
             return Ok(());
         }
@@ -6690,11 +6696,12 @@ impl Pager {
             let ckpt_sync = self.ckpt_sync_flags();
             let persist_wal = self.persist_wal;
             if let Some(ref db_fd) = self.file {
-                let close = if idle_wal && !self.readonly {
-                    let checkpoint_on_close = self.db_size == 0 || match db_fd.has_moved() {
-                        Ok(moved) => !moved,
-                        Err(error) => error.extended_code == ErrorCode::NotFound as i32,
-                    };
+                let close = if !checkpoint || (idle_wal && !self.readonly) {
+                    let checkpoint_on_close = checkpoint
+                        && (self.db_size == 0 || match db_fd.has_moved() {
+                            Ok(moved) => !moved,
+                            Err(error) => error.extended_code == ErrorCode::NotFound as i32,
+                        });
                     wal.close_for_database(db_fd.as_ref(), ckpt_sync, persist_wal, checkpoint_on_close)
                 } else {
                     wal.close(db_fd.as_ref(), ckpt_sync, persist_wal)

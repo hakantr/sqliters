@@ -256,6 +256,8 @@ pub struct DatabaseSet {
     enable_view: bool,
     enable_trigger: bool,
     dqs_dml: bool,
+    /// `SQLITE_NoCkptOnClose` applies to every pager owned by the connection.
+    pub(crate) no_ckpt_on_close: bool,
     expr_depth_limit: usize,
     max_column_ceiling: usize,
     column_limit: usize,
@@ -387,6 +389,7 @@ impl DatabaseSet {
             enable_view: true,
             enable_trigger: true,
             dqs_dml: true,
+            no_ckpt_on_close: false,
             expr_depth_limit: SQLITE_MAX_EXPR_DEPTH,
             max_column_ceiling: SQLITE_MAX_COLUMN,
             column_limit: SQLITE_MAX_COLUMN,
@@ -1433,7 +1436,7 @@ impl DatabaseSet {
                     "temporary storage cannot be changed from within a transaction",
                 ));
             }
-            bt.close()?;
+            bt.close_with_wal_checkpoint(!self.no_ckpt_on_close)?;
             self.slots[1].btree = None;
             self.slots[1].schema = Schema::default();
             self.temp_trigger_bindings.clear();
@@ -1927,14 +1930,14 @@ impl DatabaseSet {
         enable_8_3_names: bool,
     ) -> Result<DatabaseId> {
         if self.attached_count() >= self.max_attached {
-            let _ = btree.close();
+            let _ = btree.close_with_wal_checkpoint(!self.no_ckpt_on_close);
             return Err(SqliteError::new(
                 ErrorCode::Error,
                 format!("too many attached databases - max {}", self.max_attached),
             ));
         }
         if self.find_db_id(&name).is_some() {
-            let _ = btree.close();
+            let _ = btree.close_with_wal_checkpoint(!self.no_ckpt_on_close);
             return Err(SqliteError::new(
                 ErrorCode::Error,
                 format!("database {name} is already in use"),
@@ -1986,7 +1989,7 @@ impl DatabaseSet {
         self.vtab_registry.disconnect_schema(&removed.name);
         let redirected = self.detach_temp_triggers(removed.schema_instance_id);
         if let Some(ref mut bt) = removed.btree {
-            bt.close()?;
+            bt.close_with_wal_checkpoint(!self.no_ckpt_on_close)?;
         }
         Ok((removed.schema_instance_id, redirected))
     }
@@ -2349,7 +2352,7 @@ impl DatabaseSet {
         let mut last_err: Option<SqliteError> = None;
         for slot in &mut self.slots {
             if let Some(ref mut bt) = slot.btree
-                && let Err(e) = bt.close()
+                && let Err(e) = bt.close_with_wal_checkpoint(!self.no_ckpt_on_close)
             {
                 // Preserve the error from the highest slot, as in reverse order.
                 last_err = Some(e);

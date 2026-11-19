@@ -4862,6 +4862,25 @@ impl Connection {
         }
     }
 
+    /// Queries or sets `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`, returning the current setting.
+    /// When enabled, closing a main or attached database skips its automatic WAL checkpoint.
+    pub fn db_config_no_ckpt_on_close(&self, enabled: Option<bool>) -> bool {
+        let Ok(mut session) = self.shared.enter() else {
+            return false;
+        };
+        let inner = session.inner_mut();
+        if inner.ensure_usable().is_err() {
+            return false;
+        }
+        if let Some(enabled) = enabled
+            && inner.db_set.no_ckpt_on_close != enabled
+        {
+            inner.db_set.no_ckpt_on_close = enabled;
+            inner.db_set.c_expire_all();
+        }
+        inner.db_set.no_ckpt_on_close
+    }
+
     /// Queries (`enabled == None`) or updates (`enabled == Some(b)`)
     /// `SQLITE_DBCONFIG_WRITABLE_SCHEMA`, returning the state of the flag. Like
     /// `sqlite3_db_config()` this sets the `SQLITE_WriteSchema` bit even in defensive mode
