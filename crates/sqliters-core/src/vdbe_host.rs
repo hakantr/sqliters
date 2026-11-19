@@ -426,11 +426,32 @@ fn read_machine_program(
         Some(values) => crate::cgen::c_prepare_bound(inner, raw_sql, values).0,
         None => crate::cgen::c_prepare(inner, raw_sql).0,
     }) {
-        PrepareResult::Program(p) => {
+        PrepareResult::Program(mut p) => {
             if like_only && !crate::cgen::program_has_like(&p) { return Ok(None); }
             if schema_free && p.btree_mask != 0 { return Ok(None); }
             if p.explain != 0 {
                 return Ok(None);
+            }
+            let mut table_scan = false;
+            if let Some(Stmt::Select(select)) = stmt
+                && let Some((table_root, index_root)) =
+                    crate::engine::mixed_collation_table_scan(select, &inner.db_set, &inner.collations)
+                && opens_main_root(&p, index_root, true)
+            {
+                let PrepareResult::Program(table_program) =
+                    crate::cgen::c_prepare_table_scan(inner, raw_sql, bound_values, table_root)
+                else {
+                    trace("fallback: mixed index table scan", raw_sql);
+                    return Ok(None);
+                };
+                if !opens_main_root(&table_program, table_root, false)
+                    || opens_main_root(&table_program, index_root, true)
+                {
+                    trace("fallback: mixed index table scan", raw_sql);
+                    return Ok(None);
+                }
+                p = table_program;
+                table_scan = true;
             }
             if let Some(why) = unsupported_reason(&p) {
                 trace(&format!("fallback: {why}"), raw_sql);
@@ -449,7 +470,7 @@ fn read_machine_program(
                 trace("fallback: index collation mismatch", raw_sql);
                 return Ok(None);
             }
-            trace("machine", raw_sql);
+            trace(if table_scan { "machine: mixed index table scan" } else { "machine" }, raw_sql);
             Ok(Some(Arc::new(*p)))
         }
         PrepareResult::Error { code, message, offset } => {
@@ -472,6 +493,15 @@ fn read_machine_program(
             Ok(None)
         }
     }
+}
+
+fn opens_main_root(program: &Program, root: u32, index: bool) -> bool {
+    program.a_op.iter().any(|op| {
+        op.opcode == sqliters_vdbe::opcodes::OP_OpenRead
+            && op.p3 == DatabaseId::MAIN.index() as i32
+            && op.p2 == root as i32
+            && matches!(&op.p4, P4::KeyInfo(_)) == index
+    })
 }
 
 /// Follow unconditional control flow and encoding-independent integer setup.

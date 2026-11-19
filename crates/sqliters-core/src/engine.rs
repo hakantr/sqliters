@@ -44253,6 +44253,204 @@ fn find_pragma_index(
     Ok(None)
 }
 
+fn index_xinfo_collations(
+    idx_db_id: DatabaseId,
+    idx: &IndexSchema,
+    collations: &CollationRegistry,
+) -> Option<Vec<Option<(String, bool)>>> {
+    // build.c preserves the spelling of an explicit index COLLATE token.
+    // The catalog describes the declared collation. KeySortOrder is the comparison rule.
+    let mixed_builtin_key = idx_db_id == DatabaseId::MAIN
+        && !idx.table_without_rowid
+        && !idx.unique
+        && !idx.is_autoindex
+        && idx.where_clause.is_none()
+        && matches!(idx.columns.as_slice(), [key] if key.col_idx.is_some());
+    idx.raw_sql.as_deref().and_then(|sql| {
+        let (Some(Stmt::CreateIndex(create)), _) = parse_one(sql).ok()? else {
+            return None;
+        };
+        let clauses = create.columns.iter().filter(|col| col.collation.is_some()).count();
+        if clauses == 0 || create.columns.len() != idx.columns.len() {
+            return None;
+        }
+        let tokens = tokenize(sql).ok()?;
+        let open = tokens.iter().position(|token| token.kind == TokenKind::Lp)?;
+        let close = find_matching_rparen(&tokens, open)?;
+        let key_tokens = &tokens[open + 1..close];
+        let collate_tokens = key_tokens
+            .iter()
+            .filter(|token| token.kind == TokenKind::Collate)
+            .count();
+        if collate_tokens == clauses {
+            return Some(
+                create.columns.into_iter()
+                    .map(|col| col.collation.map(|name| (name, false)))
+                    .collect(),
+            );
+        }
+
+        // IndexedColumn retains only one name. For a direct column wrapped in
+        // postfix COLLATE clauses, C reports the last (outermost) spelling.
+        let mut depth = 0usize;
+        let mut terms = key_tokens.split(|token| match token.kind {
+            TokenKind::Lp => {
+                depth += 1;
+                false
+            }
+            TokenKind::Rp => {
+                depth = depth.saturating_sub(1);
+                false
+            }
+            TokenKind::Comma => depth == 0,
+            _ => false,
+        });
+        let mut names = Vec::with_capacity(create.columns.len());
+        for column in create.columns {
+            let term = terms.next()?;
+            let mut name = None;
+            if let Some(canonical) = column.collation.as_deref()
+                && column.expr.is_none()
+            {
+                let spellings: Vec<_> = term
+                    .windows(2)
+                    .filter(|pair| pair[0].kind == TokenKind::Collate)
+                    .map(|pair| dequote(pair[1].text))
+                    .collect();
+                if spellings.len() > 1 {
+                    let equivalent = spellings.iter().all(|s| s.eq_ignore_ascii_case(canonical));
+                    let mixed_builtin = !equivalent && mixed_builtin_key
+                        && spellings.iter().all(|s| {
+                            Collation::from_name(s).is_some()
+                                && collations.get_custom(s).is_none()
+                        });
+                    if equivalent || mixed_builtin {
+                        name = spellings.into_iter().last().map(|name| (name, mixed_builtin));
+                    }
+                }
+            }
+            names.push(name);
+        }
+        if terms.next().is_some() {
+            return None;
+        }
+        Some(names)
+    })
+}
+
+/// Returns the table and secondary index roots for a simple read whose two schema
+/// representations disagree about the index collation.
+pub(crate) fn mixed_collation_table_scan(
+    select: &SelectStmt,
+    db_set: &DatabaseSet,
+    collations: &CollationRegistry,
+) -> Option<(Pgno, Pgno)> {
+    let SelectCore::Select {
+        distinct: false,
+        projection,
+        from: Some(from),
+        selection: Some(selection),
+        group_by,
+        having: None,
+        windows,
+    } = &select.body.head else {
+        return None;
+    };
+    let TableOrSubquery::Table {
+        name,
+        table_args: None,
+        alias: None,
+        indexed_by: None | Some(IndexHint::NotIndexed),
+    } = &from.head else {
+        return None;
+    };
+    if !select.ctes.is_empty()
+        || !select.body.compounds.is_empty()
+        || !from.joins.is_empty()
+        || !group_by.is_empty()
+        || !windows.is_empty()
+        || !projection.iter().all(|column| {
+            matches!(column, ResultColumn::Star | ResultColumn::Expr { expr: Expr::Column(_), alias: None, .. })
+        })
+        || ["BINARY", "NOCASE", "RTRIM"].iter().any(|name| collations.get_custom(name).is_some())
+    {
+        return None;
+    }
+    if !select.order_by.iter().all(|term| match &term.expr {
+        Expr::Column(_) | Expr::Integer(_) => true,
+        Expr::Collate { expr, collation } => {
+            matches!(expr.as_ref(), Expr::Column(_)) && Collation::from_name(collation).is_some()
+        }
+        _ => false,
+    }) || select.limit.as_ref().is_some_and(|limit| {
+        !matches!(limit.limit, Expr::Integer(_) | Expr::Bind(_))
+            || !limit.offset.as_ref().is_none_or(|expr| matches!(expr, Expr::Integer(_) | Expr::Bind(_)))
+    }) {
+        return None;
+    }
+    let Some((DatabaseId::MAIN, crate::db_set::RelationRef::Table(table))) =
+        db_set.find_relation_ref_in_set(name).ok()?
+    else {
+        return None;
+    };
+    let schema = &db_set.slot(DatabaseId::MAIN)?.schema;
+    let mut indexes = schema.indexes.iter().filter(|index| index.table_name.eq_ignore_ascii_case(&table.name));
+    let (Some(index), None) = (indexes.next(), indexes.next()) else {
+        return None;
+    };
+    let [key] = index.columns.as_slice() else {
+        return None;
+    };
+    if table.root_pgno <= 1
+        || index.root_pgno <= 1
+        || table.without_rowid
+        || table.columns.iter().any(|column| column.generated.is_some() || column.custom_collation.is_some())
+        || key.col_idx.is_none()
+        || key.expr.is_some()
+        || key.sort_order.custom_collation.is_some()
+    {
+        return None;
+    }
+    let names = index_xinfo_collations(DatabaseId::MAIN, index, collations)?;
+    let [Some((outer_name, true))] = names.as_slice() else {
+        return None;
+    };
+    let outer = Collation::from_name(outer_name)?;
+    let inner = key.sort_order.collation;
+    if outer == inner || !is_mixed_collation_filter(selection, &key.name, outer, inner) {
+        return None;
+    }
+    Some((table.root_pgno, index.root_pgno))
+}
+
+fn is_mixed_collation_filter(expr: &Expr, name: &str, outer: Collation, inner: Collation) -> bool {
+    let column = |expr: &Expr| {
+        let Expr::Collate { expr, collation } = expr else {
+            return false;
+        };
+        matches!(expr.as_ref(), Expr::Column(column)
+            if column.schema.is_none() && column.table.is_none() && column.column.eq_ignore_ascii_case(name))
+            && matches!(Collation::from_name(collation), Some(coll) if coll == outer || coll == inner)
+    };
+    let value = |expr: &Expr| matches!(
+        expr,
+        Expr::String(_) | Expr::Integer(_) | Expr::Float(_) | Expr::Blob(_) | Expr::Null | Expr::Bind(_)
+    );
+    match expr {
+        Expr::Binary { left, op: BinaryOp::And, right } => {
+            is_mixed_collation_filter(left, name, outer, inner)
+                && is_mixed_collation_filter(right, name, outer, inner)
+        }
+        Expr::Binary {
+            left,
+            op: BinaryOp::Eq | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge,
+            right,
+        } => (column(left) && value(right)) || (value(left) && column(right)),
+        Expr::Between { expr, low, high, negated: false } => column(expr) && value(low) && value(high),
+        _ => false,
+    }
+}
+
 fn exec_pragma(
     ctx: &mut ExecContext<'_>,
     schema: Option<&str>,
@@ -45204,84 +45402,7 @@ fn exec_pragma(
                     }
                 }
             };
-            // build.c preserves the spelling of an explicit index COLLATE token.
-            // Use the catalog SQL only for display; KeySortOrder is the comparison rule.
-            let mixed_builtin_key = idx_db_id == DatabaseId::MAIN
-                && !idx.table_without_rowid
-                && !idx.unique
-                && !idx.is_autoindex
-                && idx.where_clause.is_none()
-                && matches!(idx.columns.as_slice(), [key] if key.col_idx.is_some());
-            let explicit_collations = idx.raw_sql.as_deref().and_then(|sql| {
-                let (Some(Stmt::CreateIndex(create)), _) = parse_one(sql).ok()? else {
-                    return None;
-                };
-                let clauses = create.columns.iter().filter(|col| col.collation.is_some()).count();
-                if clauses == 0 || create.columns.len() != idx.columns.len() {
-                    return None;
-                }
-                let tokens = tokenize(sql).ok()?;
-                let open = tokens.iter().position(|token| token.kind == TokenKind::Lp)?;
-                let close = find_matching_rparen(&tokens, open)?;
-                let key_tokens = &tokens[open + 1..close];
-                let collate_tokens = key_tokens
-                    .iter()
-                    .filter(|token| token.kind == TokenKind::Collate)
-                    .count();
-                if collate_tokens == clauses {
-                    return Some(
-                        create.columns.into_iter()
-                            .map(|col| col.collation.map(|name| (name, false)))
-                            .collect(),
-                    );
-                }
-
-                // IndexedColumn retains only one name. For a direct column wrapped in
-                // postfix COLLATE clauses, C reports the last (outermost) spelling.
-                let mut depth = 0usize;
-                let mut terms = key_tokens.split(|token| match token.kind {
-                    TokenKind::Lp => {
-                        depth += 1;
-                        false
-                    }
-                    TokenKind::Rp => {
-                        depth = depth.saturating_sub(1);
-                        false
-                    }
-                    TokenKind::Comma => depth == 0,
-                    _ => false,
-                });
-                let mut names = Vec::with_capacity(create.columns.len());
-                for column in create.columns {
-                    let term = terms.next()?;
-                    let mut name = None;
-                    if let Some(canonical) = column.collation.as_deref()
-                        && column.expr.is_none()
-                    {
-                        let spellings: Vec<_> = term
-                            .windows(2)
-                            .filter(|pair| pair[0].kind == TokenKind::Collate)
-                            .map(|pair| dequote(pair[1].text))
-                            .collect();
-                        if spellings.len() > 1 {
-                            let equivalent = spellings.iter().all(|s| s.eq_ignore_ascii_case(canonical));
-                            let mixed_builtin = !equivalent && mixed_builtin_key
-                                && spellings.iter().all(|s| {
-                                    Collation::from_name(s).is_some()
-                                        && ctx.collations.get_custom(s).is_none()
-                                });
-                            if equivalent || mixed_builtin {
-                                name = spellings.into_iter().last().map(|name| (name, mixed_builtin));
-                            }
-                        }
-                    }
-                    names.push(name);
-                }
-                if terms.next().is_some() {
-                    return None;
-                }
-                Some(names)
-            });
+            let explicit_collations = index_xinfo_collations(idx_db_id, &idx, ctx.collations);
             let mut rows = Vec::new();
             for (seqno, ic) in idx.columns.iter().enumerate() {
                 let (cid, name_val) = match ic.col_idx {

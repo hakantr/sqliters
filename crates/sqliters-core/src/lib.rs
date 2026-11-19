@@ -5790,6 +5790,7 @@ fn compile_parsed_stmt(
         collations,
     )?;
 
+    let has_authorizer = authorizer.is_some();
     let (stmt_opt_auth, ignored_fk_parent_tables) = driver::authorize_stmt_with_slot_and_fks(
         &stmt,
         db_set,
@@ -5797,7 +5798,7 @@ fn compile_parsed_stmt(
         foreign_keys,
         authorizer,
     )?;
-    let Some(stmt) = stmt_opt_auth else {
+    let Some(mut stmt) = stmt_opt_auth else {
         return Ok(CompiledArtifacts {
             stmt: None,
             requires_schema,
@@ -5810,6 +5811,17 @@ fn compile_parsed_stmt(
             ignored_fk_parent_tables,
         });
     };
+
+    if !has_authorizer
+        && let Stmt::Select(select) = &mut stmt
+        && engine::mixed_collation_table_scan(select, db_set, collations).is_some()
+        && let SelectCore::Select { from: Some(from), .. } = &mut select.body.head
+        && let TableOrSubquery::Table { indexed_by, .. } = &mut from.head
+        && indexed_by.is_none()
+    {
+        // The legacy compiler, fast read and engine all honor this access hint.
+        *indexed_by = Some(sqliters_syntax::IndexHint::NotIndexed);
+    }
 
     let category = Some(classify_stmt_category(&stmt));
     let mut compiled_vdbe = None;
@@ -8106,10 +8118,22 @@ impl Statement {
         raw_sql: &str,
         bound_values: Option<&[Value]>,
     ) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
-        let Some(Stmt::Explain { .. }) = stmt else {
+        let Some(Stmt::Explain { stmt: nested, .. }) = stmt else {
             return Ok(None);
         };
-        match bound_values.map_or_else(|| cgen::c_explain(inner, raw_sql), |values| cgen::c_explain_bound(inner, raw_sql, values)) {
+        let explain = if !inner.authorizer.is_some()
+            && let Stmt::Select(select) = nested.as_ref()
+            && let Some((root, _)) = engine::mixed_collation_table_scan(select, &inner.db_set, &inner.collations)
+        {
+            match cgen::c_prepare_table_scan(inner, raw_sql, bound_values, root) {
+                sqliters_codegen::PrepareResult::Program(p) => cgen::CExplain::Program(Arc::new(*p)),
+                sqliters_codegen::PrepareResult::Error { code, message, offset } => cgen::CExplain::Error { code, message, offset },
+                sqliters_codegen::PrepareResult::Unsupported(_) => cgen::CExplain::Unsupported,
+            }
+        } else {
+            bound_values.map_or_else(|| cgen::c_explain(inner, raw_sql), |values| cgen::c_explain_bound(inner, raw_sql, values))
+        };
+        match explain {
             cgen::CExplain::Program(p) => Ok(Some(p)),
             cgen::CExplain::Unsupported => Ok(None),
             cgen::CExplain::Error { code, message, offset } => {

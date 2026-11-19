@@ -947,3 +947,8 @@ Basit doğrudan anahtarda dış yerleşik kolasyonun SQL yazımı korunuyor. Her
 ## V6b.128 — Açık TEMP ile WAL geçişi ve journal kipi
 
 Yalnız gerçek NamedDisk geçişleri ortak bitişe katılıyor ve TEMP FILE PERSIST/TRUNCATE kipini kullanabiliyor. 1.026 normal akış ve 5.508 C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,264 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_128.md).
+
+
+## V6b.129 — Karma indekslerde güvenli salt okunur erişim
+
+Özgün SQL ve bağlamalar korunarak ana tabloya yönleniyor. Her kipte 324/324 C tablo referansı eş ve V127 metadata korunuyor. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,256 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_129.md).

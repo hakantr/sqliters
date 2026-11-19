@@ -3785,6 +3785,19 @@ fn sqlite3_select_body(p: &mut Parse, sel: SelectId, dest: &mut SelectDest, b_po
     if p.n_err != 0 {
         return rc;
     }
+    if let Some(root) = p.db.table_scan_root {
+        let src = p.s(sel).p_src;
+        if src.nn()
+            && let [item] = p.src(src).a.as_slice()
+            && !item.is_indexed_by
+            && item.p_s_tab.nn()
+            && p.tab(item.p_s_tab).i_db == 0
+            && p.tab(item.p_s_tab).tnum == root
+            && p.tab(item.p_s_tab).has_rowid()
+        {
+            p.srcm(src).a[0].not_indexed = true;
+        }
+    }
     if dest.e_dest as i32 == SRT_Output {
         crate::treedump::v1_dump_select(p, "R", sel);
     }

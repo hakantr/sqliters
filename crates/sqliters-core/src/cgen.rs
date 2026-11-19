@@ -486,12 +486,18 @@ pub(crate) fn c_prepare_quiet(inner: &ConnectionInner, sql: &str) -> (PrepareRes
 /// Run C's parser and code generator over one statement (`sqlite3Prepare`).
 /// The third value: C's `sqlite3Init()` loaded the schemas during this prepare.
 pub(crate) fn c_prepare(inner: &ConnectionInner, sql: &str) -> (PrepareResult, usize, bool) {
-    c_prepare_impl(inner, sql, false, None, None, false)
+    c_prepare_impl(inner, sql, false, None, None, false, None)
 }
 
 /// Recompile with the old statement's parameter values (pParse->pReprepare).
 pub(crate) fn c_prepare_bound(inner: &ConnectionInner, sql: &str, values: &[Value]) -> (PrepareResult, usize, bool) {
-    c_prepare_impl(inner, sql, false, Some(values), None, false)
+    c_prepare_impl(inner, sql, false, Some(values), None, false, None)
+}
+
+pub(crate) fn c_prepare_table_scan(
+    inner: &ConnectionInner, sql: &str, values: Option<&[Value]>, root: u32,
+) -> PrepareResult {
+    c_prepare_impl(inner, sql, false, values, None, false, Some(root)).0
 }
 
 pub(crate) fn c_explain_bound(inner: &ConnectionInner, sql: &str, values: &[Value]) -> CExplain {
@@ -568,7 +574,7 @@ fn c_prepare_probe(
     let temp = take_c_temp_opened();
     let rowest = take_c_rowest_clamped();
     let quiet = C_QUIET.with(|c| c.replace(true));
-    let (result, _, reads_schema) = c_prepare_impl(inner, sql, schema_probe, None, deferred_vtab_connect, true);
+    let (result, _, reads_schema) = c_prepare_impl(inner, sql, schema_probe, None, deferred_vtab_connect, true, None);
     C_QUIET.with(|c| c.set(quiet));
     C_PRAGMA_EFFECTS.with(|c| *c.borrow_mut() = effects);
     C_TEMP_OPENED.with(|c| c.set(temp));
@@ -583,6 +589,7 @@ fn c_prepare_impl(
     bound_values: Option<&[Value]>,
     deferred_vtab_connect: Option<&std::cell::Cell<bool>>,
     suppress_vtab_callbacks: bool,
+    table_scan_root: Option<u32>,
 ) -> (PrepareResult, usize, bool) {
     let interrupted = deferred_vtab_connect.is_some();
     let host = EngineHost {
@@ -605,6 +612,7 @@ fn c_prepare_impl(
         }
     }
     let mut db = make_db(inner, &host);
+    db.table_scan_root = table_scan_root;
     if interrupted {
         db.schema_not_loaded = inner.db_set.c_any_schema_unloaded();
     }

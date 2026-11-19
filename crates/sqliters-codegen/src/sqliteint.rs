@@ -1292,6 +1292,8 @@ pub struct Db<'a> {
     pub x_auth: bool,
     /// `nAnalysisLimit`: PRAGMA analysis_limit
     pub n_analysis_limit: i32,
+    /// MAIN table root whose secondary indexes are unavailable for this SELECT.
+    pub table_scan_root: Option<u32>,
     /// The engine side
     pub host: &'a dyn Host,
 }
@@ -1334,6 +1336,7 @@ impl<'a> Db<'a> {
             case_sensitive_like: false,
             x_auth: false,
             n_analysis_limit: 0,
+            table_scan_root: None,
             host,
         }
     }
