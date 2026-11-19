@@ -276,6 +276,12 @@ struct HotJournalSection {
     original_pages: Pgno,
 }
 
+#[derive(Clone, Copy)]
+struct SqlJournalModeTransition {
+    previous: JournalMode,
+    target: JournalMode,
+}
+
 /// Manages page-level reads, writes, caching, rollback journaling, WAL protocol, crash recovery,
 /// and sub-savepoints.
 pub struct Pager {
@@ -310,9 +316,9 @@ pub struct Pager {
     default_wal_synchronous: u8,
     locking_mode: LockingMode,
     journal_mode: JournalMode,
-    // The SQL mode is visible while page one is still protected by its
-    // rollback journal and the statement is paused at its result row.
-    pending_sql_journal_mode: Option<JournalMode>,
+    // The target is visible while the page-one write belongs to the
+    // statement paused at its result row.
+    pending_sql_journal_mode: Option<SqlJournalModeTransition>,
     journal_size_limit: i64,
 
     header: DatabaseHeader,
@@ -1284,7 +1290,7 @@ impl Pager {
     #[inline]
     pub const fn journal_mode(&self) -> JournalMode {
         match self.pending_sql_journal_mode {
-            Some(mode) => mode,
+            Some(transition) => transition.target,
             None => self.journal_mode,
         }
     }
@@ -2522,16 +2528,17 @@ impl Pager {
     /// is completed by the statement's normal commit outcome.
     #[doc(hidden)]
     pub fn stage_sql_journal_mode(&mut self, mode: JournalMode) -> Result<(JournalMode, bool)> {
+        let touches_volatile_journal = matches!(mode, JournalMode::Memory | JournalMode::Off)
+            || matches!(self.journal_mode, JournalMode::Memory | JournalMode::Off);
         let defer = self.state == TransactionState::Open
             && self.db_kind == DatabaseKind::NamedDisk
             && self.page_count > 0
             && self.pending_sql_journal_mode.is_none()
-            && (!(matches!(mode, JournalMode::Memory | JournalMode::Off)
-                || self.journal_mode == JournalMode::Memory)
-                || self.locking_mode == LockingMode::Normal)
+            && (!touches_volatile_journal || self.locking_mode == LockingMode::Normal)
             && matches!(
                 (self.journal_mode, mode),
-                (JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate | JournalMode::Memory, JournalMode::Wal)
+                (JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate
+                    | JournalMode::Memory | JournalMode::Off, JournalMode::Wal)
                     | (JournalMode::Wal, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate
                         | JournalMode::Memory | JournalMode::Off)
             );
@@ -2608,8 +2615,8 @@ impl Pager {
                 if let Some(mut jfd) = self.journal_file.take() {
                     let _ = jfd.close();
                 }
-                // OP_JournalMode stages a MEMORY→WAL page-one write without a journal.
-                self.journal_mode = if defer && saved_mode == JournalMode::Memory {
+                // OP_JournalMode stages MEMORY/OFF→WAL page one without a journal.
+                self.journal_mode = if defer && matches!(saved_mode, JournalMode::Memory | JournalMode::Off) {
                     JournalMode::Off
                 } else {
                     JournalMode::Delete
@@ -2629,7 +2636,10 @@ impl Pager {
                     hdr_copy.write_into(&mut p1[0..DB_HEADER_SIZE]);
                 }
                 if defer {
-                    self.pending_sql_journal_mode = Some(JournalMode::Wal);
+                    self.pending_sql_journal_mode = Some(SqlJournalModeTransition {
+                        previous: saved_mode,
+                        target: JournalMode::Wal,
+                    });
                     return Ok(());
                 }
                 self.commit_phase_one(None)?;
@@ -2695,7 +2705,10 @@ impl Pager {
                         hdr_copy.write_into(&mut p1[0..DB_HEADER_SIZE]);
                     }
                     if defer {
-                        self.pending_sql_journal_mode = Some(target_mode);
+                        self.pending_sql_journal_mode = Some(SqlJournalModeTransition {
+                            previous: old_mode,
+                            target: target_mode,
+                        });
                         return Ok(());
                     }
                     self.commit_phase_one(None)?;
@@ -5132,8 +5145,11 @@ impl Pager {
             self.state = TransactionState::Write;
             let _ = self.rollback_inner(false);
         }
-        if pending_mode == Some(JournalMode::Wal) && self.journal_mode == JournalMode::Off {
-            self.journal_mode = JournalMode::Memory;
+        if self.journal_mode == JournalMode::Off
+            && let Some(transition) = pending_mode
+            && transition.target == JournalMode::Wal
+        {
+            self.journal_mode = transition.previous;
         }
         if let Some(wal) = self.wal.as_mut() {
             let _ = wal.end_read_transaction();
@@ -5617,12 +5633,11 @@ impl Pager {
             self.finalize_journal_after_tx(self.set_super)?;
         }
 
-        if let Some(target) = self.pending_sql_journal_mode.take() {
-            // The rollback journal is finalized. Later notification or unlock
-            // failures must keep the mode committed to page one.
-            self.journal_mode = target;
+        if let Some(transition) = self.pending_sql_journal_mode.take() {
+            // Later notification or unlock failures must keep the mode committed to page one.
+            self.journal_mode = transition.target;
             self.suppress_auto_wal = false;
-            if target == JournalMode::Wal {
+            if transition.target == JournalMode::Wal {
                 self.apply_default_wal_synchronous_if_unset();
             }
         }
@@ -5716,14 +5731,11 @@ impl Pager {
         let was_write = self.state == TransactionState::Write;
         let result = self.rollback_inner(retain_read);
         if result.is_ok()
-            && let Some(target) = self.pending_sql_journal_mode.take()
+            && let Some(transition) = self.pending_sql_journal_mode.take()
         {
             self.suppress_auto_wal = false;
-            if target != JournalMode::Wal {
-                self.journal_mode = JournalMode::Wal;
-            } else if self.journal_mode == JournalMode::Off {
-                // Discard the intermediate mode of a staged MEMORY→WAL transition.
-                self.journal_mode = JournalMode::Memory;
+            if transition.target != JournalMode::Wal || self.journal_mode == JournalMode::Off {
+                self.journal_mode = transition.previous;
             }
         }
         if was_write && let Err(ref error) = result {
@@ -6085,7 +6097,9 @@ impl Pager {
 
     /// pager_end_transaction (pager.c:2117–2161).
     fn finalize_journal_after_tx(&mut self, has_super: bool) -> Result<()> {
-        if self.pending_sql_journal_mode == Some(JournalMode::Wal) {
+        if matches!(self.pending_sql_journal_mode,
+            Some(SqlJournalModeTransition { target: JournalMode::Wal, .. }))
+        {
             return self.remove_delete_journal();
         }
         if self.keeps_delete_journal() || self.journal_mode == JournalMode::Persist {
