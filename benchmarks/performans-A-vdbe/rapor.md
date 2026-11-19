@@ -847,3 +847,8 @@ Bağlantı ayarı, filtresiz ve sırasız zorlanmış ikincil indeksin tam taram
 ## V6b.108 — WITHOUT ROWID görünüm UPDATE aralığı
 
 Tek ikincil indeksli sayısal literal aralık C materyalizasyon sırasını izliyor. Her API ve kipte 78/78 kalıcı dosya ve C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,257 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_108.md).
+
+
+## V6b.109 — İlk ATTACH ana şema kodlaması
+
+Ana şema ve kayıtlı kodlama C gibi ATTACH hazırlığında yükleniyor. 48 CLI, 96 native ve 12 EXPLAIN karşılaştırması C eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,252 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_109.md).

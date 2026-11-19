@@ -8230,14 +8230,15 @@ impl Statement {
         // C reads the schema at prepare for more statements than the engine loads it for
         // (pragmas with PragFlg_NeedSchema, the query form of PRAGMA encoding): C's state only.
         let c_reads_schema = needs_schema || stmt_opt.as_ref().is_some_and(crate::engine::c_pragma_reads_schema);
-        let c_first_load = (c_reads_schema || matches!(stmt_opt, Some(Stmt::AttachDatabase { .. })))
-            && inner.db_set.c_any_schema_unloaded();
-        if needs_schema && !matches!(stmt_opt, Some(Stmt::Explain { .. })) {
-            // (a statement that will be stepped: its OP_Transaction checks the cookie. EXPLAIN
-            // does not run the program, so it still lists the cookie that is ahead.)
+        let c_first_load = c_reads_schema && inner.db_set.c_any_schema_unloaded();
+        if needs_schema
+            && !matches!(stmt_opt, Some(Stmt::Explain { .. } | Stmt::AttachDatabase { .. }))
+        {
+            // ATTACH prepares against the schema without an OP_Transaction cookie check.
+            // EXPLAIN only lists the program and leaves the cookie state pending.
             inner.db_set.c_apply_cookie_ahead();
         }
-        if c_reads_schema || matches!(stmt_opt, Some(Stmt::AttachDatabase { .. })) {
+        if c_reads_schema {
             // sqlite3ReadSchema() -> sqlite3Init(): every schema is loaded from here on
             inner.db_set.c_mark_schemas_loaded();
         }

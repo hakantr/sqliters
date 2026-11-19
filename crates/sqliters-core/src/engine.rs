@@ -1594,7 +1594,9 @@ pub(crate) fn stmt_loads_schema_on_prepare(stmt: &Stmt) -> bool {
     if let Stmt::Explain { stmt: inner, .. } = stmt {
         return stmt_loads_schema_on_prepare(inner);
     }
-    if stmt_requires_schema(stmt) {
+    // attach.c:382 reads the schema before compiling ATTACH. On a fresh
+    // connection this also loads the main database's text encoding.
+    if matches!(stmt, Stmt::AttachDatabase { .. }) || stmt_requires_schema(stmt) {
         return true;
     }
     if matches!(stmt, Stmt::Pragma { name, value: None, .. } if name.eq_ignore_ascii_case("encoding")) {
