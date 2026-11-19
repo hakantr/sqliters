@@ -1764,6 +1764,15 @@ impl ConnectionInner {
         }
     }
 
+    fn legacy_c_step_error(&self) -> SqliteError {
+        let message = self
+            .c_retained_error_message
+            .as_deref()
+            .unwrap_or(ErrorCode::Error.as_str());
+        let offset = usize::try_from(self.c_error_byte_offset).unwrap_or(SqliteError::NO_OFFSET);
+        SqliteError::new(ErrorCode::Error, message).with_offset(offset)
+    }
+
     fn record_c_prepare_error(&mut self, error: Option<&SqliteError>) {
         self.c_error_byte_offset = error
             .and_then(|e| e.offset)
@@ -9764,6 +9773,14 @@ impl Statement {
         inner.ensure_usable()?;
         self.read_io_during_prepare = false;
         let result = self.step_in_session_impl(shared, inner);
+        if self.mode == PrepareMode::V1
+            && self.is_journal_mode_pragma()
+            && result.as_ref().is_err_and(|error| matches!(error.code, ErrorCode::Busy | ErrorCode::Schema))
+        {
+            // Legacy OP_JournalMode step callers see SQLITE_ERROR. Reset and finalize
+            // read the underlying BUSY or SCHEMA result from the statement.
+            return Err(inner.legacy_c_step_error());
+        }
         let file_reader = self.category == Some(StmtCategory::Read)
             && self.c_machine.as_ref().map_or(self.requires_schema, |program| program.b_is_reader);
         if file_reader && !self.read_io_during_prepare
@@ -9780,6 +9797,10 @@ impl Statement {
         result
     }
 
+    fn is_journal_mode_pragma(&self) -> bool {
+        matches!(self.stmt.as_ref(), Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("journal_mode"))
+    }
+
     fn read_step_error(
         inner: &mut ConnectionInner,
         shared: &ConnectionShared,
@@ -9790,12 +9811,7 @@ impl Statement {
         // its execution error at step. Reset/finalize retain the actual interruption.
         if inner.uses_default_interrupt_flag(shared) {
             if mode == PrepareMode::V1 && error.code == ErrorCode::Interrupt {
-                let message = inner
-                    .c_retained_error_message
-                    .as_deref()
-                    .unwrap_or(ErrorCode::Error.as_str());
-                let offset = usize::try_from(inner.c_error_byte_offset).unwrap_or(SqliteError::NO_OFFSET);
-                return SqliteError::new(ErrorCode::Error, message).with_offset(offset);
+                return inner.legacy_c_step_error();
             }
             if mode == PrepareMode::V2 && matches!(error.code, ErrorCode::Error | ErrorCode::Interrupt) {
                 inner.transfer_c_read_error(Some(&error));
@@ -10175,6 +10191,11 @@ impl Statement {
             }
 
             StmtCategory::NoLockPragma => {
+                if self.mode == PrepareMode::V1 && self.is_journal_mode_pragma() {
+                    // pragma.c emits OP_Expire before OP_JournalMode, even when
+                    // execution later aborts before returning a result row.
+                    self.expired = true;
+                }
                 let stmt_clone = self.stmt.clone().expect("non-empty statement");
                 let expires_all = self.c_prepared_pragma.is_some()
                     && matches!(&stmt_clone, Stmt::Pragma { name, value: Some(_), .. }

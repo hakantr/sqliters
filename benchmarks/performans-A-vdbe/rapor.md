@@ -1087,3 +1087,8 @@ Normal OFF ve MEMORY disk commit'i C gibi COMMIT_PHASETWO bildirir ve SHARED'a i
 ## V6b.156 — Karma indeksli doğrudan sütun eşitliği
 
 Uygun UPDATE ve DELETE doğrudan indekslenmeyen sütun eşitliğinde aktif fiziksel sırayı korur. 144 yazıcı, 432 rollback ve 9.072 C/Rust satır ziyareti eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_156.md).
+
+
+## V6b.157 — V1 journal_mode kilit ve yeniden adım
+
+V1 dış SQLITE_ERROR sonucuyla dahili BUSY veya SCHEMA kodunu C sırasıyla taşır. 72 çekişme ve 24 sağlıklı pragma grubunda 192 C/Rust native ve DB çifti eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_157.md).
