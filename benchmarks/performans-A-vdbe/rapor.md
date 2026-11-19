@@ -1077,3 +1077,8 @@ Açık hedef sütunlarıyla ayrı MAIN tablosundan rowid sıralı normal ekleme 
 ## V6b.154 — Okuyucunun çağıran kesinti bayrağı
 
 Mapped SELECT ve yorumlanan okuyucu aynı özel AtomicBool kesintisini uygular. Group46, yedi interrupt yaşamı ve iki progress/pencere testi iki kipte eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,265 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_154.md).
+
+
+## V6b.155 — Normal OFF ve MEMORY commit phase-two
+
+Normal OFF ve MEMORY disk commit'i C gibi COMMIT_PHASETWO bildirir ve SHARED'a iner. 612 akış, 948 callback çifti ve 3.168 C açılışı eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_155.md).

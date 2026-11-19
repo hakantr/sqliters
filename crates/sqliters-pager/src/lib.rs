@@ -5615,13 +5615,12 @@ impl Pager {
                 let file_backed_rollback = !self.uses_temp_file_semantics() && self.pending_byte_copy.is_none();
                 let disk_rollback = file_backed_rollback
                     && matches!(self.journal_mode, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate);
-                // The SQL page-one transaction also ends through pager_end_transaction
-                // when its rollback journal is in memory or disabled.
-                let staged_without_disk_journal = file_backed_rollback
-                    && self.pending_sql_journal_mode.is_some()
+                // pager_end_transaction also runs for rollback commits with
+                // an in-memory journal or a disabled journal.
+                let rollback_without_disk_journal = file_backed_rollback
                     && matches!(self.journal_mode, JournalMode::Memory | JournalMode::Off);
                 let normal_rollback = self.locking_mode == LockingMode::Normal
-                    && (disk_rollback || staged_without_disk_journal);
+                    && (disk_rollback || rollback_without_disk_journal);
                 // sqlite3PagerCommitPhaseTwo skips pager_end_transaction for
                 // an EXCLUSIVE PERSIST writer that has not modified the database.
                 let notify = normal_rollback
