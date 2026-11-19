@@ -10610,15 +10610,8 @@ impl Statement {
                     }
                 }
 
-                // Preserve the machine's handling of a caller-supplied Rust interrupt flag.
-                if !inner.uses_default_interrupt_flag(shared)
-                    && (self.c_machine.is_some() || mapped_program.is_some())
-                    && inner.activity.summary_excluding(hid, &inner.db_set).other_active == 0
-                {
-                    inner.active_interrupt_flag.store(false, Ordering::SeqCst);
-                }
-
-                // Interpreter `Read` path (`SELECT`, `EXPLAIN`, or read `PRAGMA`):
+                // Check both mapped and interpreted reads. Only the connection's default
+                // interrupt flag can be cleared when starting an idle statement.
                 if let Err(e) = inner.check_any_interrupted() {
                     cleanup_started_reads(inner, &started_here);
                     self.lifecycle = StatementLifecycle::Halted {
