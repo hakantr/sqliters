@@ -43036,9 +43036,9 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
     if !is_in_autocommit(ctx) || ctx.activity.other_readers != 0 {
         return false;
     }
-    let previous = match target {
-        JournalMode::Wal => JournalMode::Delete,
-        JournalMode::Delete => JournalMode::Wal,
+    let previous_modes: &[JournalMode] = match target {
+        JournalMode::Wal => &[JournalMode::Delete, JournalMode::Persist, JournalMode::Truncate],
+        JournalMode::Delete => &[JournalMode::Wal],
         _ => return false,
     };
     let mut participants = 0;
@@ -43051,7 +43051,7 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
             || pager.page_count() == 0
             || pager.is_readonly()
             || !pager.ok_to_change_journal_mode()
-            || pager.journal_mode() != previous
+            || !previous_modes.contains(&pager.journal_mode())
             || pager.effective_journal_mode_target(target) != target
         {
             return false;
