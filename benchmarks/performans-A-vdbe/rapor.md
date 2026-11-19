@@ -797,3 +797,8 @@ Görünüm aralık denetimi ortaktır, ana tablo ve trigger log dosyaları C ile
 ## V6b.98 — Yerleşik MIN/MAX ve veritabanı kodlaması
 
 Yerleşik biriktirici UTF-16 BINARY metin sıralamasını C ile hizalıyor. V1/V2 ve her kipte 87/87 ham ve fiziksel eşlik doğrulandı. OFF 1186/1/337, ON 1177/10/337. DML OFF 388/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_98.md).
+
+
+## V6b.99 — Görünüm UPDATE scalar MAX eşitliği
+
+C'nin geçici tarama ve özgün filtre için bağımsız MAX değerlendirme ömrü uygulandı. Ana tablo, yerleşik kodlama, trigger sırası ve iki bağımsız cache sınırı ölçüldü. OFF 1186/1/337, ON 1177/10/337. DML OFF 388/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,260 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_99.md).

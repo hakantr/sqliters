@@ -29018,8 +29018,26 @@ fn prepare_update_exec<'a>(
                     && upd.ctes.is_empty()
                     && upd.returning.is_empty()
             });
-            let narrowed =
-                view_dml_range_select(ctx, db_id, &view, selection, outer_scopes, &col_specs);
+            let scalar_max =
+                selection.and_then(|w| view_update_max_subquery(ctx, db_id, &view, w));
+            let mut narrowed = view_dml_indexed_select(
+                ctx,
+                db_id,
+                &view,
+                selection,
+                outer_scopes,
+                &col_specs,
+                scalar_max.is_some(),
+            );
+            // C's copy of WHERE has its own scalar SELECT and Once lifetime.
+            if let (Some(candidate), Some((_, rhs))) = (&mut narrowed, scalar_max)
+                && let SelectCore::Select {
+                    selection: Some(Expr::Binary { right, .. }),
+                    ..
+                } = &mut candidate.select.body.head
+            {
+                **right = eval_view_max_literal(ctx, rhs, params, &CteStore::default())?;
+            }
             let (view_out, _, _) = eval_view_query_output(
                 ctx,
                 db_id,
@@ -29219,6 +29237,22 @@ fn prepare_update_exec<'a>(
                     PreparedViewUpdateRows::Precomputed(pairs)
                 }
             } else {
+                // The original WHERE also gets its own Once result, but only if
+                // there is a row to check. Its SELECT cache is separate from the
+                // materializing copy's and neither result survives this execution.
+                let scalar_predicate = if let Some((left, right)) = scalar_max
+                    && narrowed.is_some()
+                    && !view_out.rows.is_empty()
+                {
+                    Some(Expr::Binary {
+                        left: Box::new(left.clone()),
+                        op: BinaryOp::Eq,
+                        right: Box::new(eval_view_max_literal(ctx, right, params, &dml_ctes)?),
+                    })
+                } else {
+                    None
+                };
+                let predicate = scalar_predicate.as_ref().or(upd.selection.as_ref());
                 let mut matched = Vec::new();
                 for old_vals in view_out.rows {
                     let scope = make_single_view_scope(
@@ -29231,7 +29265,7 @@ fn prepare_update_exec<'a>(
                     let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
                     scopes.push(scope);
                     scopes.extend_from_slice(outer_scopes);
-                    if let Some(ref w) = upd.selection {
+                    if let Some(w) = predicate {
                         let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
                         if cond.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                             continue;
@@ -30601,47 +30635,16 @@ struct PreparedVTabDelete {
     ret_expanded: Vec<(Expr, String, Option<String>)>,
 }
 
-// sqlite3MaterializeView copies the UPDATE or DELETE predicate into the
-// ephemeral SELECT. Its scan order becomes the INSTEAD OF trigger input order.
-// Copy a side-effect-free range over a directly projected column to the view's
-// existing SELECT so the normal access planner can choose the range scan.
-fn view_dml_range_select(
-    ctx: &ExecContext<'_>,
-    db_id: DatabaseId,
-    view: &ViewSchema,
-    selection: Option<&Expr>,
-    outer_scopes: &[EvalRow],
-    col_specs: &[(String, Collation, Option<TypeAffinity>)],
-) -> Option<ViewSchema> {
-    if db_id != DatabaseId::MAIN
-        || !outer_scopes.is_empty()
-        || ctx.in_trigger_program()
-        || ctx.db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0
-        || !view.select.ctes.is_empty()
-        || !view.select.body.compounds.is_empty()
-        || !view.select.order_by.is_empty()
-        || view.select.limit.is_some()
+fn single_table_select_projection(
+    select: &SelectStmt,
+) -> Option<(&[ResultColumn], &QualifiedName, Option<&str>)> {
+    if !select.ctes.is_empty()
+        || !select.body.compounds.is_empty()
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
     {
         return None;
     }
-    let Expr::Binary {
-        left,
-        op: op @ (BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge),
-        right,
-    } = selection?
-    else {
-        return None;
-    };
-    let Expr::Column(target_col) = left.as_ref() else {
-        return None;
-    };
-    if target_col.schema.is_some()
-        || target_col.table.is_some()
-        || !matches!(right.as_ref(), Expr::Integer(_) | Expr::Float(_))
-    {
-        return None;
-    }
-
     let SelectCore::Select {
         distinct: false,
         projection,
@@ -30650,7 +30653,7 @@ fn view_dml_range_select(
         group_by,
         having: None,
         windows,
-    } = &view.select.body.head
+    } = &select.body.head
     else {
         return None;
     };
@@ -30663,20 +30666,149 @@ fn view_dml_range_select(
     else {
         return None;
     };
-    if !from.joins.is_empty()
-        || !group_by.is_empty()
-        || !windows.is_empty()
-        || name
-            .schema
-            .as_ref()
-            .is_some_and(|s| !s.eq_ignore_ascii_case("main"))
+    if !from.joins.is_empty() || !group_by.is_empty() || !windows.is_empty() {
+        return None;
+    }
+    Some((projection, name, alias.as_deref()))
+}
+
+// The source of the MAX must resolve to this very view without using the
+// UPDATE row scope. In particular a temp table may shadow unqualified names.
+fn view_update_max_subquery<'a>(
+    ctx: &ExecContext<'_>,
+    db_id: DatabaseId,
+    view: &ViewSchema,
+    predicate: &'a Expr,
+) -> Option<(&'a Expr, &'a Expr)> {
+    let Expr::Binary {
+        left,
+        op: BinaryOp::Eq,
+        right,
+    } = predicate
+    else {
+        return None;
+    };
+    let (Expr::Column(column), Expr::Subquery(sub)) = (left.as_ref(), right.as_ref()) else {
+        return None;
+    };
+    if db_id != DatabaseId::MAIN
+        || ctx.in_trigger_program()
+        || ctx.progress.is_enabled()
+        || ctx.functions.has_scalar_name("max")
+        || ctx.functions.has_aggregate_name("max")
+        || ctx.collations.get_custom("BINARY").is_some()
+    {
+        return None;
+    }
+
+    let (projection, source, None) = single_table_select_projection(sub)? else {
+        return None;
+    };
+    let [
+        ResultColumn::Expr {
+            expr:
+                Expr::FunctionCall {
+                    name,
+                    distinct: false,
+                    args: FunctionArgs::Exprs(args),
+                    filter: None,
+                    over: None,
+                },
+            ..
+        },
+    ] = projection
+    else {
+        return None;
+    };
+    let [Expr::Column(arg)] = args.as_slice() else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("max")
+        || arg.schema.is_some()
+        || arg.table.is_some()
+        || !arg.column.eq_ignore_ascii_case(&column.column)
+    {
+        return None;
+    }
+
+    let (source_db, ResolvedRelation::View(source_view)) =
+        ctx.db_set.find_relation_in_set(source).ok().flatten()?
+    else {
+        return None;
+    };
+    if source_db != db_id
+        || source_view.schema_rowid != view.schema_rowid
+        || !source_view.name.eq_ignore_ascii_case(&view.name)
+    {
+        return None;
+    }
+    Some((left, right))
+}
+
+fn eval_view_max_literal(
+    ctx: &mut ExecContext<'_>,
+    rhs: &Expr,
+    params: &[Value],
+    ctes: &CteStore,
+) -> Result<Expr> {
+    Ok(match eval_expr(ctx, rhs, params, &[], ctes, None)? {
+        Value::Null => Expr::Null,
+        Value::Integer(value) => Expr::Integer(value),
+        Value::Real(value) => Expr::Float(value),
+        Value::Text(value) => Expr::String(value),
+        Value::Blob(value) => Expr::Blob(value),
+    })
+}
+
+// sqlite3MaterializeView copies the UPDATE or DELETE predicate into the
+// ephemeral SELECT. Its scan order becomes the INSTEAD OF trigger input order.
+// Push only a proven index term over a directly projected column. For a
+// scalar MAX equality the caller binds its materialization value before use.
+fn view_dml_indexed_select(
+    ctx: &ExecContext<'_>,
+    db_id: DatabaseId,
+    view: &ViewSchema,
+    selection: Option<&Expr>,
+    outer_scopes: &[EvalRow],
+    col_specs: &[(String, Collation, Option<TypeAffinity>)],
+    max_eq: bool,
+) -> Option<ViewSchema> {
+    if db_id != DatabaseId::MAIN
+        || !outer_scopes.is_empty()
+        || ctx.in_trigger_program()
+        || ctx.db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0
+    {
+        return None;
+    }
+    let Expr::Binary { left, op, right } = selection? else {
+        return None;
+    };
+    let Expr::Column(target_col) = left.as_ref() else {
+        return None;
+    };
+    if target_col.schema.is_some()
+        || target_col.table.is_some()
+        || (!max_eq
+            && (!matches!(
+                op,
+                BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+            ) || !matches!(right.as_ref(), Expr::Integer(_) | Expr::Float(_))))
+    {
+        return None;
+    }
+
+    let (projection, name, alias) = single_table_select_projection(&view.select)?;
+    if name
+        .schema
+        .as_deref()
+        .is_some_and(|s| !s.eq_ignore_ascii_case("main"))
     {
         return None;
     }
 
     let schema = &ctx.db_set.main_slot().schema;
     let table = schema.find_user_table(&name.name)?;
-    if table.without_rowid
+    if table.without_rowid != max_eq
         || table.stat1.has_stat1
         || !table.foreign_keys.is_empty()
         || table
@@ -30689,7 +30821,7 @@ fn view_dml_range_select(
     let output_column = col_specs
         .iter()
         .position(|(name, _, _)| name.eq_ignore_ascii_case(&target_col.column))?;
-    let column_name = if matches!(projection.as_slice(), [ResultColumn::Star]) {
+    let column_name = if matches!(projection, [ResultColumn::Star]) {
         &table.columns.get(output_column)?.name
     } else {
         if projection.len() != col_specs.len()
@@ -30731,14 +30863,18 @@ fn view_dml_range_select(
     let [index] = indexes.as_slice() else {
         return None;
     };
+    let key = index.columns.first()?;
+    let expected_keys = if max_eq { 2 } else { 1 };
     if index.where_clause.is_some()
         || index.is_unordered()
-        || !matches!(
-            index.columns.as_slice(),
-            [key] if key.col_idx == Some(column_index)
-                && key.sort_order.collation == Collation::Binary
-                && key.sort_order.custom_collation.is_none()
-        )
+        || index.columns.len() != expected_keys
+        || key.col_idx != Some(column_index)
+        || key.sort_order.collation != Collation::Binary
+        || key.sort_order.custom_collation.is_some()
+        || (max_eq
+            && (column.is_primary_key
+                || index.columns[1].col_idx.is_none()
+                || index.columns[1].sort_order.custom_collation.is_some()))
     {
         return None;
     }
@@ -30748,7 +30884,7 @@ fn view_dml_range_select(
         *selection = Some(Expr::Binary {
             left: Box::new(Expr::Column(ColumnRef {
                 schema: None,
-                table: Some(alias.as_ref().unwrap_or(&name.name).clone()),
+                table: Some(alias.unwrap_or(&name.name).to_owned()),
                 column: column.name.clone(),
                 double_quoted: false,
             })),
@@ -30803,8 +30939,15 @@ fn prepare_delete_exec(
                     && del.ctes.is_empty()
                     && del.returning.is_empty()
             });
-            let narrowed =
-                view_dml_range_select(ctx, db_id, &view, selection, outer_scopes, &col_specs);
+            let narrowed = view_dml_indexed_select(
+                ctx,
+                db_id,
+                &view,
+                selection,
+                outer_scopes,
+                &col_specs,
+                false,
+            );
             let (view_out, _, _) = eval_view_query_output(
                 ctx,
                 db_id,
