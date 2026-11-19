@@ -2518,6 +2518,7 @@ impl Pager {
         self.ensure_not_closed()?;
         if self.state == TransactionState::Open
             && !self.header_loaded
+            && !self.has_sql_journal_mode_after_busy()
             && self.db_kind == DatabaseKind::NamedDisk
         {
             let _ = self.ensure_header_loaded()?;
@@ -2571,13 +2572,19 @@ impl Pager {
         Ok((active, defer && self.pending_sql_journal_mode.is_some()))
     }
 
+    #[doc(hidden)]
+    pub fn has_sql_journal_mode_after_busy(&self) -> bool {
+        self.sql_journal_mode_after_busy.is_some()
+    }
+
     /// Preserve the SQL mode of a slot whose opcode succeeded before another slot returned BUSY.
     #[doc(hidden)]
     pub fn preserve_sql_journal_mode_on_busy(&mut self) {
         if let Some(transition) = self.pending_sql_journal_mode.as_mut()
             && matches!(
                 (transition.previous, transition.target),
-                (JournalMode::Delete, JournalMode::Wal) | (JournalMode::Wal, JournalMode::Delete)
+                (JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate | JournalMode::Memory, JournalMode::Wal)
+                | (JournalMode::Wal, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate | JournalMode::Memory)
             )
         {
             transition.keep_mode_after_busy = true;
@@ -3385,6 +3392,9 @@ impl Pager {
                 } else {
                     self.open_wal_under_shared_lock()?;
                 }
+            } else if self.sql_journal_mode_after_busy == Some(JournalMode::Wal) {
+                // pagerOpenWalIfPresent resets WAL mode to DELETE when there is no WAL file.
+                self.journal_mode = JournalMode::Delete;
             }
         }
 

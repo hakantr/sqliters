@@ -43606,7 +43606,7 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
         if pager.db_kind() != DatabaseKind::NamedDisk
             || pager.locking_mode() != LockingMode::Normal
             || pager.transaction_state() != TransactionState::Open
-            || !pager.is_header_loaded()
+            || (!pager.is_header_loaded() && !pager.has_sql_journal_mode_after_busy())
             || pager.page_count() == 0
             || pager.is_readonly()
             || !pager.ok_to_change_journal_mode()
@@ -43639,6 +43639,7 @@ fn apply_journal_mode_on_slot(
             .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
         if bt.pager().transaction_state() == TransactionState::Open
             && !bt.pager().is_header_loaded()
+            && !bt.pager().has_sql_journal_mode_after_busy()
             && bt.pager().db_kind() == DatabaseKind::NamedDisk
         {
             ctx.busy_policy

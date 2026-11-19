@@ -1122,3 +1122,8 @@ Normal salt okunur WAL kapanışında terminal NO_LOCK ana dosya kapanışından
 ## V6b.163 — Karma indeksli açık WHERE 1 DELETE
 
 Açık WHERE 1 DELETE, uygun normal deyimde hazırlanmış yönü ve mevcut fiziksel karşılaştırıcıyı kullanır. 342 yazıcı/rollback ve 1.026 C yeniden açılış eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,254 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_163.md).
+
+
+## V6b.164 — Koordineli PERSIST TRUNCATE ve MEMORY BUSY sonu
+
+Erken başlık okumasından önce C gibi hedef kip ve fiziksel geri alma korunur. 576 akışta 1.152 son ana dosya çifti ve 1.728 C açılışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,246 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_164.md).
