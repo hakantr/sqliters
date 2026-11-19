@@ -857,3 +857,8 @@ Ana şema ve kayıtlı kodlama C gibi ATTACH hazırlığında yükleniyor. 48 CL
 ## V6b.110 — Rowid görünüm UPDATE alt ve üst sınırı
 
 Tek ikincil indeksin iki sayısal literal sınırı C gibi kaynak materyalizasyonuna katılıyor. 36/36 log ve dosya, 24/24 tek sınır koruması C eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,243 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_110.md).
+
+
+## V6b.111 — WITHOUT ROWID görünüm UPDATE iki sınırı
+
+İkinci sayısal sınır da mevcut seçilmiş aralık yürütmesine katılıyor. 72/72 log/dosya ve 60 önceki koruma C eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,250 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_111.md).

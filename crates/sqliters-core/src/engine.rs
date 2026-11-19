@@ -31175,8 +31175,7 @@ fn view_dml_indexed_select(
     let schema = &ctx.db_set.main_slot().schema;
     let table = schema.find_user_table(&name.name)?;
     if (max_eq && !table.without_rowid)
-        || (table.without_rowid
-            && (predicate == ViewDmlIndexPredicate::DeleteRange || second_term.is_some()))
+        || (table.without_rowid && predicate == ViewDmlIndexPredicate::DeleteRange)
         || table.stat1.has_stat1
         || !table.foreign_keys.is_empty()
         || table
