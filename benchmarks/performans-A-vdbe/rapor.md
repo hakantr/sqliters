@@ -777,3 +777,8 @@ Geçiş commit'i rollback journalı C ile aynı sınırda kaldırıyor. 240 sağ
 ## V6b.94 — EXCLUSIVE MEMORY ve OFF→WAL sonlandırması
 
 Başarılı geçiş commit'i rollback journal ömrünü C ile hizalıyor. 240 sağlıklı geçiş ve 240 önceki kip koruması eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 387/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,254 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_94.md).
+
+
+## V6b.95 — EXCLUSIVE WAL→MEMORY/OFF sonlandırması
+
+WAL çıkışında geçici DELETE journal commit sonunda kaldırılıyor. 480 ters geçiş, 360 önceki kip koruması ve 1.440 C/Rust açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 387/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,263 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_95.md).

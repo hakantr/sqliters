@@ -2626,7 +2626,15 @@ impl Pager {
                     if let Some(p1) = self.cache.get_data_mut(1) {
                         hdr_copy.write_into(&mut p1[0..DB_HEADER_SIZE]);
                     }
-                    self.commit()?;
+                    self.commit_phase_one(None)?;
+                    // MEMORY and OFF use a temporary DELETE journal for the header rewrite.
+                    let remove_transition_journal =
+                        tx_rb_mode != target_mode && self.locking_mode == LockingMode::Exclusive;
+                    self.commit_phase_two_with_journal_cleanup(
+                        false,
+                        false,
+                        remove_transition_journal,
+                    )?;
                 } else {
                     self.end_read_if_unused()?;
                     if self.locking_mode == LockingMode::Normal {
