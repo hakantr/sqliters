@@ -3186,6 +3186,19 @@ impl Btree {
         Ok(ok)
     }
 
+    /// `OP_Last` on the statement's table cursor.
+    pub fn cc_last(&mut self, root: Pgno, role: u8) -> Result<bool> {
+        if self.pager.page_count() == 0 {
+            return Ok(false);
+        }
+        let cursor = self.vc_open(root, role);
+        let on_row = self.vc_last(cursor)?;
+        if on_row {
+            self.vc_note_rowid_if_table(cursor)?;
+        }
+        Ok(on_row)
+    }
+
     /// `OP_Next`: `false` at the end.
     pub fn cc_next(&mut self, root: Pgno, role: u8) -> Result<bool> {
         if self.pager.page_count() == 0 {
@@ -3209,6 +3222,22 @@ impl Btree {
         let moved = self.vc_next_n(vc, n)?;
         if moved > 0 {
             self.vc_note_rowid_if_table(vc)?;
+        }
+        Ok(moved)
+    }
+
+    /// Replays up to `n` `OP_Prev` advances on the statement's table cursor.
+    pub fn cc_prev_n(&mut self, root: Pgno, role: u8, n: u64) -> Result<u64> {
+        if self.pager.page_count() == 0 || n == 0 {
+            return Ok(0);
+        }
+        let cursor = self.vc_open(root, role);
+        let mut moved = 0;
+        while moved < n && self.vc_prev(cursor)? {
+            moved += 1;
+        }
+        if moved > 0 {
+            self.vc_note_rowid_if_table(cursor)?;
         }
         Ok(moved)
     }
@@ -3240,6 +3269,27 @@ impl Btree {
             self.vc_note_rowid_if_table(vc)?;
         }
         Ok(on)
+    }
+
+    /// `OP_SeekLE` or `OP_SeekLT` on the statement's table cursor.
+    pub fn cc_seek_rowid_le(&mut self, root: Pgno, role: u8, rowid: i64, strict: bool) -> Result<bool> {
+        if self.pager.page_count() == 0 {
+            return Ok(false);
+        }
+        let cursor = self.vc_open(root, role);
+        let comparison = self.vc_table_moveto(cursor, rowid, false)?;
+        if !self.vcursors[cursor].valid {
+            return Ok(false);
+        }
+        let on_row = if comparison > 0 || (comparison == 0 && strict) {
+            self.vc_prev(cursor)?
+        } else {
+            true
+        };
+        if on_row {
+            self.vc_note_rowid_if_table(cursor)?;
+        }
+        Ok(on_row)
     }
 
     /// `OP_Close` of the read cursors on `root` (the loop over a table that feeds an index

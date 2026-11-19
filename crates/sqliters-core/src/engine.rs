@@ -120,6 +120,8 @@ pub struct StmtTxTracker {
     pub prepared_defer_fks: Option<bool>,
     /// CHECK elision is decided when the statement is prepared.
     pub(crate) prepared_ignore_checks: Option<bool>,
+    /// The generated rowid loop direction is fixed when the statement is prepared.
+    pub(crate) prepared_reverse_order: bool,
     /// Bitmask of `DatabaseId` slots whose `Read` transaction was started from `Open` by this statement.
     pub started_read_mask: u16,
     /// Bitmask of `DatabaseId` slots whose `Write` transaction (and optional `stmt_sp_slot`) was entered in this statement.
@@ -171,6 +173,10 @@ pub struct StmtTxTracker {
     /// (`Some(None)`: the range has no lower bound, the loop starts with `OP_Rewind`; the
     /// flag: `OP_SeekGT`) — `cscan.rs`.
     pub c_rowid_lo: Option<Option<(i64, bool)>>,
+    /// The upper seek bound for a backwards rowid loop. `Some(None)` means `OP_Last`.
+    pub(crate) c_rowid_hi: Option<Option<(i64, bool)>>,
+    /// Set only for a simple mixed-index write after validating the active snapshot.
+    pub(crate) reverse_mixed_range: bool,
     /// Set when REPLACE resolved a rowid conflict by keeping the table row (only its index
     /// entries are deleted, `insert.c` `case OE_Replace`) on a table without any index:
     /// `(table root, rowid)`. C's data cursor was then only positioned by `OP_NotExists` and
@@ -2779,6 +2785,8 @@ pub(crate) fn c_statement_halt(ctx: &mut ExecContext<'_>) {
     if ctx.stmt_tx.exec_depth == 0 && ctx.stmt_tx.subprogram_stack.is_empty() {
         ctx.stmt_tx.c_rowid_seek = None;
         ctx.stmt_tx.c_rowid_lo = None;
+        ctx.stmt_tx.c_rowid_hi = None;
+        ctx.stmt_tx.reverse_mixed_range = false;
         for slot in ctx.db_set.slots_mut() {
             if let Some(ref mut bt) = slot.btree {
                 bt.statement_end();
@@ -14181,6 +14189,7 @@ fn eval_table_or_subquery(
                     indexed_by.as_ref(),
                     plan_where_hint,
                     vtab_query_info,
+                    false,
                     params,
                     outer_scopes,
                     ctes,
@@ -14205,6 +14214,7 @@ fn eval_table_or_subquery(
                 indexed_by.as_ref(),
                 plan_where_hint,
                 vtab_query_info,
+                false,
                 params,
                 outer_scopes,
                 ctes,
@@ -14280,6 +14290,7 @@ fn read_table_with_plan_scan(
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
 ) -> Result<(Vec<(TableRowKey, Vec<u8>)>, crate::dml_c::ScanInfo)> {
+    let reverse_rowid_range = ctx.stmt_tx.reverse_mixed_range;
     read_table_with_plan_ctx(
         ctx,
         db_id,
@@ -14288,6 +14299,7 @@ fn read_table_with_plan_scan(
         indexed_by,
         where_hint,
         None,
+        reverse_rowid_range,
         params,
         outer_scopes,
         ctes,
@@ -14305,6 +14317,7 @@ fn read_table_with_plan_ctx(
     indexed_by: Option<&IndexHint>,
     where_hint: Option<&Expr>,
     query_info: Option<&SingleVtabQueryInfo<'_>>,
+    reverse_rowid_range: bool,
     params: &[Value],
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
@@ -14462,9 +14475,12 @@ fn read_table_with_plan_ctx(
     if db_page_count == 0 {
         return Ok((Vec::new(), scan));
     }
-    execute_access_plan(
-        ctx, db_id, db_enc, tbl, &plan, params, outer_scopes, ctes, IndexScanOrder::Forward,
-    )
+    let order = if reverse_rowid_range && scan.shape == crate::dml_c::ScanShape::RowidRange {
+        IndexScanOrder::Reverse
+    } else {
+        IndexScanOrder::Forward
+    };
+    execute_access_plan(ctx, db_id, db_enc, tbl, &plan, params, outer_scopes, ctes, order)
         .map(|r| (r, scan))
 }
 
@@ -14512,6 +14528,25 @@ pub(crate) fn eval_rowid_range_bound(
             // INTEGER is always less than BLOB
             if is_lower { None } else { Some(None) }
         }
+    }
+}
+
+/// The integer key and strictness C's upper-bound seek uses after numeric affinity.
+fn reverse_rowid_seek(value: &Value, inclusive: bool) -> Option<(i64, bool)> {
+    match value {
+        Value::Integer(key) => Some((*key, !inclusive)),
+        Value::Real(real) => {
+            let key = value.to_integer_lossy();
+            let strict = match sqliters_types::cmp_int_float(key, *real) {
+                Ordering::Greater => true,
+                Ordering::Equal => !inclusive,
+                Ordering::Less => false,
+            };
+            Some((key, strict))
+        }
+        Value::Text(text) => sqliters_types::parse_numeric_text(text)
+            .and_then(|numeric| reverse_rowid_seek(&numeric, inclusive)),
+        Value::Null | Value::Blob(_) => None,
     }
 }
 
@@ -14602,6 +14637,8 @@ fn execute_access_plan(
         }
         AccessPlan::RowidRange { lower, upper } => {
             ctx.stmt_tx.c_rowid_lo = None;
+            ctx.stmt_tx.c_rowid_hi = None;
+            let reverse = scan_order == IndexScanOrder::Reverse;
             let mut c_lo: Option<(i64, bool)> = None;
             let low_bound = if let Some(lb) = lower {
                 let v = eval_expr(ctx, &lb.expr, params, outer_scopes, ctes, None)?;
@@ -14626,8 +14663,12 @@ fn execute_access_plan(
             } else {
                 None
             };
+            let mut c_hi = None;
             let high_bound = if let Some(ub) = upper {
                 let v = eval_expr(ctx, &ub.expr, params, outer_scopes, ctes, None)?;
+                if reverse {
+                    c_hi = reverse_rowid_seek(&v, ub.inclusive);
+                }
                 let Some(b) = eval_rowid_range_bound(v, ub.inclusive, false) else {
                     return Ok(Vec::new());
                 };
@@ -14635,11 +14676,18 @@ fn execute_access_plan(
             } else {
                 None
             };
-            ctx.stmt_tx.c_rowid_lo = Some(c_lo);
+            if reverse {
+                ctx.stmt_tx.c_rowid_hi = Some(c_hi);
+            } else {
+                ctx.stmt_tx.c_rowid_lo = Some(c_lo);
+            }
             let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree else {
                 return Ok(Vec::new());
             };
-            let hits = bt.seek_table_range(tbl.root_pgno, low_bound, high_bound)?;
+            let mut hits = bt.seek_table_range(tbl.root_pgno, low_bound, high_bound)?;
+            if reverse {
+                hits.reverse();
+            }
             Ok(hits
                 .into_iter()
                 .map(|(rid, payload)| (TableRowKey::Rowid(rid), payload))
@@ -24396,7 +24444,7 @@ impl<'a> MixedIndexWrite<'a> {
         }
     }
 
-    fn applies(self, table: &TableSchema, key: &IndexedColSchema, allow_ranges: bool) -> bool {
+    fn applies(self, table: &TableSchema, key: &IndexedColSchema) -> bool {
         let literal = |expr: &Expr| matches!(
             expr, Expr::Null | Expr::Bool(_) | Expr::Integer(_) | Expr::Float(_)
                 | Expr::String(_) | Expr::Blob(_) | Expr::Bind(_)
@@ -24415,7 +24463,7 @@ impl<'a> MixedIndexWrite<'a> {
                 && update.or_conflict.is_none()
                 && update.from.is_none()
                 && update.returning.is_empty()
-                && mixed_index_rowid_selection(table, update.selection.as_ref(), allow_ranges)
+                && mixed_index_rowid_selection(table, update.selection.as_ref())
                 && matches!(update.assignments.as_slice(), [assignment]
                     if !assignment.row_value
                         && matches!(assignment.columns.as_slice(), [column]
@@ -24425,7 +24473,7 @@ impl<'a> MixedIndexWrite<'a> {
                 && delete.alias.is_none()
                 && delete.indexed_by.is_none()
                 && delete.returning.is_empty()
-                && mixed_index_rowid_selection(table, delete.selection.as_ref(), allow_ranges),
+                && mixed_index_rowid_selection(table, delete.selection.as_ref()),
         }
     }
 }
@@ -24433,16 +24481,12 @@ impl<'a> MixedIndexWrite<'a> {
 fn mixed_index_rowid_selection(
     table: &TableSchema,
     selection: Option<&Expr>,
-    allow_ranges: bool,
 ) -> bool {
     let rowid = |expr: &Expr| matches!(expr, Expr::Column(column)
         if resolve_target_col_ref(table, "main", None, column) == Some(TargetColRef::Rowid));
     let equality_bound = |expr: &Expr| matches!(expr, Expr::Integer(_) | Expr::Bind(_));
     if let Some(Expr::Binary { op: BinaryOp::Eq, left, right }) = selection {
         return (rowid(left) && equality_bound(right)) || (equality_bound(left) && rowid(right));
-    }
-    if !allow_ranges {
-        return false;
     }
     let range_bound = |expr: &Expr| match expr {
         Expr::Null | Expr::Integer(_) | Expr::Float(_) | Expr::Bind(_) => true,
@@ -24488,7 +24532,6 @@ fn mixed_index_write_collation(
     table: &TableSchema,
     index: &IndexSchema,
     collations: &CollationRegistry,
-    allow_ranges: bool,
 ) -> Option<Collation> {
     let [key] = index.columns.as_slice() else {
         return None;
@@ -24510,7 +24553,7 @@ fn mixed_index_write_collation(
             slot.schema.tables.iter().any(|table| !table.foreign_keys.is_empty())
         })
         || ["BINARY", "NOCASE", "RTRIM"].iter().any(|name| collations.get_custom(name).is_some())
-        || !write.applies(table, key, allow_ranges)
+        || !write.applies(table, key)
     {
         return None;
     }
@@ -24539,11 +24582,7 @@ pub(crate) fn mixed_index_write(
     let (Some(index), None) = (indexes.next(), indexes.next()) else {
         return false;
     };
-    // The existing relational DML range walk visits rowids in ascending order.
-    let allow_ranges = db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder == 0;
-    mixed_index_write_collation(
-        write, db_id, db_set, table, index, collations, allow_ranges,
-    ).is_some()
+    mixed_index_write_collation(write, db_id, db_set, table, index, collations).is_some()
 }
 
 fn physical_index_write_collation(
@@ -24670,11 +24709,12 @@ fn prepare_dml_write_slot(
     let mut indexes = dml_ordered_indexes(&tbl, &slot.schema.indexes_for_table(&tbl.name));
     if let [index] = indexes.as_mut_slice()
         && let Some(declared) = mixed_index_write_collation(
-            write, db_id, ctx.db_set, &tbl, index, ctx.collations, true,
+            write, db_id, ctx.db_set, &tbl, index, ctx.collations,
         )
     {
         let comparator = physical_index_write_collation(ctx, db_id, &tbl, index, declared)?;
         index.columns[0].sort_order.collation = comparator;
+        ctx.stmt_tx.reverse_mixed_range = ctx.stmt_tx.prepared_reverse_order;
     }
     Ok((tbl, indexes, sname))
 }

@@ -2,10 +2,10 @@
 //!
 //! This engine reads the rows the access plan selects before it processes any of them (those
 //! reads do not touch the page cache, see `sqliters_pager`'s side store). C's program is one
-//! loop: the cursor steps to the next row (`OP_Next`), the row is tested and — in a one-pass
+//! loop: the cursor advances (`OP_Next` or `OP_Prev`), the row is tested and — in a one-pass
 //! statement — changed right there, through the same cursor. What the page cache does depends
 //! on where that cursor is, so the statement executors replay its movements here: before a
-//! row is processed the cursor is stepped to it, one `OP_Next` per row the scan visits, and
+//! row is processed the cursor is stepped to it, one advance per row the scan visits, and
 //! after the last row it runs to the end of the scan.
 //!
 //! A statement that needs two passes (`ONEPASS_OFF`) runs the whole scan first through a read
@@ -22,8 +22,12 @@ use sqliters_types::{DatabaseId, Pgno, Result};
 enum Start {
     /// `OP_Rewind`.
     Rewind,
+    /// `OP_Last`.
+    Last,
     /// `OP_SeekGE` (`true`: `OP_SeekGT`) to the lower bound of a rowid range.
     Seek(i64, bool),
+    /// `OP_SeekLE` (`true` for `OP_SeekLT`) to the upper bound.
+    SeekBack(i64, bool),
     /// The first row the loop visits stands in for a lower bound that is not known here.
     Row(i64),
 }
@@ -33,14 +37,28 @@ impl Start {
     fn run(self, bt: &mut sqliters_btree::Btree, root: Pgno, role: u8) -> Result<bool> {
         match self {
             Start::Rewind => bt.cc_rewind(root, role),
+            Start::Last => bt.cc_last(root, role),
             Start::Seek(k, strict) => bt.cc_seek_rowid_ge(root, role, k, strict),
+            Start::SeekBack(k, strict) => bt.cc_seek_rowid_le(root, role, k, strict),
             Start::Row(k) => bt.cc_seek_rowid(root, role, k),
+        }
+    }
+
+    fn is_reverse(self) -> bool {
+        matches!(self, Start::Last | Start::SeekBack(..))
+    }
+
+    fn advance(self, bt: &mut sqliters_btree::Btree, root: Pgno, role: u8, n: u64) -> Result<u64> {
+        if self.is_reverse() {
+            bt.cc_prev_n(root, role, n)
+        } else {
+            bt.cc_next_n(root, role, n)
         }
     }
 }
 
 enum Kind {
-    /// `OP_Rewind` (or a seek to the lower bound of a rowid range) .. `OP_Next` over the table.
+    /// A forward or backward rowid walk over the table.
     Table(Start),
     /// `OP_SeekGE` .. `OP_Next` over an index.
     Index(Box<IdxScan>),
@@ -91,6 +109,7 @@ impl CScan {
             .and_then(|s| s.btree.as_mut())
             .and_then(sqliters_btree::Btree::cc_take_idx_scan);
         let rowid_lo = ctx.stmt_tx.c_rowid_lo.take();
+        let rowid_hi = ctx.stmt_tx.c_rowid_hi.take();
         let rowid_seek = ctx.stmt_tx.c_rowid_seek.take();
         if scan.rowid_seek && n_scanned == 0 {
             // `rowid = X` and no such row: the statement is its one `OP_NotExists` on the
@@ -108,13 +127,15 @@ impl CScan {
         } else if scan.shape == ScanShape::RowidIn {
             (Kind::RowidList(ctx.stmt_tx.c_rowid_in.take()?, 0, 0), table_root)
         } else if scan.shape == ScanShape::RowidRange {
-            // (the loop starts with a seek to its lower bound, or with OP_Rewind when it has
-            // none)
-            let start = match (rowid_lo, first_rowid) {
-                (Some(Some((k, strict))), _) => Start::Seek(k, strict),
-                (Some(None), _) => Start::Rewind,
-                (None, Some(k)) => Start::Row(k),
-                (None, None) => return None,
+            let start = if let Some(upper) = rowid_hi {
+                upper.map_or(Start::Last, |(key, strict)| Start::SeekBack(key, strict))
+            } else {
+                match (rowid_lo, first_rowid) {
+                    (Some(Some((k, strict))), _) => Start::Seek(k, strict),
+                    (Some(None), _) => Start::Rewind,
+                    (None, Some(k)) => Start::Row(k),
+                    (None, None) => return None,
+                }
             };
             (Kind::Table(start), table_root)
         } else if let (Some(idx_root), Some(is)) = (scan.index_root, idx_scan) {
@@ -153,9 +174,9 @@ impl CScan {
                 match &mut self.kind {
                     Kind::Table(first) => {
                         let mut on = first.run(bt, self.root, VC_READ)?;
-                        // one OP_Next per row visited; the last one finds the end of the loop
+                        // The last advance finds the end of the scan.
                         if on && self.n_scanned > 0 {
-                            on = bt.cc_next_n(self.root, VC_READ, u64::from(self.n_scanned))?
+                            on = first.advance(bt, self.root, VC_READ, u64::from(self.n_scanned))?
                                 == u64::from(self.n_scanned);
                         }
                         let _ = on;
@@ -211,7 +232,7 @@ impl CScan {
                 }
                 if self.pos < target {
                     let want = u64::from(target - self.pos);
-                    let moved = bt.cc_next_n(self.root, VC_WRITE, want)?;
+                    let moved = first.advance(bt, self.root, VC_WRITE, want)?;
                     self.pos += moved as u32;
                     if moved < want {
                         self.at_end = true;
@@ -249,17 +270,21 @@ impl CScan {
                         }
                     }
                     if self.n_scanned > 0 {
-                        // to the last row the loop visits, then the OP_Next that ends it
+                        // Advance to the last row visited, then finish the loop.
                         if !self.at_end && self.pos + 1 < self.n_scanned {
                             let want = u64::from(self.n_scanned - 1 - self.pos);
-                            let moved = bt.cc_next_n(self.root, VC_WRITE, want)?;
+                            let moved = first.advance(bt, self.root, VC_WRITE, want)?;
                             self.pos += moved as u32;
                             if moved < want {
                                 self.at_end = true;
                             }
                         }
                         if !self.at_end {
-                            bt.cc_next(self.root, VC_WRITE)?;
+                            if first.is_reverse() {
+                                bt.cc_prev_n(self.root, VC_WRITE, 1)?;
+                            } else {
+                                bt.cc_next(self.root, VC_WRITE)?;
+                            }
                             self.at_end = true;
                         }
                     }

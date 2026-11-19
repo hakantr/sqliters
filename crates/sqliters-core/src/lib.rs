@@ -5343,6 +5343,7 @@ pub struct Statement {
     c_is_reader: bool,
     compiled_defer_fks: bool,
     compiled_ignore_checks: bool,
+    compiled_reverse_order: bool,
     category: Option<StmtCategory>,
     compiled_vdbe: Option<Arc<VdbeProgram>>,
     compiled_fast_read: Option<Arc<fast_read::FastReadPlan>>,
@@ -8575,6 +8576,8 @@ impl Statement {
             c_is_reader,
             compiled_defer_fks: inner.db_set.c_defer_foreign_keys(),
             compiled_ignore_checks: inner.db_set.c_ignore_checks(),
+            compiled_reverse_order: inner.db_set.c_flags_toggled()
+                & sqliters_codegen::consts::SQLITE_ReverseOrder != 0,
             category: artifacts.category,
             compiled_vdbe: artifacts.compiled_vdbe,
             compiled_fast_read: artifacts.compiled_fast_read,
@@ -9348,6 +9351,8 @@ impl Statement {
 
             self.compiled_defer_fks = inner.db_set.c_defer_foreign_keys();
             self.compiled_ignore_checks = inner.db_set.c_ignore_checks();
+            self.compiled_reverse_order = inner.db_set.c_flags_toggled()
+                & sqliters_codegen::consts::SQLITE_ReverseOrder != 0;
             self.c_is_reader = c_explain.as_ref().or(c_machine.as_ref()).or(c_write.as_ref())
                 .map(|p| p.b_is_reader).or_else(|| select_schema_use.as_ref().and_then(|u| u.is_reader))
                 .unwrap_or(artifacts.category.is_some_and(|c| c != StmtCategory::NoLockPragma));
@@ -11401,6 +11406,7 @@ impl Statement {
                 let mut stmt_tx = StmtTxTracker {
                     prepared_defer_fks: Some(self.compiled_defer_fks),
                     prepared_ignore_checks: Some(self.compiled_ignore_checks),
+                    prepared_reverse_order: self.compiled_reverse_order,
                     stmt_sp_slot,
                     top_level_sql,
                     ignored_fk_parent_tables: self.ignored_fk_parent_tables.clone(),
