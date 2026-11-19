@@ -707,3 +707,8 @@ C'nin ad çözümü ve truth testi ölçülen SELECT ve DML kapsamlarında hizal
 ## V6b.80 — V1 bağlantı tanısı ve gerçek reset kodu
 
 Varsayılan okuma kesintisinde V1 step, bağlantıda saklanan mesaj ve ofsetle rc1 veriyor. Reset ve finalize gerçek rc9'u koruyor. 324 native vaka iki kipte C eş. Yeni V1 regresyonu iki kipte geçti. OFF 1186/1/337, ON 1177/10/337. DML ve ayrışma bulucu V6b.79 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,254 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_80.md).
+
+
+## V6b.81 — WITHOUT ROWID STORED tam tarama
+
+Dar aday, ölçülen STORED WITHOUT ROWID taramasında C'nin eş maliyet sırasını izliyor. 712 fiziksel dosya grubu ve 48 INSERT/REPLACE ölçümü iki kipte C eş. Önceki geniş adayın yeni sıra farkı dar kapsamda kapandı. OFF 1186/1/337, ON 1177/10/337. DML OFF 382/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 0,992 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_81.md).

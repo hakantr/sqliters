@@ -349,6 +349,24 @@ fn choose_single_term_plan(
     schema: &Schema,
     ctx: QueryPlanContext<'_>,
 ) -> AccessPlan {
+    // Keep the full-scan correction in the STORED generated-column case
+    // where the secondary index competes with the stored PRIMARY KEY.
+    if tbl.without_rowid
+        && tbl
+            .columns
+            .iter()
+            .any(|col| col.generated.as_ref().is_some_and(|(_, stored)| *stored))
+        && selection.is_none()
+        && ctx.projection.is_some()
+        && ctx.indexed_by.is_none()
+        && ctx.order_by.is_empty()
+        && ctx.group_by.is_empty()
+        && ctx.having.is_none()
+        && let Some(plan) = choose_unordered_without_rowid_scan(tbl, schema_name, alias, schema, &ctx)
+    {
+        return plan;
+    }
+
     let forced_idx_name = match ctx.indexed_by {
         Some(IndexHint::IndexedBy(name)) => Some(name.as_str()),
         _ => None,
@@ -841,10 +859,7 @@ fn choose_single_term_plan(
                 || satisfies_ob;
             if eligible_full_scan {
                 let r_size = idx_est.first().copied().unwrap_or(tbl_row_est);
-                let mut cost = r_size + 1 + (15 * idx_sz) / tab_sz;
-                if !is_covering {
-                    cost = sqlite_log_est_add(cost, r_size + 16);
-                }
+                let mut cost = full_index_scan_cost(r_size, idx_sz, tab_sz, is_covering);
                 if satisfies_ob {
                     // Saves an external sorter pass (~ 3 * r_size)
                     cost = cost.saturating_sub(16);
@@ -890,6 +905,76 @@ fn choose_single_term_plan(
     }
 
     best_plan
+}
+
+/// Compare full scans of the primary and secondary B-trees when there is
+/// no predicate, ordering requirement, or ANALYZE estimate to price.
+fn choose_unordered_without_rowid_scan(
+    tbl: &TableSchema,
+    schema_name: &str,
+    alias: Option<&str>,
+    schema: &Schema,
+    ctx: &QueryPlanContext<'_>,
+) -> Option<AccessPlan> {
+    let indexes = schema.indexes_for_table(&tbl.name);
+    if tbl.stat1.has_stat1
+        || tbl.without_rowid_pk_stat1.is_some()
+        || indexes.iter().any(|idx| idx.stat1.is_some())
+    {
+        return None;
+    }
+    // build.c estimateTableWidth adds one unit with iPKey < 0, including
+    // WITHOUT ROWID. The PRIMARY KEY index contains only stored columns.
+    let mut table_width = 1;
+    let mut primary_width = 0;
+    for col in &tbl.columns {
+        let width = u64::from(col.estimated_width());
+        table_width += width;
+        if !col.generated.as_ref().is_some_and(|(_, stored)| !stored) {
+            primary_width += width;
+        }
+    }
+    let table_size = sqlite_log_est(table_width * 4).max(1);
+    let primary_size = sqlite_log_est(primary_width * 4);
+    let mut best_plan = AccessPlan::FullScan;
+    let mut best_cost = i16::MAX;
+    // C keeps the first equal-cost loop with the same estimated output
+    // count. Use the pTable->pIndex order, including the PRIMARY KEY.
+    for idx in crate::engine::ordered_table_indexes(tbl, &indexes) {
+        if idx.where_clause.is_some() || idx.is_unordered() {
+            continue;
+        }
+        let is_primary = idx.origin == "pk" && idx.root_pgno == tbl.root_pgno;
+        let is_covering =
+            is_primary || index_is_covering_for_query(&idx, tbl, schema_name, alias, None, ctx);
+        let index_size = if is_primary {
+            primary_size
+        } else {
+            idx.default_sz_idx_row(tbl)
+        };
+        let cost = full_index_scan_cost(tbl.stat1.n_row_log_est, index_size, table_size, is_covering);
+        if cost < best_cost {
+            best_cost = cost;
+            best_plan = if is_primary {
+                AccessPlan::FullScan
+            } else {
+                AccessPlan::IndexFullScan {
+                    index: idx,
+                    is_covering,
+                }
+            };
+        }
+    }
+    Some(best_plan)
+}
+
+fn full_index_scan_cost(r_size: i16, index_size: i16, table_size: i16, is_covering: bool) -> i16 {
+    let cost = r_size + 1 + (15 * index_size) / table_size;
+    if is_covering {
+        cost
+    } else {
+        sqlite_log_est_add(cost, r_size + 16)
+    }
 }
 
 fn is_rowid_or_ipk_name(tbl: &TableSchema, col_name: &str) -> bool {

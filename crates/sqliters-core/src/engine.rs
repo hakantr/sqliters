@@ -20416,7 +20416,7 @@ fn remove_row_and_indexes_opt(
 /// Orders all indexes on `tbl` (including `WITHOUT ROWID` PK when applicable) in `pTab->pIndex`
 /// linked-list order (`sqlite/src/build.c:3980-4004`): non-`Replace` indexes in reverse creation
 /// order, followed by the `Replace` indexes, also in reverse creation order.
-fn ordered_table_indexes(tbl: &TableSchema, indexes: &[IndexSchema]) -> Vec<IndexSchema> {
+pub(crate) fn ordered_table_indexes(tbl: &TableSchema, indexes: &[IndexSchema]) -> Vec<IndexSchema> {
     let parse_auto_num = |name: &str| -> usize {
         name.rsplit('_')
             .next()
