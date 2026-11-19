@@ -967,3 +967,8 @@ Geçici pager normal COMMIT ve ROLLBACK sonrasında journalı sıfıra indiriyor
 ## V6b.132 — Karma indeks bütünlük tanısı
 
 Dar integrity_check kapsamı C dış kolasyonu ve aynı cursor ile üyeliği arıyor. 114 dosyada her kipte 1.710 C grubu eş ve quick_check korunuyor. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,261 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_132.md).
+
+
+## V6b.133 — WAL→MEMORY statement bitişi
+
+Normal WAL çıkışında gerçek MEMORY journal ve C ROW sınırı kullanılıyor. 756 geçiş, 216 retained kontrolü ve 6.318 C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,248 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_133.md).

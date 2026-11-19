@@ -2526,10 +2526,11 @@ impl Pager {
             && self.db_kind == DatabaseKind::NamedDisk
             && self.page_count > 0
             && self.pending_sql_journal_mode.is_none()
+            && (mode != JournalMode::Memory || self.locking_mode == LockingMode::Normal)
             && matches!(
                 (self.journal_mode, mode),
                 (JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate, JournalMode::Wal)
-                    | (JournalMode::Wal, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate)
+                    | (JournalMode::Wal, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate | JournalMode::Memory)
             );
         let active = self.change_journal_mode(mode, defer)?;
         Ok((active, defer && self.pending_sql_journal_mode.is_some()))
@@ -2661,9 +2662,11 @@ impl Pager {
 
             // `.db` currently holds `LockLevel::Exclusive`, and `self.wal` is `None`.
             // Suppress automatic WAL re-open while rewriting Page 1 `(2, 2) -> (1, 1)` under a
-            // rollback journal (`Delete` if target is `Memory`/`Off` so bytes 18..19 are crash-safe!).
+            // rollback journal. OP_JournalMode selects MEMORY before staging page one
+            // in the statement. Inline MEMORY and OFF rewrites use a DELETE journal.
             let tx_rb_mode = match target_mode {
-                JournalMode::Memory | JournalMode::Off => JournalMode::Delete,
+                JournalMode::Memory if !defer => JournalMode::Delete,
+                JournalMode::Off => JournalMode::Delete,
                 other => other,
             };
             self.journal_mode = tx_rb_mode;
@@ -2689,7 +2692,7 @@ impl Pager {
                         return Ok(());
                     }
                     self.commit_phase_one(None)?;
-                    // MEMORY and OFF use a temporary DELETE journal for the header rewrite.
+                    // Inline MEMORY and OFF use a temporary DELETE journal.
                     let remove_transition_journal =
                         tx_rb_mode != target_mode && self.locking_mode == LockingMode::Exclusive;
                     self.commit_phase_two_with_journal_cleanup(
