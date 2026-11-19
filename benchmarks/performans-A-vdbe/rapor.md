@@ -1132,3 +1132,8 @@ Erken başlık okumasından önce C gibi hedef kip ve fiziksel geri alma korunur
 ## V6b.165 — Karma indeksli rowid aralığı ve sütun filtresi
 
 Uygun AND bileşiminde C rowid aralığı ve mevcut fiziksel karşılaştırıcı korunur. 144 yazma, 288 rollback ile 432 C açılışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,098 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_165.md).
+
+
+## V6b.166 — Koordineli OFF ve WAL BUSY sonu
+
+Mevcut izinli native OFF ve WAL geçişi C gibi ara kip, fiziksel geri alma ve normal yeniden okuma verir. 264 native akış, 528 ana dosya slot çifti ve 792 C açılışı eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,255 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_166.md).

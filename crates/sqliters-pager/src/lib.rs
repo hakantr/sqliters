@@ -2583,8 +2583,8 @@ impl Pager {
         if let Some(transition) = self.pending_sql_journal_mode.as_mut()
             && matches!(
                 (transition.previous, transition.target),
-                (JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate | JournalMode::Memory, JournalMode::Wal)
-                | (JournalMode::Wal, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate | JournalMode::Memory)
+                (JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate | JournalMode::Memory | JournalMode::Off, JournalMode::Wal)
+                | (JournalMode::Wal, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate | JournalMode::Memory | JournalMode::Off)
             )
         {
             transition.keep_mode_after_busy = true;
