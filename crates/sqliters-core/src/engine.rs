@@ -43279,7 +43279,7 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
         }
         let previous = pager.journal_mode();
         let supported_previous = supported.contains(&previous)
-            || (target == JournalMode::Memory && previous == JournalMode::Memory);
+            || (previous == JournalMode::Memory && matches!(target, JournalMode::Memory | JournalMode::Wal));
         if pager.db_kind() != DatabaseKind::NamedDisk
             || pager.locking_mode() != LockingMode::Normal
             || pager.transaction_state() != TransactionState::Open

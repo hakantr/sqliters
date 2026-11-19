@@ -2526,10 +2526,11 @@ impl Pager {
             && self.db_kind == DatabaseKind::NamedDisk
             && self.page_count > 0
             && self.pending_sql_journal_mode.is_none()
-            && (mode != JournalMode::Memory || self.locking_mode == LockingMode::Normal)
+            && (!(mode == JournalMode::Memory || self.journal_mode == JournalMode::Memory)
+                || self.locking_mode == LockingMode::Normal)
             && matches!(
                 (self.journal_mode, mode),
-                (JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate, JournalMode::Wal)
+                (JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate | JournalMode::Memory, JournalMode::Wal)
                     | (JournalMode::Wal, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate | JournalMode::Memory)
             );
         let active = self.change_journal_mode(mode, defer)?;
@@ -2605,7 +2606,12 @@ impl Pager {
                 if let Some(mut jfd) = self.journal_file.take() {
                     let _ = jfd.close();
                 }
-                self.journal_mode = JournalMode::Delete;
+                // OP_JournalMode stages a MEMORY→WAL page-one write without a journal.
+                self.journal_mode = if defer && saved_mode == JournalMode::Memory {
+                    JournalMode::Off
+                } else {
+                    JournalMode::Delete
+                };
             }
             // A staged PERSIST/TRUNCATE write reuses the previous rollback
             // journal. Pending WAL mode removes it at statement completion.
@@ -5111,7 +5117,8 @@ impl Pager {
         }
         self.error_unlock_pending = false;
         self.pager_error = None;
-        if self.pending_sql_journal_mode.take().is_some() {
+        let pending_mode = self.pending_sql_journal_mode.take();
+        if pending_mode.is_some() {
             // The next shared-lock acquisition reads the authoritative header
             // after the existing pager error and rollback-journal cleanup.
             self.suppress_auto_wal = false;
@@ -5120,6 +5127,9 @@ impl Pager {
             // An in-memory journal cannot be recovered after it is discarded.
             self.state = TransactionState::Write;
             let _ = self.rollback_inner(false);
+        }
+        if pending_mode == Some(JournalMode::Wal) && self.journal_mode == JournalMode::Off {
+            self.journal_mode = JournalMode::Memory;
         }
         if let Some(wal) = self.wal.as_mut() {
             let _ = wal.end_read_transaction();
@@ -5705,9 +5715,11 @@ impl Pager {
             && let Some(target) = self.pending_sql_journal_mode.take()
         {
             self.suppress_auto_wal = false;
-            // Entry kept the old rollback mode while preparing page one.
             if target != JournalMode::Wal {
                 self.journal_mode = JournalMode::Wal;
+            } else if self.journal_mode == JournalMode::Off {
+                // Discard the intermediate mode of a staged MEMORY→WAL transition.
+                self.journal_mode = JournalMode::Memory;
             }
         }
         if was_write && let Err(ref error) = result {

@@ -982,3 +982,8 @@ Yazma görüntüsünde gerçek karşılaştırıcı seçiliyor ve önceki nullab
 ## V6b.135 — Karma indeksli noktasal DML kolon yerleşimi
 
 İndeks anahtarı ve rowid konumunda normal kayıt çözümlemesi kullanılıyor. 240 rollback-journal ve 108 WAL C/Rust tam dosya çifti eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,236 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_135.md).
+
+
+## V6b.136 — MEMORY→WAL statement bitişi
+
+Normal geçişte ilk ROW C gibi fiziksel başlığı koruyor. 756 yeni, 270 koruma ve 7.128 salt okunur C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 0,965 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_136.md).
