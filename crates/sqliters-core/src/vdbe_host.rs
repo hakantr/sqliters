@@ -297,7 +297,7 @@ fn ordered_index_collation_mismatch(
         name,
         table_args: None,
         alias: None,
-        indexed_by: Some(IndexHint::IndexedBy(index_name)),
+        indexed_by,
     } = &from.head
     else {
         return false;
@@ -323,8 +323,28 @@ fn ordered_index_collation_mismatch(
     else {
         return false;
     };
-    let Some(index) = inner.db_set.slot(db_id).and_then(|slot| slot.schema.find_index(index_name))
-    else {
+    let Some(slot) = inner.db_set.slot(db_id) else {
+        return false;
+    };
+    let index = match indexed_by {
+        Some(IndexHint::IndexedBy(index_name)) => slot.schema.find_index(index_name),
+        Some(IndexHint::NotIndexed) => return false,
+        None => {
+            // Resolve the actual index selected by the program, rather than a
+            // candidate that merely happens to have the requested column.
+            let mut opens = program.a_op.iter().filter(|op| {
+                op.opcode == OP_OpenRead && matches!(&op.p4, P4::KeyInfo(_))
+            });
+            let (Some(open), None) = (opens.next(), opens.next()) else {
+                return false;
+            };
+            if open.p3 != db_id.index() as i32 {
+                return false;
+            }
+            slot.schema.indexes.iter().find(|index| index.root_pgno as i32 == open.p2)
+        }
+    };
+    let Some(index) = index else {
         return false;
     };
     let [key] = index.columns.as_slice() else {

@@ -912,3 +912,8 @@ Doğrulanan tek kaynakta planner ve fiziksel indeks farklı collation kullanırs
 ## V6b.121 — Çoklu journal ve desteklenen disk slotları
 
 Mevcut ortak commit iki ve üçten fazla normal diske uygulanıyor. 180 dört/altı, 6 üst sınır ve 180 eski native kontrol C eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_121.md).
+
+
+## V6b.122 — İpucusuz SELECT ve seçilen indeks sırası
+
+Tek gerçek OpenRead ve KeyInfo ile seçilen fiziksel indeks güvenli sıralama için doğrulanıyor. Dört yeni ve dört adlandırılmış sıra farkı C eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,256 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_122.md).
