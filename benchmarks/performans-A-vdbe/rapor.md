@@ -1037,3 +1037,8 @@ Tek hedefli normal D/P/T SQL çıkışı C gibi WAL yeniden açılmadan önce SH
 ## V6b.146 — İfade indeksi INDEX_XINFO kolasyon adı
 
 C'nin ifade kökündeki açık kolasyon adı doğrudan ve tablo değerli metadata için korunuyor. 18 eski fark kapandı ve her kipte 726 yeni grup eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,257 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_146.md).
+
+
+## V6b.147 — Tek tırnaklı COLLATE adı
+
+C'nin COLLATE adı kabul ettiği dört konumda tek tırnaklı diziler mevcut ad akışından geçer. 12 C dosyası iki kipte açıldı, 84/84 SELECT ve 11 parser kontrolü eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,263 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_147.md).

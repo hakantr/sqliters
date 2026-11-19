@@ -324,6 +324,17 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parses the ID or STRING after COLLATE in SQLite's grammar.
+    fn parse_collation_name(&mut self) -> Result<String> {
+        let tok = self.peek();
+        if tok.kind == TokenKind::StringLiteral {
+            self.advance();
+            Ok(self.alloc_ident_from_token(tok))
+        } else {
+            self.parse_ident()
+        }
+    }
+
     const fn is_join_kw(kind: TokenKind) -> bool {
         matches!(
             kind,
@@ -1171,7 +1182,7 @@ impl<'a> Parser<'a> {
                     .map(|t| t.trim_matches(|c: char| c.is_ascii_whitespace()).to_owned());
                 constraints.push(ColumnConstraint::Default(expr));
             } else if self.eat(TokenKind::Collate) {
-                constraints.push(ColumnConstraint::Collate(self.parse_ident()?));
+                constraints.push(ColumnConstraint::Collate(self.parse_collation_name()?));
             } else if self.eat(TokenKind::References) {
                 let ref_table = self.parse_ident()?;
                 let mut ref_columns = Vec::new();
@@ -1418,7 +1429,7 @@ impl<'a> Parser<'a> {
             raw_expr = *expr;
         }
         if self.eat(TokenKind::Collate) {
-            collation = Some(self.parse_ident()?);
+            collation = Some(self.parse_collation_name()?);
         }
         let (name, expr) = match raw_expr {
             Expr::Column(ColumnRef {
@@ -1684,7 +1695,7 @@ impl<'a> Parser<'a> {
             raw_expr = *expr;
         }
         if self.eat(TokenKind::Collate) {
-            collation = Some(self.parse_ident()?);
+            collation = Some(self.parse_collation_name()?);
         }
         let (name, expr) = match raw_expr {
             Expr::Column(ColumnRef {
@@ -2928,7 +2939,7 @@ impl<'a> Parser<'a> {
             // Postfix COLLATE
             if tok.kind == TokenKind::Collate && 19 >= min_bp {
                 self.advance();
-                let collation = self.parse_ident()?;
+                let collation = self.parse_collation_name()?;
                 lhs = Expr::Collate {
                     expr: Box::new(lhs),
                     collation,
