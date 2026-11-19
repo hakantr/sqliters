@@ -48858,6 +48858,36 @@ fn validate_fk_check_static(
     Ok(())
 }
 
+/// `sqlite3FkOldmask` resolves every incoming FK when an UPDATE needs FK
+/// processing, including those on unchanged keys. A later `sqlite3FkCheck`
+/// error overrides this diagnostic. The caller has already checked that path.
+fn validate_fk_oldmask_static(
+    db_set: &DatabaseSet,
+    db_id: DatabaseId,
+    table: &TableSchema,
+    modified: &[bool],
+    changes_rowid: bool,
+) -> Result<()> {
+    if crate::dml_c::fk_required_update(db_set, db_id, table, true, modified, changes_rowid) == 0 {
+        return Ok(());
+    }
+    let Some(slot) = db_set.slot(db_id) else {
+        return Ok(());
+    };
+    let mut result = Ok(());
+    for child in slot.schema.tables.iter().rev() {
+        for fk in child.foreign_keys.iter().rev() {
+            if fk.ref_table.eq_ignore_ascii_case(&table.name)
+                && let Err(error) = resolve_fk_parent_cols(&slot.schema, &slot.name, &child.name, fk)
+            {
+                // sqlite3ErrorMsg replaces the previous diagnostic.
+                result = Err(error);
+            }
+        }
+    }
+    result
+}
+
 /// Whether `sqlite3GenerateConstraintChecks` codes a REPLACE row delete for this UPDATE: a
 /// rowid change resolved by REPLACE, or a UNIQUE index the statement rewrites (`aRegIdx != 0`)
 /// whose conflicts are resolved by REPLACE.
@@ -50017,6 +50047,17 @@ fn validate_update_static_inner(
                     Some((&modified, chng_rowid)),
                     false,
                 )?;
+                if db_id == DatabaseId::MAIN
+                    && !tbl.without_rowid
+                    && trig_depth == 0
+                    && upd.ctes.is_empty()
+                    && upd.from.is_none()
+                    && upd.returning.is_empty()
+                    && effective_or_conflict.is_none()
+                    && !db_set.has_any_triggers()
+                {
+                    validate_fk_oldmask_static(db_set, db_id, &tbl, &modified, chng_rowid)?;
+                }
             }
 
             if !upd.returning.is_empty() {

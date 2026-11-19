@@ -1022,3 +1022,8 @@ Normal tablo taraması aynı yazma görüntüsünde fiziksel sıra ve C ileri/te
 ## V6b.143 — Journalsız SQL geçişinde VFS bitişi
 
 Sayfa 1 sync sonrasında C COMMIT_PHASETWO ve SHARED sırası kullanılıyor. 468 bitiş ve 1.971 salt okunur C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,256 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_143.md).
+
+
+## V6b.144 — Yabancı anahtar oldmask hazırlama tanısı
+
+Uygun parent UPDATE hazırlığında değişmeyen gelen FK de C oldmask kararına katılıyor. 18 yeni OFF hazırlama farkı kapandı ve 135 dosya SHA korundu. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_144.md).
