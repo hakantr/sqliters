@@ -972,3 +972,8 @@ Dar integrity_check kapsamı C dış kolasyonu ve aynı cursor ile üyeliği ar�
 ## V6b.133 — WAL→MEMORY statement bitişi
 
 Normal WAL çıkışında gerçek MEMORY journal ve C ROW sınırı kullanılıyor. 756 geçiş, 216 retained kontrolü ve 6.318 C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,248 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_133.md).
+
+
+## V6b.134 — Karma indeksli noktasal DML fiziksel düzeni
+
+Yazma görüntüsünde gerçek karşılaştırıcı seçiliyor ve önceki nullable kayıtlar korunuyor. 192 rollback-journal ve 72 WAL C/Rust tam dosya çifti eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,280 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_134.md).

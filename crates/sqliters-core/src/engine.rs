@@ -24361,10 +24361,202 @@ fn resolve_create_table_target(
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum PointWrite<'a> {
+    Insert(&'a InsertStmt),
+    Update(&'a UpdateStmt),
+    Delete(&'a DeleteStmt),
+}
+
+impl<'a> PointWrite<'a> {
+    pub(crate) fn from_stmt(stmt: &'a Stmt) -> Option<Self> {
+        match stmt {
+            Stmt::Insert(insert) => Some(Self::Insert(insert)),
+            Stmt::Update(update) => Some(Self::Update(update)),
+            Stmt::Delete(delete) => Some(Self::Delete(delete)),
+            _ => None,
+        }
+    }
+
+    fn target(self) -> &'a QualifiedName {
+        match self {
+            Self::Insert(insert) => &insert.table,
+            Self::Update(update) => &update.table,
+            Self::Delete(delete) => &delete.table,
+        }
+    }
+
+    fn applies(self, table: &TableSchema, key: &IndexedColSchema) -> bool {
+        let literal = |expr: &Expr| matches!(
+            expr, Expr::Null | Expr::Bool(_) | Expr::Integer(_) | Expr::Float(_)
+                | Expr::String(_) | Expr::Blob(_) | Expr::Bind(_)
+        );
+        let rowid_equals = |selection: Option<&Expr>| {
+            let Some(Expr::Binary { op: BinaryOp::Eq, left, right }) = selection else {
+                return false;
+            };
+            let rowid = |expr: &Expr| matches!(expr, Expr::Column(column)
+                if resolve_target_col_ref(table, "main", None, column) == Some(TargetColRef::Rowid));
+            let bound = |expr: &Expr| matches!(expr, Expr::Integer(_) | Expr::Bind(_));
+            (rowid(left) && bound(right)) || (bound(left) && rowid(right))
+        };
+        match self {
+            Self::Insert(insert) => insert.ctes.is_empty()
+                && insert.alias.is_none()
+                && insert.or_conflict.is_none()
+                && insert.upsert_clauses.is_empty()
+                && insert.returning.is_empty()
+                && matches!(&insert.source, InsertSource::Values(rows)
+                    if rows.iter().all(|row| row.iter().all(literal))),
+            Self::Update(update) => update.ctes.is_empty()
+                && update.alias.is_none()
+                && update.indexed_by.is_none()
+                && update.or_conflict.is_none()
+                && update.from.is_none()
+                && update.returning.is_empty()
+                && rowid_equals(update.selection.as_ref())
+                && matches!(update.assignments.as_slice(), [assignment]
+                    if !assignment.row_value
+                        && matches!(assignment.columns.as_slice(), [column]
+                            if column.eq_ignore_ascii_case(&key.name))
+                        && literal(&assignment.expr)),
+            Self::Delete(delete) => delete.ctes.is_empty()
+                && delete.alias.is_none()
+                && delete.indexed_by.is_none()
+                && delete.returning.is_empty()
+                && rowid_equals(delete.selection.as_ref()),
+        }
+    }
+}
+
+fn mixed_point_write_collation(
+    write: PointWrite<'_>,
+    db_id: DatabaseId,
+    db_set: &DatabaseSet,
+    table: &TableSchema,
+    index: &IndexSchema,
+    collations: &CollationRegistry,
+) -> Option<Collation> {
+    let [key] = index.columns.as_slice() else {
+        return None;
+    };
+    if db_id != DatabaseId::MAIN
+        || table.without_rowid || table.strict || table.autoincrement
+        || table.rowid_alias_col != Some(0) || table.columns.len() != 2
+        || table.rowid_pk_conflict != ConflictAction::Abort || !table.checks.is_empty()
+        || index.root_pgno <= 1 || table.root_pgno <= 1
+        || key.col_idx != Some(1) || key.expr.is_some() || key.sort_order.custom_collation.is_some()
+        || key.sort_order.desc != key.sort_order.nulls_last
+        || !table.columns.get(1).is_some_and(|column| column.affinity == TypeAffinity::Text)
+        || table.columns.iter().any(|column| {
+            column.generated.is_some() || column.default_expr.is_some() || column.custom_collation.is_some()
+        })
+        || db_set.has_any_triggers()
+        || db_set.slots().iter().any(|slot| {
+            slot.schema.tables.iter().any(|table| !table.foreign_keys.is_empty())
+        })
+        || ["BINARY", "NOCASE", "RTRIM"].iter().any(|name| collations.get_custom(name).is_some())
+        || !write.applies(table, key)
+    {
+        return None;
+    }
+    let names = index_xinfo_collations(db_id, index, collations)?;
+    let [Some((declared, true))] = names.as_slice() else {
+        return None;
+    };
+    let declared = Collation::from_name(declared)?;
+    (declared != key.sort_order.collation).then_some(declared)
+}
+
+pub(crate) fn mixed_point_write(
+    write: PointWrite<'_>,
+    db_set: &DatabaseSet,
+    collations: &CollationRegistry,
+) -> bool {
+    let Ok(Some((db_id, crate::db_set::RelationRef::Table(table)))) =
+        db_set.find_relation_ref_in_set(write.target())
+    else {
+        return false;
+    };
+    let Some(slot) = db_set.slot(db_id) else {
+        return false;
+    };
+    let mut indexes = slot.schema.indexes.iter().filter(|index| index.table_name.eq_ignore_ascii_case(&table.name));
+    let (Some(index), None) = (indexes.next(), indexes.next()) else {
+        return false;
+    };
+    mixed_point_write_collation(write, db_id, db_set, table, index, collations).is_some()
+}
+
+fn physical_point_write_collation(
+    btree: &mut Btree,
+    table: &TableSchema,
+    index: &IndexSchema,
+    declared: Collation,
+) -> Result<Collation> {
+    let unverified = || SqliteError::new(
+        ErrorCode::Error,
+        format!("unable to verify physical order of index {}", index.name),
+    );
+    if btree.transaction_state() != TransactionState::Write
+        || !btree.integrity_check_report(&[table.root_pgno, index.root_pgno], true, 1)?.messages.is_empty()
+    {
+        return Err(unverified());
+    }
+    let encoding = btree.encoding();
+    let mut rows = HashMap::new();
+    for (rowid, record) in btree.scan_table(table.root_pgno)? {
+        let fields = decode_record_with_encoding(&record, encoding)?;
+        // The B-tree key supplies the INTEGER PRIMARY KEY alias. For rows
+        // written before ADD COLUMN, the absent nullable key defaults to NULL.
+        let indexed_value = match fields.as_slice() {
+            [Value::Null] => Value::Null,
+            [Value::Null, indexed_value] => indexed_value.clone(),
+            _ => return Err(unverified()),
+        };
+        if rows.insert(rowid, indexed_value).is_some() {
+            return Err(unverified());
+        }
+    }
+    let records = btree.scan_index(index.root_pgno)?;
+    for record in &records {
+        let fields = decode_record_with_encoding(record, encoding)?;
+        let [value, Value::Integer(rowid)] = fields.as_slice() else {
+            return Err(unverified());
+        };
+        if rows.remove(rowid).as_ref() != Some(value) {
+            return Err(unverified());
+        }
+    }
+    if !rows.is_empty() {
+        return Err(unverified());
+    }
+    let legacy = index.key_sort_orders();
+    let mut outer = legacy.clone();
+    outer[0].collation = declared;
+    let ordered = |orders: &[KeySortOrder]| -> Result<bool> {
+        for pair in records.windows(2) {
+            if sqliters_types::compare_raw_records_with_encoding(
+                &pair[0], &pair[1], None, orders, encoding,
+            )? != Ordering::Less {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    if ordered(&outer)? {
+        return Ok(declared);
+    }
+    if ordered(&legacy)? {
+        return Ok(legacy[0].collation);
+    }
+    Err(unverified())
+}
+
 fn prepare_dml_write_slot(
     ctx: &mut ExecContext<'_>,
     db_id: DatabaseId,
-    qn: &QualifiedName,
+    write: PointWrite<'_>,
     is_catalog: bool,
     fallback_tbl: TableSchema,
 ) -> Result<(TableSchema, Vec<IndexSchema>, String)> {
@@ -24395,13 +24587,23 @@ fn prepare_dml_write_slot(
         .ok_or_else(|| {
             SqliteError::new(
                 ErrorCode::Error,
-                format!("no such table: {}", qn.display_name()),
+                format!("no such table: {}", write.target().display_name()),
             )
         })?;
     // The secondary indexes in `pTab->pIndex` order — the order in which C checks UNIQUE
     // constraints and writes / deletes index entries (`sqlite3CompleteInsertion`,
     // `sqlite3GenerateRowIndexDelete`).
-    let indexes = dml_ordered_indexes(&tbl, &slot.schema.indexes_for_table(&tbl.name));
+    let mut indexes = dml_ordered_indexes(&tbl, &slot.schema.indexes_for_table(&tbl.name));
+    if let [index] = indexes.as_mut_slice()
+        && let Some(declared) = mixed_point_write_collation(
+            write, db_id, ctx.db_set, &tbl, index, ctx.collations,
+        )
+    {
+        let btree = ctx.db_set.slot_mut(db_id).and_then(|slot| slot.btree.as_mut())
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        let comparator = physical_point_write_collation(btree, &tbl, index, declared)?;
+        index.columns[0].sort_order.collation = comparator;
+    }
     Ok((tbl, indexes, sname))
 }
 
@@ -27092,7 +27294,7 @@ fn prepare_insert_exec<'a>(
             };
 
             let (tbl, indexes, schema_name) =
-                prepare_dml_write_slot(ctx, db_id, &ins.table, is_catalog, *initial_tbl)?;
+                prepare_dml_write_slot(ctx, db_id, PointWrite::Insert(ins), is_catalog, *initial_tbl)?;
             let (enc, _) = slot_encoding_and_name(ctx, db_id);
             let ordered_uniques = ordered_unique_indexes(&tbl, &indexes);
             let (upsert_steps, resolved_do_updates) = if ins.upsert_clauses.is_empty() {
@@ -29675,7 +29877,7 @@ fn prepare_update_exec<'a>(
             };
 
             let (tbl, indexes, schema_name) =
-                prepare_dml_write_slot(ctx, db_id, &upd.table, is_catalog, *initial_tbl)?;
+                prepare_dml_write_slot(ctx, db_id, PointWrite::Update(upd), is_catalog, *initial_tbl)?;
             let (enc, _) = slot_encoding_and_name(ctx, db_id);
             let resolved_assigns = resolve_set_assignments_for_table(&tbl, &upd.assignments)?;
             let modified_col_mask = build_table_modified_col_mask(&tbl, &resolved_assigns);
@@ -31413,7 +31615,7 @@ fn prepare_delete_exec(
             ..
         } => {
             let (tbl, indexes, schema_name) =
-                prepare_dml_write_slot(ctx, db_id, &del.table, is_catalog, *initial_tbl)?;
+                prepare_dml_write_slot(ctx, db_id, PointWrite::Delete(del), is_catalog, *initial_tbl)?;
             let has_del_triggers = !is_catalog
                 && ctx.db_set.has_active_triggers_for_event(
                     db_id,

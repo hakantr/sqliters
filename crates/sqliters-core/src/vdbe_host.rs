@@ -573,6 +573,12 @@ pub(crate) fn machine_write_program(inner: &ConnectionInner, stmt: Option<&Stmt>
         trace("fallback: authorizer", raw_sql);
         return (WriteRoute::Engine, false);
     }
+    if stmt.and_then(crate::engine::PointWrite::from_stmt).is_some_and(|write| {
+        crate::engine::mixed_point_write(write, &inner.db_set, &inner.collations)
+    }) {
+        trace("fallback: mixed index write snapshot", raw_sql);
+        return (WriteRoute::Engine, false);
+    }
     if inner.mutation_pipeline.is_trace_enabled() {
         // (the engine's own row-mutation trace, `Connection::set_mutation_trace_enabled`: not
         // a C feature; the machine does not record it)
