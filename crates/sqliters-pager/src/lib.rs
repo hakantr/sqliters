@@ -2559,7 +2559,8 @@ impl Pager {
         let honor_persistence = single_target && defer && self.locking_mode == LockingMode::Normal
             && matches!(
                 mode,
-                JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate | JournalMode::Memory
+                JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate
+                    | JournalMode::Memory | JournalMode::Off
             );
         let active = self.change_journal_mode(mode, defer, honor_persistence)?;
         Ok((active, defer && self.pending_sql_journal_mode.is_some()))

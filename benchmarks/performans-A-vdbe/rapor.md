@@ -1097,3 +1097,8 @@ V1 dış SQLITE_ERROR sonucuyla dahili BUSY veya SCHEMA kodunu C sırasıyla ta�
 ## V6b.158 — Retained WAL takip yazısında rollback başlığı
 
 Fiziksel WAL ve mantıksal rollback kipinde sayfa 1 biçimi korunur. 96 retained akış, 64 eski format farkı ve 1.008 C açılışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,225 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_158.md).
+
+
+## V6b.159 — WAL OFF PERSIST_WAL kararı
+
+İzinli sağlıklı tek hedef WAL OFF geçişi C PERSIST_WAL kararını uygular. 1.620 akış ve 5.712 C açılışı eş, önceki 60 ilk ROW bildirimi kapandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,242 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_159.md).
