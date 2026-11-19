@@ -5608,17 +5608,21 @@ impl Pager {
                     return self.finish_tx_to_read_or_open(retain_read);
                 }
 
-                let disk_rollback = !self.uses_temp_file_semantics()
-                    && self.pending_byte_copy.is_none()
+                let file_backed_rollback = !self.uses_temp_file_semantics() && self.pending_byte_copy.is_none();
+                let disk_rollback = file_backed_rollback
                     && matches!(self.journal_mode, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate);
-                let normal_rollback = disk_rollback && self.locking_mode == LockingMode::Normal;
+                // The SQL page-one transaction also ends through pager_end_transaction
+                // when its rollback journal is in memory or disabled.
+                let staged_without_disk_journal = file_backed_rollback
+                    && self.pending_sql_journal_mode.is_some()
+                    && matches!(self.journal_mode, JournalMode::Memory | JournalMode::Off);
+                let normal_rollback = self.locking_mode == LockingMode::Normal
+                    && (disk_rollback || staged_without_disk_journal);
                 // sqlite3PagerCommitPhaseTwo skips pager_end_transaction for
                 // an EXCLUSIVE PERSIST writer that has not modified the database.
-                let notify = disk_rollback
-                    && (normal_rollback
-                        || self.journal_mode != JournalMode::Persist
-                        || self.cache_modified
-                        || self.db_file_modified);
+                let notify = normal_rollback
+                    || (disk_rollback
+                        && (self.journal_mode != JournalMode::Persist || self.cache_modified || self.db_file_modified));
                 let finalized = self.finalize_rollback_commit(remove_transition_journal);
                 let notified = if notify && finalized.is_ok() {
                     self.notify_commit_phase_two()
