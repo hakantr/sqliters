@@ -1117,3 +1117,8 @@ SQL, C deklarasyonu ve aktif fiziksel sıra uyumunda indeks araması çalışır
 ## V6b.162 — Salt okunur WAL terminal NO_LOCK
 
 Normal salt okunur WAL kapanışında terminal NO_LOCK ana dosya kapanışından önce gelir. 432 salt okunur akışta 288 terminal çağrı ve toplam 960 C açılışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_162.md).
+
+
+## V6b.163 — Karma indeksli açık WHERE 1 DELETE
+
+Açık WHERE 1 DELETE, uygun normal deyimde hazırlanmış yönü ve mevcut fiziksel karşılaştırıcıyı kullanır. 342 yazıcı/rollback ve 1.026 C yeniden açılış eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,254 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_163.md).

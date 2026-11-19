@@ -5834,7 +5834,7 @@ fn compile_parsed_stmt(
     }
 
     let category = Some(classify_stmt_category(&stmt));
-    let mixed_index_write = engine::MixedIndexWrite::from_stmt(&stmt)
+    let mixed_index_write = engine::MixedIndexWrite::from_stmt(&stmt, !has_authorizer)
         .is_some_and(|write| engine::mixed_index_write(write, db_set, collations));
     let mut compiled_vdbe = None;
     let mut compiled_fast_read = None;
@@ -11433,6 +11433,7 @@ impl Statement {
                     prepared_defer_fks: Some(self.compiled_defer_fks),
                     prepared_ignore_checks: Some(self.compiled_ignore_checks),
                     prepared_reverse_order: self.compiled_reverse_order,
+                    allow_mixed_where_one: !inner.authorizer.is_some(),
                     stmt_sp_slot,
                     top_level_sql,
                     ignored_fk_parent_tables: self.ignored_fk_parent_tables.clone(),

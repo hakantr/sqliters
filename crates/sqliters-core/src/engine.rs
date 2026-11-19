@@ -177,6 +177,8 @@ pub struct StmtTxTracker {
     pub(crate) c_rowid_hi: Option<Option<(i64, bool)>>,
     /// Set only for a simple mixed-index write after validating the active snapshot.
     pub(crate) reverse_mixed_scan: bool,
+    /// Allows a top-level SQL DELETE WHERE 1 to use the mixed-index writer.
+    pub(crate) allow_mixed_where_one: bool,
     /// Set when REPLACE resolved a rowid conflict by keeping the table row (only its index
     /// entries are deleted, `insert.c` `case OE_Replace`) on a table without any index:
     /// `(table root, rowid)`. C's data cursor was then only positioned by `OP_NotExists` and
@@ -14507,6 +14509,7 @@ fn read_table_with_plan_ctx(
             crate::dml_c::ScanShape::RowidRange | crate::dml_c::ScanShape::RowidIn => true,
             crate::dml_c::ScanShape::FullTable => {
                 where_hint.is_none()
+                    || mixed_index_all_rows_filter(where_hint)
                     || matches!(where_hint, Some(Expr::InList { negated: false, .. }))
                     || slot_ref
                         .schema
@@ -24488,15 +24491,18 @@ fn resolve_create_table_target(
 pub(crate) enum MixedIndexWrite<'a> {
     Insert(&'a InsertStmt),
     Update(&'a UpdateStmt),
-    Delete(&'a DeleteStmt),
+    Delete {
+        stmt: &'a DeleteStmt,
+        allow_where_one: bool,
+    },
 }
 
 impl<'a> MixedIndexWrite<'a> {
-    pub(crate) fn from_stmt(stmt: &'a Stmt) -> Option<Self> {
+    pub(crate) fn from_stmt(stmt: &'a Stmt, allow_where_one: bool) -> Option<Self> {
         match stmt {
             Stmt::Insert(insert) => Some(Self::Insert(insert)),
             Stmt::Update(update) => Some(Self::Update(update)),
-            Stmt::Delete(delete) => Some(Self::Delete(delete)),
+            Stmt::Delete(stmt) => Some(Self::Delete { stmt, allow_where_one }),
             _ => None,
         }
     }
@@ -24505,7 +24511,7 @@ impl<'a> MixedIndexWrite<'a> {
         match self {
             Self::Insert(insert) => &insert.table,
             Self::Update(update) => &update.table,
-            Self::Delete(delete) => &delete.table,
+            Self::Delete { stmt, .. } => &stmt.table,
         }
     }
 
@@ -24553,15 +24559,20 @@ impl<'a> MixedIndexWrite<'a> {
                         && matches!(assignment.columns.as_slice(), [column]
                             if column.eq_ignore_ascii_case(&key.name))
                         && literal(&assignment.expr)),
-            Self::Delete(delete) => delete.ctes.is_empty()
+            Self::Delete { stmt: delete, allow_where_one } => delete.ctes.is_empty()
                 && delete.alias.is_none()
                 && delete.indexed_by.is_none()
                 && delete.returning.is_empty()
                 && (mixed_index_rowid_selection(table, delete.selection.as_ref())
                     || mixed_index_table_equality(table, key, delete.selection.as_ref())
-                    || key_equality(delete.selection.as_ref())),
+                    || key_equality(delete.selection.as_ref())
+                    || (allow_where_one && mixed_index_all_rows_filter(delete.selection.as_ref()))),
         }
     }
+}
+
+fn mixed_index_all_rows_filter(selection: Option<&Expr>) -> bool {
+    matches!(selection, Some(Expr::Integer(1)))
 }
 
 fn mixed_index_key_equality<'a>(
@@ -31944,8 +31955,12 @@ fn prepare_delete_exec(
             is_catalog,
             ..
         } => {
+            let write = MixedIndexWrite::Delete {
+                stmt: del,
+                allow_where_one: ctx.stmt_tx.allow_mixed_where_one,
+            };
             let (tbl, indexes, schema_name, mixed_declared) =
-                prepare_dml_write_slot(ctx, db_id, MixedIndexWrite::Delete(del), is_catalog, *initial_tbl)?;
+                prepare_dml_write_slot(ctx, db_id, write, is_catalog, *initial_tbl)?;
             let has_del_triggers = !is_catalog
                 && ctx.db_set.has_active_triggers_for_event(
                     db_id,
