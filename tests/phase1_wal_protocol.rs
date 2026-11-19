@@ -2669,12 +2669,13 @@ fn test_suite8_audit_edge_case_regressions() {
     );
     assert!(ro.is_header_loaded());
     assert_eq!(ro.journal_mode(), JournalMode::Wal);
-    assert_eq!(
-        ro.transition_journal_mode(JournalMode::Delete)
-            .unwrap_err()
-            .code,
-        ErrorCode::ReadOnly
-    );
+    let error = ro.transition_journal_mode(JournalMode::Delete).unwrap_err();
+    // C requests an EXCLUSIVE lock on the stock Unix read-only database
+    // descriptor before it can change the WAL mode.
+    #[cfg(unix)]
+    assert_eq!(error.extended_code, extended::SQLITE_IOERR_LOCK);
+    #[cfg(not(unix))]
+    assert_eq!(error.code, ErrorCode::ReadOnly);
     ro.close().unwrap();
 
     // `:memory:` pager inside `Write` transaction treats `set_journal_mode(Wal)` as a no-op returning `Memory`!

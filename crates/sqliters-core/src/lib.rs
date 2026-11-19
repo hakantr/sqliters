@@ -9815,6 +9815,7 @@ impl Statement {
             && self.is_journal_mode_pragma()
             && result.as_ref().is_err_and(|error| {
                 matches!(error.code, ErrorCode::Error | ErrorCode::Busy | ErrorCode::Schema | ErrorCode::ReadOnly)
+                    || error.extended_code == extended::SQLITE_IOERR_LOCK
             })
         {
             // Legacy OP_JournalMode step callers see SQLITE_ERROR. Reset and finalize

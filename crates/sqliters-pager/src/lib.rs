@@ -2713,6 +2713,23 @@ impl Pager {
         // Transition 2: `WAL -> Rollback` (`vdbe.c:8286-8309`, `pager.c:7746-7782`, `btree.c:11581-11600`)
         if old_mode == JournalMode::Wal {
             if self.readonly {
+                if self.db_kind == DatabaseKind::NamedDisk
+                    && self.locking_mode == LockingMode::Normal
+                    && let Some(file) = self.file.as_ref().filter(|file| file.is_readonly())
+                    && let Some(shm) = self.wal.as_ref().and_then(Wal::shm_handle)
+                    && let Some(result) = file.lock_readonly_wal_exclusive(shm)
+                {
+                    // pagerExclusiveLock restores SHARED on failure. A
+                    // read-only pager must also keep its WAL if a VFS grants the lock.
+                    let _ = self.unlock_db_file(LockLevel::Shared);
+                    result.map_err(|error| {
+                        if error.extended_code == extended::SQLITE_IOERR_LOCK {
+                            SqliteError::with_extended(error.extended_code, ErrorCode::IoErr.as_str())
+                        } else {
+                            error
+                        }
+                    })?;
+                }
                 return Err(SqliteError::readonly(
                     "attempt to write a readonly database",
                 ));

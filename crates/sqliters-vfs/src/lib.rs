@@ -233,6 +233,14 @@ pub trait VfsFile: Send + Sync {
     /// Upgrades the file lock to `level` (`xLock`).
     fn lock(&self, level: LockLevel) -> Result<()>;
 
+    /// Tries the native SHARED-to-EXCLUSIVE lock for a read-only WAL exit.
+    /// `shm` is the open WAL-index session attached to this file. VFS implementations
+    /// without this capability retain their ordinary read-only behavior.
+    #[doc(hidden)]
+    fn lock_readonly_wal_exclusive(&self, _shm: &WalShm) -> Option<Result<()>> {
+        None
+    }
+
     /// Downgrades the file lock to `level` (`xUnlock`, where `level <= Shared`).
     fn unlock(&self, level: LockLevel) -> Result<()>;
 
@@ -1371,10 +1379,15 @@ impl UnixShmNode {
 #[cfg(unix)]
 struct UnixShmSession {
     node: Arc<UnixShmNode>,
+    db_fd: std::os::fd::RawFd,
 }
 
 #[cfg(unix)]
 impl shm::ShmBackend for UnixShmSession {
+    fn unix_backing(&self, db_fd: std::os::fd::RawFd) -> Option<&sys::unix::SysShmBacking> {
+        (self.db_fd == db_fd).then_some(self.node.backing.as_ref())
+    }
+
     fn is_readonly(&self) -> bool {
         self.node.backing.is_readonly()
     }
@@ -2202,6 +2215,69 @@ impl Drop for OsFile {
 }
 
 impl VfsFile for OsFile {
+    #[cfg(unix)]
+    fn lock_readonly_wal_exclusive(&self, shm: &WalShm) -> Option<Result<()>> {
+        use std::os::fd::AsRawFd;
+
+        if !self.readonly {
+            return None;
+        }
+        let fd = match self.file_ref() {
+            Ok(file) => file.as_raw_fd(),
+            Err(error) => return Some(Err(error)),
+        };
+        shm.with_unix_backing(fd, |backing| {
+            let mut file_lock = self
+                .lock_level
+                .lock()
+                .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned file lock"))?;
+            if *file_lock != LockLevel::Shared {
+                return Ok(None);
+            }
+            let mut inode = self
+                .inode_info
+                .lock()
+                .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned inode lock"))?;
+            if !inode.shm_node.as_ref().is_some_and(|node| {
+                std::ptr::eq(backing, node.backing.as_ref())
+                    && node.dms_locked.load(AtomicOrdering::Acquire)
+            }) {
+                return Ok(None);
+            }
+
+            // unixLock checks local sharing before consulting the attached SHM DMS.
+            if inode.e_file_lock != *file_lock || inode.n_shared > 1 {
+                return Err(SqliteError::new(ErrorCode::Busy, ErrorCode::Busy.as_str()));
+            }
+            let peer = backing.with_file(|file| {
+                let probe = sys::unix::get_posix_lock_type(
+                    file.as_raw_fd(),
+                    sys::unix::UNIX_SHM_DMS,
+                    1,
+                    extended::SQLITE_IOERR_LOCK,
+                );
+                // unixIsSharingShmNode treats an inconclusive probe as sharing.
+                Ok(!matches!(probe, Ok(sys::unix::F_UNLCK)))
+            })?;
+            if peer {
+                return Err(SqliteError::new(ErrorCode::Busy, ErrorCode::Busy.as_str()));
+            }
+
+            // C upgrades from SHARED directly on the shared byte range. Only a
+            // RESERVED-to-EXCLUSIVE upgrade takes the Pending byte first.
+            sys::unix::set_posix_lock(
+                fd,
+                sys::unix::F_WRLCK,
+                self.lock_geometry.shared_first_offset() as i64,
+                self.lock_geometry.shared_size() as i64,
+                extended::SQLITE_IOERR_LOCK,
+            )?;
+            *file_lock = LockLevel::Exclusive;
+            inode.e_file_lock = LockLevel::Exclusive;
+            Ok(Some(()))
+        })
+    }
+
     fn persist_wal_mode(&self, mode: &mut i32) -> Option<Result<()>> {
         if let Err(error) = self.file_ref() {
             return Some(Err(error));
@@ -2994,7 +3070,7 @@ impl VfsFile for OsFile {
                     })?;
                     st.locks.register_connection(conn_id);
                 }
-                let session = Arc::new(UnixShmSession { node });
+                let session = Arc::new(UnixShmSession { node, db_fd: db_file.as_raw_fd() });
                 return Ok(WalShm::new(conn_id, session));
             }
 
@@ -3219,7 +3295,7 @@ impl VfsFile for OsFile {
                 inode.shm_node = Some(Arc::clone(&node));
             }
 
-            let session = Arc::new(UnixShmSession { node });
+            let session = Arc::new(UnixShmSession { node, db_fd: db_file.as_raw_fd() });
             Ok(WalShm::new(conn_id, session))
         }
 

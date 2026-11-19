@@ -43859,6 +43859,9 @@ fn apply_journal_mode_on_slot(
     }
     // Rollback-only mode changes use the pager's ordinary mode update.
     let previous = bt.journal_mode();
+    // pagerExclusiveLock does not invoke the busy handler when leaving WAL.
+    let readonly_wal_exit = bt.pager().is_readonly()
+        && previous == JournalMode::Wal && target != JournalMode::Wal;
     let coordinated = ctx.stmt_tx.coordinated_journal_mode
         && ((previous == JournalMode::Wal) != (target == JournalMode::Wal));
     if (single_target || coordinated) && !disallow_wal_transition {
@@ -43878,6 +43881,8 @@ fn apply_journal_mode_on_slot(
             })?;
             ctx.stmt_tx.journal_mode_cleanup_error = cleanup_error;
             outcome?
+        } else if readonly_wal_exit {
+            bt.pager_mut().stage_single_target_sql_journal_mode(target)?
         } else {
             ctx.busy_policy
                 .retry_btree(bt, |b| b.pager_mut().stage_single_target_sql_journal_mode(target))?
@@ -43886,6 +43891,8 @@ fn apply_journal_mode_on_slot(
             ctx.stmt_tx.staged_journal_modes.push_unique(instance);
         }
         Ok(active)
+    } else if readonly_wal_exit {
+        bt.set_journal_mode(target)
     } else {
         ctx.busy_policy
             .retry_btree(bt, |b| b.set_journal_mode(target))

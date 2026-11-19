@@ -392,6 +392,11 @@ pub trait WalShmOps {
 /// - once `map_region(r, _)` has returned `Some(chunk)`, region `r` stays backed by that same
 ///   mapping (regions are appended, never relocated or replaced, until the node is torn down).
 pub(crate) trait ShmBackend: Send + Sync {
+    #[cfg(unix)]
+    fn unix_backing(&self, _db_fd: std::os::fd::RawFd) -> Option<&crate::sys::unix::SysShmBacking> {
+        None
+    }
+
     fn is_readonly(&self) -> bool;
     fn dms_state(&self) -> ShmDmsState;
     fn ensure_dms_ready(&self) -> Result<()>;
@@ -442,6 +447,27 @@ impl WalShm {
             closed_or_poisoned: AtomicBool::new(false),
             region0: Mutex::new(None),
         }
+    }
+
+    /// Keep this session open while comparing and probing its Unix backing.
+    #[cfg(unix)]
+    pub(crate) fn with_unix_backing<T>(
+        &self,
+        db_fd: std::os::fd::RawFd,
+        operation: impl FnOnce(&crate::sys::unix::SysShmBacking) -> Result<Option<T>>,
+    ) -> Option<Result<T>> {
+        let backing = self.backend.unix_backing(db_fd)?;
+        let result = (|| {
+            let closed = self
+                .closed
+                .lock()
+                .map_err(|_| SqliteError::new(ErrorCode::Internal, "poisoned closed mutex"))?;
+            if *closed || self.closed_or_poisoned.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            operation(backing)
+        })();
+        result.transpose()
     }
 
     /// Returns a cloned snapshot of this connection's [`WalLockState`].
