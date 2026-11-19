@@ -2567,7 +2567,12 @@ impl Pager {
                 if let Some(p1) = self.cache.get_data_mut(1) {
                     hdr_copy.write_into(&mut p1[0..DB_HEADER_SIZE]);
                 }
-                self.commit()
+                self.commit_phase_one(None)?;
+                // OP_JournalMode publishes WAL before the header commit is finalized.
+                // The rollback journal protects the page writes and is then removed.
+                let remove_transition_journal = saved_mode == JournalMode::Delete
+                    && self.locking_mode == LockingMode::Exclusive;
+                self.commit_phase_two_with_journal_cleanup(false, false, remove_transition_journal)
             })();
 
             if let Err(e) = step_res {
@@ -5381,10 +5386,21 @@ impl Pager {
     ///   I/O error while cleaning up cold journals or unlocking is absorbed without rolling back
     ///   the already-committed database, and the pager still transitions cleanly out of `Write`.
     pub fn commit_phase_two(&mut self, retain_read: bool, cleanup_benign: bool) -> Result<()> {
+        self.commit_phase_two_with_journal_cleanup(retain_read, cleanup_benign, false)
+    }
+
+    fn commit_phase_two_with_journal_cleanup(
+        &mut self,
+        retain_read: bool,
+        cleanup_benign: bool,
+        remove_transition_journal: bool,
+    ) -> Result<()> {
         let was_write = self.state == TransactionState::Write;
         let can_commit = self.ensure_not_closed();
         let count_failed_commit = was_write && !cleanup_benign && can_commit.is_ok();
-        let result = can_commit.and_then(|()| self.commit_phase_two_inner(retain_read));
+        let result = can_commit.and_then(|()| {
+            self.commit_phase_two_inner(retain_read, remove_transition_journal)
+        });
         if let Err(ref error) = result {
             // btree.c:4447–4451 skips compensating iDataVersion when the
             // b-tree layer propagates the phase-two error.
@@ -5407,7 +5423,11 @@ impl Pager {
         result
     }
 
-    fn commit_phase_two_inner(&mut self, retain_read: bool) -> Result<()> {
+    fn commit_phase_two_inner(
+        &mut self,
+        retain_read: bool,
+        remove_transition_journal: bool,
+    ) -> Result<()> {
         match self.state {
             TransactionState::Open => Ok(()),
             TransactionState::Read => self.finish_tx_to_read_or_open(retain_read),
@@ -5459,7 +5479,7 @@ impl Pager {
                         || self.journal_mode != JournalMode::Persist
                         || self.cache_modified
                         || self.db_file_modified);
-                let finalized = self.finalize_rollback_commit();
+                let finalized = self.finalize_rollback_commit(remove_transition_journal);
                 let notified = if notify && finalized.is_ok() {
                     self.notify_commit_phase_two()
                 } else {
@@ -5496,8 +5516,12 @@ impl Pager {
         }
     }
 
-    fn finalize_rollback_commit(&mut self) -> Result<()> {
-        self.finalize_journal_after_tx(self.set_super)?;
+    fn finalize_rollback_commit(&mut self, remove_transition_journal: bool) -> Result<()> {
+        if remove_transition_journal {
+            self.remove_delete_journal()?;
+        } else {
+            self.finalize_journal_after_tx(self.set_super)?;
+        }
 
         if self.pending_byte_copy.is_none() {
             // `pager_end_transaction`: "else if( rc==SQLITE_OK && bCommit &&

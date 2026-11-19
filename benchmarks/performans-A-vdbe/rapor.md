@@ -762,3 +762,8 @@ Sütun adı bayrakları ve reprepare metadata'sı C ile hizalandı. 168 ham norm
 ## V6b.91 — ORDER BY +TRUE ve +FALSE
 
 Unary artı altındaki ad çözümlemesi ve kolasyon C ile hizalandı. 132 hedef ve 48 ad bayrağı ham eş, 4.500 fiziksel C açılışı doğrulandı. OFF 1186/1/337, ON 1177/10/337. DML OFF 387/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,257 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_91.md).
+
+
+## V6b.92 — EXCLUSIVE DELETE→WAL journal sonlandırması
+
+EXCLUSIVE geçişinde rollback journalı commit sonunda C ile aynı sınırda kaldırıldı. 240 sağlıklı geçiş ve 54 normal RESTART guard doğrulandı. OFF 1186/1/337, ON 1177/10/337. DML OFF 387/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,257 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_92.md).
