@@ -2529,7 +2529,7 @@ impl Pager {
             && matches!(
                 (self.journal_mode, mode),
                 (JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate, JournalMode::Wal)
-                    | (JournalMode::Wal, JournalMode::Delete)
+                    | (JournalMode::Wal, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate)
             );
         let active = self.change_journal_mode(mode, defer)?;
         Ok((active, defer && self.pending_sql_journal_mode.is_some()))
