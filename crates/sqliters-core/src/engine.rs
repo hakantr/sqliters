@@ -43813,6 +43813,49 @@ fn integrity_check_blob_column_encoding(
     }
 }
 
+/// The declaration used by C's OP_Found in the narrow mixed-collation case.
+fn integrity_declared_key(
+    db_id: DatabaseId,
+    table: &TableSchema,
+    index: &IndexSchema,
+    collations: &CollationRegistry,
+    encoding: TextEncoding,
+) -> Option<sqliters_vdbe::vdbeaux_rt::KeyInfoRt> {
+    let [key] = index.columns.as_slice() else {
+        return None;
+    };
+    if table.without_rowid
+        || key.expr.is_some()
+        || key.sort_order.custom_collation.is_some()
+        || key.sort_order.desc != key.sort_order.nulls_last
+        || !key
+            .col_idx
+            .and_then(|ci| table.columns.get(ci))
+            .is_some_and(|column| column.generated.is_none())
+        || ["BINARY", "NOCASE", "RTRIM"].iter().any(|name| collations.get_custom(name).is_some())
+    {
+        return None;
+    }
+    let names = index_xinfo_collations(db_id, index, collations)?;
+    let [Some((declared, true))] = names.as_slice() else {
+        return None;
+    };
+    if Collation::from_name(declared)? == key.sort_order.collation {
+        return None;
+    }
+    let mut collation = sqliters_vdbe::vdbemem::builtin_coll(declared)?;
+    if collation.is_binary {
+        collation.enc = encoding as u8;
+    }
+    Some(sqliters_vdbe::vdbeaux_rt::KeyInfoRt {
+        enc: encoding as u8,
+        n_key_field: 1,
+        n_all_field: 2,
+        a_sort_flags: vec![u8::from(key.sort_order.desc), 0],
+        a_coll: vec![Some(Arc::new(collation)), None],
+    })
+}
+
 /// The row loop of `PRAGMA integrity_check` for one ordinary table (`pragma.c`): for every row,
 /// in storage order,
 ///  * `WITHOUT ROWID` keys are ascending (not for `quick_check`),
@@ -43897,15 +43940,23 @@ fn integrity_check_table_rows(
         }
     };
 
-    let cid = {
+    let declared_key = if !is_quick && let [index] = indexes {
+        integrity_declared_key(db_id, tbl, index, ctx.collations, enc)
+            .map(|key| (index.root_pgno, key))
+    } else {
+        None
+    };
+    let (cid, mut declared_cursor) = {
         let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) else {
             return Ok(());
         };
-        if tbl.without_rowid {
+        let cid = if tbl.without_rowid {
             bt.open_index_cursor(tbl.root_pgno, pk_orders.clone(), false)
         } else {
             bt.open_table_cursor(tbl.root_pgno, false)
-        }
+        };
+        let cursor = declared_key.map(|(root, key)| (bt.bc_cursor(root, false, true), key));
+        (cid, cursor)
     };
     let res = (|| -> Result<()> {
         let mut has_row = {
@@ -44079,34 +44130,53 @@ fn integrity_check_table_rows(
                     // finding ends the checks of this index for the row.
                     {
                         let n_all = keys.len();
-                        let needs_values = idx.columns.iter().any(|ic| {
-                            ic.sort_order.custom_collation.is_some()
-                                || ic.sort_order.collation != Collation::Binary
-                        });
                         let mut present = false;
                         let mut found: Option<Vec<Value>> = None;
-                        bt.seek_index_range_raw_cells(
-                            idx.root_pgno,
-                            &keys[..n_all],
-                            None,
-                            None,
-                            orders,
-                            false,
-                            |rec| {
-                                // A record with fewer fields than the key is not the entry.
-                                let n_fields = record_field_count(rec);
-                                if n_fields < n_all {
-                                    return Ok(std::ops::ControlFlow::Continue(()));
-                                }
+                        if let Some((cursor, key_info)) = &mut declared_cursor {
+                            use sqliters_vdbe::vdbeaux_rt::{UnpackedRecord, sqlite3_vdbe_record_unpack};
+
+                            let packed = encode_record_with_encoding(&keys, enc);
+                            let registers = sqlite3_vdbe_record_unpack(key_info, &packed, n_all);
+                            let mut unpacked = UnpackedRecord::new(key_info, &registers, n_all as u16, 0);
+                            unpacked.find_compare();
+                            // C's OP_Found keeps this cursor between table rows. In particular,
+                            // a legacy index under the declared rule must follow C's descent
+                            // and cursor reuse for the same membership diagnostics.
+                            if bt.bc_index_moveto(cursor, &mut unpacked)? == 0 {
+                                let n = bt.bc_payload_size(cursor)? as usize;
+                                let mut record = vec![0; n];
+                                bt.bc_payload(cursor, 0, &mut record)?;
                                 present = true;
-                                if needs_values || n_fields != n_all {
-                                    found = Some(sqliters_types::decode_record_with_encoding(
-                                        rec, enc,
-                                    )?);
-                                }
-                                Ok(std::ops::ControlFlow::Break(()))
-                            },
-                        )?;
+                                found = Some(sqliters_types::decode_record_with_encoding(&record, enc)?);
+                            }
+                        } else {
+                            let needs_values = idx.columns.iter().any(|ic| {
+                                ic.sort_order.custom_collation.is_some()
+                                    || ic.sort_order.collation != Collation::Binary
+                            });
+                            bt.seek_index_range_raw_cells(
+                                idx.root_pgno,
+                                &keys[..n_all],
+                                None,
+                                None,
+                                orders,
+                                false,
+                                |rec| {
+                                    // A record with fewer fields than the key is not the entry.
+                                    let n_fields = record_field_count(rec);
+                                    if n_fields < n_all {
+                                        return Ok(std::ops::ControlFlow::Continue(()));
+                                    }
+                                    present = true;
+                                    if needs_values || n_fields != n_all {
+                                        found = Some(sqliters_types::decode_record_with_encoding(
+                                            rec, enc,
+                                        )?);
+                                    }
+                                    Ok(std::ops::ControlFlow::Break(()))
+                                },
+                            )?;
+                        }
                         if !present {
                             if !out.emit(format!("row {n_row} missing from index {}", idx.name)) {
                                 return Ok(());
@@ -44128,8 +44198,14 @@ fn integrity_check_table_rows(
                                 continue;
                             }
                             let differs = idx.columns.iter().enumerate().any(|(kk, ic)| {
-                                let binary = ic.sort_order.custom_collation.is_none()
-                                    && ic.sort_order.collation == Collation::Binary;
+                                let binary = if let Some((_, key_info)) = &declared_cursor {
+                                    key_info.a_coll[kk]
+                                        .as_ref()
+                                        .is_none_or(|collation| collation.is_binary)
+                                } else {
+                                    ic.sort_order.custom_collation.is_none()
+                                        && ic.sort_order.collation == Collation::Binary
+                                };
                                 !binary
                                     && match (fields.get(kk), keys.get(kk)) {
                                         (Some(a), Some(b)) => {
@@ -44207,6 +44283,9 @@ fn integrity_check_table_rows(
     })();
     if let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
         bt.close_cursor(cid);
+        if let Some((cursor, _)) = &mut declared_cursor {
+            bt.bc_close_cursor(cursor);
+        }
     }
     res
 }

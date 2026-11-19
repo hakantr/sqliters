@@ -962,3 +962,8 @@ Normal, Drop ve son statement ile tamamlanan kapanışta Btree slotları C sıra
 ## V6b.131 — TEMP FILE TRUNCATE senkronizasyonu
 
 Geçici pager normal COMMIT ve ROLLBACK sonrasında journalı sıfıra indiriyor ve C noSync kararını izliyor. 144 normal akış ve 48 retained journal C açılışı eş. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_131.md).
+
+
+## V6b.132 — Karma indeks bütünlük tanısı
+
+Dar integrity_check kapsamı C dış kolasyonu ve aynı cursor ile üyeliği arıyor. 114 dosyada her kipte 1.710 C grubu eş ve quick_check korunuyor. OFF 1186/1/337, ON 1177/10/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,261 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_132.md).
