@@ -14286,11 +14286,38 @@ fn read_table_with_plan_scan(
     alias: Option<&str>,
     indexed_by: Option<&IndexHint>,
     where_hint: Option<&Expr>,
+    mixed_index: Option<(&IndexSchema, Collation)>,
     params: &[Value],
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
 ) -> Result<(Vec<(TableRowKey, Vec<u8>)>, crate::dml_c::ScanInfo)> {
     let reverse_rowid_scan = ctx.stmt_tx.reverse_mixed_scan;
+    if let Some((index, declared)) = mixed_index
+        && let [key] = index.columns.as_slice()
+        && let Some((comparison, bound)) = mixed_index_key_equality(tbl, key, where_hint)
+    {
+        // The writer supplies the comparator verified in this write snapshot.
+        // Match C's declared index only if it is physically valid for the SQL comparison.
+        let plan = if key.sort_order.collation == declared && comparison == declared {
+            AccessPlan::IndexSeek {
+                index: index.clone(),
+                prefix_exprs: vec![bound.clone()],
+                is_covering: false,
+            }
+        } else {
+            AccessPlan::FullScan
+        };
+        ctx.ensure_read_db(db_id, true)?;
+        let (encoding, _) = slot_encoding_and_name(ctx, db_id);
+        let scan = crate::dml_c::scan_info(&plan, tbl, false);
+        let order = if reverse_rowid_scan {
+            IndexScanOrder::Reverse
+        } else {
+            IndexScanOrder::Forward
+        };
+        return execute_access_plan(ctx, db_id, encoding, tbl, &plan, params, outer_scopes, ctes, order)
+            .map(|rows| (rows, scan));
+    }
     read_table_with_plan_ctx(
         ctx,
         db_id,
@@ -14780,10 +14807,22 @@ fn execute_access_plan(
                 return Ok(rows);
             }
             let orders = index.key_sort_orders();
-            let idx_hits = {
+            let mut idx_hits = Vec::new();
+            {
                 let bt = ctx.db_set.slot_mut(db_id).unwrap().btree.as_mut().unwrap();
-                bt.seek_index_equal(index.root_pgno, &prefix_vals, &orders)?
-            };
+                bt.seek_index_range_raw_cells(
+                    index.root_pgno,
+                    &prefix_vals,
+                    None,
+                    None,
+                    &orders,
+                    scan_order == IndexScanOrder::Reverse,
+                    |record| {
+                        idx_hits.push(decode_record_with_encoding(record, db_enc)?);
+                        Ok(std::ops::ControlFlow::Continue(()))
+                    },
+                )?;
+            }
             materialize_index_hits(ctx, db_id, tbl, index, idx_hits)
         }
         AccessPlan::IndexRangeScan {
@@ -24470,11 +24509,22 @@ impl<'a> MixedIndexWrite<'a> {
         }
     }
 
-    fn applies(self, table: &TableSchema, key: &IndexedColSchema, db_set: &DatabaseSet) -> bool {
+    fn applies(
+        self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        key: &IndexedColSchema,
+        db_set: &DatabaseSet,
+    ) -> bool {
         let literal = |expr: &Expr| matches!(
             expr, Expr::Null | Expr::Bool(_) | Expr::Integer(_) | Expr::Float(_)
                 | Expr::String(_) | Expr::Blob(_) | Expr::Bind(_)
         );
+        let key_equality = |selection| {
+            !table.stat1.has_stat1
+                && index.stat1.as_ref().is_none_or(|stat| !stat.has_stat1)
+                && mixed_index_key_equality(table, key, selection).is_some()
+        };
         match self {
             Self::Insert(insert) => insert.ctes.is_empty()
                 && insert.alias.is_none()
@@ -24496,7 +24546,8 @@ impl<'a> MixedIndexWrite<'a> {
                 && update.returning.is_empty()
                 && (update.selection.is_none()
                     || mixed_index_rowid_selection(table, update.selection.as_ref())
-                    || mixed_index_table_equality(table, key, update.selection.as_ref()))
+                    || mixed_index_table_equality(table, key, update.selection.as_ref())
+                    || key_equality(update.selection.as_ref()))
                 && matches!(update.assignments.as_slice(), [assignment]
                     if !assignment.row_value
                         && matches!(assignment.columns.as_slice(), [column]
@@ -24507,8 +24558,40 @@ impl<'a> MixedIndexWrite<'a> {
                 && delete.indexed_by.is_none()
                 && delete.returning.is_empty()
                 && (mixed_index_rowid_selection(table, delete.selection.as_ref())
-                    || mixed_index_table_equality(table, key, delete.selection.as_ref())),
+                    || mixed_index_table_equality(table, key, delete.selection.as_ref())
+                    || key_equality(delete.selection.as_ref())),
         }
+    }
+}
+
+fn mixed_index_key_equality<'a>(
+    table: &TableSchema,
+    key: &IndexedColSchema,
+    selection: Option<&'a Expr>,
+) -> Option<(Collation, &'a Expr)> {
+    let key_column = key.col_idx?;
+    let Expr::Binary { op: BinaryOp::Eq, left, right } = selection? else {
+        return None;
+    };
+    let column = |expr: &Expr| {
+        let (expr, collation) = if let Expr::Collate { expr, collation } = expr {
+            (expr.as_ref(), Collation::from_name(collation)?)
+        } else {
+            (expr, table.columns.get(key_column)?.collation)
+        };
+        let Expr::Column(column) = expr else {
+            return None;
+        };
+        (resolve_target_col_ref(table, "main", None, column) == Some(TargetColRef::Col(key_column)))
+            .then_some(collation)
+    };
+    let bound = |expr: &Expr| is_in_order_literal(expr) || matches!(expr, Expr::Bind(_) | Expr::Blob(_));
+    if bound(right) && let Some(collation) = column(left) {
+        Some((collation, right))
+    } else if bound(left) && let Some(collation) = column(right) {
+        Some((collation, left))
+    } else {
+        None
     }
 }
 
@@ -24685,7 +24768,7 @@ fn mixed_index_write_collation(
             slot.schema.tables.iter().any(|table| !table.foreign_keys.is_empty())
         })
         || ["BINARY", "NOCASE", "RTRIM"].iter().any(|name| collations.get_custom(name).is_some())
-        || !write.applies(table, key, db_set)
+        || !write.applies(table, index, key, db_set)
     {
         return None;
     }
@@ -24804,7 +24887,7 @@ fn prepare_dml_write_slot(
     write: MixedIndexWrite<'_>,
     is_catalog: bool,
     fallback_tbl: TableSchema,
-) -> Result<(TableSchema, Vec<IndexSchema>, String)> {
+) -> Result<(TableSchema, Vec<IndexSchema>, String, Option<Collation>)> {
     if db_id == DatabaseId::TEMP {
         let enc = ctx.encoding();
         ctx.db_set.ensure_temp_open(enc, *ctx.writable_schema)?;
@@ -24818,7 +24901,7 @@ fn prepare_dml_write_slot(
         }
         *ctx.schema_changed_in_tx = true;
         let (_, sname) = slot_encoding_and_name(ctx, db_id);
-        return Ok((fallback_tbl, Vec::new(), sname));
+        return Ok((fallback_tbl, Vec::new(), sname, None));
     }
     let slot = ctx
         .db_set
@@ -24839,6 +24922,7 @@ fn prepare_dml_write_slot(
     // constraints and writes / deletes index entries (`sqlite3CompleteInsertion`,
     // `sqlite3GenerateRowIndexDelete`).
     let mut indexes = dml_ordered_indexes(&tbl, &slot.schema.indexes_for_table(&tbl.name));
+    let mut mixed_declared = None;
     if let [index] = indexes.as_mut_slice()
         && let Some(declared) = mixed_index_write_collation(
             write, db_id, ctx.db_set, &tbl, index, ctx.collations,
@@ -24847,8 +24931,9 @@ fn prepare_dml_write_slot(
         let comparator = physical_index_write_collation(ctx, db_id, &tbl, index, declared)?;
         index.columns[0].sort_order.collation = comparator;
         ctx.stmt_tx.reverse_mixed_scan = ctx.stmt_tx.prepared_reverse_order;
+        mixed_declared = Some(declared);
     }
-    Ok((tbl, indexes, sname))
+    Ok((tbl, indexes, sname, mixed_declared))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27537,7 +27622,7 @@ fn prepare_insert_exec<'a>(
                 }
             };
 
-            let (tbl, indexes, schema_name) =
+            let (tbl, indexes, schema_name, _) =
                 prepare_dml_write_slot(ctx, db_id, MixedIndexWrite::Insert(ins), is_catalog, *initial_tbl)?;
             let (enc, _) = slot_encoding_and_name(ctx, db_id);
             let ordered_uniques = ordered_unique_indexes(&tbl, &indexes);
@@ -30120,7 +30205,7 @@ fn prepare_update_exec<'a>(
                 None
             };
 
-            let (tbl, indexes, schema_name) =
+            let (tbl, indexes, schema_name, mixed_declared) =
                 prepare_dml_write_slot(ctx, db_id, MixedIndexWrite::Update(upd), is_catalog, *initial_tbl)?;
             let (enc, _) = slot_encoding_and_name(ctx, db_id);
             let resolved_assigns = resolve_set_assignments_for_table(&tbl, &upd.assignments)?;
@@ -30141,6 +30226,7 @@ fn prepare_update_exec<'a>(
                 upd.alias.as_deref(),
                 upd.indexed_by.as_ref(),
                 plan_where_hint,
+                indexes.first().zip(mixed_declared),
                 params,
                 outer_scopes,
                 &dml_ctes,
@@ -31858,7 +31944,7 @@ fn prepare_delete_exec(
             is_catalog,
             ..
         } => {
-            let (tbl, indexes, schema_name) =
+            let (tbl, indexes, schema_name, mixed_declared) =
                 prepare_dml_write_slot(ctx, db_id, MixedIndexWrite::Delete(del), is_catalog, *initial_tbl)?;
             let has_del_triggers = !is_catalog
                 && ctx.db_set.has_active_triggers_for_event(
@@ -31921,6 +32007,7 @@ fn prepare_delete_exec(
                 del.alias.as_deref(),
                 del.indexed_by.as_ref(),
                 del.selection.as_ref(),
+                indexes.first().zip(mixed_declared),
                 params,
                 outer_scopes,
                 &dml_ctes,
