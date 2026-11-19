@@ -13481,12 +13481,38 @@ fn covering_exists_expr_is_simple(expr: &Expr) -> bool {
     simple
 }
 
-// select.c:existsToJoin binds the inner SELECT to its own cursor. A bare
-// EXISTS with no outer column use contributes no column to the outer scan.
+fn covering_exists_outer_key(
+    expr: &Expr,
+    table: &TableSchema,
+    outer_alias: &str,
+    index: &crate::schema::IndexSchema,
+) -> bool {
+    use crate::dml_c::{Walk, walk_expr};
+    let mut has_outer_column = false;
+    let mut covered = true;
+    walk_expr(expr, &mut |node| {
+        if let Expr::Column(col) = node {
+            has_outer_column = true;
+            covered &= col.schema.is_none()
+                && col.table.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(outer_alias))
+                && match table.find_column(&col.column) {
+                    Some((ci, _)) => crate::compiler::index_provides_table_col(index, table, ci),
+                    None => table.is_implicit_rowid_name(&col.column),
+                };
+        }
+        Walk::Shallow
+    });
+    has_outer_column && covered
+}
+
+// select.c:existsToJoin binds the inner SELECT to its own cursor. Its columns
+// do not count towards the outer scan. where.c keeps the inner loop after
+// the outer cursor when the inner equality actually depends on that cursor.
 fn local_exists_allows_covering(
     ctx: &ExecContext<'_>,
     db_id: DatabaseId,
     table: &TableSchema,
+    outer_alias: &str,
     selection: Option<&Expr>,
     ctes: &CteStore,
 ) -> bool {
@@ -13533,7 +13559,7 @@ fn local_exists_allows_covering(
         name,
         table_args: None,
         indexed_by: None,
-        ..
+        alias,
     } = &from.head
     else {
         return false;
@@ -13548,32 +13574,75 @@ fn local_exists_allows_covering(
                 ..
             }]
         )
-        || !matches!(
-            predicate,
-            Expr::Binary {
-                op: BinaryOp::Eq,
-                ..
-            }
-        )
         || !covering_exists_expr_is_simple(predicate)
     {
         return false;
     }
+    let Expr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+    } = predicate
+    else {
+        return false;
+    };
 
     let Ok(Some((inner_db, inner))) = ctx.db_set.find_table_in_set(name) else {
         return false;
     };
-    if inner_db != db_id
-        || inner.root_pgno != table.root_pgno
-        || !crate::dml_c::select_is_self_contained(ctx.db_set, subquery)
+    if inner_db != db_id {
+        return false;
+    }
+    let schema = &ctx.db_set.main_slot().schema;
+    let indexes = schema.indexes_for_table(&table.name);
+    let [index] = indexes.as_slice() else {
+        return false;
+    };
+    let is_plain_index = |index: &crate::schema::IndexSchema| {
+        index.where_clause.is_none()
+            && index.stat1.is_none()
+            && matches!(index.columns.as_slice(), [key] if key.col_idx.is_some()
+                && key.sort_order.custom_collation.is_none())
+    };
+    if !is_plain_index(index) {
+        return false;
+    }
+    if inner.root_pgno == table.root_pgno
+        && crate::dml_c::select_is_self_contained(ctx.db_set, subquery)
+    {
+        return true;
+    }
+
+    let inner_alias = alias.as_deref().unwrap_or(&name.name);
+    if inner_alias.eq_ignore_ascii_case(outer_alias)
+        || inner.without_rowid
+        || inner.stat1.has_stat1
+        || !inner.foreign_keys.is_empty()
+        || inner
+            .columns
+            .iter()
+            .any(|col| col.generated.is_some() || col.custom_collation.is_some())
+        || table.columns.len() > 63
     {
         return false;
     }
-    let indexes = ctx.db_set.main_slot().schema.indexes_for_table(&table.name);
-    matches!(indexes.as_slice(), [index] if index.where_clause.is_none()
-        && index.stat1.is_none()
-        && matches!(index.columns.as_slice(), [key] if key.col_idx.is_some()
-            && key.sort_order.custom_collation.is_none()))
+    let inner_indexes = schema.indexes_for_table(&inner.name);
+    let inner_key = |expr: &Expr| {
+        let Expr::Column(col) = expr else {
+            return false;
+        };
+        col.schema.is_none()
+            && col.table.as_deref().is_none_or(|t| t.eq_ignore_ascii_case(inner_alias))
+            && match inner.find_column(&col.column) {
+                Some((ci, _)) => inner.rowid_alias_col == Some(ci)
+                    || inner_indexes.iter().any(|idx| {
+                        is_plain_index(idx) && idx.columns[0].col_idx == Some(ci)
+                    }),
+                None => inner.is_implicit_rowid_name(&col.column),
+            }
+    };
+    (inner_key(left) && covering_exists_outer_key(right, table, outer_alias, index))
+        || (inner_key(right) && covering_exists_outer_key(left, table, outer_alias, index))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13864,7 +13933,14 @@ fn eval_table_or_subquery(
             let plan_where_hint = if indexed_by.is_none()
                 && outer_scopes.is_empty()
                 && vtab_query_info.is_some_and(|q| q.allow_local_exists_covering && q.plan_ctx.is_some())
-                && local_exists_allows_covering(ctx, db_id, &tbl, where_hint, ctes)
+                && local_exists_allows_covering(
+                    ctx,
+                    db_id,
+                    &tbl,
+                    alias.as_deref().unwrap_or(&name.name),
+                    where_hint,
+                    ctes,
+                )
             {
                 None
             } else {
