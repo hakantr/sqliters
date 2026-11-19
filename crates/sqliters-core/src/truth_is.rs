@@ -53,19 +53,24 @@ pub(crate) fn resolve_simple_truth_tests(stmt: &mut Stmt, db_set: &DatabaseSet) 
                 }
             }
             let aliases = ["false", "true"].map(|name| {
-                projection.iter().find_map(|column| match column {
-                    ResultColumn::Expr {
-                        expr,
-                        alias: Some(alias),
-                        ..
-                    } if alias.eq_ignore_ascii_case(name) => Some(expr),
-                    _ => None,
-                })
+                projection
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, column)| match column {
+                        ResultColumn::Expr {
+                            expr,
+                            alias: Some(alias),
+                            ..
+                        } if alias.eq_ignore_ascii_case(name) => Some((index, expr)),
+                        _ => None,
+                    })
             });
             // WHERE looks for a source column first, then copies the first matching
             // result expression. ORDER BY has a separate alias-first rule.
             scope.where_aliases = [false, true].map(|value| {
-                aliases[usize::from(value)].filter(|_| scope.for_keyword(value).is_none())
+                aliases[usize::from(value)]
+                    .filter(|_| scope.for_keyword(value).is_none())
+                    .map(|(_, expr)| expr)
             });
             if let Some(predicate) = selection
                 && (scope.where_aliases.iter().all(Option::is_none)
@@ -83,6 +88,40 @@ pub(crate) fn resolve_simple_truth_tests(stmt: &mut Stmt, db_set: &DatabaseSet) 
             if aliases.iter().all(Option::is_none) {
                 for term in &mut select.order_by {
                     resolve_expr(&mut term.expr, scope);
+                }
+            } else if select.ctes.is_empty()
+                && let Some(table) = scope.table
+            {
+                use sqliters_codegen::consts::{SQLITE_FullColNames, SQLITE_ShortColNames};
+
+                // Both flags must differ from their defaults to qualify expanded names.
+                let column_name_flags = SQLITE_FullColNames | SQLITE_ShortColNames;
+                let long_names = db_set.c_flags_toggled() & column_name_flags == column_name_flags;
+                for term in &mut select.order_by {
+                    if let Expr::Bool(value) = term.expr
+                        && let Some((index, _)) = aliases[usize::from(value)]
+                    {
+                        // C marks each star-expanded column as a result name. A matching
+                        // short name from an earlier star can precede the explicit alias.
+                        let star_match = scope
+                            .for_keyword(value)
+                            .filter(|_| !long_names)
+                            .and_then(|name| table.find_column(name).map(|(index, _)| index));
+                        let mut ordinal = 1;
+                        for column in &projection[..index] {
+                            match column {
+                                ResultColumn::Expr { .. } => ordinal += 1,
+                                ResultColumn::Star | ResultColumn::TableStar { .. } => {
+                                    if let Some(star_index) = star_match {
+                                        ordinal += star_index;
+                                        break;
+                                    }
+                                    ordinal += table.columns.len();
+                                }
+                            }
+                        }
+                        term.expr = Expr::Integer(ordinal as i64);
+                    }
                 }
             }
         }
