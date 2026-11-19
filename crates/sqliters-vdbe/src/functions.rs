@@ -2738,7 +2738,8 @@ impl AggregateAccumulator {
     /// Feeds one row with [`RuntimeValue`] subtype tags preserved (`JSON_SUBTYPE = 74`).
     pub fn step_rt(&mut self, args: &[RuntimeValue]) -> Result<()> {
         let coll = self.collation;
-        self.step_rt_with_cmp(args, |a, b| Ok(a.cmp_sqlite(b, coll)))
+        let enc = self.encoding;
+        self.step_rt_with_cmp(args, |a, b| Ok(a.cmp_sqlite_with_encoding(b, coll, enc)))
     }
 
     /// Feeds one row with [`RuntimeValue`] subtype tags preserved and a fallible comparator.
@@ -2778,7 +2779,8 @@ impl AggregateAccumulator {
 
     pub fn step(&mut self, args: &[Value]) -> Result<()> {
         let coll = self.collation;
-        self.step_with_cmp(args, |a, b| Ok(a.cmp_sqlite(b, coll)))
+        let enc = self.encoding;
+        self.step_with_cmp(args, |a, b| Ok(a.cmp_sqlite_with_encoding(b, coll, enc)))
     }
 
     /// Feeds one row into this accumulator using a fallible value comparator `cmp_fn`
