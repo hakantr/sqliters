@@ -67,7 +67,17 @@ macro_rules! impl_json_walk_module {
                 ctx: &mut dyn VTabHostContext,
                 _args: &[String],
             ) -> Result<Box<dyn VirtualTable>> {
-                ctx.declare_vtab(JSON_EACH_SCHEMA)?;
+                ctx.declare_vtab(JSON_EACH_SCHEMA).map_err(|err| {
+                    // jsonEachConnect returns the declaration failure without a pzErr.
+                    if err.code == ErrorCode::Error && err.message == "interrupted" {
+                        SqliteError::new(
+                            ErrorCode::Error,
+                            concat!("vtable constructor failed: ", $name),
+                        )
+                    } else {
+                        err
+                    }
+                })?;
                 let _ = ctx.set_vtab_config(VTabConfigOption::Innocuous);
                 Ok(Box::new(JsonWalkTable {
                     is_tree: $is_tree,

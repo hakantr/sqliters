@@ -672,10 +672,9 @@ fn group46_connection_disjoint_borrows_custom_functions_collations_progress_and_
     // 4. `InterruptHandle` & custom `set_interrupt_flag` on compiled VDBE and interpreter
     let irq = conn.interrupt_handle();
     irq.interrupt();
-    assert_eq!(
-        conn.query("SELECT id FROM items;", &[]).unwrap_err().code,
-        ErrorCode::Interrupt
-    );
+    let idle = conn.query("SELECT id FROM items;", &[]).unwrap();
+    let ids: Vec<_> = idle.rows.iter().map(|row| row.get_i64(0).unwrap()).collect();
+    assert_eq!(ids, [1, 2, 3, 4]);
     conn.interrupt_flag().store(false, AtomicOrdering::SeqCst);
     let custom_flag = Arc::new(AtomicBool::new(true));
     conn.set_interrupt_flag(Some(Arc::clone(&custom_flag)))

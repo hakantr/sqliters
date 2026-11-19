@@ -855,6 +855,16 @@ impl VTabHostContext for CoreVTabHostContext<'_, '_, '_> {
     }
 
     fn declare_vtab(&mut self, create_table_sql: &str) -> Result<()> {
+        if self.ctx.stmt_tx.interrupt_vtab_declaration {
+            // C validates the two keywords before it runs the parser. A valid prefix
+            // then encounters a separator and the pending interrupt before TABLE.
+            let message = if sqliters_codegen::vtab::has_declare_vtab_prefix(create_table_sql) {
+                "interrupted"
+            } else {
+                "syntax error"
+            };
+            return Err(SqliteError::new(ErrorCode::Error, message));
+        }
         let (table_schema, hidden_cols) =
             parse_declare_vtab_sql(self.table_name, create_table_sql)?;
         self.declared = Some(VTabDeclaredSchema {

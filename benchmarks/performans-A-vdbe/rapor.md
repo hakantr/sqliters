@@ -663,3 +663,7 @@ C iki özel TEMP DB'de boş okuma, işlem başlangıcı ve küçük COMMIT boyun
 ## V6b.71 — Skaler fonksiyon çağrısında yıldız
 
 Legacy skaler doğrulama yıldızla gelen fonksiyon çağrısını sıfır argümanla çözüyor. 468 native vakada DB özetleri iki kipte eşit. Tam API eşliği OFF 384, ON 408 vaka. Group46/65 C beklentisiyle iki kipte geçti. OFF 1170/5/337, ON 1158/17/337. DML ve ayrışma bulucu V6b.70 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,241 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_71.md).
+
+## V6b.72 — Kesinti yaşamı, token ve sanal tablo sırası
+
+Bağlantı boşken başlayan varsayılan kesinti sonraki hazırlama/step'te temizleniyor. Etkin ifade, V1/V2 hata dönüşü ve prepare token sırası C ile hizalandı. 566 native yeniden koşu, 276 lexical ve 12 vtab örneğini içeriyor. Eski V1 hata metni açık. OFF 1176/4/337, ON 1164/16/337. DML ve ayrışma bulucu V6b.71 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,248 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_72.md).

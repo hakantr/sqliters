@@ -444,30 +444,34 @@ pub fn sqlite3_vtab_call_connect(p: &mut Parse, tab: TableId) -> i32 {
     rc
 }
 
+/// Validate the prefix sqlite3_declare_vtab checks before running its parser.
+pub fn has_declare_vtab_prefix(sql: &str) -> bool {
+    let z = sql.as_bytes();
+    let mut pos = 0;
+    for kw in [crate::tk::TK_CREATE, crate::tk::TK_TABLE] {
+        let mut t;
+        loop {
+            let (n, tt) = crate::tokenize::sqlite3_get_token(&z[pos.min(z.len())..]);
+            pos += n;
+            t = tt;
+            if n == 0 || (t != crate::tk::TK_SPACE && t != crate::tk::TK_COMMENT) {
+                break;
+            }
+        }
+        if t != kw {
+            return false;
+        }
+    }
+    true
+}
+
 /// `sqlite3_declare_vtab(db, zCreateTable)`: this function is used to set the schema of a
 /// virtual table. It is only valid to call this function from within the xCreate() or
 /// xConnect() of a virtual table module. Returns false if the text does not declare a table
 /// the generator can load (C would fail the constructor; the engine's modules never do).
 fn sqlite3_declare_vtab(p: &mut Parse, tab: TableId, z_create_table: &str) -> bool {
-    // Verify that the first two keywords in the CREATE TABLE statement really are "CREATE"
-    // and "TABLE". If this is not the case, then sqlite3_declare_vtab() is being misused.
-    {
-        let z = z_create_table.as_bytes();
-        let mut pos = 0;
-        for kw in [crate::tk::TK_CREATE, crate::tk::TK_TABLE] {
-            let mut t;
-            loop {
-                let (n, tt) = crate::tokenize::sqlite3_get_token(&z[pos.min(z.len())..]);
-                pos += n;
-                t = tt;
-                if n == 0 || (t != crate::tk::TK_SPACE && t != crate::tk::TK_COMMENT) {
-                    break;
-                }
-            }
-            if t != kw {
-                return false;
-            }
-        }
+    if !has_declare_vtab_prefix(z_create_table) {
+        return false;
     }
     let Some(new) = crate::build_tab::declare_vtab_parse(p, z_create_table) else {
         return false;

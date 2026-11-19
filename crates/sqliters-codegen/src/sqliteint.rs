@@ -1135,6 +1135,11 @@ pub struct DbInfo {
 /// What the code generator asks of the engine: the schema adapter and the registries of
 /// application-defined functions and collations.
 pub trait Host {
+    /// Whether this prepare observes a pending interrupt on an active connection.
+    fn prepare_interrupt_pending(&self) -> bool {
+        false
+    }
+
     /// sqlite3VdbeGetBoundValue(pReprepare, iVar, SQLITE_AFF_BLOB).
     /// Initial preparation has no previous statement; NULL is returned as None.
     fn bound_value(&self, _i_var: usize) -> Option<sqliters_types::Value> { None }
@@ -1348,6 +1353,7 @@ impl<'a> Db<'a> {
 pub const SQLITE_OK: i32 = 0;
 pub const SQLITE_ERROR: i32 = 1;
 pub const SQLITE_NOMEM: i32 = 7;
+pub const SQLITE_INTERRUPT: i32 = 9;
 pub const SQLITE_TOOBIG: i32 = 18;
 pub const SQLITE_DONE: i32 = 101;
 

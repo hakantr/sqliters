@@ -1745,6 +1745,23 @@ impl ConnectionInner {
     }
 
     #[inline]
+    fn uses_default_interrupt_flag(&self, shared: &ConnectionShared) -> bool {
+        Arc::ptr_eq(&self.active_interrupt_flag, &shared.interrupt_flag)
+    }
+
+    #[inline]
+    fn default_interrupt_pending(&self, shared: &ConnectionShared) -> bool {
+        self.uses_default_interrupt_flag(shared) && shared.interrupt_flag.load(Ordering::SeqCst)
+    }
+
+    #[inline]
+    fn clear_idle_interrupt(&self, shared: &ConnectionShared) {
+        if self.activity.leases.is_empty() && self.uses_default_interrupt_flag(shared) {
+            shared.interrupt_flag.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[inline]
     pub(crate) fn check_any_interrupted(&self) -> Result<()> {
         if self.active_interrupt_flag.load(Ordering::SeqCst) {
             return Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"));
@@ -2157,6 +2174,33 @@ impl ConnectionInner {
         let cleanup = self.finish_activity(hid, ActivityFinish::ExplainHalted, shared);
         self.maybe_run_wal_autocheckpoint();
         result.and(cleanup)
+    }
+
+    fn finish_point_read(
+        &mut self,
+        hid: HandleId,
+        read_instances: SmallInstVec,
+        shared: &ConnectionShared,
+    ) -> Result<()> {
+        self.runtime.stmt_timestamp_ms = None;
+        let interrupted = self.default_interrupt_pending(shared);
+        let outcome = if interrupted {
+            ActivityFinish::ReadAborted {
+                lease_cursors: Vec::new(),
+                read_instances,
+            }
+        } else {
+            ActivityFinish::ReadDone {
+                lease_cursors: Vec::new(),
+                read_instances,
+            }
+        };
+        let cleanup = self.finish_activity(hid, outcome, shared);
+        if interrupted {
+            Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"))
+        } else {
+            cleanup
+        }
     }
 
     fn finish_activity(
@@ -3739,7 +3783,9 @@ impl Connection {
         let mut session = self.shared.enter()?;
         session.inner().ensure_usable()?;
         while !sql.is_empty() {
-            if session.inner().trace_hook.is_none() {
+            if session.inner().trace_hook.is_none()
+                && !session.inner().default_interrupt_pending(&self.shared)
+            {
                 let trimmed = sql.trim_start_matches([' ', '\t', '\r', '\n']);
                 if trimmed.is_empty() {
                     session.inner_mut().c_error_byte_offset = -1;
@@ -7870,7 +7916,14 @@ impl Statement {
         sql: &str,
         mode: PrepareMode,
     ) -> Result<Self> {
-        let result = Self::compile_in_session(shared, inner, sql, mode);
+        // tokenize.c:616–617 clears interruptions only when no VM is active.
+        inner.clear_idle_interrupt(shared);
+        let result = if inner.default_interrupt_pending(shared) {
+            cgen::c_prepare_while_interrupted(inner, sql)
+                .and_then(|connect| Self::compile_in_session(shared, inner, sql, mode, connect))
+        } else {
+            Self::compile_in_session(shared, inner, sql, mode, false)
+        };
         // prepare.c:821–842: error_msg sets the offset; a bare error keeps
         // db.errByteOffset. A successful sqlite3Prepare calls ErrorClear.
         inner.c_error_byte_offset = match &result {
@@ -7885,6 +7938,7 @@ impl Statement {
         inner: &mut ConnectionInner,
         sql: &str,
         mode: PrepareMode,
+        interrupted_constructor: bool,
     ) -> Result<Self> {
         // `EXPLAIN <stmt>` that the engine's parser rejects, while C's parser and code
         // generator (the port) handle it: the listing (or the error) is C's. The statement
@@ -8008,10 +8062,23 @@ impl Statement {
             inner.db_set.c_note_stats(false);
         }
 
+        // The parser probe reached a virtual table constructor. Connect it once here
+        // so declare_vtab sees the pending interrupt and errors bypass schema retry.
+        if interrupted_constructor
+            && let Some(ref st) = stmt_opt
+        {
+            inner.with_default_exec_ctx(shared, ActivitySummary::default(), |ctx| {
+                ctx.stmt_tx.interrupt_vtab_declaration = true;
+                crate::vtab::ensure_stmt_vtabs_connected(ctx, st)
+            })?;
+        }
+
         // The port of C's code generator reaches the virtual tables through the engine's
         // connected instances (C connects them while it prepares the statement): connect the
         // ones an EXPLAIN names now. An error is the engine's to report (try_compile below).
-        if let Some(ref st @ Stmt::Explain { .. }) = stmt_opt {
+        if !interrupted_constructor
+            && let Some(ref st @ Stmt::Explain { .. }) = stmt_opt
+        {
             let _ = inner.with_default_exec_ctx(shared, ActivitySummary::default(), |ctx| {
                 crate::vtab::ensure_stmt_vtabs_connected(ctx, st)
             });
@@ -8075,7 +8142,9 @@ impl Statement {
         let try_compile =
             |inner: &mut ConnectionInner, stmt_opt: Option<Stmt>| -> Result<CompiledArtifacts> {
                 check_create_generated_column_errors(inner, stmt_opt.as_ref(), &raw_sql)?;
-                if let Some(ref st) = stmt_opt {
+                if !interrupted_constructor
+                    && let Some(ref st) = stmt_opt
+                {
                     inner.with_default_exec_ctx(shared, ActivitySummary::default(), |ctx| {
                         crate::vtab::ensure_stmt_vtabs_connected(ctx, st)
                     })?;
@@ -9033,24 +9102,19 @@ impl Statement {
             && let Some(hid) = self.handle_id
         {
             let r_insts = read_instances.clone();
-            let fin_res = {
+            let (fin_res, default_interrupt) = {
                 let mut session = self.shared.enter()?;
                 let inner = session.inner_mut();
                 inner.ensure_usable()?;
-                inner.runtime.stmt_timestamp_ms = None;
-                inner.finish_activity(
-                    hid,
-                    ActivityFinish::ReadDone {
-                        lease_cursors: Vec::new(),
-                        read_instances: r_insts,
-                    },
-                    &self.shared,
+                (
+                    inner.finish_point_read(hid, r_insts, &self.shared),
+                    inner.uses_default_interrupt_flag(&self.shared),
                 )
             };
             self.lifecycle = StatementLifecycle::Halted {
                 last_error: fin_res.as_ref().err().cloned(),
             };
-            fin_res?;
+            fin_res.map_err(|e| self.read_step_error(e, default_interrupt))?;
             return Ok(StepResult::Done);
         }
 
@@ -9075,9 +9139,11 @@ impl Statement {
                 Hit(Vec<Value>, SmallInstVec),
                 Miss,
             }
+            let default_interrupt;
             let outcome = {
                 let mut session = self.shared.enter()?;
                 let inner = session.inner_mut();
+                default_interrupt = inner.uses_default_interrupt_flag(&self.shared);
                 if let Err(e) = inner.ensure_usable() {
                     PointOutcome::EarlyErr(e)
                 } else if self.compiled_advisory_expire_generation
@@ -9113,6 +9179,7 @@ impl Statement {
                         if cookie_mismatch || self.slot_cookies_changed(inner) {
                             PointOutcome::Fallback
                         } else {
+                            inner.clear_idle_interrupt(&self.shared);
                             let started_here = inner.db_set.main_btree().transaction_state()
                                 == TransactionState::Open;
                             let mut begin_err = None;
@@ -9261,7 +9328,7 @@ impl Statement {
                     self.lifecycle = StatementLifecycle::Halted {
                         last_error: Some(e.clone()),
                     };
-                    return Err(e);
+                    return Err(self.read_step_error(e, default_interrupt));
                 }
                 PointOutcome::Hit(vals, read_instances) => {
                     self.lifecycle =
@@ -9307,6 +9374,7 @@ impl Statement {
                 if let Err(e) = inner.ensure_usable() {
                     Some(Err(e))
                 } else {
+                    inner.clear_idle_interrupt(shared);
                     try_fast_compiled_main_write_fields(
                         hid,
                         shared,
@@ -9339,6 +9407,7 @@ impl Statement {
             && !self.expired
             && self.compiled_fast_read.is_some()
         {
+            let default_interrupt;
             let fast_read_res = {
                 let Self {
                     ref shared,
@@ -9355,6 +9424,7 @@ impl Statement {
                 } = *self;
                 let mut session = shared.enter()?;
                 let inner = session.inner_mut();
+                default_interrupt = inner.uses_default_interrupt_flag(shared);
                 if let Err(e) = inner.ensure_usable() {
                     Some(Err(e))
                 } else if inner.trace_hook.is_some() || inner.authorizer.is_some()
@@ -9362,6 +9432,7 @@ impl Statement {
                 {
                     None
                 } else {
+                    inner.clear_idle_interrupt(shared);
                     try_fast_read_plan_fields(
                         hid,
                         shared,
@@ -9379,7 +9450,7 @@ impl Statement {
                 }
             };
             if let Some(res) = fast_read_res {
-                return res;
+                return res.map_err(|e| self.read_step_error(e, default_interrupt));
             }
         }
 
@@ -9406,7 +9477,20 @@ impl Statement {
             self.lifecycle = StatementLifecycle::Halted { last_error: Some(error.clone()) };
             return Err(error);
         }
+        if self.category == Some(StmtCategory::Read) && !self.read_io_during_prepare {
+            return result.map_err(|e| self.read_step_error(e, inner.uses_default_interrupt_flag(shared)));
+        }
         result
+    }
+
+    fn read_step_error(&self, error: SqliteError, default_interrupt: bool) -> SqliteError {
+        // vdbe.c:9501–9510 and vdbeapi.c:951–956: only a saved-SQL statement exposes
+        // its execution error at step. Reset/finalize retain the actual interruption.
+        if self.mode == PrepareMode::V1 && default_interrupt && error.code == ErrorCode::Interrupt {
+            SqliteError::new(ErrorCode::Error, "SQL logic error")
+        } else {
+            error
+        }
     }
 
     fn step_in_session_impl(
@@ -9431,6 +9515,8 @@ impl Statement {
         }
 
         if matches!(self.lifecycle, StatementLifecycle::Ready) {
+            // vdbeapi.c:865–867: a fresh VM can discard an idle interrupt.
+            inner.clear_idle_interrupt(shared);
             if let Some(ref mut cb) = inner.trace_hook
                 && let Err(e) =
                     execution_context::catch_infallible_callback_panic("trace_hook", || {
@@ -9722,8 +9808,10 @@ impl Statement {
                 // Diagnostic switch SQLITERS_VDBE_EXEC: C's program on the machine
                 let prog = Arc::clone(self.c_machine_write.as_ref().expect("checked"));
                 let mut vm = Box::new(sqliters_vdbe::vdbe::Vdbe::new(prog));
-                // sqlite3Step: "if( db->nVdbeActive==0 ){ AtomicStore(&db->u1.isInterrupted, 0); }"
-                if inner.activity.summary_excluding(hid, &inner.db_set).other_active == 0 {
+                // Preserve the machine's handling of a caller-supplied Rust interrupt flag.
+                if !inner.uses_default_interrupt_flag(shared)
+                    && inner.activity.summary_excluding(hid, &inner.db_set).other_active == 0
+                {
                     inner.active_interrupt_flag.store(false, Ordering::SeqCst);
                 }
                 inner.activity.start(hid, false, false);
@@ -10168,10 +10256,9 @@ impl Statement {
                     }
                 }
 
-                // Diagnostic switch SQLITERS_VDBE_EXEC — sqlite3Step: "if( db->nVdbeActive==0 ){
-                // AtomicStore(&db->u1.isInterrupted, 0); }": an interrupt is for the statements
-                // that were running when it was requested.
-                if (self.c_machine.is_some() || mapped_program.is_some())
+                // Preserve the machine's handling of a caller-supplied Rust interrupt flag.
+                if !inner.uses_default_interrupt_flag(shared)
+                    && (self.c_machine.is_some() || mapped_program.is_some())
                     && inner.activity.summary_excluding(hid, &inner.db_set).other_active == 0
                 {
                     inner.active_interrupt_flag.store(false, Ordering::SeqCst);
@@ -11207,16 +11294,8 @@ impl Statement {
 
         match running {
             RunningExec::PointSelectRowYielded { read_instances } => {
-                let r_insts = std::mem::take(read_instances);
-                inner.runtime.stmt_timestamp_ms = None;
-                let fin_res = inner.finish_activity(
-                    hid,
-                    ActivityFinish::ReadDone {
-                        lease_cursors: Vec::new(),
-                        read_instances: r_insts,
-                    },
-                    shared,
-                );
+                let read_instances = std::mem::take(read_instances);
+                let fin_res = inner.finish_point_read(hid, read_instances, shared);
                 self.lifecycle = StatementLifecycle::Halted {
                     last_error: fin_res.as_ref().err().cloned(),
                 };

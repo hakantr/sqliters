@@ -15,7 +15,7 @@ use sqliters_codegen::sqliteint::{VTable, VtabConnect, VtabModule};
 use sqliters_codegen::vtab::{IndexInfo, IndexInfoHidden};
 use sqliters_codegen::{Db, DbInfo, Host, PrepareResult};
 use sqliters_types::{
-    ErrorCode, FunctionFlags, TextEncoding, VTabConstraint, VTabConstraintOp, VTabIndexInfo, VTabIndexInfoCalls, VTabOrderBy,
+    ErrorCode, FunctionFlags, SqliteError, TextEncoding, VTabConstraint, VTabConstraintOp, VTabIndexInfo, VTabIndexInfoCalls, VTabOrderBy,
     VTabRiskFlags, Value,
 };
 use sqliters_vdbe::vdbeaux::{FuncDef, Program};
@@ -36,8 +36,9 @@ struct EngineHost<'a> {
     default_locking_mode: i64,
     /// set by [`Host::note_schema_loaded`]
     schema_loaded: std::cell::Cell<bool>,
-    /// Inspect schema use without invoking application virtual-table callbacks.
-    schema_probe: bool,
+    /// Inspect preparation without invoking application virtual-table callbacks.
+    suppress_vtab_callbacks: bool,
+    deferred_vtab_connect: Option<&'a std::cell::Cell<bool>>,
     /// The virtual-table instances handed to the generator: id -> (database, table)
     vtabs: std::cell::RefCell<Vec<(u64, String, String)>>,
 }
@@ -99,6 +100,10 @@ pub(crate) fn func_flags(flags: FunctionFlags) -> u32 {
 }
 
 impl Host for EngineHost<'_> {
+    fn prepare_interrupt_pending(&self) -> bool {
+        self.deferred_vtab_connect.is_some()
+    }
+
     fn bound_value(&self, i_var: usize) -> Option<Value> {
         self.bound_values?.get(i_var.checked_sub(1)?)
             .filter(|v| !matches!(v, Value::Null)).cloned()
@@ -289,7 +294,7 @@ impl Host for EngineHost<'_> {
     }
 
     fn vtab_module(&self, name: &str, lazy: bool) -> Option<VtabModule> {
-        if self.schema_probe { return None; }
+        if self.suppress_vtab_callbacks && self.deferred_vtab_connect.is_none() { return None; }
         let reg = self.db_set.vtab_registry();
         let (module, reg_name) = match reg.get_module(name) {
             Some(m) => (m, reg.registered_module_name(name).unwrap_or(name).to_owned()),
@@ -307,7 +312,10 @@ impl Host for EngineHost<'_> {
     }
 
     fn vtab_connect(&self, i_db: usize, table: &str, _module: &str, _args: &[String], eponymous: bool) -> VtabConnect {
-        if self.schema_probe { return VtabConnect::Unsupported; }
+        if let Some(deferred) = self.deferred_vtab_connect {
+            deferred.set(true);
+        }
+        if self.suppress_vtab_callbacks { return VtabConnect::Unsupported; }
         let Some(slot) = self.db_set.slots().get(i_db) else { return VtabConnect::Unsupported };
         let reg = self.db_set.vtab_registry();
         // (the engine connects the virtual tables a statement names before the generator runs,
@@ -478,12 +486,12 @@ pub(crate) fn c_prepare_quiet(inner: &ConnectionInner, sql: &str) -> (PrepareRes
 /// Run C's parser and code generator over one statement (`sqlite3Prepare`).
 /// The third value: C's `sqlite3Init()` loaded the schemas during this prepare.
 pub(crate) fn c_prepare(inner: &ConnectionInner, sql: &str) -> (PrepareResult, usize, bool) {
-    c_prepare_impl(inner, sql, false, None)
+    c_prepare_impl(inner, sql, false, None, None)
 }
 
 /// Recompile with the old statement's parameter values (pParse->pReprepare).
 pub(crate) fn c_prepare_bound(inner: &ConnectionInner, sql: &str, values: &[Value]) -> (PrepareResult, usize, bool) {
-    c_prepare_impl(inner, sql, false, Some(values))
+    c_prepare_impl(inner, sql, false, Some(values), None)
 }
 
 pub(crate) fn c_explain_bound(inner: &ConnectionInner, sql: &str, values: &[Value]) -> CExplain {
@@ -522,11 +530,40 @@ pub(crate) fn select_schema_use(inner: &ConnectionInner, sql: &str) -> Option<Se
 }
 
 pub(crate) fn select_schema_probe(inner: &ConnectionInner, sql: &str) -> (PrepareResult, bool) {
+    c_prepare_probe(inner, sql, true, None)
+}
+
+/// Resolve the parser's interrupt check. A true result defers to one real xConnect.
+pub(crate) fn c_prepare_while_interrupted(inner: &ConnectionInner, sql: &str) -> sqliters_types::Result<bool> {
+    let deferred_vtab_connect = std::cell::Cell::new(false);
+    let result = c_prepare_probe(inner, sql, false, Some(&deferred_vtab_connect)).0;
+    if deferred_vtab_connect.get() {
+        return Ok(true);
+    }
+    match result {
+        PrepareResult::Program(_) => Ok(false),
+        PrepareResult::Error { code, message, offset } => Err(
+            SqliteError::with_extended(code, message)
+                .with_offset(usize::try_from(offset).unwrap_or(SqliteError::NO_OFFSET)),
+        ),
+        PrepareResult::Unsupported(_) => Err(
+            SqliteError::new(ErrorCode::Interrupt, "interrupted")
+                .with_offset(usize::try_from(inner.c_error_byte_offset).unwrap_or(SqliteError::NO_OFFSET)),
+        ),
+    }
+}
+
+fn c_prepare_probe(
+    inner: &ConnectionInner,
+    sql: &str,
+    schema_probe: bool,
+    deferred_vtab_connect: Option<&std::cell::Cell<bool>>,
+) -> (PrepareResult, bool) {
     let effects = take_c_pragma_effects();
     let temp = take_c_temp_opened();
     let rowest = take_c_rowest_clamped();
     let quiet = C_QUIET.with(|c| c.replace(true));
-    let (result, _, reads_schema) = c_prepare_impl(inner, sql, true, None);
+    let (result, _, reads_schema) = c_prepare_impl(inner, sql, schema_probe, None, deferred_vtab_connect);
     C_QUIET.with(|c| c.set(quiet));
     C_PRAGMA_EFFECTS.with(|c| *c.borrow_mut() = effects);
     C_TEMP_OPENED.with(|c| c.set(temp));
@@ -534,7 +571,14 @@ pub(crate) fn select_schema_probe(inner: &ConnectionInner, sql: &str) -> (Prepar
     (result, reads_schema)
 }
 
-fn c_prepare_impl(inner: &ConnectionInner, sql: &str, schema_probe: bool, bound_values: Option<&[Value]>) -> (PrepareResult, usize, bool) {
+fn c_prepare_impl(
+    inner: &ConnectionInner,
+    sql: &str,
+    schema_probe: bool,
+    bound_values: Option<&[Value]>,
+    deferred_vtab_connect: Option<&std::cell::Cell<bool>>,
+) -> (PrepareResult, usize, bool) {
+    let interrupted = deferred_vtab_connect.is_some();
     let host = EngineHost {
         bound_values,
         functions: &inner.functions,
@@ -544,7 +588,8 @@ fn c_prepare_impl(inner: &ConnectionInner, sql: &str, schema_probe: bool, bound_
         wal_autocheckpoint: inner.wal_autocheckpoint_threshold,
         default_locking_mode: i64::from(inner.default_locking_mode == sqliters_pager::LockingMode::Exclusive),
         schema_loaded: std::cell::Cell::new(false),
-        schema_probe,
+        suppress_vtab_callbacks: schema_probe || interrupted,
+        deferred_vtab_connect,
         vtabs: std::cell::RefCell::new(Vec::new()),
     };
     if schema_dump_on() && !C_QUIET.with(std::cell::Cell::get) && sql.contains("/*#schemadump*/") {
@@ -554,6 +599,9 @@ fn c_prepare_impl(inner: &ConnectionInner, sql: &str, schema_probe: bool, bound_
         }
     }
     let mut db = make_db(inner, &host);
+    if interrupted {
+        db.schema_not_loaded = inner.db_set.c_any_schema_unloaded();
+    }
     if schema_probe {
         // Counterfactual cache state only; EncodingFixed remains the real
         // connection's bit (parse.y:523). No connection metadata is changed.

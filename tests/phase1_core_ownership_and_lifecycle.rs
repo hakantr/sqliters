@@ -579,6 +579,175 @@ fn test_group2_try_close_busy_recovery_explicit_finalize_and_facade_drop_lifetim
 // ============================================================================
 
 #[test]
+fn default_interrupt_clears_when_idle_and_stops_active_point_read() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY);
+         INSERT INTO t VALUES(1),(2);",
+    )
+    .unwrap();
+    let interrupt = conn.interrupt_handle();
+
+    interrupt.interrupt();
+    let mut point = conn.prepare("SELECT id FROM t WHERE id=?1").unwrap();
+    assert!(!interrupt.is_interrupted());
+    point.bind(1, 1).unwrap();
+    let mut peer = conn.prepare("SELECT id FROM t ORDER BY id").unwrap();
+
+    interrupt.interrupt();
+    assert!(matches!(point.step().unwrap(), StepResult::Row(_)));
+    assert!(!interrupt.is_interrupted());
+    interrupt.interrupt();
+    assert_eq!(
+        conn.prepare("SELECT id FROM t").unwrap_err().code,
+        ErrorCode::Interrupt,
+    );
+    assert_eq!(peer.step().unwrap_err().code, ErrorCode::Interrupt);
+    assert!(point.is_busy());
+    assert_eq!(peer.reset().unwrap_err().code, ErrorCode::Interrupt);
+    assert_eq!(point.step().unwrap_err().code, ErrorCode::Interrupt);
+    assert!(!point.is_busy());
+    assert_eq!(point.reset().unwrap_err().code, ErrorCode::Interrupt);
+    assert!(interrupt.is_interrupted());
+    assert!(matches!(point.step().unwrap(), StepResult::Row(_)));
+    assert!(!interrupt.is_interrupted());
+    assert!(matches!(point.step().unwrap(), StepResult::Done));
+}
+
+#[test]
+fn active_interrupt_respects_parser_token_order_and_previous_error_offset() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE t(w); INSERT INTO t VALUES(1),(2),(3);")
+        .unwrap();
+    let mut active = conn.prepare("SELECT w FROM t;").unwrap();
+    assert!(matches!(active.step().unwrap(), StepResult::Row(_)));
+    assert_eq!(conn.prepare("SELECT FROM t;").unwrap_err().c_offset(), 7);
+
+    let interrupt = conn.interrupt_handle();
+    interrupt.interrupt();
+    for sql in ["", ";", "@", "/* comment */", "SELECT(1)", "SELECT FROM t;"] {
+        let err = conn.prepare(sql).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Interrupt, "{sql:?}");
+        assert_eq!(err.c_offset(), 7, "{sql:?}");
+    }
+    for (sql, offset) in [("FOO(1);", 0), (")", 0), ("SELEC", 0), ("SELECT;", 6)] {
+        let err = conn.prepare(sql).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Error, "{sql:?}");
+        assert_eq!(err.c_offset(), offset, "{sql:?}");
+    }
+    let mut peer = conn.prepare("SELECT(1);").unwrap();
+    assert!(interrupt.is_interrupted());
+    assert_eq!(active.step().unwrap_err().code, ErrorCode::Interrupt);
+    let StepResult::Row(row) = peer.step().unwrap() else {
+        panic!("the peer runs after the last active statement has halted");
+    };
+    assert_eq!(row.get_i64(0), Some(1));
+    assert!(!interrupt.is_interrupted());
+}
+
+#[test]
+fn interrupted_prepare_invokes_virtual_table_constructor_once() {
+    use sqliters::{Result, SqliteError, VTabHostContext, VirtualTable, VirtualTableModule};
+
+    struct CountingModule(Arc<AtomicU64>);
+
+    impl VirtualTableModule for CountingModule {
+        fn name(&self) -> &str {
+            "interrupt_probe"
+        }
+
+        fn is_eponymous(&self) -> bool {
+            true
+        }
+
+        fn create(
+            &self,
+            ctx: &mut dyn VTabHostContext,
+            args: &[String],
+        ) -> Result<Box<dyn VirtualTable>> {
+            self.connect(ctx, args)
+        }
+
+        fn connect(
+            &self,
+            ctx: &mut dyn VTabHostContext,
+            _args: &[String],
+        ) -> Result<Box<dyn VirtualTable>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ctx.declare_vtab("CREATE TABLE x(v)")?;
+            Err(SqliteError::new(ErrorCode::Error, "declaration was not interrupted"))
+        }
+    }
+
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE t(w); INSERT INTO t VALUES(1),(2);")
+        .unwrap();
+    let calls = Arc::new(AtomicU64::new(0));
+    conn.create_module(Arc::new(CountingModule(Arc::clone(&calls))))
+        .unwrap();
+    let mut active = conn.prepare("SELECT w FROM t;").unwrap();
+    assert!(matches!(active.step().unwrap(), StepResult::Row(_)));
+    conn.interrupt_handle().interrupt();
+
+    let early = conn.prepare("SELECT * FROM(interrupt_probe);").unwrap_err();
+    assert_eq!(early.code, ErrorCode::Interrupt);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let nested = conn.prepare("SELECT*FROM(interrupt_probe);").unwrap_err();
+    assert_eq!(nested.code, ErrorCode::Error);
+    assert_eq!(nested.message, "interrupted");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(active.step().unwrap_err().code, ErrorCode::Interrupt);
+}
+
+#[test]
+fn v1_read_interrupt_step_masks_error_kept_by_reset_and_finalize() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY);
+         INSERT INTO t VALUES(1),(2);",
+    )
+    .unwrap();
+    let interrupt = conn.interrupt_handle();
+    for sql in ["SELECT id FROM t ORDER BY id", "SELECT id FROM t WHERE id=1"] {
+        let mut stmt = conn.prepare_v1(sql).unwrap();
+        assert!(matches!(stmt.step().unwrap(), StepResult::Row(_)));
+        interrupt.interrupt();
+        let error = stmt.step().unwrap_err();
+        assert_eq!(error.code, ErrorCode::Error);
+        assert_eq!(error.message, "SQL logic error");
+        assert_eq!(stmt.reset().unwrap_err().code, ErrorCode::Interrupt);
+
+        assert!(matches!(stmt.step().unwrap(), StepResult::Row(_)));
+        interrupt.interrupt();
+        assert_eq!(stmt.step().unwrap_err().code, ErrorCode::Error);
+        assert_eq!(stmt.finalize().unwrap_err().code, ErrorCode::Interrupt);
+    }
+}
+
+#[test]
+fn explicit_interrupt_flag_preserves_legacy_cancellation() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "PRAGMA encoding='UTF-16le';
+         CREATE TABLE t(id INTEGER PRIMARY KEY);
+         INSERT INTO t VALUES(1),(2);",
+    )
+    .unwrap();
+    let flag = Arc::new(AtomicBool::new(false));
+    conn.set_interrupt_flag(Some(Arc::clone(&flag))).unwrap();
+    let mut stmt = conn
+        .prepare_v1("WITH items AS MATERIALIZED (SELECT id FROM t) SELECT id FROM items")
+        .unwrap();
+
+    flag.store(true, Ordering::SeqCst);
+    assert_eq!(stmt.step().unwrap_err().code, ErrorCode::Interrupt);
+    assert!(flag.load(Ordering::SeqCst));
+    assert_eq!(stmt.reset().unwrap_err().code, ErrorCode::Interrupt);
+    flag.store(false, Ordering::SeqCst);
+    assert!(matches!(stmt.step().unwrap(), StepResult::Row(_)));
+}
+
+#[test]
 fn test_group3_entry_gate_reentrancy_interrupt_mirrors_pending_drops_and_poison_recovery() {
     let sandbox = TempSandbox::new("g3_gate");
     let db_path = sandbox.path().join("gate.db");
@@ -692,7 +861,7 @@ fn test_group3_entry_gate_reentrancy_interrupt_mirrors_pending_drops_and_poison_
     let conn = Arc::try_unwrap(conn).expect("sole Arc<Connection> owner");
     conn.try_close().unwrap();
 
-    // 3. Asynchronous `InterruptHandle` aborts both VDBE and interpreter (`GROUP BY` / `CTE`) queries!
+    // 3. Idle signals expire at the next SQL entry. An already-running read still stops.
     let conn_int = Connection::open(&db_path).unwrap();
     conn_int.execute("BEGIN;").unwrap();
     for i in 100..=600i64 {
@@ -707,14 +876,14 @@ fn test_group3_entry_gate_reentrancy_interrupt_mirrors_pending_drops_and_poison_
 
     let ih = conn_int.interrupt_handle();
     ih.interrupt();
-    assert_eq!(
+    assert!(
         conn_int
             .query("SELECT id, val FROM t WHERE val LIKE '%999%';", &[])
-            .unwrap_err()
-            .code,
-        ErrorCode::Interrupt
+            .unwrap()
+            .rows
+            .is_empty()
     );
-    // Interpreter CTE + GROUP BY path also honors `InterruptHandle`!
+    ih.interrupt();
     assert_eq!(
         conn_int
             .query(
@@ -722,11 +891,22 @@ fn test_group3_entry_gate_reentrancy_interrupt_mirrors_pending_drops_and_poison_
                  SELECT val, COUNT(*) FROM t GROUP BY val;",
                 &[],
             )
-            .unwrap_err()
-            .code,
-        ErrorCode::Interrupt
+            .unwrap()
+            .rows
+            .len(),
+        503,
     );
-    ih.reset();
+    for sql in [
+        "SELECT id, val FROM t WHERE val LIKE 'val-%' ORDER BY id;",
+        "WITH groups AS MATERIALIZED (SELECT val, COUNT(*) FROM t GROUP BY val) SELECT * FROM groups;",
+    ] {
+        let mut scan = conn_int.prepare(sql).unwrap();
+        assert!(matches!(scan.step().unwrap(), StepResult::Row(_)));
+        ih.interrupt();
+        assert_eq!(scan.step().unwrap_err().code, ErrorCode::Interrupt);
+        assert_eq!(scan.reset().unwrap_err().code, ErrorCode::Interrupt);
+        scan.finalize().unwrap();
+    }
     assert_eq!(
         conn_int
             .query_row("SELECT COUNT(*) FROM t;", &[])

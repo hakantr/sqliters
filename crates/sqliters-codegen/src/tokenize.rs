@@ -447,6 +447,7 @@ pub fn sqlite3_run_parser(p: &mut Parse) -> i32 {
     let mut last_token_parsed: i32 = -1;
     let mut mx_sql_len: i64 = p.db.a_limit[SQLITE_LIMIT_SQL_LENGTH as usize] as i64;
     p.rc = SQLITE_OK;
+    let interrupted = p.db.host.prepare_interrupt_pending();
     let mut engine = YyParser::new();
     loop {
         let (mut n, mut token_type) = sqlite3_get_token(&z[pos.min(z.len())..]);
@@ -461,6 +462,13 @@ pub fn sqlite3_run_parser(p: &mut Parse) -> i32 {
                 token_type,
                 TK_SPACE | TK_OVER | TK_FILTER | TK_ILLEGAL | TK_WINDOW | TK_QNUMBER | TK_COMMENT
             ));
+            // tokenize.c checks this before handling whitespace, EOF or illegal tokens.
+            // Rebuilding an already-loaded schema here is local to the code generator.
+            if interrupted && (!p.db.init_busy || p.db.schema_not_loaded) {
+                p.rc = SQLITE_INTERRUPT;
+                p.n_err += 1;
+                break;
+            }
             if token_type == TK_SPACE {
                 pos += n;
                 continue;
@@ -512,6 +520,7 @@ pub fn sqlite3_run_parser(p: &mut Parse) -> i32 {
                 match p.rc {
                     SQLITE_TOOBIG => "string or blob too big",
                     SQLITE_NOMEM => "out of memory",
+                    SQLITE_INTERRUPT => "interrupted",
                     _ => "SQL logic error",
                 }
                 .to_owned(),
