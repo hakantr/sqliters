@@ -14091,12 +14091,7 @@ fn read_table_with_plan_ctx(
                 return scan_table_raw_entries(ctx, db_id, tbl).map(|r| (r, no_scan));
             }
             IndexHint::IndexedBy(idx_name) => {
-                let Some(idx) = slot_ref
-                    .schema
-                    .indexes_for_table(&tbl.name)
-                    .into_iter()
-                    .find(|i| !i.is_autoindex && i.name.eq_ignore_ascii_case(idx_name))
-                else {
+                let Some(idx) = slot_ref.schema.find_index_for_table(tbl, idx_name) else {
                     return Err(SqliteError::new(
                         ErrorCode::Error,
                         format!("no such index: {idx_name}"),
@@ -30693,9 +30688,11 @@ fn prepare_delete_exec(
                 && crate::dml_c::fk_required_delete(ctx.db_set, db_id, &tbl, *ctx.foreign_keys);
             let mut b_complex = has_del_triggers || !del.returning.is_empty() || fk_required;
             if let Some(IndexHint::IndexedBy(ref idx_name)) = del.indexed_by
-                && !indexes
-                    .iter()
-                    .any(|i| !i.is_autoindex && i.name.eq_ignore_ascii_case(idx_name))
+                && ctx
+                    .db_set
+                    .slot(db_id)
+                    .and_then(|slot| slot.schema.find_index_for_table(&tbl, idx_name))
+                    .is_none()
             {
                 return Err(SqliteError::new(
                     ErrorCode::Error,
@@ -47093,11 +47090,7 @@ fn validate_index_hint_static(
     where_hint: Option<&Expr>,
 ) -> Result<()> {
     if let Some(IndexHint::IndexedBy(idx_name)) = indexed_by {
-        let Some(idx) = schema
-            .indexes_for_table(&tbl.name)
-            .into_iter()
-            .find(|i| !i.is_autoindex && i.name.eq_ignore_ascii_case(idx_name))
-        else {
+        let Some(idx) = schema.find_index_for_table(tbl, idx_name) else {
             return Err(SqliteError::new(
                 ErrorCode::Error,
                 format!("no such index: {idx_name}"),

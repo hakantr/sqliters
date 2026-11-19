@@ -970,6 +970,12 @@ impl Schema {
             .find(|idx| idx.name.eq_ignore_ascii_case(name))
     }
 
+    /// Resolves INDEXED BY against the named table's persistent indexes.
+    pub(crate) fn find_index_for_table(&self, table: &TableSchema, name: &str) -> Option<IndexSchema> {
+        self.find_index_including_without_rowid_pk(name)
+            .filter(|index| index.table_name.eq_ignore_ascii_case(&table.name))
+    }
+
     pub fn indexes_for_table(&self, table_name: &str) -> Vec<IndexSchema> {
         self.indexes
             .iter()

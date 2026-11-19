@@ -8596,11 +8596,7 @@ fn validate_index_hint_in_eqp(
     selection: Option<&Expr>,
 ) -> Result<()> {
     if let Some(IndexHint::IndexedBy(idx_name)) = indexed_by {
-        let Some(idx) = slot_schema
-            .indexes_for_table(&tbl.name)
-            .into_iter()
-            .find(|i| !i.is_autoindex && i.name.eq_ignore_ascii_case(idx_name))
-        else {
+        let Some(idx) = slot_schema.find_index_for_table(tbl, idx_name) else {
             return Err(SqliteError::new(
                 ErrorCode::Error,
                 format!("no such index: {idx_name}"),

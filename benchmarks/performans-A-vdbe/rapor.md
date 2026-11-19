@@ -732,3 +732,8 @@ Seçilen UTF-8 ON OR ve IN programlarında hazırlama callback tekrarı kalktı.
 ## V6b.85 — STRICT ve NOT NULL kısıt sırası
 
 Yazma kısıtlarının C sırası ve NOT NULL REPLACE sonrası generated hesaplama uygulandı. Fiziksel dosya ve C açılışı her API ve kipte 162/162 eş. OFF DML dört vaka iyileşti. OFF 1186/1/337, ON 1177/10/337. DML OFF 387/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,256 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_85.md).
+
+
+## V6b.86 — INDEXED BY ve kalıcı şema indeksleri
+
+V1/V2 ve OFF/ON dört grubun her birinde 93/93 ham ve fiziksel C eşliği. Yazma sırası, reset ve yeniden açılış ölçüldü. OFF 1186/1/337, ON 1177/10/337. DML OFF 387/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,251 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_86.md).
