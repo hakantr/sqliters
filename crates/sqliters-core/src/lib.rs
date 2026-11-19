@@ -10335,6 +10335,18 @@ impl Statement {
                         let e = if let Some(snapshot) = journal_mode_snapshot {
                             // OP_JournalMode errors halt the autocommit writer and roll back
                             // across all slots, even after a partial preparation.
+                            if stmt_tx.coordinated_journal_mode
+                                && e.extended_code == ErrorCode::Busy as i32
+                                && stmt_tx.journal_mode_cleanup_error.is_none()
+                            {
+                                for &instance in &snapshot.touched_write_instances {
+                                    if let Some(id) = inner.db_set.find_db_id_by_instance(instance)
+                                        && let Some(btree) = inner.db_set.slot_mut(id).and_then(|slot| slot.btree.as_mut())
+                                    {
+                                        btree.pager_mut().preserve_sql_journal_mode_on_busy();
+                                    }
+                                }
+                            }
                             let rollback = e.clone().with_conflict_effect(ConflictResolutionEffect::Rollback);
                             let aborted = inner.abort_write_statement(hid, &rollback, snapshot, shared);
                             if let Some(cleanup) = stmt_tx.journal_mode_cleanup_error {

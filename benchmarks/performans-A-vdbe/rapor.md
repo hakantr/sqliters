@@ -1107,3 +1107,8 @@ Fiziksel WAL ve mantıksal rollback kipinde sayfa 1 biçimi korunur. 96 retained
 ## V6b.160 — Karma indeks anahtar eşitliği
 
 SQL, C deklarasyonu ve aktif fiziksel sıra uyumunda indeks araması çalışır. 144 yazıcı, 432 rollback ve 7.848 mutasyon ziyareti eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,256 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_160.md).
+
+
+## V6b.161 — Çoklu DELETE ve WAL geçişinde BUSY sonrası kip
+
+Önceden biten slotların hedef kipi gerçek okumaya kadar korunur. 228 doğal çekişme akışı, 456 ana DB ve 684 salt okunur C açılışı eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,227 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_161.md).

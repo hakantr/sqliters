@@ -280,6 +280,7 @@ struct HotJournalSection {
 struct SqlJournalModeTransition {
     previous: JournalMode,
     target: JournalMode,
+    keep_mode_after_busy: bool,
 }
 
 /// Manages page-level reads, writes, caching, rollback journaling, WAL protocol, crash recovery,
@@ -319,6 +320,7 @@ pub struct Pager {
     // The target is visible while the page-one write belongs to the
     // statement paused at its result row.
     pending_sql_journal_mode: Option<SqlJournalModeTransition>,
+    sql_journal_mode_after_busy: Option<JournalMode>,
     journal_size_limit: i64,
 
     header: DatabaseHeader,
@@ -656,6 +658,7 @@ impl Pager {
             } else { LockingMode::Normal },
             journal_mode,
             pending_sql_journal_mode: None,
+            sql_journal_mode_after_busy: None,
             journal_size_limit: -1,
             header: candidate_header,
             header_loaded: false,
@@ -1289,9 +1292,10 @@ impl Pager {
 
     #[inline]
     pub const fn journal_mode(&self) -> JournalMode {
-        match self.pending_sql_journal_mode {
-            Some(transition) => transition.target,
-            None => self.journal_mode,
+        match (self.pending_sql_journal_mode, self.sql_journal_mode_after_busy) {
+            (Some(transition), _) => transition.target,
+            (None, Some(mode)) => mode,
+            (None, None) => self.journal_mode,
         }
     }
 
@@ -2542,15 +2546,16 @@ impl Pager {
     }
 
     fn stage_journal_mode(&mut self, mode: JournalMode, single_target: bool) -> Result<(JournalMode, bool)> {
+        let previous_mode = self.sql_journal_mode_after_busy.unwrap_or(self.journal_mode);
         let touches_volatile_journal = matches!(mode, JournalMode::Memory | JournalMode::Off)
-            || matches!(self.journal_mode, JournalMode::Memory | JournalMode::Off);
+            || matches!(previous_mode, JournalMode::Memory | JournalMode::Off);
         let defer = self.state == TransactionState::Open
             && self.db_kind == DatabaseKind::NamedDisk
             && self.page_count > 0
             && self.pending_sql_journal_mode.is_none()
             && (!touches_volatile_journal || self.locking_mode == LockingMode::Normal)
             && matches!(
-                (self.journal_mode, mode),
+                (previous_mode, mode),
                 (JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate
                     | JournalMode::Memory | JournalMode::Off, JournalMode::Wal)
                     | (JournalMode::Wal, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate
@@ -2564,6 +2569,19 @@ impl Pager {
             );
         let active = self.change_journal_mode(mode, defer, honor_persistence)?;
         Ok((active, defer && self.pending_sql_journal_mode.is_some()))
+    }
+
+    /// Preserve the SQL mode of a slot whose opcode succeeded before another slot returned BUSY.
+    #[doc(hidden)]
+    pub fn preserve_sql_journal_mode_on_busy(&mut self) {
+        if let Some(transition) = self.pending_sql_journal_mode.as_mut()
+            && matches!(
+                (transition.previous, transition.target),
+                (JournalMode::Delete, JournalMode::Wal) | (JournalMode::Wal, JournalMode::Delete)
+            )
+        {
+            transition.keep_mode_after_busy = true;
+        }
     }
 
     /// Releases resources of a failed, not-yet-owned multi-slot preparation.
@@ -2595,11 +2613,11 @@ impl Pager {
             return Ok(self.journal_mode());
         }
 
-        let old_mode = self.journal_mode;
+        let old_mode = self.sql_journal_mode_after_busy.unwrap_or(self.journal_mode);
         let target_mode = self.effective_journal_mode_target(mode);
 
         if target_mode == old_mode {
-            return Ok(self.journal_mode);
+            return Ok(old_mode);
         }
 
         if (old_mode == JournalMode::Wal || target_mode == JournalMode::Wal)
@@ -2614,6 +2632,8 @@ impl Pager {
                 },
             ));
         }
+
+        self.sql_journal_mode_after_busy = None;
 
         // Transition 1: `Rollback -> WAL` (`vdbe.c:8296-8315`, `btree.c:11581-11600`)
         if target_mode == JournalMode::Wal {
@@ -2659,6 +2679,7 @@ impl Pager {
                     self.pending_sql_journal_mode = Some(SqlJournalModeTransition {
                         previous: saved_mode,
                         target: JournalMode::Wal,
+                        keep_mode_after_busy: false,
                     });
                     return Ok(());
                 }
@@ -2737,6 +2758,7 @@ impl Pager {
                         self.pending_sql_journal_mode = Some(SqlJournalModeTransition {
                             previous: old_mode,
                             target: target_mode,
+                            keep_mode_after_busy: false,
                         });
                         return Ok(());
                     }
@@ -3315,6 +3337,7 @@ impl Pager {
             }
             return Err(e);
         }
+        self.sql_journal_mode_after_busy = None;
         // lockBtree (btree.c:3322–3323): a failed page 1 acquisition
         // must abort the read instead of being reduced to page1_ref=false.
         self.state = TransactionState::Read;
@@ -5782,6 +5805,11 @@ impl Pager {
             if transition.target != JournalMode::Wal || self.journal_mode == JournalMode::Off {
                 self.journal_mode = transition.previous;
             }
+            if transition.keep_mode_after_busy {
+                // OP_JournalMode restores the failed slot's mode. Earlier opcodes keep
+                // theirs until the next read reopens the actual database format.
+                self.sql_journal_mode_after_busy = Some(transition.target);
+            }
         }
         if was_write && let Err(ref error) = result {
             self.latch_pager_error(error);
@@ -6706,6 +6734,7 @@ impl Pager {
         self.commit_phase_one_done = false;
         self.journal_started_in_tx = false;
         self.pending_sql_journal_mode = None;
+        self.sql_journal_mode_after_busy = None;
         self.suppress_auto_wal = false;
         self.set_state(TransactionState::Open);
         self.pager_error = None;
