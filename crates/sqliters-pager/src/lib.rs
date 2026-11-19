@@ -6654,7 +6654,6 @@ impl Pager {
         let idle_wal = self.state == TransactionState::Open
             && self.locking_mode == LockingMode::Normal
             && !self.uses_temp_file_semantics()
-            && !self.readonly
             && self.pager_error.is_none()
             && self.use_wal();
         let idle_volatile_journal = self.state == TransactionState::Open
@@ -6681,7 +6680,7 @@ impl Pager {
             let ckpt_sync = self.ckpt_sync_flags();
             let persist_wal = self.persist_wal;
             if let Some(ref db_fd) = self.file {
-                let close = if idle_wal {
+                let close = if idle_wal && !self.readonly {
                     let checkpoint_on_close = self.db_size == 0 || match db_fd.has_moved() {
                         Ok(moved) => !moved,
                         Err(error) => error.extended_code == ErrorCode::NotFound as i32,
