@@ -1162,3 +1162,8 @@ V1 işlem içi journal_mode dış step için genel C tanısını, reset ve final
 ## V6b.171 — Salt okunur journal_mode sorgusu hazırlığı
 
 Soğuk salt okunur NamedDisk sorgusu prepare sırasında mevcut şema yükleme yolunu kullanır. 148 profil, 444 akış ve 531 C açılışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,247 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_171.md).
+
+
+## V6b.172 — İkinci indeksli eşitlik yazıları
+
+Etkin yazma görüntüsünde doğrulanan ikinci kök, kolasyon uygunluğuna göre normal eşitlik erişimini seçer. 576 native yazıcı, 1.152 rollback, 1.728 açılış ve ayrı 144 çok sayfalı yazıcı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,257 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_172.md).

@@ -24516,13 +24516,20 @@ impl<'a> MixedIndexWrite<'a> {
     }
 
     fn applies_with_second_index(self, table: &TableSchema) -> bool {
-        let selection = match self {
-            Self::Insert(insert) => return matches!(insert.source, InsertSource::Values(_)),
-            Self::Update(update) => update.selection.as_ref(),
-            Self::Delete { stmt, .. } => stmt.selection.as_ref(),
-        };
+        if let Self::Insert(insert) = self {
+            return matches!(insert.source, InsertSource::Values(_));
+        }
+        let selection = self.selection();
         !matches!(selection, Some(Expr::InList { .. }))
             && mixed_index_rowid_selection(table, selection)
+    }
+
+    fn selection(self) -> Option<&'a Expr> {
+        match self {
+            Self::Insert(_) => None,
+            Self::Update(update) => update.selection.as_ref(),
+            Self::Delete { stmt, .. } => stmt.selection.as_ref(),
+        }
     }
 
     fn applies(
@@ -24903,6 +24910,12 @@ fn ordinary_single_column_index(table: &TableSchema, index: &IndexSchema) -> Opt
     (collation == key.sort_order.collation).then_some(column)
 }
 
+struct MixedIndexWritePlan {
+    mixed_root: Pgno,
+    mixed_declared: Collation,
+    scan_index: Option<(Pgno, Collation)>,
+}
+
 fn mixed_index_write_root<'a>(
     write: MixedIndexWrite<'_>,
     db_id: DatabaseId,
@@ -24910,13 +24923,17 @@ fn mixed_index_write_root<'a>(
     table: &TableSchema,
     mut indexes: impl Iterator<Item = &'a IndexSchema>,
     collations: &CollationRegistry,
-) -> Option<(Pgno, Collation)> {
+) -> Option<MixedIndexWritePlan> {
     let first = indexes.next()?;
     let collation = |index: &IndexSchema| {
         mixed_index_write_collation(write, db_id, db_set, table, index, collations)
     };
     let Some(second) = indexes.next() else {
-        return collation(first).map(|declared| (first.root_pgno, declared));
+        return collation(first).map(|declared| MixedIndexWritePlan {
+            mixed_root: first.root_pgno,
+            mixed_declared: declared,
+            scan_index: Some((first.root_pgno, declared)),
+        });
     };
     if indexes.next().is_some()
         || first.root_pgno == second.root_pgno
@@ -24924,7 +24941,6 @@ fn mixed_index_write_root<'a>(
         || [first, second]
             .iter()
             .any(|index| index.stat1.as_ref().is_some_and(|stat| stat.has_stat1))
-        || !write.applies_with_second_index(table)
     {
         return None;
     }
@@ -24933,7 +24949,17 @@ fn mixed_index_write_root<'a>(
             && let Some(column) = ordinary_single_column_index(table, ordinary)
             && mixed.columns[0].col_idx != Some(column)
         {
-            return Some((mixed.root_pgno, declared));
+            let key = &ordinary.columns[0];
+            let scan_index = (table.columns[column].affinity == TypeAffinity::Text
+                && mixed_index_key_equality(table, key, write.selection()).is_some())
+            .then_some((ordinary.root_pgno, key.sort_order.collation));
+            if scan_index.is_some() || write.applies_with_second_index(table) {
+                return Some(MixedIndexWritePlan {
+                    mixed_root: mixed.root_pgno,
+                    mixed_declared: declared,
+                    scan_index,
+                });
+            }
         }
     }
     None
@@ -25026,7 +25052,7 @@ fn prepare_dml_write_slot(
     write: MixedIndexWrite<'_>,
     is_catalog: bool,
     fallback_tbl: TableSchema,
-) -> Result<(TableSchema, Vec<IndexSchema>, String, Option<Collation>)> {
+) -> Result<(TableSchema, Vec<IndexSchema>, String, Option<(Pgno, Collation)>)> {
     if db_id == DatabaseId::TEMP {
         let enc = ctx.encoding();
         ctx.db_set.ensure_temp_open(enc, *ctx.writable_schema)?;
@@ -25061,13 +25087,13 @@ fn prepare_dml_write_slot(
     // constraints and writes / deletes index entries (`sqlite3CompleteInsertion`,
     // `sqlite3GenerateRowIndexDelete`).
     let mut indexes = dml_ordered_indexes(&tbl, &slot.schema.indexes_for_table(&tbl.name));
-    let mut mixed_declared = None;
-    if let Some((root, declared)) =
+    let mut scan_index = None;
+    if let Some(plan) =
         mixed_index_write_root(write, db_id, ctx.db_set, &tbl, indexes.iter(), ctx.collations)
     {
         for index in &mut indexes {
-            let collation = if index.root_pgno == root {
-                declared
+            let collation = if index.root_pgno == plan.mixed_root {
+                plan.mixed_declared
             } else {
                 index.columns[0].sort_order.collation
             };
@@ -25075,10 +25101,18 @@ fn prepare_dml_write_slot(
             index.columns[0].sort_order.collation = comparator;
         }
         ctx.stmt_tx.reverse_mixed_scan = ctx.stmt_tx.prepared_reverse_order;
-        // Indexed predicates remain in the single-index scope.
-        mixed_declared = (indexes.len() == 1).then_some(declared);
+        scan_index = plan.scan_index;
     }
-    Ok((tbl, indexes, sname, mixed_declared))
+    Ok((tbl, indexes, sname, scan_index))
+}
+
+fn dml_snapshot_scan_index(
+    indexes: &[IndexSchema],
+    scan_index: Option<(Pgno, Collation)>,
+) -> Option<(&IndexSchema, Collation)> {
+    let (root, collation) = scan_index?;
+    let index = indexes.iter().find(|index| index.root_pgno == root)?;
+    Some((index, collation))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30350,7 +30384,7 @@ fn prepare_update_exec<'a>(
                 None
             };
 
-            let (tbl, indexes, schema_name, mixed_declared) =
+            let (tbl, indexes, schema_name, scan_index) =
                 prepare_dml_write_slot(ctx, db_id, MixedIndexWrite::Update(upd), is_catalog, *initial_tbl)?;
             let (enc, _) = slot_encoding_and_name(ctx, db_id);
             let resolved_assigns = resolve_set_assignments_for_table(&tbl, &upd.assignments)?;
@@ -30371,7 +30405,7 @@ fn prepare_update_exec<'a>(
                 upd.alias.as_deref(),
                 upd.indexed_by.as_ref(),
                 plan_where_hint,
-                indexes.first().zip(mixed_declared),
+                dml_snapshot_scan_index(&indexes, scan_index),
                 params,
                 outer_scopes,
                 &dml_ctes,
@@ -32093,7 +32127,7 @@ fn prepare_delete_exec(
                 stmt: del,
                 allow_where_one: ctx.stmt_tx.allow_mixed_where_one,
             };
-            let (tbl, indexes, schema_name, mixed_declared) =
+            let (tbl, indexes, schema_name, scan_index) =
                 prepare_dml_write_slot(ctx, db_id, write, is_catalog, *initial_tbl)?;
             let has_del_triggers = !is_catalog
                 && ctx.db_set.has_active_triggers_for_event(
@@ -32156,7 +32190,7 @@ fn prepare_delete_exec(
                 del.alias.as_deref(),
                 del.indexed_by.as_ref(),
                 del.selection.as_ref(),
-                indexes.first().zip(mixed_declared),
+                dml_snapshot_scan_index(&indexes, scan_index),
                 params,
                 outer_scopes,
                 &dml_ctes,
