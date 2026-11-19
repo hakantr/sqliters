@@ -20079,7 +20079,17 @@ fn decode_table_logical_row(
 ) -> Result<Vec<Value>> {
     let (enc, schema_name) = slot_encoding_and_name(ctx, db_id);
     let phys_vals = decode_record_with_encoding(payload, enc)?;
+    decode_table_logical_fields(ctx, tbl, rkey, phys_vals, params, &schema_name)
+}
 
+fn decode_table_logical_fields(
+    ctx: &mut ExecContext<'_>,
+    tbl: &TableSchema,
+    rkey: &TableRowKey,
+    phys_vals: Vec<Value>,
+    params: &[Value],
+    schema_name: &str,
+) -> Result<Vec<Value>> {
     if tbl.without_rowid {
         let mut logical_vals = vec![Value::Null; tbl.columns.len()];
         let mut assigned = vec![false; tbl.columns.len()];
@@ -20124,7 +20134,7 @@ fn decode_table_logical_row(
         }
         for ci in generated_col_eval_order(tbl) {
             if let Some((ref gexpr, false)) = tbl.columns[ci].generated {
-                let scope = make_single_table_scope(tbl, &schema_name, None, 0, &logical_vals);
+                let scope = make_single_table_scope(tbl, schema_name, None, 0, &logical_vals);
                 let gv = eval_expr(ctx, gexpr, params, &[scope], &CteStore::default(), None)?;
                 let mut coerced = tbl.columns[ci].affinity.apply(gv);
                 if tbl.strict
@@ -20219,7 +20229,7 @@ fn decode_table_logical_row(
 
     for ci in generated_col_eval_order(tbl) {
         if let Some((ref gexpr, false)) = tbl.columns[ci].generated {
-            let scope = make_single_table_scope(tbl, &schema_name, None, rowid, &logical_vals);
+            let scope = make_single_table_scope(tbl, schema_name, None, rowid, &logical_vals);
             let gv = eval_expr(ctx, gexpr, params, &[scope], &CteStore::default(), None)?;
             let mut coerced = tbl.columns[ci].affinity.apply(gv);
             if tbl.strict
@@ -24440,14 +24450,15 @@ fn mixed_point_write_collation(
     let [key] = index.columns.as_slice() else {
         return None;
     };
+    let key_column = key.col_idx?;
     if db_id != DatabaseId::MAIN
         || table.without_rowid || table.strict || table.autoincrement
-        || table.rowid_alias_col != Some(0) || table.columns.len() != 2
+        || table.columns.len() < 2 || table.rowid_alias_col == Some(key_column)
         || table.rowid_pk_conflict != ConflictAction::Abort || !table.checks.is_empty()
         || index.root_pgno <= 1 || table.root_pgno <= 1
-        || key.col_idx != Some(1) || key.expr.is_some() || key.sort_order.custom_collation.is_some()
+        || key.expr.is_some() || key.sort_order.custom_collation.is_some()
         || key.sort_order.desc != key.sort_order.nulls_last
-        || !table.columns.get(1).is_some_and(|column| column.affinity == TypeAffinity::Text)
+        || !table.columns.get(key_column).is_some_and(|column| column.affinity == TypeAffinity::Text)
         || table.columns.iter().any(|column| {
             column.generated.is_some() || column.default_expr.is_some() || column.custom_collation.is_some()
         })
@@ -24489,7 +24500,8 @@ pub(crate) fn mixed_point_write(
 }
 
 fn physical_point_write_collation(
-    btree: &mut Btree,
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
     table: &TableSchema,
     index: &IndexSchema,
     declared: Collation,
@@ -24498,27 +24510,42 @@ fn physical_point_write_collation(
         ErrorCode::Error,
         format!("unable to verify physical order of index {}", index.name),
     );
-    if btree.transaction_state() != TransactionState::Write
-        || !btree.integrity_check_report(&[table.root_pgno, index.root_pgno], true, 1)?.messages.is_empty()
-    {
-        return Err(unverified());
-    }
-    let encoding = btree.encoding();
-    let mut rows = HashMap::new();
-    for (rowid, record) in btree.scan_table(table.root_pgno)? {
+    let key_column = index
+        .columns
+        .first()
+        .and_then(|key| key.col_idx)
+        .ok_or_else(unverified)?;
+    let (encoding, schema_name) = slot_encoding_and_name(ctx, db_id);
+    let (table_rows, records) = {
+        let btree = ctx.db_set.slot_mut(db_id).and_then(|slot| slot.btree.as_mut())
+            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
+        if btree.transaction_state() != TransactionState::Write
+            || !btree.integrity_check_report(&[table.root_pgno, index.root_pgno], true, 1)?.messages.is_empty()
+        {
+            return Err(unverified());
+        }
+        (btree.scan_table(table.root_pgno)?, btree.scan_index(index.root_pgno)?)
+    };
+    let mut rows = HashMap::with_capacity(table_rows.len());
+    for (rowid, record) in table_rows {
         let fields = decode_record_with_encoding(&record, encoding)?;
-        // The B-tree key supplies the INTEGER PRIMARY KEY alias. For rows
-        // written before ADD COLUMN, the absent nullable key defaults to NULL.
-        let indexed_value = match fields.as_slice() {
-            [Value::Null] => Value::Null,
-            [Value::Null, indexed_value] => indexed_value.clone(),
-            _ => return Err(unverified()),
-        };
+        if fields.len() > table.columns.len()
+            || table.rowid_alias_col
+                .and_then(|column| fields.get(column))
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err(unverified());
+        }
+        // Use the writer's row decoder for columns added after the record was
+        // written. The shape guard excludes defaults and generated columns.
+        let logical_fields = decode_table_logical_fields(
+            ctx, table, &TableRowKey::Rowid(rowid), fields, &[], &schema_name,
+        )?;
+        let indexed_value = logical_fields.into_iter().nth(key_column).ok_or_else(unverified)?;
         if rows.insert(rowid, indexed_value).is_some() {
             return Err(unverified());
         }
     }
-    let records = btree.scan_index(index.root_pgno)?;
     for record in &records {
         let fields = decode_record_with_encoding(record, encoding)?;
         let [value, Value::Integer(rowid)] = fields.as_slice() else {
@@ -24599,9 +24626,7 @@ fn prepare_dml_write_slot(
             write, db_id, ctx.db_set, &tbl, index, ctx.collations,
         )
     {
-        let btree = ctx.db_set.slot_mut(db_id).and_then(|slot| slot.btree.as_mut())
-            .ok_or_else(|| SqliteError::misuse("database slot closed"))?;
-        let comparator = physical_point_write_collation(btree, &tbl, index, declared)?;
+        let comparator = physical_point_write_collation(ctx, db_id, &tbl, index, declared)?;
         index.columns[0].sort_order.collation = comparator;
     }
     Ok((tbl, indexes, sname))
