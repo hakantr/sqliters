@@ -24809,7 +24809,6 @@ fn mixed_index_rowid_range(table: &TableSchema, terms: &[&Expr]) -> bool {
 }
 
 fn mixed_index_write_collation(
-    write: MixedIndexWrite<'_>,
     db_id: DatabaseId,
     db_set: &DatabaseSet,
     table: &TableSchema,
@@ -24836,7 +24835,6 @@ fn mixed_index_write_collation(
             slot.schema.tables.iter().any(|table| !table.foreign_keys.is_empty())
         })
         || ["BINARY", "NOCASE", "RTRIM"].iter().any(|name| collations.get_custom(name).is_some())
-        || !write.applies(table, index, key, db_set)
     {
         return None;
     }
@@ -24926,14 +24924,16 @@ fn mixed_index_write_root<'a>(
 ) -> Option<MixedIndexWritePlan> {
     let first = indexes.next()?;
     let collation = |index: &IndexSchema| {
-        mixed_index_write_collation(write, db_id, db_set, table, index, collations)
+        mixed_index_write_collation(db_id, db_set, table, index, collations)
     };
     let Some(second) = indexes.next() else {
-        return collation(first).map(|declared| MixedIndexWritePlan {
-            mixed_root: first.root_pgno,
-            mixed_declared: declared,
-            scan_index: Some((first.root_pgno, declared)),
-        });
+        let declared = collation(first)?;
+        return write.applies(table, first, &first.columns[0], db_set)
+            .then_some(MixedIndexWritePlan {
+                mixed_root: first.root_pgno,
+                mixed_declared: declared,
+                scan_index: Some((first.root_pgno, declared)),
+            });
     };
     if indexes.next().is_some()
         || first.root_pgno == second.root_pgno
@@ -24953,7 +24953,14 @@ fn mixed_index_write_root<'a>(
             let scan_index = (table.columns[column].affinity == TypeAffinity::Text
                 && mixed_index_key_equality(table, key, write.selection()).is_some())
             .then_some((ordinary.root_pgno, key.sort_order.collation));
-            if scan_index.is_some() || write.applies_with_second_index(table) {
+            let mixed_key = &mixed.columns[0];
+            let writes_scan_key = scan_index.is_some()
+                && matches!(write, MixedIndexWrite::Update(_))
+                && mixed_index_table_equality(table, mixed_key, write.selection())
+                && write.applies(table, ordinary, key, db_set);
+            if (scan_index.is_some() || write.applies_with_second_index(table))
+                && (write.applies(table, mixed, mixed_key, db_set) || writes_scan_key)
+            {
                 return Some(MixedIndexWritePlan {
                     mixed_root: mixed.root_pgno,
                     mixed_declared: declared,
