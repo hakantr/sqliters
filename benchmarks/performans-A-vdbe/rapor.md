@@ -1142,3 +1142,8 @@ Mevcut izinli native OFF ve WAL geçişi C gibi ara kip, fiziksel geri alma ve n
 ## V6b.167 — NO_CKPT_ON_CLOSE bağlantı ayarı
 
 Bağlantı ve CLI aynı C uyumlu kapanış checkpoint ayarını kullanır. 702 doğal akış, 819 pager sınırı ve 846 C açılışı eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,250 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_167.md).
+
+
+## V6b.168 — Karma ve olağan iki indeksin yazma ve bütünlüğü
+
+Etkin aynı işlem görüntüsünde iki ayrı kök doğrulanıp mevcut fiziksel kurallarla yazılır. Rust 1.100 ile 288 yazıcı, 576 rollback ve 864 açılış eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_168.md).

@@ -24515,6 +24515,16 @@ impl<'a> MixedIndexWrite<'a> {
         }
     }
 
+    fn applies_with_second_index(self, table: &TableSchema) -> bool {
+        let selection = match self {
+            Self::Insert(insert) => return matches!(insert.source, InsertSource::Values(_)),
+            Self::Update(update) => update.selection.as_ref(),
+            Self::Delete { stmt, .. } => stmt.selection.as_ref(),
+        };
+        !matches!(selection, Some(Expr::InList { .. }))
+            && mixed_index_rowid_selection(table, selection)
+    }
+
     fn applies(
         self,
         table: &TableSchema,
@@ -24844,11 +24854,89 @@ pub(crate) fn mixed_index_write(
     let Some(slot) = db_set.slot(db_id) else {
         return false;
     };
-    let mut indexes = slot.schema.indexes.iter().filter(|index| index.table_name.eq_ignore_ascii_case(&table.name));
-    let (Some(index), None) = (indexes.next(), indexes.next()) else {
-        return false;
+    let indexes = slot
+        .schema
+        .indexes
+        .iter()
+        .filter(|index| index.table_name.eq_ignore_ascii_case(&table.name));
+    mixed_index_write_root(write, db_id, db_set, table, indexes, collations).is_some()
+}
+
+fn ordinary_single_column_index(table: &TableSchema, index: &IndexSchema) -> Option<usize> {
+    let [key] = index.columns.as_slice() else {
+        return None;
     };
-    mixed_index_write_collation(write, db_id, db_set, table, index, collations).is_some()
+    let column = key.col_idx?;
+    if index.root_pgno <= 1
+        || index.unique
+        || index.is_autoindex
+        || index.where_clause.is_some()
+        || key.expr.is_some()
+        || key.sort_order.custom_collation.is_some()
+        || key.sort_order.desc != key.sort_order.nulls_last
+        || table.rowid_alias_col == Some(column)
+    {
+        return None;
+    }
+    let sql = index.raw_sql.as_deref()?;
+    let (Some(Stmt::CreateIndex(create)), _) = parse_one(sql).ok()? else {
+        return None;
+    };
+    let [term] = create.columns.as_slice() else {
+        return None;
+    };
+    let declared = table.columns.get(column)?;
+    if term.expr.is_some()
+        || !term.name.eq_ignore_ascii_case(&declared.name)
+        || tokenize(sql)
+            .ok()?
+            .iter()
+            .filter(|token| token.kind == TokenKind::Collate)
+            .count() > 1
+    {
+        return None;
+    }
+    let collation = match &term.collation {
+        Some(name) => Collation::from_name(name)?,
+        None => declared.collation,
+    };
+    (collation == key.sort_order.collation).then_some(column)
+}
+
+fn mixed_index_write_root<'a>(
+    write: MixedIndexWrite<'_>,
+    db_id: DatabaseId,
+    db_set: &DatabaseSet,
+    table: &TableSchema,
+    mut indexes: impl Iterator<Item = &'a IndexSchema>,
+    collations: &CollationRegistry,
+) -> Option<(Pgno, Collation)> {
+    let first = indexes.next()?;
+    let collation = |index: &IndexSchema| {
+        mixed_index_write_collation(write, db_id, db_set, table, index, collations)
+    };
+    let Some(second) = indexes.next() else {
+        return collation(first).map(|declared| (first.root_pgno, declared));
+    };
+    if indexes.next().is_some()
+        || first.root_pgno == second.root_pgno
+        || table.stat1.has_stat1
+        || [first, second]
+            .iter()
+            .any(|index| index.stat1.as_ref().is_some_and(|stat| stat.has_stat1))
+        || !write.applies_with_second_index(table)
+    {
+        return None;
+    }
+    for (mixed, ordinary) in [(first, second), (second, first)] {
+        if let Some(declared) = collation(mixed)
+            && let Some(column) = ordinary_single_column_index(table, ordinary)
+            && mixed.columns[0].col_idx != Some(column)
+        {
+            return Some((mixed.root_pgno, declared));
+        }
+    }
+    None
 }
 
 fn physical_index_write_collation(
@@ -24974,15 +25062,21 @@ fn prepare_dml_write_slot(
     // `sqlite3GenerateRowIndexDelete`).
     let mut indexes = dml_ordered_indexes(&tbl, &slot.schema.indexes_for_table(&tbl.name));
     let mut mixed_declared = None;
-    if let [index] = indexes.as_mut_slice()
-        && let Some(declared) = mixed_index_write_collation(
-            write, db_id, ctx.db_set, &tbl, index, ctx.collations,
-        )
+    if let Some((root, declared)) =
+        mixed_index_write_root(write, db_id, ctx.db_set, &tbl, indexes.iter(), ctx.collations)
     {
-        let comparator = physical_index_write_collation(ctx, db_id, &tbl, index, declared)?;
-        index.columns[0].sort_order.collation = comparator;
+        for index in &mut indexes {
+            let collation = if index.root_pgno == root {
+                declared
+            } else {
+                index.columns[0].sort_order.collation
+            };
+            let comparator = physical_index_write_collation(ctx, db_id, &tbl, index, collation)?;
+            index.columns[0].sort_order.collation = comparator;
+        }
         ctx.stmt_tx.reverse_mixed_scan = ctx.stmt_tx.prepared_reverse_order;
-        mixed_declared = Some(declared);
+        // Indexed predicates remain in the single-index scope.
+        mixed_declared = (indexes.len() == 1).then_some(declared);
     }
     Ok((tbl, indexes, sname, mixed_declared))
 }
@@ -44533,9 +44627,24 @@ fn integrity_check_table_rows(
         }
     };
 
-    let declared_key = if !is_quick && let [index] = indexes {
-        integrity_declared_key(db_id, tbl, index, ctx.collations, enc)
-            .map(|key| (index.root_pgno, key))
+    let declared_key = if !is_quick {
+        let key_for = |index: &IndexSchema| {
+            integrity_declared_key(db_id, tbl, index, ctx.collations, enc)
+                .map(|key| (index.root_pgno, key))
+        };
+        match indexes {
+            [index] => key_for(index),
+            [first, second] if first.root_pgno != second.root_pgno => {
+                [(*first, *second), (*second, *first)].into_iter().find_map(|(mixed, ordinary)| {
+                    let column = ordinary_single_column_index(tbl, ordinary)?;
+                    if mixed.columns.first()?.col_idx == Some(column) {
+                        return None;
+                    }
+                    key_for(mixed)
+                })
+            }
+            _ => None,
+        }
     } else {
         None
     };
@@ -44548,7 +44657,7 @@ fn integrity_check_table_rows(
         } else {
             bt.open_table_cursor(tbl.root_pgno, false)
         };
-        let cursor = declared_key.map(|(root, key)| (bt.bc_cursor(root, false, true), key));
+        let cursor = declared_key.map(|(root, key)| (root, bt.bc_cursor(root, false, true), key));
         (cid, cursor)
     };
     let res = (|| -> Result<()> {
@@ -44715,6 +44824,9 @@ fn integrity_check_table_rows(
                         .slot_mut(db_id)
                         .and_then(|s| s.btree.as_mut())
                         .ok_or_else(|| SqliteError::misuse("integrity_check: btree closed"))?;
+                    let mut index_cursor = declared_cursor
+                        .as_mut()
+                        .filter(|(root, _, _)| *root == idx.root_pgno);
                     // An index entry must exist for the current table row. The entry that is
                     // found is examined in the same descent (pragma.c, after `ckUniq`): for a
                     // rowid table the rowid must be the LAST field of the index record, and a
@@ -44725,7 +44837,7 @@ fn integrity_check_table_rows(
                         let n_all = keys.len();
                         let mut present = false;
                         let mut found: Option<Vec<Value>> = None;
-                        if let Some((cursor, key_info)) = &mut declared_cursor {
+                        if let Some((_, cursor, key_info)) = &mut index_cursor {
                             use sqliters_vdbe::vdbeaux_rt::{UnpackedRecord, sqlite3_vdbe_record_unpack};
 
                             let packed = encode_record_with_encoding(&keys, enc);
@@ -44791,7 +44903,7 @@ fn integrity_check_table_rows(
                                 continue;
                             }
                             let differs = idx.columns.iter().enumerate().any(|(kk, ic)| {
-                                let binary = if let Some((_, key_info)) = &declared_cursor {
+                                let binary = if let Some((_, _, key_info)) = &index_cursor {
                                     key_info.a_coll[kk]
                                         .as_ref()
                                         .is_none_or(|collation| collation.is_binary)
@@ -44876,7 +44988,7 @@ fn integrity_check_table_rows(
     })();
     if let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
         bt.close_cursor(cid);
-        if let Some((cursor, _)) = &mut declared_cursor {
+        if let Some((_, cursor, _)) = &mut declared_cursor {
             bt.bc_close_cursor(cursor);
         }
     }
