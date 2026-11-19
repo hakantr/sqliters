@@ -30859,7 +30859,26 @@ fn view_dml_indexed_select(
     {
         return None;
     }
-    let indexes = schema.indexes_for_table(&table.name);
+    let mut indexes = schema.indexes_for_table(&table.name);
+    if max_eq && indexes.len() > 1 {
+        // A literal can change partial-index eligibility. Leave those and
+        // competing leading keys to the existing unpushed view path.
+        if indexes.iter().any(|index| {
+            index.where_clause.is_some()
+                || index.stat1.is_some()
+                || index.columns.iter().any(|col| {
+                    col.col_idx.is_none() || col.sort_order.custom_collation.is_some()
+                })
+        }) {
+            return None;
+        }
+        indexes.retain(|index| {
+            index
+                .columns
+                .first()
+                .is_some_and(|key| key.col_idx == Some(column_index))
+        });
+    }
     let [index] = indexes.as_slice() else {
         return None;
     };
