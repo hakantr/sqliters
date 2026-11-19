@@ -1147,3 +1147,8 @@ Bağlantı ve CLI aynı C uyumlu kapanış checkpoint ayarını kullanır. 702 d
 ## V6b.168 — Karma ve olağan iki indeksin yazma ve bütünlüğü
 
 Etkin aynı işlem görüntüsünde iki ayrı kök doğrulanıp mevcut fiziksel kurallarla yazılır. Rust 1.100 ile 288 yazıcı, 576 rollback ve 864 açılış eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_168.md).
+
+
+## V6b.169 — Salt okunur journal_mode V1 dış tanısı
+
+V1 READONLY dış step için genel C tanısını, reset ve finalize için asıl kodu taşır. 24 native grup ve 72 C açılışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,265 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_169.md).

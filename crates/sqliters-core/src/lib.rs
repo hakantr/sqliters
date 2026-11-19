@@ -9794,10 +9794,12 @@ impl Statement {
         let result = self.step_in_session_impl(shared, inner);
         if self.mode == PrepareMode::V1
             && self.is_journal_mode_pragma()
-            && result.as_ref().is_err_and(|error| matches!(error.code, ErrorCode::Busy | ErrorCode::Schema))
+            && result.as_ref().is_err_and(|error| {
+                matches!(error.code, ErrorCode::Busy | ErrorCode::Schema | ErrorCode::ReadOnly)
+            })
         {
             // Legacy OP_JournalMode step callers see SQLITE_ERROR. Reset and finalize
-            // read the underlying BUSY or SCHEMA result from the statement.
+            // read the underlying error from the statement.
             return Err(inner.legacy_c_step_error());
         }
         let file_reader = self.category == Some(StmtCategory::Read)
