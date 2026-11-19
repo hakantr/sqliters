@@ -725,6 +725,45 @@ fn v1_read_interrupt_step_masks_error_kept_by_reset_and_finalize() {
 }
 
 #[test]
+fn v1_interrupted_read_keeps_the_connection_diagnostic() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES(1),(2);")
+        .unwrap();
+    for action in ["keep", "range", "prepare"] {
+        let mut active = conn.prepare_v1("SELECT x FROM t;").unwrap();
+        let mut unused = conn.prepare("SELECT ?1;").unwrap();
+        assert!(matches!(active.step().unwrap(), StepResult::Row(_)));
+        conn.interrupt_handle().interrupt();
+        let parser_error = conn.prepare("SELEC 1;").unwrap_err();
+        assert_eq!(parser_error.c_offset(), 0);
+        unused.bind_text(1, "text").unwrap();
+        unused.bind(1, Value::Null).unwrap();
+        unused.clear_bindings().unwrap();
+        unused.reset().unwrap();
+        let (message, offset) = match action {
+            "range" => {
+                let error = unused.bind(2, 1).unwrap_err();
+                assert_eq!(error.code, ErrorCode::Range);
+                assert_eq!(error.c_offset(), 0);
+                (ErrorCode::Error.as_str(), 0)
+            }
+            "prepare" => {
+                conn.prepare("SELECT(1);").unwrap().finalize().unwrap();
+                (ErrorCode::Error.as_str(), -1)
+            }
+            _ => (parser_error.message.as_str(), 0),
+        };
+        unused.finalize().unwrap();
+        let error = active.step().unwrap_err();
+        assert_eq!(error.code, ErrorCode::Error);
+        assert_eq!((error.message.as_str(), error.c_offset()), (message, offset));
+        let real_error = active.reset().unwrap_err();
+        assert_eq!(real_error.code, ErrorCode::Interrupt);
+        assert_eq!((real_error.message.as_str(), real_error.c_offset()), ("interrupted", -1));
+    }
+}
+
+#[test]
 fn explicit_interrupt_flag_preserves_legacy_cancellation() {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(

@@ -702,3 +702,8 @@ Legacy planlayıcı üretilen sütunun C kullanım maskesini ve örtücü ifade 
 ## V6b.79 — TRUE/FALSE adları ve IS truth testi
 
 C'nin ad çözümü ve truth testi ölçülen SELECT ve DML kapsamlarında hizalandı. 480 değer, 72 DML ve 648 yeniden açılış iki kipte C eş. Dört yeni test iki kipte geçti. OFF 1185/1/337, ON 1176/10/337. DML ve ayrışma bulucu V6b.78 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,247 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_79.md).
+
+
+## V6b.80 — V1 bağlantı tanısı ve gerçek reset kodu
+
+Varsayılan okuma kesintisinde V1 step, bağlantıda saklanan mesaj ve ofsetle rc1 veriyor. Reset ve finalize gerçek rc9'u koruyor. 324 native vaka iki kipte C eş. Yeni V1 regresyonu iki kipte geçti. OFF 1186/1/337, ON 1177/10/337. DML ve ayrışma bulucu V6b.79 ile aynı. Önceki 147 kurtarma eşit. Rust 1.100 süre oranı 1,254 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_80.md).

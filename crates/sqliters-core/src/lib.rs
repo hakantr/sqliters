@@ -1072,6 +1072,8 @@ pub(crate) struct ConnectionInner {
     pub(crate) count_changes: bool,
     pub(crate) wal_autocheckpoint_threshold: i32,
     pub(crate) c_error_byte_offset: i32,
+    // An ordinary prepare or read error may outlive a later successful API call.
+    c_retained_error_message: Option<String>,
     pub(crate) default_locking_mode: LockingMode,
     pub(crate) writable_schema: bool,
     pub(crate) working_dir: Option<PathBuf>,
@@ -1760,6 +1762,21 @@ impl ConnectionInner {
         if self.activity.leases.is_empty() && self.uses_default_interrupt_flag(shared) {
             shared.interrupt_flag.store(false, Ordering::SeqCst);
         }
+    }
+
+    fn record_c_prepare_error(&mut self, error: Option<&SqliteError>) {
+        self.c_error_byte_offset = error
+            .and_then(|e| e.offset)
+            .and_then(|offset| i32::try_from(offset).ok())
+            .unwrap_or(-1);
+        self.c_retained_error_message = error
+            .filter(|e| matches!(e.code, ErrorCode::Error | ErrorCode::Interrupt))
+            .map(|e| e.message.clone());
+    }
+
+    fn transfer_c_read_error(&mut self, error: Option<&SqliteError>) {
+        self.c_error_byte_offset = -1;
+        self.c_retained_error_message = error.map(|e| e.message.clone());
     }
 
     #[inline]
@@ -3558,6 +3575,7 @@ impl Connection {
             count_changes: false,
             wal_autocheckpoint_threshold: SQLITE_DEFAULT_WAL_AUTOCHECKPOINT,
             c_error_byte_offset: -1,
+            c_retained_error_message: None,
             default_locking_mode: LockingMode::Normal,
             writable_schema: false,
             working_dir: None,
@@ -3789,14 +3807,16 @@ impl Connection {
             {
                 let trimmed = sql.trim_start_matches([' ', '\t', '\r', '\n']);
                 if trimmed.is_empty() {
-                    session.inner_mut().c_error_byte_offset = -1;
+                    session.inner_mut().record_c_prepare_error(None);
                     break;
                 }
                 if let Some((res, tail)) = session
                     .inner_mut()
                     .try_fast_exec_literal_insert_step(&self.shared, trimmed)
                 {
-                    session.inner_mut().c_error_byte_offset = res.as_ref().err()
+                    let inner = session.inner_mut();
+                    inner.c_retained_error_message = None;
+                    inner.c_error_byte_offset = res.as_ref().err()
                         .and_then(|e| e.offset).and_then(|n| i32::try_from(n).ok()).unwrap_or(-1);
                     res?;
                     sql = tail;
@@ -7967,12 +7987,8 @@ impl Statement {
         } else {
             Self::compile_in_session(shared, inner, sql, mode, false)
         };
-        // prepare.c:821–842: error_msg sets the offset; a bare error keeps
-        // db.errByteOffset. A successful sqlite3Prepare calls ErrorClear.
-        inner.c_error_byte_offset = match &result {
-            Ok(_) => -1,
-            Err(e) => e.offset.and_then(|n| i32::try_from(n).ok()).unwrap_or(-1),
-        };
+        // prepare.c:821–842 clears the diagnostic on success and copies the parser error otherwise.
+        inner.record_c_prepare_error(result.as_ref().err());
         result
     }
 
@@ -8676,20 +8692,43 @@ impl Statement {
             && !self.shared.gate_busy.load(Ordering::Acquire)
     }
 
+    fn positional_bind_error(inner: &mut ConnectionInner, error: SqliteError) -> SqliteError {
+        if error.code == ErrorCode::Range {
+            // vdbeUnbind clears pErr, and sqlite3Error retains the previous byte offset.
+            inner.c_retained_error_message = None;
+            let offset = usize::try_from(inner.c_error_byte_offset).unwrap_or(SqliteError::NO_OFFSET);
+            return SqliteError::new(ErrorCode::Range, ErrorCode::Range.as_str()).with_offset(offset);
+        }
+        error
+    }
+
+    fn check_fast_positional_bind(&self, result: Result<()>) -> Result<()> {
+        if let Err(error) = result {
+            if error.code == ErrorCode::Range {
+                let mut session = self.shared.enter()?;
+                return Err(Self::positional_bind_error(session.inner_mut(), error));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Binds a 1-based parameter (`?1`, `?`, etc.) (`sqlite3_bind_*`).
     /// Requires the statement to be in `Ready` state (`ErrorCode::Misuse` if `Running` or `Halted` without `reset()`).
     #[inline]
     pub fn bind(&mut self, index_1_based: usize, value: impl Into<Value>) -> Result<&mut Self> {
         if self.can_fast_bind() {
             self.ensure_ready_for_bind()?;
-            self.set_bound_value(index_1_based, value)?;
+            let result = self.set_bound_value(index_1_based, value);
+            self.check_fast_positional_bind(result)?;
             return Ok(self);
         }
         let shared = Arc::clone(&self.shared);
-        let session = shared.enter()?;
+        let mut session = shared.enter()?;
         session.inner().ensure_usable()?;
         self.ensure_ready_for_bind()?;
-        self.set_bound_value(index_1_based, value)?;
+        self.set_bound_value(index_1_based, value)
+            .map_err(|e| Self::positional_bind_error(session.inner_mut(), e))?;
         drop(session);
         Ok(self)
     }
@@ -8700,14 +8739,16 @@ impl Statement {
     pub fn bind_text(&mut self, index_1_based: usize, text: &str) -> Result<&mut Self> {
         if self.can_fast_bind() {
             self.ensure_ready_for_bind()?;
-            self.set_bound_text(index_1_based, text)?;
+            let result = self.set_bound_text(index_1_based, text);
+            self.check_fast_positional_bind(result)?;
             return Ok(self);
         }
         let shared = Arc::clone(&self.shared);
-        let session = shared.enter()?;
+        let mut session = shared.enter()?;
         session.inner().ensure_usable()?;
         self.ensure_ready_for_bind()?;
-        self.set_bound_text(index_1_based, text)?;
+        self.set_bound_text(index_1_based, text)
+            .map_err(|e| Self::positional_bind_error(session.inner_mut(), e))?;
         drop(session);
         Ok(self)
     }
@@ -8776,6 +8817,31 @@ impl Statement {
         Ok(())
     }
 
+    fn transfer_read_cleanup_error(
+        &self,
+        inner: &mut ConnectionInner,
+        shared: &ConnectionShared,
+        ran: bool,
+        result: &Result<()>,
+    ) {
+        if !ran
+            || self.category != Some(StmtCategory::Read)
+            || !inner.uses_default_interrupt_flag(shared)
+        {
+            return;
+        }
+        match result {
+            Ok(()) => inner.transfer_c_read_error(None),
+            Err(e)
+                if !self.read_io_during_prepare
+                    && matches!(e.code, ErrorCode::Error | ErrorCode::Interrupt) =>
+            {
+                inner.transfer_c_read_error(Some(e));
+            }
+            Err(_) => {}
+        }
+    }
+
     /// Resets execution back to `Ready` while preserving bound parameter values (`sqlite3_reset`).
     ///
     /// Surfaces any error recorded on the prior `step()` or encountered while halting/committing
@@ -8783,10 +8849,10 @@ impl Statement {
     /// (unless cleanup I/O poisoned the connection).
     pub fn reset(&mut self) -> Result<()> {
         self.deferred_error = None;
-        if matches!(
-            self.lifecycle,
-            StatementLifecycle::Ready | StatementLifecycle::Halted { last_error: None }
-        ) && self.can_fast_bind()
+        if (matches!(self.lifecycle, StatementLifecycle::Ready)
+            || (self.category != Some(StmtCategory::Read)
+                && matches!(self.lifecycle, StatementLifecycle::Halted { last_error: None })))
+            && self.can_fast_bind()
         {
             self.lifecycle = StatementLifecycle::Ready;
             return Ok(());
@@ -8815,7 +8881,8 @@ impl Statement {
         inner.ensure_usable()?;
 
         let prev = std::mem::replace(&mut self.lifecycle, StatementLifecycle::Ready);
-        match prev {
+        let ran = !matches!(prev, StatementLifecycle::Ready);
+        let result = match prev {
             StatementLifecycle::Ready => Ok(()),
             StatementLifecycle::Halted { last_error } => match last_error {
                 Some(err) => Err(err),
@@ -8854,7 +8921,9 @@ impl Statement {
                 )
             }
             StatementLifecycle::Running(run) => inner.finish_running_exec(hid, run, shared),
-        }
+        };
+        self.transfer_read_cleanup_error(inner, shared, ran, &result);
+        result
     }
 
     /// Explicitly finalizes and consumes this [`Statement`] (`sqlite3_finalize`), finishing any
@@ -8875,6 +8944,7 @@ impl Statement {
             return Ok(());
         };
         let prev = std::mem::replace(&mut self.lifecycle, StatementLifecycle::Ready);
+        let ran = !matches!(prev, StatementLifecycle::Ready);
         let res = match prev {
             StatementLifecycle::Ready => {
                 if let ConnectionState::Poisoned(ref p_err) = inner.state {
@@ -8896,6 +8966,7 @@ impl Statement {
             StatementLifecycle::Running(run) => inner.finish_running_exec(hid, run, shared),
         };
         inner.open_handles.remove(&hid);
+        self.transfer_read_cleanup_error(inner, shared, ran, &res);
         res
     }
 
@@ -8951,8 +9022,7 @@ impl Statement {
 
     fn reprepare_in_open_tx(&mut self, inner: &mut ConnectionInner) -> Result<()> {
         let result = self.recompile_in_open_tx(inner);
-        inner.c_error_byte_offset = result.as_ref().err()
-            .and_then(|e| e.offset).and_then(|n| i32::try_from(n).ok()).unwrap_or(-1);
+        inner.record_c_prepare_error(result.as_ref().err());
         result
     }
 
@@ -9147,19 +9217,14 @@ impl Statement {
             && let Some(hid) = self.handle_id
         {
             let r_insts = read_instances.clone();
-            let (fin_res, default_interrupt) = {
-                let mut session = self.shared.enter()?;
-                let inner = session.inner_mut();
-                inner.ensure_usable()?;
-                (
-                    inner.finish_point_read(hid, r_insts, &self.shared),
-                    inner.uses_default_interrupt_flag(&self.shared),
-                )
-            };
+            let mut session = self.shared.enter()?;
+            let inner = session.inner_mut();
+            inner.ensure_usable()?;
+            let fin_res = inner.finish_point_read(hid, r_insts, &self.shared);
             self.lifecycle = StatementLifecycle::Halted {
                 last_error: fin_res.as_ref().err().cloned(),
             };
-            fin_res.map_err(|e| self.read_step_error(e, default_interrupt))?;
+            fin_res.map_err(|e| Self::read_step_error(inner, &self.shared, self.mode, e))?;
             return Ok(StepResult::Done);
         }
 
@@ -9184,11 +9249,9 @@ impl Statement {
                 Hit(Vec<Value>, SmallInstVec),
                 Miss,
             }
-            let default_interrupt;
+            let mut session = self.shared.enter()?;
+            let inner = session.inner_mut();
             let outcome = {
-                let mut session = self.shared.enter()?;
-                let inner = session.inner_mut();
-                default_interrupt = inner.uses_default_interrupt_flag(&self.shared);
                 if let Err(e) = inner.ensure_usable() {
                     PointOutcome::EarlyErr(e)
                 } else if self.compiled_advisory_expire_generation
@@ -9373,7 +9436,7 @@ impl Statement {
                     self.lifecycle = StatementLifecycle::Halted {
                         last_error: Some(e.clone()),
                     };
-                    return Err(self.read_step_error(e, default_interrupt));
+                    return Err(Self::read_step_error(inner, &self.shared, self.mode, e));
                 }
                 PointOutcome::Hit(vals, read_instances) => {
                     self.lifecycle =
@@ -9452,7 +9515,7 @@ impl Statement {
             && !self.expired
             && self.compiled_fast_read.is_some()
         {
-            let default_interrupt;
+            let mode = self.mode;
             let fast_read_res = {
                 let Self {
                     ref shared,
@@ -9469,8 +9532,7 @@ impl Statement {
                 } = *self;
                 let mut session = shared.enter()?;
                 let inner = session.inner_mut();
-                default_interrupt = inner.uses_default_interrupt_flag(shared);
-                if let Err(e) = inner.ensure_usable() {
+                let result = if let Err(e) = inner.ensure_usable() {
                     Some(Err(e))
                 } else if inner.trace_hook.is_some() || inner.authorizer.is_some()
                     || inner.db_set.main_slot().btree.as_ref().is_some_and(|bt| bt.pager().uses_fetch())
@@ -9492,10 +9554,11 @@ impl Statement {
                         params,
                         lifecycle,
                     )
-                }
+                };
+                result.map(|res| res.map_err(|e| Self::read_step_error(inner, shared, mode, e)))
             };
             if let Some(res) = fast_read_res {
-                return res.map_err(|e| self.read_step_error(e, default_interrupt));
+                return res;
             }
         }
 
@@ -9523,19 +9586,33 @@ impl Statement {
             return Err(error);
         }
         if self.category == Some(StmtCategory::Read) && !self.read_io_during_prepare {
-            return result.map_err(|e| self.read_step_error(e, inner.uses_default_interrupt_flag(shared)));
+            return result.map_err(|e| Self::read_step_error(inner, shared, self.mode, e));
         }
         result
     }
 
-    fn read_step_error(&self, error: SqliteError, default_interrupt: bool) -> SqliteError {
+    fn read_step_error(
+        inner: &mut ConnectionInner,
+        shared: &ConnectionShared,
+        mode: PrepareMode,
+        error: SqliteError,
+    ) -> SqliteError {
         // vdbe.c:9501–9510 and vdbeapi.c:951–956: only a saved-SQL statement exposes
         // its execution error at step. Reset/finalize retain the actual interruption.
-        if self.mode == PrepareMode::V1 && default_interrupt && error.code == ErrorCode::Interrupt {
-            SqliteError::new(ErrorCode::Error, "SQL logic error")
-        } else {
-            error
+        if inner.uses_default_interrupt_flag(shared) {
+            if mode == PrepareMode::V1 && error.code == ErrorCode::Interrupt {
+                let message = inner
+                    .c_retained_error_message
+                    .as_deref()
+                    .unwrap_or(ErrorCode::Error.as_str());
+                let offset = usize::try_from(inner.c_error_byte_offset).unwrap_or(SqliteError::NO_OFFSET);
+                return SqliteError::new(ErrorCode::Error, message).with_offset(offset);
+            }
+            if mode == PrepareMode::V2 && matches!(error.code, ErrorCode::Error | ErrorCode::Interrupt) {
+                inner.transfer_c_read_error(Some(&error));
+            }
         }
+        error
     }
 
     fn step_in_session_impl(
