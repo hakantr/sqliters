@@ -32400,8 +32400,7 @@ fn view_dml_indexed_select(
         return None;
     }
     if indexes.len() > 1 && (max_eq || two_index_range) {
-        // A literal can change partial-index eligibility. Leave those and
-        // competing leading keys to the existing unpushed view path.
+        // Partial, statistical and expression indexes need separate planning.
         if indexes.iter().any(|index| {
             index.where_clause.is_some()
                 || index.stat1.is_some()
@@ -32419,6 +32418,32 @@ fn view_dml_indexed_select(
                 .first()
                 .is_some_and(|key| key.col_idx == Some(column_index))
         });
+    }
+    let tied_range = two_index_range && indexes.len() == 2;
+    if tied_range {
+        let has_snapshot = ctx.db_set.main_slot().btree.as_ref().is_some_and(|bt| {
+            matches!(
+                bt.transaction_state(),
+                TransactionState::Read | TransactionState::Write
+            )
+        });
+        let needs_table = table.columns.iter().enumerate().any(|(i, col)| {
+            i != column_index
+                && Some(i) != table.rowid_alias_col
+                && (matches!(projection, [ResultColumn::Star])
+                    || projection.iter().any(|item| {
+                        matches!(item, ResultColumn::Expr { expr: Expr::Column(reference), .. }
+                            if reference.column.eq_ignore_ascii_case(&col.name))
+                    }))
+        });
+        if !has_snapshot || !needs_table || table.columns.iter().any(|col| col.generated.is_some())
+        {
+            return None;
+        }
+        // C considers the newest catalog entry first and keeps it on equal cost.
+        // The two range indexes have the same key and require the same table reads.
+        indexes = ordered_table_indexes(table, &indexes);
+        indexes.truncate(1);
     }
     let [index] = indexes.as_slice() else {
         return None;
@@ -32460,7 +32485,15 @@ fn view_dml_indexed_select(
     };
     let first = make_term(op, bound);
     let mut narrowed = view.clone();
-    if let SelectCore::Select { selection, .. } = &mut narrowed.select.body.head {
+    if let SelectCore::Select {
+        from: Some(from),
+        selection,
+        ..
+    } = &mut narrowed.select.body.head
+    {
+        if tied_range && let TableOrSubquery::Table { indexed_by, .. } = &mut from.head {
+            *indexed_by = Some(IndexHint::IndexedBy(index.name.clone()));
+        }
         *selection = Some(if let Some((_, other_op, other_bound)) = second_term {
             Expr::Binary {
                 left: Box::new(first),

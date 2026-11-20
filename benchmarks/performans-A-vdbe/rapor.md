@@ -1537,3 +1537,8 @@ Sabit şemalı doğrudan rowid görünüm UPDATE’inde iki tam nonunique BINARY
 ## V6b.246 — Negatif ISO 24:00 süre dönüşü
 
 Canonical negatif tarihli 24:00 süre değiştiricileri için C sayı sınırı ve yuvarlama, geçici Julian taşması ve son değer denetimi korunur. 20 ölçülen süre zinciri, üç ilk ve üç ara dönüş C eş. 42 ek native aritmetik, 450 C açılışı, 12 VDBE ve 6.305 strict doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 242/245, determinism 244/245. Açık L1, L4 ve L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,264 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_246.md).
+
+
+## V6b.247 — Görünüm UPDATE eş maliyetli iki tam indeks
+
+Sabit şemada aynı BINARY NUMERIC anahtarını kullanan iki tam aralık indeksi, tablo okuması gerektiğinde ve mevcut MAIN okuma veya yazma snapshot’ı varsa C katalog sırasıyla değerlendirilir. 1.060 kalıcı sıra ve dosya farkı kapandı. Önceki 644 vaka, 48 covering kontrolü ve 6.276 bağımsız C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 242/245, determinism 244/245. Açık L1, L4 ve L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,276 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_247.md).
