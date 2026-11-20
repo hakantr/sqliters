@@ -1507,3 +1507,8 @@ Doğrudan tek rowid kaynaklı görünüm UPDATE işleminde tek tam BINARY TEXT i
 ## V6b.240 — STRFTIME %k
 
 STRFTIME %k mevcut saat çıktısı ile aynı değeri iki karakter genişlikte boşlukla doldurur. 185 bağımsız bağlam iki kipte ham eş. 0–23 saatler, üç kodlama, UTC/ofset, tarihli ve yalın 24:00, NULL ve karışık biçimler ölçüldü. 198 gerçek saklama satırı, 654 C açılışı, 12 VDBE testi ve 6.895 strict doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,263 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_240.md).
+
+
+## V6b.241 — Görünüm UPDATE tırnaklı NUMERIC aralığı
+
+Tek tam BINARY NUMERIC indeksli doğrudan rowid görünüm UPDATE işleminde mevcut affinity tırnaklı sınırı sayıya dönüştürünce aynı indeksli materyalizasyon kullanılır. 276 OFF ve 184 UTF16 ON eski kalıcı sıra/dosya farkı ile negatif sonsuzluktaki 20 ek fark kapandı. Önceki dört tırnaklı fark C eş. 4.380 native ve 4.380 C açılışı, 31.465 strict doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,275 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_241.md).
