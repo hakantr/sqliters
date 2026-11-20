@@ -1390,11 +1390,18 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 const UNIX_EPOCH_JULIAN_MS: i64 = 210_866_760_000_000;
 const JULIAN_MS_LIMIT: i64 = 464_269_060_800_000;
 
-#[derive(Default)]
+#[derive(Clone, Copy)]
+struct BareHour24 {
+    offset_ms: i64,
+    legacy_accepted: bool,
+}
+
+#[derive(Clone, Copy, Default)]
 struct ParsedDateTime {
     unix_ms: i64,
     raw_seconds: Option<f64>,
     is_utc: bool,
+    bare_hour24: Option<BareHour24>,
 }
 
 impl ParsedDateTime {
@@ -1456,23 +1463,38 @@ fn parse_datetime_value(
         (time, modifiers, check_julian_range)
     };
 
-    let mut use_subsec = false;
-    for m in modifiers {
-        let mod_str = m.to_text_lossy();
-        if mod_str.eq_ignore_ascii_case("subsec") || mod_str.eq_ignore_ascii_case("subsecond") {
-            use_subsec = true;
-            continue;
-        }
-        let mt = mod_str.trim();
-        if mt.eq_ignore_ascii_case("utc") {
-            if !time.is_utc {
-                time.raw_seconds = None;
+    let initial_time = time;
+    let mut bare_hour24 = time.bare_hour24;
+    let use_subsec = 'modifiers: loop {
+        let mut use_subsec = false;
+        for m in modifiers {
+            let mod_str = m.to_text_lossy();
+            if mod_str.eq_ignore_ascii_case("subsec") || mod_str.eq_ignore_ascii_case("subsecond") {
+                use_subsec = true;
+                continue;
             }
-            continue;
+            let mt = mod_str.trim();
+            if mt.eq_ignore_ascii_case("utc") {
+                if !time.is_utc {
+                    // Continue to use the previous path for host timezone conversion.
+                    if let Some(clock) = bare_hour24.take() {
+                        if !clock.legacy_accepted {
+                            return None;
+                        }
+                        time = initial_time;
+                        time.bare_hour24 = None;
+                        time.is_utc = true;
+                        continue 'modifiers;
+                    }
+                    time.raw_seconds = None;
+                }
+                continue;
+            }
+            time.unix_ms = apply_datetime_modifier_ms(&mut time, mt)?;
+            time.raw_seconds = None;
         }
-        time.unix_ms = apply_datetime_modifier_ms(time.unix_ms, mt)?;
-        time.raw_seconds = None;
-    }
+        break use_subsec;
+    };
 
     if check_julian_range
         && !(-UNIX_EPOCH_JULIAN_MS..JULIAN_MS_LIMIT - UNIX_EPOCH_JULIAN_MS).contains(&time.unix_ms)
@@ -1589,7 +1611,7 @@ fn parse_iso_datetime(input: &str) -> Option<ParsedDateTime> {
         } else {
             clock
         };
-        let (clock_ms, raw_seconds) = parse_hms_ms(clock, true, has_date)?;
+        let (clock_ms, raw_seconds) = parse_hms_ms(clock, true, true)?;
         let local_ms = midnight_ms + clock_ms;
         // A 24:00 clock advances the local date before applying its offset.
         if local_ms >= YEAR_10000_MS {
@@ -1597,28 +1619,33 @@ fn parse_iso_datetime(input: &str) -> Option<ParsedDateTime> {
         }
         let offset_ms = parse_numeric_time_offset_ms(offset)?;
         let utc_ms = local_ms - offset_ms;
+        let bare_hour24 = (!has_date && clock_ms == 86_400_000).then(|| BareHour24 {
+            offset_ms,
+            legacy_accepted: clock[3..]
+                .bytes()
+                .all(|byte| matches!(byte, b'0' | b':' | b'.')),
+        });
         return (utc_ms < YEAR_10000_MS).then_some(ParsedDateTime {
             unix_ms: utc_ms,
             raw_seconds: if offset_ms == 0 { raw_seconds } else { None },
-            is_utc: true,
+            is_utc: bare_hour24.is_none() || offset_ms == 0,
+            bare_hour24,
         });
     }
 
     let without_z = clock.strip_suffix(['Z', 'z']);
     let clock = without_z.unwrap_or(clock);
-    let dated_hour24 = has_date
-        .then(|| {
-            clock
-                .trim_start_matches(|c| c == 'T' || is_date_time_space(c))
-                .trim_end_matches(is_date_time_space)
-        })
-        .filter(|clock| {
-            clock.starts_with("24:")
-                && unsigned_date()
-                && input.trim_end_matches(is_date_time_space) == s
-        });
-    let clock = if let Some(clock) = dated_hour24 {
+    let hour24_clock = if has_date {
+        clock.trim_start_matches(|c| c == 'T' || is_date_time_space(c))
+    } else {
         clock
+    }
+    .trim_end_matches(is_date_time_space);
+    let hour24 = hour24_clock.starts_with("24:")
+        && (!has_date || unsigned_date())
+        && input.trim_end_matches(is_date_time_space) == s;
+    let clock = if hour24 {
+        hour24_clock
     } else if has_date {
         clock.trim_start_matches([' ', 'T', 't'])
     } else {
@@ -1627,15 +1654,19 @@ fn parse_iso_datetime(input: &str) -> Option<ParsedDateTime> {
     if has_date && clock.is_empty() {
         return Some(ParsedDateTime::from_unix_ms(midnight_ms));
     }
-    let (clock_ms, raw_seconds) = parse_hms_ms(clock, false, dated_hour24.is_some())?;
+    let (clock_ms, raw_seconds) = parse_hms_ms(clock, false, hour24)?;
     let unix_ms = midnight_ms + clock_ms;
-    if dated_hour24.is_some() && unix_ms >= YEAR_10000_MS {
+    if hour24 && unix_ms >= YEAR_10000_MS {
         return None;
     }
     Some(ParsedDateTime {
         unix_ms,
         raw_seconds,
         is_utc: without_z.is_some(),
+        bare_hour24: (!has_date && clock_ms == 86_400_000).then_some(BareHour24 {
+            offset_ms: 0,
+            legacy_accepted: false,
+        }),
     })
 }
 
@@ -1667,14 +1698,14 @@ fn parse_numeric_time_offset_ms(s: &str) -> Option<i64> {
 fn parse_hms_ms(
     s: &str,
     has_numeric_offset: bool,
-    allow_dated_hour24: bool,
+    allow_hour24: bool,
 ) -> Option<(i64, Option<f64>)> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() < 2 || parts.len() > 3 {
         return None;
     }
-    let dated_hour24 = allow_dated_hour24 && parts[0] == "24";
-    let strict = has_numeric_offset || dated_hour24;
+    let hour24 = allow_hour24 && parts[0] == "24";
+    let strict = has_numeric_offset || hour24;
     let parse_part = |part: &str| -> Option<u32> {
         if strict {
             parse_two_time_digits(part)
@@ -1707,15 +1738,11 @@ fn parse_hms_ms(
         (0, 0, None)
     };
     if hh > 23 {
-        let midnight = if dated_hour24 {
-            mm == 0 && ss == 0 && ms == 0 && raw_seconds.is_none_or(|seconds| seconds == 0.0)
-        } else {
-            has_numeric_offset
-                && hh == 24
-                && parts[1..]
-                    .iter()
-                    .all(|part| part.bytes().all(|b| matches!(b, b'0' | b'.')))
-        };
+        let midnight = hour24
+            && mm == 0
+            && ss == 0
+            && ms == 0
+            && raw_seconds.is_none_or(|seconds| seconds == 0.0);
         if !midnight {
             return None;
         }
@@ -1745,9 +1772,14 @@ fn parse_long_clock_fraction(second: u32, digits: &str) -> Option<(u32, f64)> {
     Some((millis, seconds))
 }
 
-fn apply_datetime_modifier_ms(ms: i64, s: &str) -> Option<i64> {
+fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, s: &str) -> Option<i64> {
+    let mut ms = time.unix_ms;
+    let bare_hour24 = time.bare_hour24.take();
     let lower = s.to_ascii_lowercase();
     match lower.as_str() {
+        "start of day" | "start of month" | "start of year" if bare_hour24.is_some() => {
+            return Some(days_from_civil(2000, 1, 1) * 86_400_000);
+        }
         "start of day" => {
             let (y, mo, d, _, _, _) = utc_ymdhms_from_unix_ms(ms);
             return Some(days_from_civil(i64::from(y), mo, d) * 86_400_000);
@@ -1770,6 +1802,10 @@ fn apply_datetime_modifier_ms(ms: i64, s: &str) -> Option<i64> {
         if !wf.is_finite() || wf.fract() != 0.0 || !(0.0..7.0).contains(&wf) {
             return None;
         }
+        if let Some(clock) = bare_hour24 {
+            // C's weekday calculation discards the offset of a bare clock.
+            ms += clock.offset_ms;
+        }
         let target_dow = wf as i64;
         let days = ms.div_euclid(86_400_000);
         let dow = (days + 4).rem_euclid(7);
@@ -1785,6 +1821,9 @@ fn apply_datetime_modifier_ms(ms: i64, s: &str) -> Option<i64> {
     let unit = parts.next()?.to_ascii_lowercase();
     if parts.next().is_some() {
         return None;
+    }
+    if bare_hour24.is_some_and(|clock| clock.offset_ms != 0) {
+        time.is_utc = true;
     }
     match unit.trim_end_matches('s') {
         "second" => Some(ms.saturating_add((num * 1_000.0).round() as i64)),

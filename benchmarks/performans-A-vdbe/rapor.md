@@ -1492,3 +1492,8 @@ SELECT projeksiyonunda şema ve tablo veya alias ile nitelenmiş yıldız C gibi
 ## V6b.237 — Tarihli ISO 24:00
 
 İşaretsiz ISO tarihli 24:00, canonical saat parçaları ve ham kesir sıfır olduğunda yerel ertesi güne taşınır. Yerel yıl sınırı ofsetten ve son Julian denetiminden ayrı uygulanır. 104 bağlam ve kip başına 1.872 ham kayıt C ile eşleşti. 460 diğer ana bağlam değişmedi. 61 gerçek saklama kontrolü, 923 C açılışı, 12 VDBE testi ve 9.102 strict doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_237.md).
+
+
+## V6b.238 — Yalın ISO 24:00
+
+Yalın 24:00 ayrıştırmasında ilk takvim değiştiricisine kadar C'nin tarih ve ofset durumu izlenir. 55 kabul ve 10 iJD farkında kip başına 1.170 ham kayıt eşleşti. 499 diğer ana bağlam ve 104 tarihli düzeltme korundu. İki TZ'de 54 mevcut host dönüşüm zinciri ham eş kaldı. 72 gerçek saklama, 1.055 C açılışı, 12 VDBE testi ve 10.273 strict doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,255 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_238.md).
