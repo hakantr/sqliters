@@ -222,6 +222,18 @@ fn dec_or_hex(z: &str) -> Option<i64> {
     (rc == 0).then_some(value)
 }
 
+/// Matches a journal mode by its SQLite pragma prefix and returns its opcode value and name.
+#[doc(hidden)]
+pub fn resolve_journal_mode(value: &str) -> Option<(i32, &'static str)> {
+    let modes = ["delete", "persist", "off", "truncate", "memory", "wal"];
+    modes.into_iter().enumerate()
+        .find(|(_, name)| {
+            name.as_bytes().get(..value.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(value.as_bytes()))
+        })
+        .map(|(mode, name)| (mode as i32, name))
+}
+
 /// sqlite3Pragma, pragma.c:428. Every recognized but unported handler is rejected.
 pub fn sqlite3_pragma(
     p: &mut Parse,
@@ -558,16 +570,7 @@ pub fn sqlite3_pragma(
         }
         23 => {
             // journal_mode, pragma.c:733
-            let modes = ["delete", "persist", "off", "truncate", "memory", "wal"];
-            let mut mode = right
-                .and_then(|z| {
-                    modes.iter().position(|m| {
-                        m.as_bytes()
-                            .get(..z.len())
-                            .is_some_and(|s| s.eq_ignore_ascii_case(z.as_bytes()))
-                    })
-                })
-                .map_or(-1, |m| m as i32);
+            let mut mode = right.and_then(resolve_journal_mode).map_or(-1, |(mode, _)| mode);
             if mode == 2 && p.db.flags & SQLITE_Defensive != 0 {
                 mode = -1;
             }

@@ -1277,3 +1277,8 @@ C WAL kapanışının doğrudan hata dönüşü önceki koşullarla tüm koordin
 ## V6b.194 — WAL geri almada sıfır canlı frame
 
 Ortak indekste sıfır canlı frame durumunda erişilemeyen kayıtlar C gibi sonraki ilk yazıya kadar kalıyor. 432 doğal spill akışı, 45 bağlantı yaşamı ve 1.728 C yeniden açılışı eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,230 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_194.md).
+
+
+## V6b.195 — Journal mode değerleri ve C önek eşlemesi
+
+Hazırlama ve SQL yürütmesi C kip adlarının aynı ASCII önek kuralını paylaşıyor. 672 tek, 72 bağlı dosya C çifti ve temiz dosya açılışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,254 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_195.md).

@@ -45972,40 +45972,37 @@ fn exec_pragma(
             ));
         }
         "JOURNAL_MODE" => {
+            let target_opt = value.and_then(|pv| {
+                let s = pragma_to_string(pv);
+                let (_, name) = sqliters_codegen::pragma::resolve_journal_mode(&s)?;
+                JournalMode::from_pragma_str(name)
+            }).filter(|target| !(ctx.db_set.defensive() && *target == JournalMode::Off));
             if schema.is_none() {
-                if let Some(pv) = value {
-                    let s = pragma_to_string(pv);
-                    // pragma.c: journal mode OFF is not allowed in defensive mode ("the
-                    // database can become corrupted using ordinary SQL when the journal is
-                    // off"); the statement becomes a query of the current mode.
-                    let target_opt = JournalMode::from_pragma_str(s.trim())
-                        .filter(|t| !(ctx.db_set.defensive() && *t == JournalMode::Off));
-                    if let Some(target) = target_opt {
-                        let mut main_mode = JournalMode::Delete;
-                        let single_target = ctx
-                            .db_set
-                            .slots()
-                            .iter()
-                            .filter(|slot| slot.btree.is_some())
-                            .count() == 1;
-                        ctx.stmt_tx.coordinated_journal_mode =
-                            !single_target && can_coordinate_journal_mode(ctx, target);
-                        for idx in (0..ctx.db_set.slot_count()).rev() {
-                            if ctx.db_set.slots()[idx].btree.is_none() {
-                                continue;
-                            }
-                            let res_mode = apply_journal_mode_on_slot(
-                                ctx, DatabaseId(idx), Some(target), single_target,
-                            )?;
-                            if idx == 0 {
-                                main_mode = res_mode;
-                            }
+                if let Some(target) = target_opt {
+                    let mut main_mode = JournalMode::Delete;
+                    let single_target = ctx
+                        .db_set
+                        .slots()
+                        .iter()
+                        .filter(|slot| slot.btree.is_some())
+                        .count() == 1;
+                    ctx.stmt_tx.coordinated_journal_mode =
+                        !single_target && can_coordinate_journal_mode(ctx, target);
+                    for idx in (0..ctx.db_set.slot_count()).rev() {
+                        if ctx.db_set.slots()[idx].btree.is_none() {
+                            continue;
                         }
-                        return Ok(single_col(
-                            "journal_mode",
-                            Value::Text(main_mode.as_str().to_owned()),
-                        ));
+                        let res_mode = apply_journal_mode_on_slot(
+                            ctx, DatabaseId(idx), Some(target), single_target,
+                        )?;
+                        if idx == 0 {
+                            main_mode = res_mode;
+                        }
                     }
+                    return Ok(single_col(
+                        "journal_mode",
+                        Value::Text(main_mode.as_str().to_owned()),
+                    ));
                 }
                 let active = apply_journal_mode_on_slot(ctx, DatabaseId::MAIN, None, false)?;
                 return Ok(single_col(
@@ -46013,12 +46010,6 @@ fn exec_pragma(
                     Value::Text(active.as_str().to_owned()),
                 ));
             }
-            let defensive = ctx.db_set.defensive();
-            let target_opt = value.and_then(|pv| {
-                let s = pragma_to_string(pv);
-                JournalMode::from_pragma_str(s.trim())
-                    .filter(|t| !(defensive && *t == JournalMode::Off))
-            });
             let active = apply_journal_mode_on_slot(ctx, db_id, target_opt, true)?;
             return Ok(single_col(
                 "journal_mode",
