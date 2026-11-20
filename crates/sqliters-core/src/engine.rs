@@ -14210,6 +14210,7 @@ fn eval_table_or_subquery(
                     plan_where_hint,
                     vtab_query_info,
                     false,
+                    false,
                     params,
                     outer_scopes,
                     ctes,
@@ -14234,6 +14235,7 @@ fn eval_table_or_subquery(
                 indexed_by.as_ref(),
                 plan_where_hint,
                 vtab_query_info,
+                false,
                 false,
                 params,
                 outer_scopes,
@@ -14307,6 +14309,7 @@ fn read_table_with_plan_scan(
     indexed_by: Option<&IndexHint>,
     where_hint: Option<&Expr>,
     mixed_index: Option<(&IndexSchema, Collation)>,
+    allow_wr_delete_covering: bool,
     params: &[Value],
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
@@ -14347,6 +14350,7 @@ fn read_table_with_plan_scan(
         where_hint,
         None,
         reverse_rowid_scan,
+        allow_wr_delete_covering,
         params,
         outer_scopes,
         ctes,
@@ -14365,6 +14369,7 @@ fn read_table_with_plan_ctx(
     where_hint: Option<&Expr>,
     query_info: Option<&SingleVtabQueryInfo<'_>>,
     reverse_rowid_scan: bool,
+    allow_wr_delete_covering: bool,
     params: &[Value],
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
@@ -14489,7 +14494,7 @@ fn read_table_with_plan_ctx(
         }
     }
 
-    let plan = crate::compiler::choose_plain_table_plan(
+    let mut plan = crate::compiler::choose_plain_table_plan(
         tbl,
         &slot_name,
         alias,
@@ -14507,6 +14512,13 @@ fn read_table_with_plan_ctx(
             && !ctx.in_trigger_program()
             && ctx.db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder == 0,
     );
+    if allow_wr_delete_covering
+        && matches!(plan, AccessPlan::FullScan)
+        && let Some(covering) =
+            crate::compiler::choose_wr_delete_covering_scan(tbl, &slot_name, &slot_ref.schema)
+    {
+        plan = covering;
+    }
     let mut scan = crate::dml_c::scan_info(&plan, tbl, false);
     if query_ctx.is_none()
         && !scan.one_row
@@ -30773,6 +30785,7 @@ fn prepare_update_exec<'a>(
                 upd.indexed_by.as_ref(),
                 plan_where_hint,
                 dml_snapshot_scan_index(&indexes, scan_index),
+                false,
                 params,
                 outer_scopes,
                 &dml_ctes,
@@ -32672,6 +32685,20 @@ fn prepare_delete_exec(
             // (the rows are read ahead of the point at which C's loop visits them)
             c_dml_silent(ctx, db_id, true);
             c_register_index_order(ctx, db_id, &tbl, &indexes);
+            let allow_wr_delete_covering = tbl.without_rowid
+                && db_id == DatabaseId::MAIN
+                && !is_catalog
+                && !b_complex
+                && del.alias.is_none()
+                && del.indexed_by.is_none()
+                && del.selection.as_ref().is_some_and(is_simple_covering_expr)
+                && tbl.foreign_keys.is_empty()
+                && outer_scopes.is_empty()
+                && dml_ctes.scopes.is_empty()
+                && !ctx.in_trigger_program()
+                && !ctx.progress.is_enabled()
+                && ctx.collations.get_custom("BINARY").is_none()
+                && ctx.db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder == 0;
             let (candidates, scan) = read_table_with_plan_scan(
                 ctx,
                 db_id,
@@ -32680,6 +32707,7 @@ fn prepare_delete_exec(
                 del.indexed_by.as_ref(),
                 del.selection.as_ref(),
                 dml_snapshot_scan_index(&indexes, scan_index),
+                allow_wr_delete_covering,
                 params,
                 outer_scopes,
                 &dml_ctes,

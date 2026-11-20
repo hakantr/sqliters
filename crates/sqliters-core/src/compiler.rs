@@ -934,6 +934,56 @@ pub(crate) fn choose_plain_table_plan(
     }
 }
 
+/// With no competing secondary loop, price a fully covering explicit index
+/// against the WITHOUT ROWID primary-key scan as SQLite does for DELETE.
+pub(crate) fn choose_wr_delete_covering_scan(
+    tbl: &TableSchema,
+    schema_name: &str,
+    schema: &Schema,
+) -> Option<AccessPlan> {
+    if !tbl.without_rowid
+        || tbl.columns.len() > 63
+        || tbl.columns.iter().any(|column| {
+            column.generated.is_some()
+                || column.collation != Collation::Binary
+                || column.custom_collation.is_some()
+        })
+    {
+        return None;
+    }
+    let indexes = schema.indexes_for_table(&tbl.name);
+    let [index] = indexes.as_slice() else {
+        return None;
+    };
+    if index.is_autoindex
+        || index.unique
+        || index.where_clause.is_some()
+        || index.columns.len() != 1
+        || index.columns.len() + index.trailing_pk_cols.len() != tbl.columns.len()
+        || index
+            .columns
+            .iter()
+            .chain(&index.trailing_pk_cols)
+            .any(|key| {
+                key.col_idx.is_none()
+                    || key.sort_order.collation != Collation::Binary
+                    || key.sort_order.custom_collation.is_some()
+            })
+    {
+        return None;
+    }
+
+    // In sqlite3CreateIndex an explicit index isCovering only if it stores
+    // every table column. For this DELETE full-scan candidate model that
+    // check with the existing covering projection and scan cost comparison.
+    let ctx = QueryPlanContext {
+        projection: Some(&[ResultColumn::Star]),
+        ..Default::default()
+    };
+    choose_unordered_without_rowid_scan(tbl, schema_name, None, schema, &ctx, None)
+        .filter(|plan| matches!(plan, AccessPlan::IndexFullScan { is_covering: true, .. }))
+}
+
 /// Compare full scans of the primary and secondary B-trees when there is
 /// no predicate, ordering requirement, or ANALYZE estimate to price.
 fn choose_unordered_without_rowid_scan(
