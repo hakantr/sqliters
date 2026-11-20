@@ -9356,7 +9356,7 @@ impl Statement {
                     || main_slot.schema.had_pages != had_pages;
             }
         }
-        slot_cookies_changed_slice(&self.compiled_slot_cookies, inner)
+        slot_cookies_changed_slice(&self.compiled_slot_cookies, &inner.db_set)
     }
 
     fn needs_reprepare(&self, inner: &ConnectionInner) -> bool {
@@ -10361,6 +10361,18 @@ impl Statement {
                     // returns before executing, leaving the connection diagnostic alone.
                     self.c_v1_flag_pragma_expired = true;
                     return Err(inner.legacy_c_step_error_with_diagnostic(inner.c_connection_diagnostic_code));
+                }
+                if self.expired
+                    && self.c_machine_write.is_none()
+                    && self
+                        .stmt
+                        .as_ref()
+                        .is_some_and(|stmt| engine::is_main_rowid_view_update(stmt, &inner.db_set))
+                {
+                    if !expired_before_run {
+                        inner.c_connection_diagnostic_code = ErrorCode::Error;
+                    }
+                    return Err(inner.legacy_c_step_error());
                 }
                 return Err(err);
             }
@@ -11783,6 +11795,18 @@ impl Statement {
                 let stmt_ref = self.stmt.as_ref().expect("non-empty statement");
                 let compiled_prog_ref = self.compiled_vdbe.as_ref();
                 let machine_write_ref = self.c_machine_write.as_ref();
+                let legacy_view_cookie = if self.mode == PrepareMode::V1
+                    && machine_write_ref.is_none()
+                    && compiled_prog_ref.is_none()
+                    && engine::is_main_rowid_view_update(stmt_ref, &inner.db_set)
+                {
+                    let instance = inner.db_set.main_slot().schema_instance_id;
+                    self.compiled_slot_cookies
+                        .iter()
+                        .find(|(id, _, _)| *id == instance)
+                } else {
+                    None
+                };
                 let raw_sql_ref = self.raw_sql.as_str();
                 let write_scratch = &mut self.write_vm_scratch;
                 let params_ref = &self.params;
@@ -11800,6 +11824,7 @@ impl Statement {
                     );
                 }
                 let mut expire_self_only = false;
+                let mut legacy_view_schema_changed = false;
                 let exec_res = inner.with_exec_ctx(
                     shared,
                     summary,
@@ -11813,6 +11838,18 @@ impl Statement {
                                     Some(ctx.db_set.main_btree().pager().vfs().current_unix_millis());
                             }
                             return vdbe_host::run_write(ctx, prog, params_ref, raw_sql_ref);
+                        }
+                        if let Some(cookie) = legacy_view_cookie {
+                            // Use the snapshot that normal view materialization will read.
+                            ctx.ensure_read_db(DatabaseId::MAIN, true)?;
+                            if slot_cookies_changed_slice(std::slice::from_ref(cookie), ctx.db_set)
+                            {
+                                legacy_view_schema_changed = true;
+                                return Err(SqliteError::new(
+                                    ErrorCode::Schema,
+                                    "database schema has changed",
+                                ));
+                            }
                         }
                         engine::apply_stmt_journal_policy(ctx, stmt_ref);
                         if let Some(sp_slot) = ctx.stmt_tx.stmt_sp_slot
@@ -11854,6 +11891,27 @@ impl Statement {
                 merge_instances(&mut touched_write_instances, &initial_insts);
                 let started_read_instances =
                     mask_to_instances(&inner.db_set, stmt_tx.started_read_mask);
+                if legacy_view_schema_changed && let Err(error) = &exec_res {
+                    // No trigger or statement journal started. Preserve prior DML changes.
+                    let cleanup = inner.finish_activity(
+                        hid,
+                        ActivityFinish::ReadAborted {
+                            lease_cursors: Vec::new(),
+                            read_instances: started_read_instances,
+                        },
+                        shared,
+                    );
+                    self.expired = true;
+                    let error = cleanup.err().unwrap_or_else(|| error.clone());
+                    self.lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(error.clone()),
+                    };
+                    if error.code == ErrorCode::Schema {
+                        inner.c_connection_diagnostic_code = ErrorCode::Error;
+                        return Err(inner.legacy_c_step_error());
+                    }
+                    return Err(error);
+                }
                 let mut read_insts = mask_to_instances(&inner.db_set, stmt_tx.read_db_mask);
                 merge_instances(&mut read_insts, &touched_write_instances);
                 inner
@@ -12484,18 +12542,17 @@ impl Statement {
 #[inline]
 fn slot_cookies_changed_slice(
     compiled_slot_cookies: &[(SchemaInstanceId, u32, bool)],
-    inner: &ConnectionInner,
+    db_set: &DatabaseSet,
 ) -> bool {
     if let [(inst, cookie, had_pages)] = *compiled_slot_cookies {
-        let main_slot = inner.db_set.main_slot();
+        let main_slot = db_set.main_slot();
         if main_slot.schema_instance_id == inst && main_slot.btree.is_some() {
             return main_slot.schema.schema_cookie != cookie
                 || main_slot.schema.had_pages != had_pages;
         }
     }
     for &(inst, cookie, had_pages) in compiled_slot_cookies {
-        let Some(slot) = inner
-            .db_set
+        let Some(slot) = db_set
             .slots()
             .iter()
             .find(|s| s.schema_instance_id == inst && s.btree.is_some())
@@ -13132,7 +13189,7 @@ fn try_fast_read_plan_fields(
             return None;
         }
     }
-    if slot_cookies_changed_slice(compiled_slot_cookies, inner) {
+    if slot_cookies_changed_slice(compiled_slot_cookies, &inner.db_set) {
         return None;
     }
 
@@ -13389,7 +13446,7 @@ fn try_fast_compiled_main_write_fields(
             return None;
         }
     }
-    if slot_cookies_changed_slice(compiled_slot_cookies, inner) {
+    if slot_cookies_changed_slice(compiled_slot_cookies, &inner.db_set) {
         return None;
     }
 

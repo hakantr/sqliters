@@ -1512,3 +1512,8 @@ STRFTIME %k mevcut saat çıktısı ile aynı değeri iki karakter genişlikte b
 ## V6b.241 — Görünüm UPDATE tırnaklı NUMERIC aralığı
 
 Tek tam BINARY NUMERIC indeksli doğrudan rowid görünüm UPDATE işleminde mevcut affinity tırnaklı sınırı sayıya dönüştürünce aynı indeksli materyalizasyon kullanılır. 276 OFF ve 184 UTF16 ON eski kalıcı sıra/dosya farkı ile negatif sonsuzluktaki 20 ek fark kapandı. Önceki dört tırnaklı fark C eş. 4.380 native ve 4.380 C açılışı, 31.465 strict doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,275 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_241.md).
+
+
+## V6b.242 — Legacy görünüm UPDATE şema denetimi
+
+Olağan ilişkisel MAIN legacy V1 görünüm UPDATE işlemi gerçek Btree okuma snapshot üstünde hazırlanmış şema kimliğini ve cookie değerini doğrular. 48 OFF ve 32 UTF16 ON geri dönüşünde eski şema yazmadan reddedildi. STEP, RESET, FINALIZE, ana dosya ve log C eş. Ek önceki değişiklik sayacı ve normal takip işlemleri korundu. 576 native ve 576 C açılışı, iki kipte önceki 10/10 test ve 4.735 strict doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 242/245, determinism 244/245. Açık L1, L4 ve L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,252 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_242.md).

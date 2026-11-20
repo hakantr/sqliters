@@ -32090,6 +32090,51 @@ fn single_table_select_projection(
     Some((projection, name, alias.as_deref()))
 }
 
+pub(crate) fn is_main_rowid_view_update(stmt: &Stmt, db_set: &DatabaseSet) -> bool {
+    let Stmt::Update(update) = stmt else {
+        return false;
+    };
+    if update.from.is_some()
+        || update.alias.is_some()
+        || update.indexed_by.is_some()
+        || !update.ctes.is_empty()
+        || !update.returning.is_empty()
+    {
+        return false;
+    }
+    let Ok(Some((DatabaseId::MAIN, ResolvedRelation::View(view)))) =
+        db_set.find_relation_in_set(&update.table)
+    else {
+        return false;
+    };
+    let Some((projection, source, _)) = single_table_select_projection(&view.select) else {
+        return false;
+    };
+    let main = db_set.main_slot();
+    source
+        .schema
+        .as_ref()
+        .is_none_or(|schema| schema.eq_ignore_ascii_case(&main.name))
+        && projection.iter().all(|column| {
+            matches!(
+                column,
+                ResultColumn::Star
+                    | ResultColumn::Expr {
+                        expr: Expr::Column(_),
+                        ..
+                    }
+            )
+        })
+        && main
+            .schema
+            .find_user_table(&source.name)
+            .is_some_and(|table| !table.without_rowid)
+        && main
+            .btree
+            .as_ref()
+            .is_some_and(|bt| bt.pager().db_kind() == DatabaseKind::NamedDisk)
+}
+
 // The source of the MAX must resolve to this very view without using the
 // UPDATE row scope. In particular a temp table may shadow unqualified names.
 fn view_update_max_subquery<'a>(
