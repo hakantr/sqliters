@@ -1232,3 +1232,8 @@ Soğuk yazılabilir NamedDisk setter ve EXPLAIN şemayı C ile aynı prepare aş
 ## V6b.185 — Açık TEMP ile boş ana dosyanın WAL girişi
 
 Nitelemesiz WAL girişinde boş ana dosya ilk ROW boyunca sıfır kalır ve TEMP kipi korunur. 1.656 fiziksel çift, 2.772 C açılışı ve birleşik 24 canlı eş profili doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,342 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_185.md).
+
+
+## V6b.186 — İki kökte açık WHERE 1 DELETE
+
+İki kök aynı yazma görüntüsünde doğrulanır ve açık WHERE 1 C'nin satır bazlı sırasını kullanır. 396 native yazıcı ve rollback, 1.188 açılış ve 48 fiziksel Clear ayrımı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,032 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_186.md).

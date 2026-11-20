@@ -24563,6 +24563,8 @@ impl<'a> MixedIndexWrite<'a> {
         let selection = self.selection();
         mixed_index_rowid_selection(table, selection)
             || mixed_index_range_and_equality(table, mixed_key, Some(ordinary_key), selection)
+            || (matches!(self, Self::Delete { allow_where_one: true, .. })
+                && mixed_index_all_rows_filter(selection))
     }
 
     fn selection(self) -> Option<&'a Expr> {
