@@ -43827,9 +43827,10 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
     if !supported.contains(&target) && !matches!(target, JournalMode::Memory | JournalMode::Off) {
         return false;
     }
-    // This caller coordinates multiple open slots. With only main and TEMP
-    // present, main is the sole possible WAL participant.
-    let allow_empty_main = target == JournalMode::Wal && ctx.db_set.slot_count() == 2;
+    // An empty main may join the WAL transition with at most one attached database.
+    let allow_empty_main = target == JournalMode::Wal
+        && ctx.db_set.attached_count() <= 1
+        && ctx.db_set.main_btree().pager().page_count() == 0;
     let mut has_wal_transition = false;
     for (index, slot) in ctx.db_set.slots().iter().enumerate() {
         let Some(bt) = slot.btree.as_ref() else {
@@ -43841,6 +43842,11 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
             continue;
         }
         let previous = pager.journal_mode();
+        let mode_after_busy = pager.has_sql_journal_mode_after_busy();
+        // A journal-free rollback can invalidate the cached page count. A
+        // preserved mode already equal to the target needs no page-one write.
+        let allow_zero_pages = allow_empty_main
+            && (index == DatabaseId::MAIN.index() || (mode_after_busy && previous == target));
         let supported_previous = supported.contains(&previous)
             || (previous == JournalMode::Memory
                 && matches!(target, JournalMode::Memory | JournalMode::Wal | JournalMode::Off))
@@ -43848,8 +43854,8 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
         if pager.db_kind() != DatabaseKind::NamedDisk
             || pager.locking_mode() != LockingMode::Normal
             || pager.transaction_state() != TransactionState::Open
-            || (!pager.is_header_loaded() && !pager.has_sql_journal_mode_after_busy())
-            || (pager.page_count() == 0 && !(allow_empty_main && index == DatabaseId::MAIN.index()))
+            || (!pager.is_header_loaded() && !mode_after_busy)
+            || (pager.page_count() == 0 && !allow_zero_pages)
             || pager.is_readonly()
             || !pager.ok_to_change_journal_mode()
             || !supported_previous
@@ -43944,7 +43950,7 @@ fn apply_journal_mode_on_slot(
             let outcome = ctx.busy_policy.retry_btree(bt, |b| {
                 let pager = b.pager_mut();
                 let result = if pager.page_count() == 0 {
-                    // can_coordinate_journal_mode admits only the sole WAL participant here.
+                    // The empty main uses the pager staging path that initializes page one.
                     pager.stage_single_target_sql_journal_mode(target)
                 } else {
                     pager.stage_sql_journal_mode(target)
