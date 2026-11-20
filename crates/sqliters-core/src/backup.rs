@@ -702,6 +702,8 @@ impl Backup {
         dst_inner.open_handles.remove(&dst_hid);
 
         rb_res?;
+        // sqlite3Error() clears the destination's previous message on explicit finish.
+        dst_inner.c_retained_error_message = None;
         let _ = self.fatal_error.take();
         // `rc = (p->rc==SQLITE_DONE) ? SQLITE_OK : p->rc;`: the result of the last step when
         // that step failed (SQLITE_BUSY and SQLITE_LOCKED included).

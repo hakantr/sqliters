@@ -1407,3 +1407,8 @@ SUM, TOTAL ve AVG üç metin kodlamasında BLOB sayısal önekini C ile aynı ku
 ## V6b.220 — Bellek hedefli backup geometri kontrolü
 
 Farklı sayfa boyutlu dolu bellek hedefi step(0) sırasında READONLY 8 ve 0/0 bildiriyor. 48 API farkı kapandı ve 5.004 C açılışı doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,265 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_220.md).
+
+
+## V6b.221 — Backup finish hedef tanısı
+
+72 hazır V1 akışında eski sözdizimi mesajı taşınmıyor. 400 profil ve 1.644 C açılışı doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,292 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_221.md).
