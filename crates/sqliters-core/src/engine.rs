@@ -24560,7 +24560,9 @@ impl<'a> MixedIndexWrite<'a> {
                 && ordinary_key.col_idx.and_then(|column| table.columns.get(column))
                     .is_some_and(|column| column.affinity == TypeAffinity::Text);
         }
-        mixed_index_rowid_selection(table, self.selection())
+        let selection = self.selection();
+        mixed_index_rowid_selection(table, selection)
+            || mixed_index_range_and_equality(table, mixed_key, Some(ordinary_key), selection)
     }
 
     fn selection(self) -> Option<&'a Expr> {
@@ -24603,7 +24605,7 @@ impl<'a> MixedIndexWrite<'a> {
             no_statistics && mixed_index_key_equality(table, key, selection).is_some()
         };
         let range_and_equality = |selection| {
-            no_statistics && mixed_index_range_and_equality(table, key, selection)
+            no_statistics && mixed_index_range_and_equality(table, key, None, selection)
         };
         match self {
             Self::Insert(insert) => insert.ctes.is_empty()
@@ -24799,6 +24801,7 @@ fn mixed_index_is_rowid(table: &TableSchema, expr: &Expr) -> bool {
 fn mixed_index_range_and_equality(
     table: &TableSchema,
     key: &IndexedColSchema,
+    other_key: Option<&IndexedColSchema>,
     selection: Option<&Expr>,
 ) -> bool {
     let Some(selection @ Expr::Binary { op: BinaryOp::And, .. }) = selection else {
@@ -24809,7 +24812,10 @@ fn mixed_index_range_and_equality(
     if !matches!(terms.len(), 2 | 3) {
         return false;
     }
-    let Some(i) = terms.iter().position(|term| mixed_index_table_equality(table, key, Some(term))) else {
+    let Some(i) = terms.iter().position(|term| {
+        mixed_index_table_equality(table, key, Some(term))
+            && other_key.is_none_or(|other| mixed_index_table_equality(table, other, Some(term)))
+    }) else {
         return false;
     };
     terms.remove(i);
