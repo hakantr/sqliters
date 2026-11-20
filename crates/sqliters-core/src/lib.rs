@@ -1075,6 +1075,7 @@ pub(crate) struct ConnectionInner {
     // An ordinary prepare or read error may outlive a later successful API call.
     c_retained_error_message: Option<String>,
     c_connection_diagnostic_code: ErrorCode,
+    c_foreign_keys_expire_seq: Option<u64>,
     pub(crate) default_locking_mode: LockingMode,
     pub(crate) writable_schema: bool,
     pub(crate) working_dir: Option<PathBuf>,
@@ -1770,12 +1771,20 @@ impl ConnectionInner {
     }
 
     fn legacy_c_step_error_with_diagnostic(&self, fallback: ErrorCode) -> SqliteError {
+        self.legacy_c_error_with_diagnostic(ErrorCode::Error, fallback)
+    }
+
+    fn legacy_c_error_with_diagnostic(&self, code: ErrorCode, fallback: ErrorCode) -> SqliteError {
         let message = self
             .c_retained_error_message
             .as_deref()
             .unwrap_or(fallback.as_str());
         let offset = usize::try_from(self.c_error_byte_offset).unwrap_or(SqliteError::NO_OFFSET);
-        SqliteError::new(ErrorCode::Error, message).with_offset(offset)
+        SqliteError::new(code, message).with_offset(offset)
+    }
+
+    fn c_foreign_keys_expiry(&self) -> Option<u64> {
+        self.c_foreign_keys_expire_seq.filter(|seq| *seq == self.db_set.c_expire_seq())
     }
 
     fn record_c_prepare_error(&mut self, error: Option<&SqliteError>) {
@@ -1795,9 +1804,19 @@ impl ConnectionInner {
         self.c_retained_error_message = error.map(|e| e.message.clone());
     }
 
-    fn note_c_read_step_status(&mut self, status: ErrorCode) {
-        if self.db_set.c_ddl_rollback_expiry().is_some() {
+    fn note_c_step_status(&mut self, status: ErrorCode, is_read: bool) {
+        if self.c_foreign_keys_expiry().is_some()
+            || (is_read && self.db_set.c_ddl_rollback_expiry().is_some())
+        {
             self.c_connection_diagnostic_code = status;
+        }
+    }
+
+    fn note_c_step_result(&mut self, result: &Result<StepResult>, is_read: bool) {
+        match result {
+            Ok(StepResult::Row(_)) => self.note_c_step_status(ErrorCode::Row, is_read),
+            Ok(StepResult::Done) => self.note_c_step_status(ErrorCode::Done, is_read),
+            Err(_) => {}
         }
     }
 
@@ -3629,6 +3648,7 @@ impl Connection {
             c_error_byte_offset: -1,
             c_retained_error_message: None,
             c_connection_diagnostic_code: ErrorCode::Ok,
+            c_foreign_keys_expire_seq: None,
             default_locking_mode: LockingMode::Normal,
             writable_schema: false,
             working_dir: None,
@@ -5441,6 +5461,7 @@ pub struct Statement {
     compiled_slot_cookies: Vec<(SchemaInstanceId, u32, bool)>,
     expired: bool,
     c_v1_expired_before_run: bool,
+    c_v1_foreign_keys_expired: bool,
     c_reprepare_count: u32,
     c_reprepare_after_schema_check: bool,
     column_names: Vec<String>,
@@ -8704,6 +8725,7 @@ impl Statement {
             compiled_slot_cookies: inner.snapshot_slot_cookies(),
             expired: false,
             c_v1_expired_before_run: false,
+            c_v1_foreign_keys_expired: false,
             c_reprepare_count: 0,
             c_reprepare_after_schema_check: false,
             column_names: artifacts.column_names,
@@ -9145,17 +9167,20 @@ impl Statement {
         Ok(())
     }
 
-    fn transfer_read_cleanup_error(
+    fn transfer_c_cleanup_diagnostic(
         &self,
         inner: &mut ConnectionInner,
         shared: &ConnectionShared,
         ran: bool,
         result: &Result<()>,
     ) {
-        if !ran
-            || self.category != Some(StmtCategory::Read)
-            || !inner.uses_default_interrupt_flag(shared)
-        {
+        if !ran || !inner.uses_default_interrupt_flag(shared) {
+            return;
+        }
+        if self.category != Some(StmtCategory::Read) {
+            if result.is_ok() && self.category.is_some() && inner.c_foreign_keys_expiry().is_some() {
+                inner.transfer_c_read_error(None);
+            }
             return;
         }
         match result {
@@ -9213,9 +9238,13 @@ impl Statement {
 
         let prev = std::mem::replace(&mut self.lifecycle, StatementLifecycle::Ready);
         let ran = !matches!(prev, StatementLifecycle::Ready);
+        let foreign_keys_expired = std::mem::take(&mut self.c_v1_foreign_keys_expired);
         let result = match prev {
             StatementLifecycle::Ready => Ok(()),
             StatementLifecycle::Halted { last_error } => match last_error {
+                Some(_) if foreign_keys_expired => Err(inner.legacy_c_error_with_diagnostic(
+                    ErrorCode::Schema, inner.c_connection_diagnostic_code,
+                )),
                 Some(err) => Err(err),
                 None => Ok(()),
             },
@@ -9253,7 +9282,7 @@ impl Statement {
             }
             StatementLifecycle::Running(run) => inner.finish_running_exec(hid, run, shared),
         };
-        self.transfer_read_cleanup_error(inner, shared, ran, &result);
+        self.transfer_c_cleanup_diagnostic(inner, shared, ran, &result);
         result
     }
 
@@ -9285,6 +9314,9 @@ impl Statement {
                 }
             }
             StatementLifecycle::Halted { last_error } => match last_error {
+                Some(_) if self.c_v1_foreign_keys_expired => Err(inner.legacy_c_error_with_diagnostic(
+                    ErrorCode::Schema, inner.c_connection_diagnostic_code,
+                )),
                 Some(err) => Err(err),
                 None => {
                     if let ConnectionState::Poisoned(ref p_err) = inner.state {
@@ -9297,7 +9329,7 @@ impl Statement {
             StatementLifecycle::Running(run) => inner.finish_running_exec(hid, run, shared),
         };
         inner.open_handles.remove(&hid);
-        self.transfer_read_cleanup_error(inner, shared, ran, &res);
+        self.transfer_c_cleanup_diagnostic(inner, shared, ran, &res);
         res
     }
 
@@ -9563,7 +9595,7 @@ impl Statement {
                 last_error: fin_res.as_ref().err().cloned(),
             };
             fin_res.map_err(|e| Self::read_step_error(inner, &self.shared, self.mode, e))?;
-            inner.note_c_read_step_status(ErrorCode::Done);
+            inner.note_c_step_status(ErrorCode::Done, true);
             return Ok(StepResult::Done);
         }
 
@@ -9782,12 +9814,12 @@ impl Statement {
                         StatementLifecycle::Running(RunningExec::PointSelectRowYielded {
                             read_instances,
                         });
-                    inner.note_c_read_step_status(ErrorCode::Row);
+                    inner.note_c_step_status(ErrorCode::Row, true);
                     return Ok(StepResult::Row(Row::new(vals)));
                 }
                 PointOutcome::Miss => {
                     self.lifecycle = StatementLifecycle::Halted { last_error: None };
-                    inner.note_c_read_step_status(ErrorCode::Done);
+                    inner.note_c_step_status(ErrorCode::Done, true);
                     return Ok(StepResult::Done);
                 }
             }
@@ -9841,7 +9873,10 @@ impl Statement {
                         write_vm_scratch,
                     )
                 };
-                result.map(|result| result.map_err(|error| Self::write_step_error(inner, mode, error)))
+                result.map(|result| {
+                    inner.note_c_step_result(&result, false);
+                    result.map_err(|error| Self::write_step_error(inner, mode, error))
+                })
             };
             if let Some(res) = fast_write {
                 return res;
@@ -9899,11 +9934,7 @@ impl Statement {
                     )
                 };
                 result.map(|res| {
-                    match &res {
-                        Ok(StepResult::Row(_)) => inner.note_c_read_step_status(ErrorCode::Row),
-                        Ok(StepResult::Done) => inner.note_c_read_step_status(ErrorCode::Done),
-                        Err(_) => {}
-                    }
+                    inner.note_c_step_result(&res, true);
                     res.map_err(|e| Self::read_step_error(inner, shared, mode, e))
                 })
             };
@@ -9947,13 +9978,7 @@ impl Statement {
                 return Err(inner.legacy_c_step_error_with_diagnostic(diagnostic));
             }
         }
-        if self.category == Some(StmtCategory::Read) {
-            match &result {
-                Ok(StepResult::Row(_)) => inner.note_c_read_step_status(ErrorCode::Row),
-                Ok(StepResult::Done) => inner.note_c_read_step_status(ErrorCode::Done),
-                Err(_) => {}
-            }
-        }
+        inner.note_c_step_result(&result, self.category == Some(StmtCategory::Read));
         if self.mode == PrepareMode::V1
             && self.is_journal_mode_pragma()
             && result.as_ref().is_err_and(|error| {
@@ -10037,6 +10062,7 @@ impl Statement {
             self.lifecycle = StatementLifecycle::Ready;
         }
         self.c_v1_expired_before_run = false;
+        self.c_v1_foreign_keys_expired = false;
 
         // Empty / comment-only SQL (`stmt.is_none()` with no parsed statement)
         if self.stmt.is_none() && matches!(parse_one(&self.raw_sql), Ok((None, _))) {
@@ -10320,6 +10346,16 @@ impl Statement {
                 self.lifecycle = StatementLifecycle::Halted {
                     last_error: Some(err.clone()),
                 };
+                if expired_before_run
+                    && matches!(self.category, Some(StmtCategory::Read | StmtCategory::Write))
+                    && inner.c_foreign_keys_expiry()
+                        .is_some_and(|seq| self.compiled_c_expire_seq != seq)
+                {
+                    // The foreign_keys setter ran OP_Expire. This legacy statement
+                    // returns before executing, leaving the connection diagnostic alone.
+                    self.c_v1_foreign_keys_expired = true;
+                    return Err(inner.legacy_c_step_error_with_diagnostic(inner.c_connection_diagnostic_code));
+                }
                 return Err(err);
             }
             if let Err(e) = self.reprepare_in_open_tx(inner) {
@@ -10482,6 +10518,11 @@ impl Statement {
                 }
                 if expires_all && res.is_ok() {
                     inner.advisory_expire_generation += 1;
+                    if matches!(&stmt_clone, Stmt::Pragma { name, .. }
+                        if name.eq_ignore_ascii_case("foreign_keys"))
+                    {
+                        inner.c_foreign_keys_expire_seq = Some(inner.db_set.c_expire_seq());
+                    }
                 }
                 inner.end_autocommit_started_reads(stmt_tx.started_read_mask, summary);
                 if expire_self_only || stmt_tx.coordinated_journal_mode {

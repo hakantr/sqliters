@@ -1347,3 +1347,8 @@ Eski TEMP cookie ilk yazma denetiminde saptandığında V1 step 1 ve terminal 17
 ## V6b.208 — TEMP journal OFF savepoint
 
 Açık journal handle olmayan özel TEMP OFF pager savepoint playback yapmıyor. 2.070 C açılışı ve ana dosya sonuçları eş. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,262 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_208.md).
+
+
+## V6b.209 — foreign_keys setter sonrası legacy V1 erken expiry
+
+Gerçek setter adımından sonra erken V1 step 1, reset ve finalize 17 döndürür. Önceki tanı ve byte ofseti korunur. 804 profil ve 2.412 C açılışı eş. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,260 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_209.md).
