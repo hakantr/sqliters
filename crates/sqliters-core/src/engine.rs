@@ -43885,7 +43885,7 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
     let allow_empty_main = target == JournalMode::Wal
         && ctx.db_set.attached_count() <= 1
         && ctx.db_set.main_btree().pager().page_count() == 0;
-    let allow_preserved_off = target == JournalMode::Off && ctx.db_set.attached_count() == 1;
+    let allow_preserved_off = target == JournalMode::Off && ctx.db_set.attached_count() != 0;
     let mut has_wal_transition = false;
     for (index, slot) in ctx.db_set.slots().iter().enumerate() {
         let Some(bt) = slot.btree.as_ref() else {
@@ -43969,7 +43969,7 @@ fn apply_journal_mode_on_slot(
     }
 
     let disallow_wal_transition = !is_in_autocommit(ctx) || ctx.activity.other_readers > 0;
-    let one_attached = ctx.db_set.attached_count() == 1;
+    let has_attached = ctx.db_set.attached_count() != 0;
     let slot = ctx
         .db_set
         .slot_mut(db_id)
@@ -44008,7 +44008,7 @@ fn apply_journal_mode_on_slot(
                 let result = if pager.page_count() == 0 {
                     // The empty main uses the pager staging path that initializes page one.
                     pager.stage_single_target_sql_journal_mode(target).map(Ok)
-                } else if wal_exit && one_attached {
+                } else if wal_exit && has_attached {
                     pager.stage_sql_journal_mode_with_busy_retry(target)
                 } else {
                     pager.stage_sql_journal_mode(target).map(Ok)

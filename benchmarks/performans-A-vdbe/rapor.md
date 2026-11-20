@@ -1267,3 +1267,8 @@ Kilit ve checkpoint sonucu C gibi korunuyor. Yan dosya temizliği devam ederken 
 ## V6b.192 — Bağlantı kapanış sonucu
 
 Etkin statement ön koşulu C gibi BUSY. Kabul edilen bağlantı kapanışında pager temizliği tamamlandıktan sonra C gibi başarı dönüyor. 192 C–Rust sonuç ve fiziksel çift, 18 eski dönüş farkı ve 480 C yeniden açılışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,155 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_192.md).
+
+
+## V6b.193 — Birden çok ATTACH ile WAL çıkışı
+
+C WAL kapanışının doğrudan hata dönüşü önceki koşullarla tüm koordineli slotlara uygulanıyor. 630 C çift, 946 eski callback ve 56 OFF ilk satır dosya farkı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,260 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_193.md).

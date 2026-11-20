@@ -1,0 +1,3 @@
+# V6b.193 — Açık kapsam
+
+Ham Linux SHM DMS ön kontrolü ve Rust EXCLUSIVE denemesi arasındaki sistem çağrısı farkı sürüyor. İlk birleşik tekrarın daha kısa scratch yolu, bir profilde ortak journal adını taşıyan ham yazıların uzunluğunu ve devam ofsetini iki motorda değiştirdi. Aynı uzunlukta ayrı scratch yolu ile tam fiziksel, API ve VFS karşılaştırması geçti. [İlk koşu](/github/sqliters/target/perf-work/v193-combined-stage-replay.xA8h30vH/res/result.txt) · [Yol uzunluğu ölçümü](/github/sqliters/target/perf-work/v193-combined-stage-replay-zero-pad.TPt7ODg3/res/path-length.txt) · [Geçen tekrar](/github/sqliters/target/perf-work/v193-combined-stage-replay-zero-pad.TPt7ODg3/res/result.txt)
