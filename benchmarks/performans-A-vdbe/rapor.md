@@ -1582,3 +1582,8 @@ Sağlıklı MAIN WITHOUT ROWID tablosunda örtük tam taramalı DELETE için kan
 ## V6b.255 — Süre biriminde tek çoğul ek
 
 Ortak süre değiştiricisi C gibi en fazla bir çoğul s ekini kabul eder. 2.925 fark kapandı ve 4.347 geçerli sonuç C ile eş kaldı. Numeric TEXT, negatif 24:00 ve 60 bağımsız C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_255.md).
+
+
+## V6b.256 — Ortak ISO tarih sözdizimi
+
+Ortak tarih ayrıştırıcı C’nin ASCII yıl, ay ve gün alanlarını, büyük T ve ASCII boşluk ayırıcısını ve saatli Z kuralını kullanır. 92 girdi üç kodlamada C ile hizalandı, 530 eş sonuç ve önceki numeric, kesir ve korunmuş takvim kontrolleri korundu. Üç dosya profili ile 60 C salt okunur açılışı eş. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,263 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_256.md).

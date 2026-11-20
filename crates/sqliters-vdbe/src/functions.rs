@@ -1614,25 +1614,22 @@ fn parse_iso_datetime(input: &str, allow_signed_year: bool) -> Option<ParsedDate
                 prefix[4] == b'-' && prefix[..4].iter().all(u8::is_ascii_digit)
             })
     });
-    let input = signed_date.unwrap_or(input);
+    let s = signed_date
+        .unwrap_or(input)
+        .trim_end_matches(is_date_time_space);
     let signed = signed_date.is_some();
-    let s = if signed {
-        input.trim_end_matches(is_date_time_space)
-    } else {
-        input.trim()
-    };
     let has_date = s.len() >= 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-';
-    let canonical_date = || {
-        has_date
-            && s.as_bytes()[..10]
-                .iter()
-                .enumerate()
-                .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
-    };
-    if signed && (!canonical_date() || s.contains('\0')) {
+    if signed && (!has_date || s.contains('\0')) {
         return None;
     }
     let (days, clock, signed_year_end) = if has_date {
+        if !s.as_bytes()[..10]
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+        {
+            return None;
+        }
         let mut y: i64 = s.get(0..4)?.parse().ok()?;
         let m: u32 = s.get(5..7)?.parse().ok()?;
         let d: u32 = s.get(8..10)?.parse().ok()?;
@@ -1652,7 +1649,8 @@ fn parse_iso_datetime(input: &str, allow_signed_year: bool) -> Option<ParsedDate
         }
         (
             days_from_civil(y, m, d),
-            s.get(10..)?,
+            s.get(10..)?
+                .trim_start_matches(|c| c == 'T' || is_date_time_space(c)),
             (signed && m == 12 && d == 31).then_some(y),
         )
     } else if s.contains(':') {
@@ -1671,19 +1669,8 @@ fn parse_iso_datetime(input: &str, allow_signed_year: bool) -> Option<ParsedDate
     };
 
     if let Some(offset_start) = clock.find(['+', '-']) {
-        if input.trim_end_matches(is_date_time_space) != s {
-            return None;
-        }
         let (clock, offset) = clock.split_at(offset_start);
         let clock = clock.trim_end_matches(is_date_time_space);
-        let clock = if has_date {
-            if !canonical_date() {
-                return None;
-            }
-            clock.trim_start_matches(|c| c == 'T' || is_date_time_space(c))
-        } else {
-            clock
-        };
         let (clock_ms, raw_seconds) = parse_hms_ms(clock, true)?;
         let local_ms = local_clock_ms(clock_ms)?;
         // A 24:00 clock advances the local date before applying its offset.
@@ -1710,25 +1697,12 @@ fn parse_iso_datetime(input: &str, allow_signed_year: bool) -> Option<ParsedDate
     }
 
     let without_z = clock.strip_suffix(['Z', 'z']);
-    let clock = without_z.unwrap_or(clock);
-    let hour24_clock = if has_date {
-        clock.trim_start_matches(|c| c == 'T' || is_date_time_space(c))
-    } else {
-        clock
-    }
-    .trim_end_matches(is_date_time_space);
-    let hour24 = hour24_clock.starts_with("24:")
-        && (!has_date || canonical_date())
-        && input.trim_end_matches(is_date_time_space) == s;
-    let clock = if hour24 || signed {
-        hour24_clock
-    } else if has_date {
-        clock.trim_start_matches([' ', 'T', 't'])
-    } else {
-        clock
-    };
+    let clock = without_z
+        .unwrap_or(clock)
+        .trim_end_matches(is_date_time_space);
+    let hour24 = clock.starts_with("24:");
     if has_date && clock.is_empty() {
-        if signed && without_z.is_some() {
+        if without_z.is_some() {
             return None;
         }
         return Some(ParsedDateTime::from_unix_ms(midnight_ms));
