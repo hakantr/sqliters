@@ -1390,11 +1390,27 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 const UNIX_EPOCH_JULIAN_MS: i64 = 210_866_760_000_000;
 const JULIAN_MS_LIMIT: i64 = 464_269_060_800_000;
 
+#[derive(Default)]
+struct ParsedDateTime {
+    unix_ms: i64,
+    raw_seconds: Option<f64>,
+    is_utc: bool,
+}
+
+impl ParsedDateTime {
+    fn from_unix_ms(unix_ms: i64) -> Self {
+        Self {
+            unix_ms,
+            ..Self::default()
+        }
+    }
+}
+
 fn parse_datetime_value(
     val: &Value,
     modifiers: &[Value],
     ctx: &VmRuntimeContext,
-) -> Option<(i64, bool)> {
+) -> Option<(ParsedDateTime, bool)> {
     if val.is_null() || modifiers.iter().any(Value::is_null) {
         return None;
     }
@@ -1406,28 +1422,38 @@ fn parse_datetime_value(
         .map(datetime_c_string)
         .unwrap_or_default();
 
-    let (mut ms, modifiers, check_julian_range) = if first_name.eq_ignore_ascii_case("unixepoch") {
+    let (mut time, modifiers, check_julian_range) = if first_name.eq_ignore_ascii_case("unixepoch")
+    {
         let seconds = parse_raw_datetime_number(val, ctx.text_encoding)?;
-        (unix_seconds_to_ms(seconds)?, &modifiers[1..], true)
+        (
+            ParsedDateTime::from_unix_ms(unix_seconds_to_ms(seconds)?),
+            &modifiers[1..],
+            true,
+        )
     } else if first_name.eq_ignore_ascii_case("julianday") {
         let days = parse_raw_datetime_number(val, ctx.text_encoding)?;
-        (julian_days_to_ms(days)?, &modifiers[1..], true)
+        (
+            ParsedDateTime::from_unix_ms(julian_days_to_ms(days)?),
+            &modifiers[1..],
+            true,
+        )
     } else if first_name.eq_ignore_ascii_case("auto") {
-        (parse_auto_datetime_ms(val, ctx)?, &modifiers[1..], true)
+        (parse_auto_datetime(val, ctx)?, &modifiers[1..], true)
     } else {
-        let (ms, check_julian_range) = match val {
+        let (time, check_julian_range) = match val {
             Value::Integer(jd) => {
                 // Julian day -> Unix ms (`2440587.5` JD = Unix epoch)
-                (
-                    ((*jd as f64 - 2_440_587.5) * 86_400_000.0).round() as i64,
-                    false,
-                )
+                let ms = ((*jd as f64 - 2_440_587.5) * 86_400_000.0).round() as i64;
+                (ParsedDateTime::from_unix_ms(ms), false)
             }
-            Value::Real(jd) => (((*jd - 2_440_587.5) * 86_400_000.0).round() as i64, false),
-            Value::Text(s) => parse_datetime_text_ms(s, ctx)?,
+            Value::Real(jd) => {
+                let ms = ((*jd - 2_440_587.5) * 86_400_000.0).round() as i64;
+                (ParsedDateTime::from_unix_ms(ms), false)
+            }
+            Value::Text(s) => parse_datetime_text(s, ctx)?,
             Value::Null | Value::Blob(_) => return None,
         };
-        (ms, modifiers, check_julian_range)
+        (time, modifiers, check_julian_range)
     };
 
     let mut use_subsec = false;
@@ -1439,29 +1465,36 @@ fn parse_datetime_value(
         }
         let mt = mod_str.trim();
         if mt.eq_ignore_ascii_case("utc") {
+            if !time.is_utc {
+                time.raw_seconds = None;
+            }
             continue;
         }
-        ms = apply_datetime_modifier_ms(ms, mt)?;
+        time.unix_ms = apply_datetime_modifier_ms(time.unix_ms, mt)?;
+        time.raw_seconds = None;
     }
 
     if check_julian_range
-        && !(-UNIX_EPOCH_JULIAN_MS..JULIAN_MS_LIMIT - UNIX_EPOCH_JULIAN_MS).contains(&ms)
+        && !(-UNIX_EPOCH_JULIAN_MS..JULIAN_MS_LIMIT - UNIX_EPOCH_JULIAN_MS).contains(&time.unix_ms)
     {
         return None;
     }
-    Some((ms, use_subsec))
+    Some((time, use_subsec))
 }
 
 fn datetime_c_string(text: &str) -> &str {
     text.split_once('\0').map_or(text, |(prefix, _)| prefix)
 }
 
-fn parse_datetime_text_ms(text: &str, ctx: &VmRuntimeContext) -> Option<(i64, bool)> {
+fn parse_datetime_text(text: &str, ctx: &VmRuntimeContext) -> Option<(ParsedDateTime, bool)> {
     if text.trim().eq_ignore_ascii_case("now") {
-        Some((ctx.effective_timestamp_ms(), false))
+        Some((
+            ParsedDateTime::from_unix_ms(ctx.effective_timestamp_ms()),
+            false,
+        ))
     } else {
         // Validate the ISO timestamp after all modifiers have run.
-        parse_iso_datetime_ms(text).map(|ms| (ms, true))
+        parse_iso_datetime(text).map(|time| (time, true))
     }
 }
 
@@ -1478,24 +1511,24 @@ fn parse_raw_datetime_number(val: &Value, encoding: TextEncoding) -> Option<f64>
     }
 }
 
-fn parse_auto_datetime_ms(val: &Value, ctx: &VmRuntimeContext) -> Option<i64> {
+fn parse_auto_datetime(val: &Value, ctx: &VmRuntimeContext) -> Option<ParsedDateTime> {
     if let Some(number) = parse_raw_datetime_number(val, ctx.text_encoding) {
         if let Some(ms) = julian_days_to_ms(number) {
-            return Some(ms);
+            return Some(ParsedDateTime::from_unix_ms(ms));
         }
         // The auto Unix range ends at the last whole second of year 9999.
         if (-210_866_760_000.0..=253_402_300_799.0).contains(&number) {
-            return unix_seconds_to_ms(number);
+            return unix_seconds_to_ms(number).map(ParsedDateTime::from_unix_ms);
         }
         return None;
     }
 
     match val {
-        Value::Text(text) => parse_iso_datetime_ms(datetime_c_string(text))
-            .or_else(|| parse_datetime_text_ms(text, ctx).map(|(ms, _)| ms)),
+        Value::Text(text) => parse_iso_datetime(datetime_c_string(text))
+            .or_else(|| parse_datetime_text(text, ctx).map(|(time, _)| time)),
         Value::Blob(_) => {
             let text = value_to_text_in_encoding(val, ctx.text_encoding);
-            parse_iso_datetime_ms(datetime_c_string(&text))
+            parse_iso_datetime(datetime_c_string(&text))
         }
         _ => None,
     }
@@ -1515,7 +1548,7 @@ fn unix_seconds_to_ms(seconds: f64) -> Option<i64> {
         .then(|| (julian_ms + 0.5) as i64 - UNIX_EPOCH_JULIAN_MS)
 }
 
-fn parse_iso_datetime_ms(input: &str) -> Option<i64> {
+fn parse_iso_datetime(input: &str) -> Option<ParsedDateTime> {
     let s = input.trim();
     let has_date = s.len() >= 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-';
     let (days, clock) = if has_date {
@@ -1552,23 +1585,35 @@ fn parse_iso_datetime_ms(input: &str) -> Option<i64> {
         } else {
             clock
         };
-        let local_ms = midnight_ms + parse_hms_ms(clock, true)?;
-        let utc_ms = local_ms - parse_numeric_time_offset_ms(offset)?;
+        let (clock_ms, raw_seconds) = parse_hms_ms(clock, true)?;
+        let offset_ms = parse_numeric_time_offset_ms(offset)?;
+        let local_ms = midnight_ms + clock_ms;
+        let utc_ms = local_ms - offset_ms;
         // A 24:00 clock can advance the date before applying its offset.
         const YEAR_10000_MS: i64 = 253_402_300_800_000;
-        return (local_ms < YEAR_10000_MS && utc_ms < YEAR_10000_MS).then_some(utc_ms);
+        return (local_ms < YEAR_10000_MS && utc_ms < YEAR_10000_MS).then_some(ParsedDateTime {
+            unix_ms: utc_ms,
+            raw_seconds: if offset_ms == 0 { raw_seconds } else { None },
+            is_utc: true,
+        });
     }
 
-    let clock = clock.strip_suffix(['Z', 'z']).unwrap_or(clock);
+    let without_z = clock.strip_suffix(['Z', 'z']);
+    let clock = without_z.unwrap_or(clock);
     let clock = if has_date {
         clock.trim_start_matches([' ', 'T', 't'])
     } else {
         clock
     };
     if has_date && clock.is_empty() {
-        return Some(midnight_ms);
+        return Some(ParsedDateTime::from_unix_ms(midnight_ms));
     }
-    Some(midnight_ms + parse_hms_ms(clock, false)?)
+    let (clock_ms, raw_seconds) = parse_hms_ms(clock, false)?;
+    Some(ParsedDateTime {
+        unix_ms: midnight_ms + clock_ms,
+        raw_seconds,
+        is_utc: without_z.is_some(),
+    })
 }
 
 fn is_date_time_space(c: char) -> bool {
@@ -1596,7 +1641,7 @@ fn parse_numeric_time_offset_ms(s: &str) -> Option<i64> {
     Some(if s.starts_with('-') { -ms } else { ms })
 }
 
-fn parse_hms_ms(s: &str, has_numeric_offset: bool) -> Option<i64> {
+fn parse_hms_ms(s: &str, has_numeric_offset: bool) -> Option<(i64, Option<f64>)> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() < 2 || parts.len() > 3 {
         return None;
@@ -1610,7 +1655,7 @@ fn parse_hms_ms(s: &str, has_numeric_offset: bool) -> Option<i64> {
     };
     let hh = parse_part(parts[0])?;
     let mm = parse_part(parts[1])?;
-    let (ss, ms) = if parts.len() == 3 {
+    let (ss, ms, raw_seconds) = if parts.len() == 3 {
         if let Some((sec_part, frac_part)) = parts[2].split_once('.') {
             let sec = parse_part(sec_part)?;
             if (has_numeric_offset && frac_part.is_empty())
@@ -1618,17 +1663,21 @@ fn parse_hms_ms(s: &str, has_numeric_offset: bool) -> Option<i64> {
             {
                 return None;
             }
-            let mut frac_digits: String = frac_part.chars().take(3).collect();
-            while frac_digits.len() < 3 {
-                frac_digits.push('0');
+            if frac_part.len() > 3 && [parts[0], parts[1], sec_part].iter().all(|p| p.len() == 2) {
+                let (millis, seconds) = parse_long_clock_fraction(sec, frac_part)?;
+                (sec, millis, Some(seconds))
+            } else {
+                let mut frac_digits: String = frac_part.chars().take(3).collect();
+                while frac_digits.len() < 3 {
+                    frac_digits.push('0');
+                }
+                (sec, frac_digits.parse().ok()?, None)
             }
-            let millis: u32 = frac_digits.parse().ok()?;
-            (sec, millis)
         } else {
-            (parse_part(parts[2])?, 0)
+            (parse_part(parts[2])?, 0, None)
         }
     } else {
-        (0, 0)
+        (0, 0, None)
     };
     if hh > 23 {
         let midnight = has_numeric_offset
@@ -1643,7 +1692,26 @@ fn parse_hms_ms(s: &str, has_numeric_offset: bool) -> Option<i64> {
     if mm > 59 || ss > 59 {
         return None;
     }
-    Some((i64::from(hh) * 3_600 + i64::from(mm) * 60 + i64::from(ss)) * 1_000 + i64::from(ms))
+    let clock_ms =
+        (i64::from(hh) * 3_600 + i64::from(mm) * 60 + i64::from(ss)) * 1_000 + i64::from(ms);
+    Some((clock_ms, raw_seconds))
+}
+
+fn parse_long_clock_fraction(second: u32, digits: &str) -> Option<(u32, f64)> {
+    let mut numerator = 0.0;
+    let mut scale = 1.0;
+    for digit in digits.bytes() {
+        numerator = numerator * 10.0 + f64::from(digit) - f64::from(b'0');
+        scale *= 10.0;
+    }
+    let fraction = numerator / scale;
+    if fraction.is_nan() {
+        return None;
+    }
+    // SQLite rounds after adding the whole second to the capped fraction.
+    let seconds = f64::from(second) + fraction.min(0.999);
+    let millis = (seconds * 1_000.0 + 0.5) as u32 - second * 1_000;
+    Some((millis, seconds))
 }
 
 fn apply_datetime_modifier_ms(ms: i64, s: &str) -> Option<i64> {
@@ -1743,10 +1811,10 @@ fn eval_datetime_function(
     let (unix_ms, use_subsec) = if args.is_empty() {
         (ctx.effective_timestamp_ms(), false)
     } else {
-        let Some(parsed) = parse_datetime_value(&args[0], &args[1..], ctx) else {
+        let Some((time, use_subsec)) = parse_datetime_value(&args[0], &args[1..], ctx) else {
             return Ok(Value::Null);
         };
-        parsed
+        (time.unix_ms, use_subsec)
     };
 
     match upper_name {
@@ -1781,14 +1849,18 @@ fn eval_strftime_function(args: &[Value], ctx: &VmRuntimeContext) -> Result<Valu
         return Ok(Value::Null);
     }
     let fmt = args[0].to_text_lossy();
-    let (unix_ms, use_subsec) = if args.len() == 1 {
-        (ctx.effective_timestamp_ms(), false)
+    let (time, use_subsec) = if args.len() == 1 {
+        (
+            ParsedDateTime::from_unix_ms(ctx.effective_timestamp_ms()),
+            false,
+        )
     } else {
         let Some(parsed) = parse_datetime_value(&args[1], &args[2..], ctx) else {
             return Ok(Value::Null);
         };
         parsed
     };
+    let unix_ms = time.unix_ms;
     let (y, m, d, hh, mm, ss) = utc_ymdhms_from_unix_ms(unix_ms);
     let ms_rem = unix_ms.rem_euclid(1_000) as u32;
     let total_secs = unix_ms.div_euclid(1_000);
@@ -1823,7 +1895,17 @@ fn eval_strftime_function(args: &[Value], ctx: &VmRuntimeContext) -> Result<Valu
             }
             'M' => out.push_str(&format!("{mm:02}")),
             'S' => out.push_str(&format!("{ss:02}")),
-            'f' => out.push_str(&format!("{ss:02}.{ms_rem:03}")),
+            'f' => {
+                if let Some(seconds) = time.raw_seconds {
+                    let bytes = crate::printf::sqlite_printf(b"%06.3f", &[Value::real(seconds)])
+                        .map_err(|_| {
+                            SqliteError::new(ErrorCode::TooBig, "string or blob too big")
+                        })?;
+                    out.push_str(&String::from_utf8_lossy(&bytes));
+                } else {
+                    out.push_str(&format!("{ss:02}.{ms_rem:03}"));
+                }
+            }
             'F' => out.push_str(&format!("{y:04}-{m:02}-{d:02}")),
             'T' => out.push_str(&format!("{hh:02}:{mm:02}:{ss:02}")),
             'R' => out.push_str(&format!("{hh:02}:{mm:02}")),
