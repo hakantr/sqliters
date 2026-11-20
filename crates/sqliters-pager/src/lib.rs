@@ -2439,7 +2439,12 @@ impl Pager {
     ///
     /// If `LockLevel::Exclusive` cannot be obtained due to active readers/writers, returns
     /// `ErrorCode::Busy` WITHOUT closing `self.wal`!
-    fn close_wal_for_mode_switch(&mut self, honor_persistence: bool) -> Result<()> {
+    fn close_wal_for_mode_switch(
+        &mut self,
+        honor_persistence: bool,
+        wal_close_failed: &mut bool,
+    ) -> Result<()> {
+        *wal_close_failed = true;
         let acquired_shared = self.wal.is_none() && self.db_file()?.lock_level() == LockLevel::NoLock;
         if self.wal.is_none() {
             self.lock_db_file(LockLevel::Shared)?;
@@ -2482,14 +2487,20 @@ impl Pager {
                 }
                 return Err(e);
             }
-        } else if let Err(error) = self.acquire_exclusive_lock_or_restore() {
-            // The xAccess probe acquired SHARED without opening a B-tree
-            // reader. Release it so the other connection can close its WAL.
-            if acquired_shared && self.locking_mode == LockingMode::Normal {
-                let _ = self.unlock_db_file(LockLevel::NoLock);
+        } else {
+            // With no WAL to close, the exclusive lock belongs to the
+            // page-one rewrite (sqlite3BtreeSetVersion).
+            *wal_close_failed = false;
+            if let Err(error) = self.acquire_exclusive_lock_or_restore() {
+                // The xAccess probe acquired SHARED without opening a B-tree
+                // reader. Release it so the other connection can close its WAL.
+                if acquired_shared && self.locking_mode == LockingMode::Normal {
+                    let _ = self.unlock_db_file(LockLevel::NoLock);
+                }
+                return Err(error);
             }
-            return Err(error);
         }
+        *wal_close_failed = false;
         Ok(())
     }
 
@@ -2530,23 +2541,32 @@ impl Pager {
     /// in `pager.c:7437`), performing rollback-journaled Page 1 `(1, 1) <-> (2, 2)` transitions
     /// when switching into or out of [`JournalMode::Wal`].
     pub fn set_journal_mode(&mut self, mode: JournalMode) -> Result<JournalMode> {
-        self.change_journal_mode(mode, false, false)
+        self.change_journal_mode(mode, false, false, &mut false)
     }
 
     /// Prepares a SQL mode change whose page-one transaction
     /// is completed by the statement's normal commit outcome.
     #[doc(hidden)]
     pub fn stage_sql_journal_mode(&mut self, mode: JournalMode) -> Result<(JournalMode, bool)> {
-        self.stage_journal_mode(mode, false)
+        self.stage_journal_mode(mode, false)?
     }
 
     /// Stages a mode change targeting one SQL database, including its WAL persistence policy.
     #[doc(hidden)]
     pub fn stage_single_target_sql_journal_mode(&mut self, mode: JournalMode) -> Result<(JournalMode, bool)> {
+        self.stage_journal_mode(mode, true)?
+    }
+
+    /// Returns WAL-close errors in the statement result, outside the busy retry.
+    #[doc(hidden)]
+    pub fn stage_single_target_sql_journal_mode_with_busy_retry(
+        &mut self,
+        mode: JournalMode,
+    ) -> Result<Result<(JournalMode, bool)>> {
         self.stage_journal_mode(mode, true)
     }
 
-    fn stage_journal_mode(&mut self, mode: JournalMode, single_target: bool) -> Result<(JournalMode, bool)> {
+    fn stage_journal_mode(&mut self, mode: JournalMode, single_target: bool) -> Result<Result<(JournalMode, bool)>> {
         let previous_mode = self.sql_journal_mode_after_busy.unwrap_or(self.journal_mode);
         let touches_volatile_journal = matches!(mode, JournalMode::Memory | JournalMode::Off)
             || matches!(previous_mode, JournalMode::Memory | JournalMode::Off);
@@ -2574,8 +2594,14 @@ impl Pager {
                 JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate
                     | JournalMode::Memory | JournalMode::Off
             );
-        let active = self.change_journal_mode(mode, defer, honor_persistence)?;
-        Ok((active, defer && self.pending_sql_journal_mode.is_some()))
+        let mut wal_close_failed = false;
+        let result = self.change_journal_mode(mode, defer, honor_persistence, &mut wal_close_failed)
+            .map(|active| (active, defer && self.pending_sql_journal_mode.is_some()));
+        if wal_close_failed {
+            Ok(result)
+        } else {
+            result.map(Ok)
+        }
     }
 
     #[doc(hidden)]
@@ -2619,7 +2645,13 @@ impl Pager {
         Ok(())
     }
 
-    fn change_journal_mode(&mut self, mode: JournalMode, defer: bool, honor_persistence: bool) -> Result<JournalMode> {
+    fn change_journal_mode(
+        &mut self,
+        mode: JournalMode,
+        defer: bool,
+        honor_persistence: bool,
+        wal_close_failed: &mut bool,
+    ) -> Result<JournalMode> {
         self.ensure_not_closed()?;
 
         if !self.ok_to_change_journal_mode() {
@@ -2741,7 +2773,7 @@ impl Pager {
                 ));
             }
 
-            self.close_wal_for_mode_switch(honor_persistence)?;
+            self.close_wal_for_mode_switch(honor_persistence, wal_close_failed)?;
             if std::mem::take(&mut self.dv_wal_page1_written) {
                 // `sqlite3PagerSharedLock` of the header rewrite below: the database file now
                 // carries the page 1 this connection committed through the WAL, which is not

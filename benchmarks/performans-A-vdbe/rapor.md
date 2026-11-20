@@ -1247,3 +1247,8 @@ Nitelemesiz WAL girişinde boş ana dosya ilk ROW boyunca sıfır kalır ve TEMP
 ## V6b.188 — Üç kökte rowid nokta yazımları
 
 Rowid noktası ve düz VALUES üç kökün etkin işlem görüntüsü doğrulamasını kullanır. 1.026 yazıcı, eş rollback ve takip yazısı, 540 C fiziksel çift ve bağımsız C yeniden açılış doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,281 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_188.md).
+
+
+## V6b.189 — Tek hedefli WAL çıkışında busy handler
+
+Normal yazılabilir tek dosyada WAL kapatma hatası C gibi doğrudan dönüyor. 498 C–Rust çifti, 48 hazırlık ve 36 WAL giriş koruması ile yeniden deneme ömrü doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,262 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_189.md).
