@@ -1753,7 +1753,16 @@ fn eval_datetime_function(
         }
         "UNIXEPOCH" if use_subsec => Ok(Value::real(unix_ms as f64 / 1_000.0)),
         "UNIXEPOCH" => Ok(Value::Integer(unix_ms.div_euclid(1_000))),
-        "JULIANDAY" => Ok(Value::real((unix_ms as f64) / 86_400_000.0 + 2_440_587.5)),
+        "JULIANDAY" => {
+            let day = unix_ms
+                .checked_add(UNIX_EPOCH_JULIAN_MS)
+                .filter(|ms| (0..JULIAN_MS_LIMIT).contains(ms))
+                .map_or_else(
+                    || (unix_ms as f64) / 86_400_000.0 + 2_440_587.5,
+                    |julian_ms| julian_ms as f64 / 86_400_000.0,
+                );
+            Ok(Value::real(day))
+        }
         _ => unreachable!(),
     }
 }
