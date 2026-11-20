@@ -1517,3 +1517,8 @@ Tek tam BINARY NUMERIC indeksli doğrudan rowid görünüm UPDATE işleminde mev
 ## V6b.242 — Legacy görünüm UPDATE şema denetimi
 
 Olağan ilişkisel MAIN legacy V1 görünüm UPDATE işlemi gerçek Btree okuma snapshot üstünde hazırlanmış şema kimliğini ve cookie değerini doğrular. 48 OFF ve 32 UTF16 ON geri dönüşünde eski şema yazmadan reddedildi. STEP, RESET, FINALIZE, ana dosya ve log C eş. Ek önceki değişiklik sayacı ve normal takip işlemleri korundu. 576 native ve 576 C açılışı, iki kipte önceki 10/10 test ve 4.735 strict doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 242/245, determinism 244/245. Açık L1, L4 ve L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,252 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_242.md).
+
+
+## V6b.243 — Negatif ISO yıl ayrıştırması
+
+Canonical negatif ISO tarih ve olağan saatte geçerli yerel gün, dört ASCII yıl hanesi ve erken yıl sınırı mevcut Gregorian hesap ve son Julian denetimiyle çalışır. 54 hedef bağlam ve kip başına 972 ham kayıt C eş. 89 diğer bağlam ve önceki korumalar değişmedi. 54 gerçek saklama, C açılışları, 12 VDBE testi ve 6.803 strict final exact doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 242/245, determinism 244/245. Açık L1, L4 ve L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_243.md).
