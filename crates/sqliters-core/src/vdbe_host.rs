@@ -121,7 +121,7 @@ pub(crate) fn mapped_table_read_program(
     sql: &str,
     n_param: usize,
 ) -> Option<Arc<Program>> {
-    use sqliters_syntax::{SelectCore, TableOrSubquery};
+    use sqliters_syntax::{Expr, SelectCore, TableOrSubquery};
     use sqliters_vdbe::opcodes::*;
 
     if inner.authorizer.is_some() {
@@ -183,13 +183,30 @@ pub(crate) fn mapped_table_read_program(
     if !mapped {
         // A live table cursor can seek again after a rollback. A SQLite sorter
         // owns its rows after the sort, so keep its existing execution path.
+        // A fixed LIMIT can use the same live scan when its only extra
+        // instructions initialize and decrement the row counter.
+        let limit_counter = select.limit.as_ref().and_then(|limit| {
+            let Expr::Integer(rows) = limit.limit else {
+                return None;
+            };
+            if rows < 2 || limit.offset.is_some() {
+                return None;
+            }
+            let rows = i32::try_from(rows).ok()?;
+            let decrement = program.a_op.iter().find(|op| op.opcode == OP_DecrJumpZero)?;
+            Some((rows, decrement.p1))
+        });
         let direct_scan = open.p2 == table.root_pgno as i32
             && open.p3 == db.index() as i32
             && program.a_op.iter().any(|op| matches!(op.opcode, OP_Next | OP_Prev))
-            && program.a_op.iter().all(|op| matches!(op.opcode,
+            && program.a_op.iter().all(|op| match op.opcode {
+                OP_Integer => limit_counter == Some((op.p1, op.p2)),
+                OP_DecrJumpZero => limit_counter.is_some_and(|(_, register)| op.p1 == register),
                 OP_Init | OP_Halt | OP_Transaction | OP_Goto | OP_OpenRead | OP_Close
                 | OP_Rewind | OP_Last | OP_Next | OP_Prev | OP_Rowid | OP_Column
-                | OP_RealAffinity | OP_ResultRow | OP_Noop));
+                | OP_RealAffinity | OP_ResultRow | OP_Noop => true,
+                _ => false,
+            });
         return direct_scan.then(|| Arc::new(*program));
     }
     if !program.a_op.iter().all(|op| match op.opcode {

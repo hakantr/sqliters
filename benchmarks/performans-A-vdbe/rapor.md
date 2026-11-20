@@ -1387,3 +1387,8 @@ Sayım INSTEAD OF tetikleyicisinden önce yapılıyor. 94 OFF farkı kapandı ve
 ## V6b.216 — Bağlı açık okuyucunun rollback sonucu
 
 İlk bağlı rowid okuyucusu restore edilmiş satırı görüyor. 24 OFF farkı kapandı ve 2.880 C açılışı eş. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_216.md).
+
+
+## V6b.217 — Bağlı sabit LIMIT okuyucusu
+
+İlk bağlı canlı tarama sabit LIMIT sayacını koruyor. 42 OFF farkı kapandı ve 4.650 C açılışı geçti. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,257 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_217.md).
