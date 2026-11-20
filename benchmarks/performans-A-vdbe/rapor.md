@@ -1437,3 +1437,8 @@ Geçerli UTF-16LE/BE gömülü NUL ve devamını koruyor. 54 ayrı sonuç, 24 fi
 ## V6b.226 — Backup fiziksel sayfa imajı
 
 Önceden kopyalanmış sayfa son fiziksel yayımdan yenileniyor. 48 hedef farkı kapandı. 744 eski ve 144 geniş profil doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_226.md).
+
+
+## V6b.227 — auto zaman değiştiricisi
+
+İlk auto, C sayısal Julian/Unix ayrımını ve sınırlarını uyguluyor. 687 ana ve 28 önceki fark kapandı. 540 C açılışı geçti. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,256 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_227.md).

@@ -1398,16 +1398,19 @@ fn parse_datetime_value(
     if val.is_null() || modifiers.iter().any(Value::is_null) {
         return None;
     }
-    let has_unixepoch = modifiers.first().is_some_and(|modifier| {
-        let text = value_to_text_in_encoding(modifier, ctx.text_encoding);
-        let name = text
-            .split_once('\0')
-            .map_or(text.as_str(), |(name, _)| name);
-        name.eq_ignore_ascii_case("unixepoch")
-    });
+    let first_modifier = modifiers
+        .first()
+        .map(|modifier| value_to_text_in_encoding(modifier, ctx.text_encoding));
+    let first_name = first_modifier
+        .as_deref()
+        .map(datetime_c_string)
+        .unwrap_or_default();
 
-    let (mut ms, modifiers) = if has_unixepoch {
-        (parse_unixepoch_ms(val, ctx.text_encoding)?, &modifiers[1..])
+    let (mut ms, modifiers, check_julian_range) = if first_name.eq_ignore_ascii_case("unixepoch") {
+        let seconds = parse_raw_datetime_number(val, ctx.text_encoding)?;
+        (unix_seconds_to_ms(seconds)?, &modifiers[1..], true)
+    } else if first_name.eq_ignore_ascii_case("auto") {
+        (parse_auto_datetime_ms(val, ctx)?, &modifiers[1..], true)
     } else {
         let ms = match val {
             Value::Integer(jd) => {
@@ -1415,16 +1418,10 @@ fn parse_datetime_value(
                 ((*jd as f64 - 2_440_587.5) * 86_400_000.0).round() as i64
             }
             Value::Real(jd) => ((*jd - 2_440_587.5) * 86_400_000.0).round() as i64,
-            Value::Text(s) => {
-                if s.trim().eq_ignore_ascii_case("now") {
-                    ctx.effective_timestamp_ms()
-                } else {
-                    parse_iso_datetime_ms(s)?
-                }
-            }
+            Value::Text(s) => parse_datetime_text_ms(s, ctx)?,
             Value::Null | Value::Blob(_) => return None,
         };
-        (ms, modifiers)
+        (ms, modifiers, false)
     };
 
     let mut use_subsec = false;
@@ -1435,13 +1432,13 @@ fn parse_datetime_value(
             continue;
         }
         let mt = mod_str.trim();
-        if mt.eq_ignore_ascii_case("utc") || mt.eq_ignore_ascii_case("auto") {
+        if mt.eq_ignore_ascii_case("utc") {
             continue;
         }
         ms = apply_datetime_modifier_ms(ms, mt)?;
     }
 
-    if has_unixepoch
+    if check_julian_range
         && !(-UNIX_EPOCH_JULIAN_MS..JULIAN_MS_LIMIT - UNIX_EPOCH_JULIAN_MS).contains(&ms)
     {
         return None;
@@ -1449,20 +1446,55 @@ fn parse_datetime_value(
     Some((ms, use_subsec))
 }
 
-fn parse_unixepoch_ms(val: &Value, encoding: TextEncoding) -> Option<i64> {
-    let seconds = match val {
-        Value::Integer(value) => *value as f64,
-        Value::Real(value) => *value,
+fn datetime_c_string(text: &str) -> &str {
+    text.split_once('\0').map_or(text, |(prefix, _)| prefix)
+}
+
+fn parse_datetime_text_ms(text: &str, ctx: &VmRuntimeContext) -> Option<i64> {
+    if text.trim().eq_ignore_ascii_case("now") {
+        Some(ctx.effective_timestamp_ms())
+    } else {
+        parse_iso_datetime_ms(text)
+    }
+}
+
+fn parse_raw_datetime_number(val: &Value, encoding: TextEncoding) -> Option<f64> {
+    match val {
+        Value::Integer(value) => Some(*value as f64),
+        Value::Real(value) => Some(*value),
         Value::Text(_) | Value::Blob(_) => {
             let text = value_to_text_in_encoding(val, encoding);
             let (value, result) = sqliters_types::sqlite_atof(text.as_bytes());
-            if result <= 0 {
-                return None;
-            }
-            value
+            (result > 0).then_some(value)
         }
-        Value::Null => return None,
-    };
+        Value::Null => None,
+    }
+}
+
+fn parse_auto_datetime_ms(val: &Value, ctx: &VmRuntimeContext) -> Option<i64> {
+    if let Some(number) = parse_raw_datetime_number(val, ctx.text_encoding) {
+        if (0.0..5373484.5).contains(&number) {
+            return Some((number * 86_400_000.0 + 0.5) as i64 - UNIX_EPOCH_JULIAN_MS);
+        }
+        // The auto Unix range ends at the last whole second of year 9999.
+        if (-210_866_760_000.0..=253_402_300_799.0).contains(&number) {
+            return unix_seconds_to_ms(number);
+        }
+        return None;
+    }
+
+    match val {
+        Value::Text(text) => parse_iso_datetime_ms(datetime_c_string(text))
+            .or_else(|| parse_datetime_text_ms(text, ctx)),
+        Value::Blob(_) => {
+            let text = value_to_text_in_encoding(val, ctx.text_encoding);
+            parse_iso_datetime_ms(datetime_c_string(&text))
+        }
+        _ => None,
+    }
+}
+
+fn unix_seconds_to_ms(seconds: f64) -> Option<i64> {
     // C checks the unrounded Julian value before applying any later modifiers.
     let julian_ms = seconds * 1_000.0 + UNIX_EPOCH_JULIAN_MS as f64;
     (0.0..JULIAN_MS_LIMIT as f64)
