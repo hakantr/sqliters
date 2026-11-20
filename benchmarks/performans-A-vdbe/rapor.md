@@ -1577,3 +1577,8 @@ Normal sayısal TEXT, değiştiricisiz veya yalnız çıktı hassasiyeti bayrakl
 ## V6b.254 — Finder S10 WITHOUT ROWID DELETE
 
 Sağlıklı MAIN WITHOUT ROWID tablosunda örtük tam taramalı DELETE için kanıtlanan tek tam covering indeks, mevcut C uyumlu tarama ve silme sırasını kullanır. Kanonik ve ortak 15.000 kayıtlı başlangıç dosyasında Rust OFF/ON ile C L0. 165 bağımsız C salt okunur açılışı, 12 hedef ve 21 koruma profili ile iki tam yeni Finder koşusu geçti. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,514 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_254.md).
+
+
+## V6b.255 — Süre biriminde tek çoğul ek
+
+Ortak süre değiştiricisi C gibi en fazla bir çoğul s ekini kabul eder. 2.925 fark kapandı ve 4.347 geçerli sonuç C ile eş kaldı. Numeric TEXT, negatif 24:00 ve 60 bağımsız C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_255.md).

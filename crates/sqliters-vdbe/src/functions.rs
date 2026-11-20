@@ -1953,11 +1953,7 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, modifier: &str) -> Opti
         }
         Some(ms.saturating_add((num * (seconds * 1_000.0)).round() as i64))
     };
-    let unit = if signed_hour24 {
-        unit.strip_suffix('s').unwrap_or(&unit)
-    } else {
-        unit.trim_end_matches('s')
-    };
+    let unit = unit.strip_suffix('s').unwrap_or(&unit);
     match unit {
         "second" => elapsed(1.0, 4.6427e14),
         "minute" => elapsed(60.0, 7.7379e12),
