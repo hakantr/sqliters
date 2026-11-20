@@ -45614,10 +45614,7 @@ fn exec_pragma(
         "TEMP_STORE" => {
             if let Some(pv) = value {
                 let mode = TempStoreMode::from_pragma_str(&pragma_to_string(pv));
-                if ctx.db_set.set_temp_store(mode, is_in_autocommit(ctx))? {
-                    // invalidateTempStorage(): sqlite3ResetAllSchemasOfConnection()
-                    ctx.db_set.c_clear_all_schemas();
-                    for slot in ctx.db_set.slots_mut() { slot.schema = Schema::default(); }
+                if ctx.db_set.set_sql_temp_store(mode, is_in_autocommit(ctx))? {
                     *ctx.schema_generation += 1;
                     *ctx.v1_expire_generation += 1;
                 }

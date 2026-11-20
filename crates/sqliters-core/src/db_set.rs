@@ -170,6 +170,22 @@ pub struct DbSlot {
 }
 
 impl DbSlot {
+    /// sqlite3SchemaClear: discard the generator's loaded-schema metadata.
+    pub(crate) fn c_clear_schema(&mut self) {
+        if !self.c_loaded {
+            return;
+        }
+        self.c_generation += 1;
+        self.c_loaded = false;
+        self.c_stat_dirty = false;
+        self.c_stat_seen.clear();
+        self.c_stat_stale.clear();
+        self.c_incremental.clear();
+        self.c_tbl_hash = None;
+        self.c_rowest_clamped = false;
+        self.c_rowest_tables.clear();
+    }
+
     /// Reloads `self.schema` from `self.btree` using `self.name` for `SchemaFixer` permanent-view
     /// schema validation.
     pub fn reload_schema(&mut self) -> Result<()> {
@@ -990,17 +1006,7 @@ impl DatabaseSet {
     pub fn c_clear_all_schemas(&mut self) {
         self.c_cookie_ahead = None;
         for slot in &mut self.slots {
-            if slot.c_loaded {
-                slot.c_generation += 1;
-                slot.c_loaded = false;
-                slot.c_stat_dirty = false;
-                slot.c_stat_seen.clear();
-                slot.c_stat_stale.clear();
-                slot.c_incremental.clear();
-                slot.c_tbl_hash = None;
-                slot.c_rowest_clamped = false;
-                slot.c_rowest_tables.clear();
-            }
+            slot.c_clear_schema();
         }
     }
 
@@ -1437,8 +1443,12 @@ impl DatabaseSet {
                 ));
             }
             bt.close_with_wal_checkpoint(!self.no_ckpt_on_close)?;
-            self.slots[1].btree = None;
-            self.slots[1].schema = Schema::default();
+            let temp = &mut self.slots[DatabaseId::TEMP.index()];
+            temp.btree = None;
+            // sqlite3SchemaClear drops the catalog but leaves its cookie.
+            let cookie = temp.schema.schema_cookie;
+            temp.schema = Schema::default();
+            temp.schema.schema_cookie = cookie;
             self.temp_trigger_bindings.clear();
             let temp_inst = self.slots[1].schema_instance_id;
             self.invalidate_blobs_for_instance(temp_inst);
@@ -1448,6 +1458,20 @@ impl DatabaseSet {
         }
         self.temp_store = mode;
         Ok(false)
+    }
+
+    /// SQL invalidateTempStorage also clears the loaded schemas of open Btrees.
+    pub(crate) fn set_sql_temp_store(&mut self, mode: TempStoreMode, in_autocommit: bool) -> Result<bool> {
+        let closed = self.set_temp_store(mode, in_autocommit)?;
+        if closed {
+            self.c_clear_all_schemas();
+            for slot in &mut self.slots {
+                if slot.btree.is_some() {
+                    slot.schema = Schema::default();
+                }
+            }
+        }
+        Ok(closed)
     }
 
     /// Finds a database slot by case-insensitive schema name across `0..nDb`, **including** slot `1`

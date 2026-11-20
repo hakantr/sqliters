@@ -1297,3 +1297,8 @@ NamedDisk negatif sorgusu C gibi native VFS handle'ına gidiyor. Callback bulunm
 ## V6b.198 — max_page_count değer dönüşümü ve fiziksel sınır
 
 Codegen ve çalıştırma aynı C dönüşümünü kullanıyor. Geçerli hex, decimal ve mevcut sayfa sınırı eş. 4.608 native kontrol ve 72 C yeniden açılışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,254 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_198.md).
+
+
+## V6b.199 — TEMP CREATE hazırlığı ve şema cookie ömrü
+
+Hazırlama TEMP Btree'yi açıyor, eski cookie ilk gerçek şema kontrolüne kadar saklanıyor. 1.608 native ve 72 opcode akışı, 1.680 bağımsız C açılışı eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_199.md).

@@ -2064,15 +2064,21 @@ impl ConnectionInner {
                 continue;
             }
             // A write lock on an empty database allocates page 1 before OP_Transaction
-            // reads the schema cookie. The new empty catalog has the same schema generation.
+            // reads the schema cookie. A new TEMP Btree may have replaced one whose
+            // cookie survived sqlite3SchemaClear.
+            let cur_cookie = bt.pager().header().schema_cookie;
             if slot.schema.loaded
                 && !slot.schema.had_pages
                 && bt.pager().has_uncommitted_empty_schema_page()
             {
+                if idx == DatabaseId::TEMP.index() && slot.schema.schema_cookie != cur_cookie {
+                    slot.c_clear_schema();
+                    slot.schema.schema_cookie = cur_cookie;
+                    any_changed = true;
+                }
                 continue;
             }
             let has_pages = bt.pager().page_count() > 0;
-            let cur_cookie = bt.pager().header().schema_cookie;
             if !slot.schema.loaded
                 || slot.schema.had_pages != has_pages
                 || slot.schema.schema_cookie != cur_cookie
@@ -6318,9 +6324,7 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) -> Result<()> {
             PrepareEffect::TempStore(mode) => {
                 let mode = match mode { 1 => TempStoreMode::File, 2 => TempStoreMode::Memory, _ => TempStoreMode::Default };
                 let auto_commit = !(inner.explicit_tx || inner.implicit_savepoint_tx);
-                if inner.db_set.set_temp_store(mode, auto_commit)? {
-                    inner.db_set.c_clear_all_schemas();
-                    for slot in inner.db_set.slots_mut() { slot.schema = Schema::default(); }
+                if inner.db_set.set_sql_temp_store(mode, auto_commit)? {
                     inner.schema_generation += 1;
                     inner.v1_expire_generation += 1;
                 }
@@ -6818,6 +6822,11 @@ fn target_write_db_for_stmt(stmt: &Stmt, db_set: &DatabaseSet) -> Option<Databas
         },
         _ => None,
     }
+}
+
+fn creates_temp_table(stmt: &Stmt) -> bool {
+    matches!(stmt, Stmt::CreateTable(table)
+        if table.temp || table.name.schema.as_deref().is_some_and(|name| name.eq_ignore_ascii_case("temp")))
 }
 
 fn is_noop_if_exists_ddl(stmt: &Stmt, db_set: &DatabaseSet) -> bool {
@@ -8575,6 +8584,15 @@ impl Statement {
             },
         };
 
+        if !inner.db_set.is_temp_open()
+            && artifacts.stmt.as_ref().is_some_and(creates_temp_table)
+        {
+            // sqlite3StartTable reads the TEMP schema before opening its Btree
+            // in sqlite3BeginWriteOperation. Preparing the DDL creates no table.
+            let encoding = inner.effective_encoding();
+            let temp = inner.db_set.ensure_temp_open(encoding, inner.writable_schema)?;
+            temp.schema.loaded = true;
+        }
         apply_prepare_auto_vacuum_pragma(inner, &mut artifacts, c_prepared_auto_vacuum);
         if let Some(prog) = &c_explain {
             // sqlite3VdbeList lists instructions; it does not run their transactions.
@@ -9317,6 +9335,9 @@ impl Statement {
                 || (needs_schema && inner.db_set.slots().iter().any(|s| s.btree.is_some() && !s.schema.loaded))
             {
                 let _ = inner.ensure_schemas_loaded_for_prepare(false)?;
+            }
+            if parsed_stmt.as_ref().is_some_and(creates_temp_table) {
+                inner.db_set.c_mark_schemas_loaded();
             }
             let prepared_vtab = check_c_prepare_error(
                 inner, parsed_stmt.as_ref(), select_schema_use.as_ref(), &self.raw_sql,
