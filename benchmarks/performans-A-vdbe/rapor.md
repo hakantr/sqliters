@@ -1382,3 +1382,8 @@ Hazır yazı biçimi, sütun adı ve changes() yaşamı C ile eş. 1.128 ana ve 
 ## V6b.215 — View DELETE hedef sayımı
 
 Sayım INSTEAD OF tetikleyicisinden önce yapılıyor. 94 OFF farkı kapandı ve 1.944 view profili C ile eş. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,292 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_215.md).
+
+
+## V6b.216 — Bağlı açık okuyucunun rollback sonucu
+
+İlk bağlı rowid okuyucusu restore edilmiş satırı görüyor. 24 OFF farkı kapandı ve 2.880 C açılışı eş. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_216.md).

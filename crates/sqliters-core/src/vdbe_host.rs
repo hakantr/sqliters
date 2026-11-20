@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use sqliters_btree::Btree;
 use sqliters_codegen::PrepareResult;
-use sqliters_pager::{LockingMode, PagerOpenOptions, TransactionState};
+use sqliters_pager::{JournalMode, LockingMode, PagerOpenOptions, TransactionState};
 use sqliters_types::DatabaseKind;
 use sqliters_syntax::Stmt;
 use sqliters_types::{
@@ -124,11 +124,20 @@ pub(crate) fn mapped_table_read_program(
     use sqliters_syntax::{SelectCore, TableOrSubquery};
     use sqliters_vdbe::opcodes::*;
 
-    if inner.authorizer.is_some()
-        || !inner.db_set.slots().iter().any(|slot| {
-            slot.btree.as_ref().is_some_and(|bt| bt.pager().uses_fetch())
-        })
-    {
+    if inner.authorizer.is_some() {
+        return None;
+    }
+    // The first attachment cannot move when another attachment is detached.
+    let first_attached = DatabaseId(2);
+    let attached_write = !inner.is_autocommit()
+        && !inner.schema_changed_in_tx
+        && inner.db_set.slot(first_attached).and_then(|slot| slot.btree.as_ref())
+            .is_some_and(|bt| bt.pager().db_kind() == DatabaseKind::NamedDisk
+                && matches!(bt.journal_mode(), JournalMode::Delete | JournalMode::Wal)
+                && bt.transaction_state() == TransactionState::Write);
+    if !attached_write && !inner.db_set.slots().iter().any(|slot| {
+        slot.btree.as_ref().is_some_and(|bt| bt.pager().uses_fetch())
+    }) {
         return None;
     }
     let Some(Stmt::Select(select)) = stmt else {
@@ -147,8 +156,9 @@ pub(crate) fn mapped_table_read_program(
         inner.db_set.find_relation_ref_in_set(name).ok()?? else {
             return None;
         };
+    let mapped = inner.db_set.slot(db)?.btree.as_ref()?.pager().uses_fetch();
     if table.root_pgno <= 1 || table.without_rowid
-        || !inner.db_set.slot(db)?.btree.as_ref()?.pager().uses_fetch()
+        || (!mapped && !(attached_write && db == first_attached))
     {
         return None;
     }
@@ -169,6 +179,18 @@ pub(crate) fn mapped_table_read_program(
             && !program.a_op.iter().any(|op| op.opcode == OP_Count && op.p3 == 0))
     {
         return None;
+    }
+    if !mapped {
+        // A live table cursor can seek again after a rollback. A SQLite sorter
+        // owns its rows after the sort, so keep its existing execution path.
+        let direct_scan = open.p2 == table.root_pgno as i32
+            && open.p3 == db.index() as i32
+            && program.a_op.iter().any(|op| matches!(op.opcode, OP_Next | OP_Prev))
+            && program.a_op.iter().all(|op| matches!(op.opcode,
+                OP_Init | OP_Halt | OP_Transaction | OP_Goto | OP_OpenRead | OP_Close
+                | OP_Rewind | OP_Last | OP_Next | OP_Prev | OP_Rowid | OP_Column
+                | OP_RealAffinity | OP_ResultRow | OP_Noop));
+        return direct_scan.then(|| Arc::new(*program));
     }
     if !program.a_op.iter().all(|op| match op.opcode {
         OP_Init | OP_Halt | OP_Transaction | OP_Goto | OP_OpenRead | OP_Close
