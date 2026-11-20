@@ -1202,3 +1202,8 @@ Uygun eşitlik aktif yazma görüntüsünde karma kökü seçer, diğer durumda 
 ## V6b.179 — İki kökte sıralı INSERT SELECT
 
 Ayrı MAIN kaynağı rowid sırasıyla okunur ve iki hedef kök aynı yazma görüntüsünde doğrulanır. 396 native, 396 takip yazıcısı, 792 rollback ve 1.188 açılış doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,262 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_179.md).
+
+
+## V6b.180 — Yazılabilir journal_mode sorgusunun hazırlığı
+
+Soğuk yazılabilir ana NamedDisk üzerinde değersiz sorgu ve EXPLAIN şemayı C ile aynı prepare sınırında açar. 672 fiziksel çift, 640 VFS sıra ve 24 doğal BUSY profili doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,230 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_180.md).

@@ -1932,16 +1932,18 @@ impl ConnectionInner {
         self.db_set.rebind_all_collations(&self.collations);
     }
 
-    // sqlite3Pragma() reads the unloaded main schema for journal_mode,
-    // including setters and EXPLAIN.
-    fn readonly_journal_mode_needs_schema(&self, stmt: &Stmt) -> bool {
+    // sqlite3Pragma() loads the schema for journal_mode while preparing
+    // the query or EXPLAIN, before OP_JournalMode can run.
+    fn journal_mode_needs_schema(&self, stmt: &Stmt) -> bool {
         let stmt = match stmt {
             Stmt::Explain { stmt, .. } => stmt.as_ref(),
             stmt => stmt,
         };
-        if !matches!(stmt, Stmt::Pragma { schema, name, .. }
-            if name.eq_ignore_ascii_case("journal_mode")
-                && schema.as_deref().is_none_or(|name| name.eq_ignore_ascii_case("main")))
+        let Stmt::Pragma { schema, name, value } = stmt else {
+            return false;
+        };
+        if !name.eq_ignore_ascii_case("journal_mode")
+            || schema.as_deref().is_some_and(|name| !name.eq_ignore_ascii_case("main"))
         {
             return false;
         }
@@ -1950,7 +1952,7 @@ impl ConnectionInner {
         !main.schema.loaded
             && main.btree.as_ref().is_some_and(|bt| {
                 let pager = bt.pager();
-                pager.is_readonly() && pager.db_kind() == DatabaseKind::NamedDisk
+                pager.db_kind() == DatabaseKind::NamedDisk && (value.is_none() || pager.is_readonly())
             })
     }
 
@@ -8314,9 +8316,9 @@ impl Statement {
         }
         // C reads the schema at prepare for more statements than the engine loads it for
         // (pragmas with PragFlg_NeedSchema, the query form of PRAGMA encoding).
-        let readonly_journal_schema = stmt_opt.as_ref()
-            .is_some_and(|stmt| inner.readonly_journal_mode_needs_schema(stmt));
-        let c_reads_schema = needs_schema || readonly_journal_schema
+        let journal_mode_schema = stmt_opt.as_ref()
+            .is_some_and(|stmt| inner.journal_mode_needs_schema(stmt));
+        let c_reads_schema = needs_schema || journal_mode_schema
             || stmt_opt.as_ref().is_some_and(crate::engine::c_pragma_reads_schema);
         let c_first_load = c_reads_schema && inner.db_set.c_any_schema_unloaded();
         if needs_schema
@@ -8340,7 +8342,7 @@ impl Statement {
         if needs_schema {
             inner.refresh_open_tx_schemas()?;
         }
-        if readonly_journal_schema
+        if journal_mode_schema
             || (needs_schema && inner.db_set.slots().iter().any(|s| s.btree.is_some() && !s.schema.loaded))
         {
             let _ = inner.ensure_schemas_loaded_for_prepare(false)?;
@@ -9317,9 +9319,9 @@ impl Statement {
             if needs_schema || select_schema_use.is_none() {
                 inner.refresh_open_tx_schemas()?;
             }
-            let readonly_journal_schema = parsed_stmt.as_ref()
-                .is_some_and(|stmt| inner.readonly_journal_mode_needs_schema(stmt));
-            if readonly_journal_schema
+            let journal_mode_schema = parsed_stmt.as_ref()
+                .is_some_and(|stmt| inner.journal_mode_needs_schema(stmt));
+            if journal_mode_schema
                 || (needs_schema && inner.db_set.slots().iter().any(|s| s.btree.is_some() && !s.schema.loaded))
             {
                 let _ = inner.ensure_schemas_loaded_for_prepare(false)?;
