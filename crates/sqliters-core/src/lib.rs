@@ -6481,16 +6481,17 @@ fn refine_prepare_error(
 }
 
 /// Add the parser's byte offset when the C and legacy resolvers agree about
-/// the missing column or function diagnostic.
+/// the column or function diagnostic.
 fn select_name_error_offset(
     inner: &ConnectionInner,
     sql: &str,
     error: SqliteError,
 ) -> SqliteError {
-    let missing_column = error.message.starts_with("no such column: ");
+    let column_error = error.message.starts_with("no such column: ")
+        || error.message.starts_with("ambiguous column name: ");
     if error.offset.is_some()
-        || (missing_column && inner.authorizer.is_some())
-        || !(missing_column
+        || (column_error && inner.authorizer.is_some())
+        || !(column_error
             || error.message.starts_with("wrong number of arguments to function ")
             || error.message.starts_with("no such function: "))
     {
@@ -6500,10 +6501,10 @@ fn select_name_error_offset(
         cgen::c_prepare_diagnostic(inner, sql)
         && code == error.extended_code
         && (message == error.message
-            || (!missing_column && message.eq_ignore_ascii_case(&error.message)))
+            || (!column_error && message.eq_ignore_ascii_case(&error.message)))
         && let Ok(offset) = usize::try_from(offset)
     {
-        if missing_column {
+        if column_error {
             error.with_offset(offset)
         } else {
             SqliteError::with_extended(code, message).with_offset(offset)
