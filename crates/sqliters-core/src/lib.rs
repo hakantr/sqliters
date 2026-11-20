@@ -1075,7 +1075,7 @@ pub(crate) struct ConnectionInner {
     // An ordinary prepare or read error may outlive a later successful API call.
     c_retained_error_message: Option<String>,
     c_connection_diagnostic_code: ErrorCode,
-    c_foreign_keys_expire_seq: Option<u64>,
+    c_flag_pragma_expire_seq: Option<u64>,
     pub(crate) default_locking_mode: LockingMode,
     pub(crate) writable_schema: bool,
     pub(crate) working_dir: Option<PathBuf>,
@@ -1783,8 +1783,8 @@ impl ConnectionInner {
         SqliteError::new(code, message).with_offset(offset)
     }
 
-    fn c_foreign_keys_expiry(&self) -> Option<u64> {
-        self.c_foreign_keys_expire_seq.filter(|seq| *seq == self.db_set.c_expire_seq())
+    fn c_flag_pragma_expiry(&self) -> Option<u64> {
+        self.c_flag_pragma_expire_seq.filter(|seq| *seq == self.db_set.c_expire_seq())
     }
 
     fn record_c_prepare_error(&mut self, error: Option<&SqliteError>) {
@@ -1805,7 +1805,7 @@ impl ConnectionInner {
     }
 
     fn note_c_step_status(&mut self, status: ErrorCode, is_read: bool) {
-        if self.c_foreign_keys_expiry().is_some()
+        if self.c_flag_pragma_expiry().is_some()
             || (is_read && self.db_set.c_ddl_rollback_expiry().is_some())
         {
             self.c_connection_diagnostic_code = status;
@@ -3648,7 +3648,7 @@ impl Connection {
             c_error_byte_offset: -1,
             c_retained_error_message: None,
             c_connection_diagnostic_code: ErrorCode::Ok,
-            c_foreign_keys_expire_seq: None,
+            c_flag_pragma_expire_seq: None,
             default_locking_mode: LockingMode::Normal,
             writable_schema: false,
             working_dir: None,
@@ -5461,7 +5461,7 @@ pub struct Statement {
     compiled_slot_cookies: Vec<(SchemaInstanceId, u32, bool)>,
     expired: bool,
     c_v1_expired_before_run: bool,
-    c_v1_foreign_keys_expired: bool,
+    c_v1_flag_pragma_expired: bool,
     c_reprepare_count: u32,
     c_reprepare_after_schema_check: bool,
     column_names: Vec<String>,
@@ -8725,7 +8725,7 @@ impl Statement {
             compiled_slot_cookies: inner.snapshot_slot_cookies(),
             expired: false,
             c_v1_expired_before_run: false,
-            c_v1_foreign_keys_expired: false,
+            c_v1_flag_pragma_expired: false,
             c_reprepare_count: 0,
             c_reprepare_after_schema_check: false,
             column_names: artifacts.column_names,
@@ -9178,7 +9178,7 @@ impl Statement {
             return;
         }
         if self.category != Some(StmtCategory::Read) {
-            if result.is_ok() && self.category.is_some() && inner.c_foreign_keys_expiry().is_some() {
+            if result.is_ok() && self.category.is_some() && inner.c_flag_pragma_expiry().is_some() {
                 inner.transfer_c_read_error(None);
             }
             return;
@@ -9238,11 +9238,11 @@ impl Statement {
 
         let prev = std::mem::replace(&mut self.lifecycle, StatementLifecycle::Ready);
         let ran = !matches!(prev, StatementLifecycle::Ready);
-        let foreign_keys_expired = std::mem::take(&mut self.c_v1_foreign_keys_expired);
+        let flag_pragma_expired = std::mem::take(&mut self.c_v1_flag_pragma_expired);
         let result = match prev {
             StatementLifecycle::Ready => Ok(()),
             StatementLifecycle::Halted { last_error } => match last_error {
-                Some(_) if foreign_keys_expired => Err(inner.legacy_c_error_with_diagnostic(
+                Some(_) if flag_pragma_expired => Err(inner.legacy_c_error_with_diagnostic(
                     ErrorCode::Schema, inner.c_connection_diagnostic_code,
                 )),
                 Some(err) => Err(err),
@@ -9314,7 +9314,7 @@ impl Statement {
                 }
             }
             StatementLifecycle::Halted { last_error } => match last_error {
-                Some(_) if self.c_v1_foreign_keys_expired => Err(inner.legacy_c_error_with_diagnostic(
+                Some(_) if self.c_v1_flag_pragma_expired => Err(inner.legacy_c_error_with_diagnostic(
                     ErrorCode::Schema, inner.c_connection_diagnostic_code,
                 )),
                 Some(err) => Err(err),
@@ -10062,7 +10062,7 @@ impl Statement {
             self.lifecycle = StatementLifecycle::Ready;
         }
         self.c_v1_expired_before_run = false;
-        self.c_v1_foreign_keys_expired = false;
+        self.c_v1_flag_pragma_expired = false;
 
         // Empty / comment-only SQL (`stmt.is_none()` with no parsed statement)
         if self.stmt.is_none() && matches!(parse_one(&self.raw_sql), Ok((None, _))) {
@@ -10348,12 +10348,12 @@ impl Statement {
                 };
                 if expired_before_run
                     && matches!(self.category, Some(StmtCategory::Read | StmtCategory::Write))
-                    && inner.c_foreign_keys_expiry()
+                    && inner.c_flag_pragma_expiry()
                         .is_some_and(|seq| self.compiled_c_expire_seq != seq)
                 {
-                    // The foreign_keys setter ran OP_Expire. This legacy statement
+                    // The flag pragma setter ran OP_Expire. This legacy statement
                     // returns before executing, leaving the connection diagnostic alone.
-                    self.c_v1_foreign_keys_expired = true;
+                    self.c_v1_flag_pragma_expired = true;
                     return Err(inner.legacy_c_step_error_with_diagnostic(inner.c_connection_diagnostic_code));
                 }
                 return Err(err);
@@ -10519,9 +10519,10 @@ impl Statement {
                 if expires_all && res.is_ok() {
                     inner.advisory_expire_generation += 1;
                     if matches!(&stmt_clone, Stmt::Pragma { name, .. }
-                        if name.eq_ignore_ascii_case("foreign_keys"))
+                        if name.eq_ignore_ascii_case("foreign_keys")
+                            || name.eq_ignore_ascii_case("recursive_triggers"))
                     {
-                        inner.c_foreign_keys_expire_seq = Some(inner.db_set.c_expire_seq());
+                        inner.c_flag_pragma_expire_seq = Some(inner.db_set.c_expire_seq());
                     }
                 }
                 inner.end_autocommit_started_reads(stmt_tx.started_read_mask, summary);

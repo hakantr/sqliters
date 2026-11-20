@@ -1357,3 +1357,8 @@ Gerçek setter adımından sonra erken V1 step 1, reset ve finalize 17 döndür�
 ## V6b.210 — Yazısız TEMP FILE OFF geri alma
 
 Sayfa yazılmamış ve backing henüz açılmamış özel TEMP FILE OFF işleminde önceki kaydedilmiş sayfalar korunur. 1.296 yeni ve 3.024 koruma C açılışı doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_210.md).
+
+
+## V6b.211 — recursive_triggers setter sonrası V1 erken expiry
+
+Fiilen çalışmış recursive_triggers setter adımı sonrası V1 erken step ve terminal C ile eş. 1.104 fark kapandı. 4.644 C açılışı doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,249 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_211.md).
