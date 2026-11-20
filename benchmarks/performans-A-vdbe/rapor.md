@@ -1462,3 +1462,8 @@ Geçerli Julian milisaniyesi C gibi tam sayı toplamından sonra tek bölmeyle R
 ## V6b.231 — STRFTIME %J biçimi
 
 STRFTIME %J ortak Julian REAL hesabı ve C uyumlu %.16g biçimini kullanıyor. 594 ayrı fark kapandı. 735 C açılışı ve 12 VDBE testi doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,285 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_231.md).
+
+
+## V6b.232 — Normal rollback küçültme sırası
+
+Normal D/P/T disk rollback büyümüş fiziksel dosyayı preimage yazısından önce özgün boyuta getiriyor. 36 sıra farkı kapandı. 324 C açılışı ve 216 fiziksel karşılaştırma doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,269 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_232.md).

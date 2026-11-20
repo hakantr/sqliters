@@ -6083,6 +6083,24 @@ impl Pager {
                     if should_replay {
                         self.lock_db_file(LockLevel::Exclusive)?;
                         let ps = u64::from(self.tx_orig_header.page_size);
+                        let orig_size = u64::from(orig_count) * ps;
+                        let mut original_size_restored = false;
+                        if disk_rollback
+                            && self.locking_mode == LockingMode::Normal
+                            && !self.set_super
+                            && !self.image_truncated
+                            && self.subsavepoints.is_empty()
+                            && self.page_count > orig_count
+                        {
+                            // C pager_playback restores the original size before replaying
+                            // the first journal's preimages. Those writes stay within orig_size.
+                            let file = self.db_file()?;
+                            let size = file.file_size()?;
+                            if size > orig_size {
+                                file.truncate(orig_size)?;
+                            }
+                            original_size_restored = size >= orig_size;
+                        }
                         let lock_byte_pgno = self
                             .lock_geometry
                             .lock_byte_page(self.tx_orig_header.page_size);
@@ -6111,8 +6129,7 @@ impl Pager {
                             }
                         }
 
-                        let orig_size = u64::from(orig_count) * ps;
-                        if self.db_file()?.file_size()? != orig_size {
+                        if !original_size_restored && self.db_file()?.file_size()? != orig_size {
                             self.db_file()?.truncate(orig_size)?;
                         }
                     }
