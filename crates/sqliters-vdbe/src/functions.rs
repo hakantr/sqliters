@@ -1470,7 +1470,21 @@ fn parse_datetime_value(
                 let ms = ((*jd - 2_440_587.5) * 86_400_000.0).round() as i64;
                 (ParsedDateTime::from_unix_ms(ms), false)
             }
-            Value::Text(s) => parse_datetime_text(s, ctx, allow_signed_year)?,
+            Value::Text(s) => parse_datetime_text(s, ctx, allow_signed_year).or_else(|| {
+                // Output precision does not change the meaning of the Julian input.
+                if s.contains('\0')
+                    || !modifiers.iter().all(|m| {
+                        matches!(m, Value::Text(text)
+                            if text.eq_ignore_ascii_case("subsec")
+                                || text.eq_ignore_ascii_case("subsecond"))
+                    })
+                {
+                    return None;
+                }
+                let days = parse_raw_datetime_number(val, ctx.text_encoding)?;
+                let ms = julian_days_to_ms(days)?;
+                Some((ParsedDateTime::from_unix_ms(ms), true))
+            })?,
             Value::Null | Value::Blob(_) => return None,
         };
         (time, modifiers, check_julian_range)
