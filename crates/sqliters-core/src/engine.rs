@@ -122,6 +122,8 @@ pub struct StmtTxTracker {
     pub(crate) prepared_ignore_checks: Option<bool>,
     /// The generated rowid loop direction is fixed when the statement is prepared.
     pub(crate) prepared_reverse_order: bool,
+    /// Named trigger recursion is fixed by the prepared program.
+    pub(crate) prepared_recursive_triggers: Option<bool>,
     /// Bitmask of `DatabaseId` slots whose `Read` transaction was started from `Open` by this statement.
     pub started_read_mask: u16,
     /// Bitmask of `DatabaseId` slots whose `Write` transaction (and optional `stmt_sp_slot`) was entered in this statement.
@@ -502,6 +504,10 @@ impl ExecContext<'_> {
     #[inline]
     fn prepared_defer_fks(&self) -> bool {
         self.stmt_tx.prepared_defer_fks.unwrap_or_else(|| self.db_set.c_defer_foreign_keys())
+    }
+
+    fn prepared_recursive_triggers(&self) -> bool {
+        self.stmt_tx.prepared_recursive_triggers.unwrap_or(*self.recursive_triggers)
     }
 
     fn prepared_ignore_checks(&self) -> bool {
@@ -2976,7 +2982,7 @@ pub(crate) fn apply_stmt_journal_policy(ctx: &mut ExecContext<'_>, stmt: &Stmt) 
             ctx.db_set,
             stmt,
             *ctx.foreign_keys,
-            *ctx.recursive_triggers,
+            ctx.prepared_recursive_triggers(),
             ctx.prepared_defer_fks(),
         ),
     };
@@ -21574,7 +21580,7 @@ fn fire_row_triggers(
     };
     for idx in 0..batch.triggers.len() {
         let (_trig_db_id, trig_inst, ref trig) = batch.triggers[idx];
-        if !*ctx.recursive_triggers
+        if !ctx.prepared_recursive_triggers()
             && ctx
                 .stmt_tx
                 .subprogram_stack
@@ -21730,7 +21736,7 @@ fn replace_conflict_delete_row(
     };
     let cvals = decode_table_logical_row(ctx, db_id, tbl, ckey, &cpayload, params)?;
     let run_del_triggers = !is_catalog
-        && *ctx.recursive_triggers
+        && ctx.prepared_recursive_triggers()
         && ctx.db_set.has_active_triggers_for_event(
             db_id,
             &tbl.name,
@@ -29888,7 +29894,7 @@ fn decide_insert_fk_halts_immediately(ctx: &mut ExecContext<'_>, ins: &InsertStm
             ctx.db_set,
             ins,
             *ctx.foreign_keys,
-            *ctx.recursive_triggers,
+            ctx.prepared_recursive_triggers(),
             ctx.prepared_defer_fks(),
         );
         ctx.stmt_tx.insert_fk_halts_immediately = !flags.multi_write;

@@ -1367,3 +1367,8 @@ Fiilen çalışmış recursive_triggers setter adımı sonrası V1 erken step ve
 ## V6b.212 — Açık TEMP FILE OFF yazısız geri alma
 
 Gerçek TEMP dosyası açıkken sıfır yazılı geri alma önceki commit verisini koruyor. 1.608 birleşik C açılışı ve fiziksel TEMP yazma izi eş. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,239 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_212.md).
+
+
+## V6b.213 — Hazırlanmış trigger yazısı
+
+24 OFF farkı kapandı. Önceden hazırlanmış yazı recursion kararını koruyor. 600 C açılışı doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_213.md).
