@@ -10466,6 +10466,10 @@ impl Statement {
                     self.expired = true;
                 }
                 let stmt_clone = self.stmt.clone().expect("non-empty statement");
+                let default_main_optimize = !inner.authorizer.is_some()
+                    && matches!(&stmt_clone, Stmt::Pragma { schema, name, value: None }
+                        if name.eq_ignore_ascii_case("optimize")
+                            && schema.as_deref().is_none_or(|schema| schema.eq_ignore_ascii_case("main")));
                 let expires_all = self.c_prepared_pragma.is_some()
                     && matches!(&stmt_clone, Stmt::Pragma { name, value: Some(_), .. }
                         if sqliters_codegen::pragma::flag_mask(name).is_some());
@@ -10518,6 +10522,8 @@ impl Statement {
                             // when classified as `NoLockPragma`, execution is a 0-op `SQLITE_DONE`!
                             *ctx.expire_self_only = true;
                             Ok(QueryOutput::default())
+                        } else if default_main_optimize {
+                            engine::execute_default_main_optimize(ctx)
                         } else {
                             execute_nolock_stmt(ctx, &stmt_clone, &self.params)
                         }

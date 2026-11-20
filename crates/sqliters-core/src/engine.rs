@@ -36129,6 +36129,65 @@ fn validate_index_ddl_expr(
     }
 }
 
+/// Runs the default MAIN optimization for one ordinary, previously unanalyzed index.
+pub(crate) fn execute_default_main_optimize(ctx: &mut ExecContext<'_>) -> Result<QueryOutput> {
+    let db_id = DatabaseId::MAIN;
+    if ctx.is_connection_readonly
+        || ctx.activity.other_active != 0
+        || ctx.db_set.attached_count() != 0
+        || ctx.db_set.corrupt_rdonly()
+        || ctx.db_set.main_btree().pager().db_kind() != DatabaseKind::NamedDisk
+    {
+        return Ok(QueryOutput::default());
+    }
+    ctx.ensure_read_db(db_id, true)?;
+    let slot = ctx.db_set.main_slot();
+    let [index] = slot.schema.indexes.as_slice() else {
+        return Ok(QueryOutput::default());
+    };
+    if slot.schema.find_user_table("sqlite_stat1").is_some()
+        || index.where_clause.is_some()
+        || index.stat1.is_some()
+        || index.is_autoindex
+        || index.unique
+        || !matches!(index.columns.as_slice(), [key]
+            if key.col_idx.is_some()
+                && key.sort_order.collation == Collation::Binary
+                && key.sort_order.custom_collation.is_none())
+    {
+        return Ok(QueryOutput::default());
+    }
+    let Some(table) = slot.schema.find_user_table(&index.table_name) else {
+        return Ok(QueryOutput::default());
+    };
+    if table.without_rowid || is_reserved_sqlite_name(&table.name) {
+        return Ok(QueryOutput::default());
+    }
+    let target = QualifiedName::qualified(slot.name.clone(), table.name.clone());
+    let root = table.root_pgno;
+    let btree = ctx.db_set.main_btree_mut();
+    let cursor = btree.open_table_cursor(root, false);
+    let nonempty = btree.cursor_first(cursor);
+    btree.close_cursor(cursor);
+    if !nonempty? {
+        return Ok(QueryOutput::default());
+    }
+
+    // As in C's OP_SqlExec, the nested ANALYZE sees a temporary limit.
+    const OPTIMIZE_LIMIT: i32 = 2000;
+    let previous_limit = ctx.db_set.analysis_limit();
+    if previous_limit == 0 || previous_limit > OPTIMIZE_LIMIT {
+        ctx.db_set.set_analysis_limit(OPTIMIZE_LIMIT);
+    }
+    let started_reads = ctx.stmt_tx.started_read_mask;
+    let result = run_write_autocommit(ctx, false, |ctx| {
+        ctx.stmt_tx.started_read_mask |= started_reads;
+        execute_write_body(ctx, &Stmt::Analyze(Some(target)), &[])
+    });
+    ctx.db_set.set_analysis_limit(previous_limit);
+    result
+}
+
 fn exec_analyze(ctx: &mut ExecContext<'_>, target: Option<&QualifiedName>) -> Result<()> {
     match target {
         None => {
