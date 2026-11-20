@@ -1406,6 +1406,7 @@ struct ParsedDateTime {
     raw_seconds: Option<f64>,
     is_utc: bool,
     signed_hour24: bool,
+    calendar_retained: bool,
     bare_hour24: Option<BareHour24>,
 }
 
@@ -1689,6 +1690,7 @@ fn parse_iso_datetime(input: &str, allow_signed_year: bool) -> Option<ParsedDate
             raw_seconds: if offset_ms == 0 { raw_seconds } else { None },
             is_utc: bare_hour24.is_none() || offset_ms == 0,
             signed_hour24,
+            calendar_retained: signed_hour24 && offset_ms == 0,
             bare_hour24,
         });
     }
@@ -1728,6 +1730,7 @@ fn parse_iso_datetime(input: &str, allow_signed_year: bool) -> Option<ParsedDate
         raw_seconds,
         is_utc: without_z.is_some(),
         signed_hour24,
+        calendar_retained: signed_hour24,
         bare_hour24: (!has_date && clock_ms == 86_400_000).then_some(BareHour24 {
             offset_ms: 0,
             legacy_accepted: false,
@@ -1841,7 +1844,8 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, modifier: &str) -> Opti
     if signed_hour24 && (s != modifier || !s.is_ascii()) {
         return None;
     }
-    let calendar_input = (!signed_hour24 || valid_julian_unix_ms(ms)).then_some(());
+    let calendar_in_range = !signed_hour24 || valid_julian_unix_ms(ms);
+    let calendar_input = (calendar_in_range || time.calendar_retained).then_some(());
     let calendar_output =
         |result| (!signed_hour24 || valid_julian_unix_ms(result)).then_some(result);
     let lower = s.to_ascii_lowercase();
@@ -1852,17 +1856,20 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, modifier: &str) -> Opti
         "start of day" => {
             calendar_input?;
             let (y, mo, d, _, _, _) = utc_ymdhms_from_unix_ms(ms);
-            return calendar_output(days_from_civil(i64::from(y), mo, d) * 86_400_000);
+            time.calendar_retained = signed_hour24;
+            return Some(days_from_civil(i64::from(y), mo, d) * 86_400_000);
         }
         "start of month" => {
             calendar_input?;
             let (y, mo, _, _, _, _) = utc_ymdhms_from_unix_ms(ms);
-            return calendar_output(days_from_civil(i64::from(y), mo, 1) * 86_400_000);
+            time.calendar_retained = signed_hour24;
+            return Some(days_from_civil(i64::from(y), mo, 1) * 86_400_000);
         }
         "start of year" => {
             calendar_input?;
             let (y, _, _, _, _, _) = utc_ymdhms_from_unix_ms(ms);
-            return calendar_output(days_from_civil(i64::from(y), 1, 1) * 86_400_000);
+            time.calendar_retained = signed_hour24;
+            return Some(days_from_civil(i64::from(y), 1, 1) * 86_400_000);
         }
         _ => {}
     }
@@ -1871,7 +1878,15 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, modifier: &str) -> Opti
         if !rest.starts_with(char::is_whitespace) || (signed_hour24 && !rest.starts_with(' ')) {
             return None;
         }
-        let wf: f64 = rest.trim().parse().ok()?;
+        let wf: f64 = if calendar_in_range {
+            rest.trim().parse().ok()?
+        } else {
+            if rest.contains('-') {
+                return None;
+            }
+            let (value, status) = sqliters_types::sqlite_atof(rest.as_bytes());
+            (status > 0).then_some(value)?
+        };
         if !wf.is_finite() || wf.fract() != 0.0 || !(0.0..7.0).contains(&wf) {
             return None;
         }
@@ -1880,6 +1895,18 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, modifier: &str) -> Opti
             ms += clock.offset_ms;
         }
         let target_dow = wf as i64;
+        time.calendar_retained = false;
+        if !calendar_in_range {
+            // SQLite uses signed division and remainder for a retained date
+            // below the Julian origin.
+            let dow = (ms + UNIX_EPOCH_JULIAN_MS + 129_600_000) / 86_400_000 % 7;
+            let days = if dow > target_dow {
+                target_dow - dow + 7
+            } else {
+                target_dow - dow
+            };
+            return Some(ms + days * 86_400_000);
+        }
         let days = ms.div_euclid(86_400_000);
         let dow = (days + 4).rem_euclid(7);
         let add_days = (target_dow - dow).rem_euclid(7);
@@ -1907,6 +1934,7 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, modifier: &str) -> Opti
     if bare_hour24.is_some_and(|clock| clock.offset_ms != 0) {
         time.is_utc = true;
     }
+    time.calendar_retained = false;
     let elapsed = |seconds: f64, limit: f32| {
         if signed_hour24 {
             // SQLite's duration table uses an exclusive binary32 limit and casts
@@ -1931,6 +1959,9 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, modifier: &str) -> Opti
         "day" => elapsed(86_400.0, 5_373_485.0),
         "month" => {
             calendar_input?;
+            if !calendar_in_range && (num.fract() != 0.0 || num.abs() >= 176_546.0) {
+                return None;
+            }
             let whole_months = num.trunc() as i64;
             let frac_months = num - (whole_months as f64);
             let (y, mo, d, _, _, _) = utc_ymdhms_from_unix_ms(ms);
@@ -1949,6 +1980,9 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, modifier: &str) -> Opti
         }
         "year" => {
             calendar_input?;
+            if !calendar_in_range && (num.fract() != 0.0 || num.abs() >= 14_713.0) {
+                return None;
+            }
             let whole_years = num.trunc() as i64;
             let frac_years = num - (whole_years as f64);
             let (y, mo, d, _, _, _) = utc_ymdhms_from_unix_ms(ms);
