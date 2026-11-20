@@ -6445,7 +6445,7 @@ fn refine_prepare_error(
         return error;
     }
     if matches!(stmt, Some(Stmt::Select(_))) {
-        return select_function_error_offset(inner, sql, error);
+        return select_name_error_offset(inner, sql, error);
     }
     if inner.authorizer.is_some() {
         return error;
@@ -6480,15 +6480,18 @@ fn refine_prepare_error(
         .with_offset(usize::try_from(offset).unwrap_or(SqliteError::NO_OFFSET))
 }
 
-/// The legacy resolver has a function name but no token location. Use C's
-/// byte offset when both resolvers report the same function diagnostic.
-fn select_function_error_offset(
+/// Add the parser's byte offset when the C and legacy resolvers agree about
+/// the missing column or function diagnostic.
+fn select_name_error_offset(
     inner: &ConnectionInner,
     sql: &str,
     error: SqliteError,
 ) -> SqliteError {
+    let missing_column = error.message.starts_with("no such column: ");
     if error.offset.is_some()
-        || !(error.message.starts_with("wrong number of arguments to function ")
+        || (missing_column && inner.authorizer.is_some())
+        || !(missing_column
+            || error.message.starts_with("wrong number of arguments to function ")
             || error.message.starts_with("no such function: "))
     {
         return error;
@@ -6496,10 +6499,15 @@ fn select_function_error_offset(
     if let sqliters_codegen::PrepareResult::Error { code, message, offset } =
         cgen::c_prepare_diagnostic(inner, sql)
         && code == error.extended_code
-        && message.eq_ignore_ascii_case(&error.message)
+        && (message == error.message
+            || (!missing_column && message.eq_ignore_ascii_case(&error.message)))
         && let Ok(offset) = usize::try_from(offset)
     {
-        SqliteError::with_extended(code, message).with_offset(offset)
+        if missing_column {
+            error.with_offset(offset)
+        } else {
+            SqliteError::with_extended(code, message).with_offset(offset)
+        }
     } else {
         error
     }
