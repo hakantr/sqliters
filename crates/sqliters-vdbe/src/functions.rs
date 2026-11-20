@@ -1724,6 +1724,13 @@ fn apply_datetime_modifier_ms(ms: i64, s: &str) -> Option<i64> {
     }
 }
 
+fn valid_julian_day(unix_ms: i64) -> Option<f64> {
+    unix_ms
+        .checked_add(UNIX_EPOCH_JULIAN_MS)
+        .filter(|ms| (0..JULIAN_MS_LIMIT).contains(ms))
+        .map(|julian_ms| julian_ms as f64 / 86_400_000.0)
+}
+
 fn eval_datetime_function(
     upper_name: &str,
     args: &[Value],
@@ -1754,13 +1761,8 @@ fn eval_datetime_function(
         "UNIXEPOCH" if use_subsec => Ok(Value::real(unix_ms as f64 / 1_000.0)),
         "UNIXEPOCH" => Ok(Value::Integer(unix_ms.div_euclid(1_000))),
         "JULIANDAY" => {
-            let day = unix_ms
-                .checked_add(UNIX_EPOCH_JULIAN_MS)
-                .filter(|ms| (0..JULIAN_MS_LIMIT).contains(ms))
-                .map_or_else(
-                    || (unix_ms as f64) / 86_400_000.0 + 2_440_587.5,
-                    |julian_ms| julian_ms as f64 / 86_400_000.0,
-                );
+            let day = valid_julian_day(unix_ms)
+                .unwrap_or_else(|| (unix_ms as f64) / 86_400_000.0 + 2_440_587.5);
             Ok(Value::real(day))
         }
         _ => unreachable!(),
@@ -1790,7 +1792,6 @@ fn eval_strftime_function(args: &[Value], ctx: &VmRuntimeContext) -> Result<Valu
     let dow = (days + 4).rem_euclid(7); // 1970-01-01 was Thursday (4); Sunday = 0
     let jan1_days = days_from_civil(i64::from(y), 1, 1);
     let doy_1_based = (days - jan1_days) + 1;
-    let jd = (unix_ms as f64) / 86_400_000.0 + 2_440_587.5;
 
     let mut out = String::with_capacity(fmt.len() + 16);
     let mut chars = fmt.chars();
@@ -1823,7 +1824,18 @@ fn eval_strftime_function(args: &[Value], ctx: &VmRuntimeContext) -> Result<Valu
             'T' => out.push_str(&format!("{hh:02}:{mm:02}:{ss:02}")),
             'R' => out.push_str(&format!("{hh:02}:{mm:02}")),
             'j' => out.push_str(&format!("{doy_1_based:03}")),
-            'J' => out.push_str(&format!("{jd:.9}")),
+            'J' => {
+                if let Some(day) = valid_julian_day(unix_ms) {
+                    let bytes = crate::printf::sqlite_printf(b"%.16g", &[Value::real(day)])
+                        .map_err(|_| {
+                            SqliteError::new(ErrorCode::TooBig, "string or blob too big")
+                        })?;
+                    out.push_str(&String::from_utf8_lossy(&bytes));
+                } else {
+                    let jd = (unix_ms as f64) / 86_400_000.0 + 2_440_587.5;
+                    out.push_str(&format!("{jd:.9}"));
+                }
+            }
             's' if use_subsec => {
                 let sign = if unix_ms < 0 { "-" } else { "" };
                 let magnitude = unix_ms.unsigned_abs();

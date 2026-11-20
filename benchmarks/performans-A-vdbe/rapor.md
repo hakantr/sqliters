@@ -1457,3 +1457,8 @@ Geçerli UTF-16LE/BE gömülü NUL ve devamını koruyor. 54 ayrı sonuç, 24 fi
 ## V6b.230 — JULIANDAY REAL çıkışı
 
 Geçerli Julian milisaniyesi C gibi tam sayı toplamından sonra tek bölmeyle REAL oluyor. 171 ayrı bit farkı kapandı. 851 C açılışı ve 12 VDBE testi doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,274 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_230.md).
+
+
+## V6b.231 — STRFTIME %J biçimi
+
+STRFTIME %J ortak Julian REAL hesabı ve C uyumlu %.16g biçimini kullanıyor. 594 ayrı fark kapandı. 735 C açılışı ve 12 VDBE testi doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,285 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_231.md).
