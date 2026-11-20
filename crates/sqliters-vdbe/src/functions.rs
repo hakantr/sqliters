@@ -1670,7 +1670,7 @@ fn parse_iso_datetime(input: &str, allow_signed_year: bool) -> Option<ParsedDate
         } else {
             clock
         };
-        let (clock_ms, raw_seconds) = parse_hms_ms(clock, true, true)?;
+        let (clock_ms, raw_seconds) = parse_hms_ms(clock, true)?;
         let local_ms = local_clock_ms(clock_ms)?;
         // A 24:00 clock advances the local date before applying its offset.
         if local_ms >= YEAR_10000_MS {
@@ -1719,7 +1719,7 @@ fn parse_iso_datetime(input: &str, allow_signed_year: bool) -> Option<ParsedDate
         }
         return Some(ParsedDateTime::from_unix_ms(midnight_ms));
     }
-    let (clock_ms, raw_seconds) = parse_hms_ms(clock, signed, hour24)?;
+    let (clock_ms, raw_seconds) = parse_hms_ms(clock, hour24)?;
     let unix_ms = local_clock_ms(clock_ms)?;
     let signed_hour24 = signed && hour24;
     if hour24 && unix_ms >= YEAR_10000_MS {
@@ -1763,29 +1763,21 @@ fn parse_numeric_time_offset_ms(s: &str) -> Option<i64> {
     Some(if s.starts_with('-') { -ms } else { ms })
 }
 
-fn parse_hms_ms(s: &str, strict_clock: bool, allow_hour24: bool) -> Option<(i64, Option<f64>)> {
+fn parse_hms_ms(s: &str, allow_hour24: bool) -> Option<(i64, Option<f64>)> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() < 2 || parts.len() > 3 {
         return None;
     }
     let hour24 = allow_hour24 && parts[0] == "24";
-    let strict = strict_clock || hour24;
-    let parse_part = |part: &str| -> Option<u32> {
-        if strict {
-            parse_two_time_digits(part)
-        } else {
-            part.parse().ok()
-        }
-    };
-    let hh = parse_part(parts[0])?;
-    let mm = parse_part(parts[1])?;
+    let hh = parse_two_time_digits(parts[0])?;
+    let mm = parse_two_time_digits(parts[1])?;
     let (ss, ms, raw_seconds) = if parts.len() == 3 {
         if let Some((sec_part, frac_part)) = parts[2].split_once('.') {
-            let sec = parse_part(sec_part)?;
+            let sec = parse_two_time_digits(sec_part)?;
             if frac_part.is_empty() || !frac_part.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
             }
-            if frac_part.len() > 3 && [parts[0], parts[1], sec_part].iter().all(|p| p.len() == 2) {
+            if frac_part.len() > 3 {
                 let (millis, seconds) = parse_long_clock_fraction(sec, frac_part)?;
                 (sec, millis, Some(seconds))
             } else {
@@ -1796,7 +1788,7 @@ fn parse_hms_ms(s: &str, strict_clock: bool, allow_hour24: bool) -> Option<(i64,
                 (sec, frac_digits.parse().ok()?, None)
             }
         } else {
-            (parse_part(parts[2])?, 0, None)
+            (parse_two_time_digits(parts[2])?, 0, None)
         }
     } else {
         (0, 0, None)

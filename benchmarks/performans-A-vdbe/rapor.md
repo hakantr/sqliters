@@ -1557,3 +1557,8 @@ Saat metninde saniyeden sonraki nokta en az bir kesir rakamı gerektirir. Sabit 
 ## V6b.250 — Finder L03 olağan PRAGMA optimize
 
 Normal MAIN kapsamındaki dolu, istatistiksiz tam indeks için varsayılan PRAGMA optimize, C gibi mevcut ANALYZE yoluyla istatistik yazar ve geçici limiti geri yükler. Kanonik senaryonun beş evresindeki C ve Rust dosyaları eş. Bağımsız 588 C salt okunur açılışı ve iki taze tam Finder koşusu geçti. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 243/245, determinism 244/245. Açık L4 ve L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_250.md).
+
+
+## V6b.251 — ISO saat alanlarının genişliği
+
+Ortak saat ayrıştırması saat, dakika ve saniye alanlarında C gibi iki ASCII rakam ister. 824 sorguluk matriste 84 fark kapandı, 740 eş kontrol ve önceki kesir sonuçları korundu. Üç kalıcı dosya ve 15 bağımsız C salt okunur açılışı eş. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 243/245, determinism 244/245. Açık L4 ve L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,268 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_251.md).
