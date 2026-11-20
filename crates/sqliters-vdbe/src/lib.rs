@@ -2697,6 +2697,19 @@ pub fn eval_cast_with_encoding(val: Value, type_name: &str, enc: TextEncoding) -
             }
         },
         TypeAffinity::Text => match val {
+            Value::Blob(b) if enc != TextEncoding::Utf8 => {
+                let text = enc.decode_bytes(&b);
+                if text.contains(char::REPLACEMENT_CHARACTER) && text.contains('\0') {
+                    // Preserve the existing result for ill-formed UTF-16. A literal
+                    // replacement character round-trips to the original code units.
+                    let mut encoded = Vec::new();
+                    enc.encode_into(&text, &mut encoded);
+                    if encoded != b[..b.len() & !1] {
+                        return Value::Text(decode_blob_for_cast(&b, enc));
+                    }
+                }
+                Value::Text(text)
+            }
             Value::Blob(b) => Value::Text(decode_blob_for_cast(&b, enc)),
             other => Value::Text(other.to_text_lossy()),
         },

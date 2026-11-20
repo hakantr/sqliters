@@ -1427,3 +1427,8 @@ Dört zaman işlevi kesirli SQL tipi ve biçimini C ile eşliyor. Kip başına 2
 ## V6b.224 — Açık unixepoch girdisi
 
 İlk explicit unixepoch girdi türü, sıra, yuvarlama ve tarih sınırı C ile eş. 384 ana ve 12 önceki fark kapandı. 423 C açılışı geçti. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,249 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_224.md).
+
+
+## V6b.225 — UTF-16 BLOB CAST metni
+
+Geçerli UTF-16LE/BE gömülü NUL ve devamını koruyor. 54 ayrı sonuç, 24 fiziksel profil C ile eşleşti. 444 C açılışı geçti. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,244 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_225.md).
