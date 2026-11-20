@@ -6160,7 +6160,6 @@ impl Pager {
             self.page_size_fixed = self.page_count > 0;
             self.header_loaded = true;
         } else if self.db_kind == DatabaseKind::PrivateTemporary
-            && self.file.is_none()
             && self.journal_file.is_none()
             && !self.cache_modified
             && !self.db_file_modified
