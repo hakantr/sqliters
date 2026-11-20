@@ -426,11 +426,14 @@ pub fn sqlite3_pragma(
                     size: sqlite3_get_int32(z).unwrap_or(0),
                 });
             } else if let Some(n) = host_int(p, i_db, "cache_size") {
-                // Reading the schema may initialize the pager's cache size.
-                p.db.host.note_pragma_effect(PrepareEffect::CacheSize {
-                    i_db: i_db as usize,
-                    size: n as i32,
-                });
+                // TEMP's schema setting survives its Btree. A query must
+                // leave the new Btree's independent cache at its own size.
+                if i_db != 1 {
+                    p.db.host.note_pragma_effect(PrepareEffect::CacheSize {
+                        i_db: i_db as usize,
+                        size: n as i32,
+                    });
+                }
                 return_int(p, n);
             }
         }

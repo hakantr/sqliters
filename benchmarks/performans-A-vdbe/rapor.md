@@ -1317,3 +1317,8 @@ Dış V1 step 1. Reset ve finalize asıl 13 sonucunu koruyor. 432 C açılışı
 ## V6b.202 — DDL geri alımında V1 okuyucu step sonucu
 
 Dış step 1. Canlı okuyucunun 516 ve stale deyimin 17 terminal kodu korunuyor. 1.728 C açılışı ölçüldü. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,249 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_202.md).
+
+
+## V6b.203 — TEMP cache_size şema ve pager ömrü
+
+Şema ayarı korunuyor. Yeni pager varsayılan cache ile açılıyor. 876 native ve C açılışı eş, önceki 72 regresyon kapandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,243 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_203.md).

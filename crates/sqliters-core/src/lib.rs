@@ -6367,9 +6367,7 @@ fn apply_codegen_pragma_effects(inner: &mut ConnectionInner) -> Result<()> {
                 apply_all_pragma_pager_flags(inner);
             }
             PrepareEffect::CacheSize { i_db, size } => {
-                if let Some(bt) = inner.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut()) {
-                    bt.set_cache_size(size);
-                }
+                inner.db_set.set_pragma_cache_size(DatabaseId(i_db), size);
             }
             PrepareEffect::JournalSizeLimit { i_db, limit } => {
                 if let Some(bt) = inner.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut()) {
@@ -8311,7 +8309,13 @@ impl Statement {
         let unparsed_tail = tail.to_owned();
 
         let select_schema_use = stmt_opt.as_ref().and_then(|st| select_schema_use_of(inner, st, &raw_sql));
-        let needs_schema = select_schema_use.as_ref().map_or_else(
+        // EXPLAIN does not open TEMP. Without its Btree the PRAGMA
+        // file-control fails before SQLite loads any schemas.
+        let unopened_temp_pragma_explain = !inner.db_set.is_temp_open()
+            && matches!(stmt_opt.as_ref(), Some(Stmt::Explain { stmt, .. })
+                if matches!(stmt.as_ref(), Stmt::Pragma { schema: Some(schema), .. }
+                    if schema.eq_ignore_ascii_case("temp")));
+        let needs_schema = !unopened_temp_pragma_explain && select_schema_use.as_ref().map_or_else(
             || stmt_opt.as_ref().is_some_and(stmt_loads_schema_on_prepare), |usage| usage.reads_schema,
         );
         // A statement that writes sqlite_stat1: C's in-memory statistics and the engine's may
@@ -8347,7 +8351,15 @@ impl Statement {
             inner.db_set.c_apply_cookie_ahead();
         }
         if c_reads_schema {
-            // sqlite3ReadSchema() -> sqlite3Init(): every schema is loaded from here on
+            // sqlite3Pragma opens an explicitly named TEMP Btree before
+            // sqlite3ReadSchema initializes the TEMP schema's cache setting.
+            if !inner.db_set.is_temp_open()
+                && matches!(stmt_opt.as_ref(), Some(Stmt::Pragma { schema: Some(schema), .. })
+                    if schema.eq_ignore_ascii_case("temp"))
+            {
+                let encoding = inner.effective_encoding();
+                inner.db_set.ensure_temp_open(encoding, inner.writable_schema)?;
+            }
             inner.db_set.c_mark_schemas_loaded();
         }
         if !inner.db_set.is_temp_open()

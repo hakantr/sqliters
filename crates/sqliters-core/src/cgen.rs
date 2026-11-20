@@ -143,6 +143,9 @@ impl Host for EngineHost<'_> {
         if name == "default_locking_mode" { return Some(self.default_locking_mode); }
         if name == "busy_timeout" { return self.busy_timeout; }
         if name == "wal_autocheckpoint" { return Some(i64::from(self.wal_autocheckpoint)); }
+        if i_db == 1 && name == "cache_size" {
+            return Some(i64::from(self.db_set.temp_schema_cache_size()));
+        }
         let slot = self.db_set.slots().get(i_db)?;
         if i_db == 1 && slot.btree.is_none() {
             if name == "locking_mode" { return Some(1); }

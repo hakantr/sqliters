@@ -4108,7 +4108,9 @@ fn execute_write_body_inner(
                     let size = prepared.unwrap_or_else(|| pragma_to_i64(pv).saturating_abs().min(i64::from(i32::MAX)) as i32);
                     if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree {
                         bt.pager_mut().header_mut()?.default_cache_size = size;
-                        if prepared.is_none() { bt.set_cache_size(size); }
+                    }
+                    if prepared.is_none() {
+                        ctx.db_set.set_pragma_cache_size(db_id, size);
                     }
                     Ok(QueryOutput::default())
                 }
@@ -46813,8 +46815,8 @@ fn exec_pragma(
                 ctx.ensure_write_db(db_id, false)?;
                 if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree {
                     bt.pager_mut().header_mut()?.default_cache_size = size;
-                    bt.set_cache_size(size);
                 }
+                ctx.db_set.set_pragma_cache_size(db_id, size);
                 Ok(QueryOutput::default())
             } else {
                 ctx.ensure_read_db(db_id, false)?;
@@ -47108,19 +47110,17 @@ fn exec_pragma(
             pragma_need_schema(ctx, db_id)?;
             if let Some(pv) = value {
                 let sz = pragma_to_i64(pv).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
-                if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut())
-                {
-                    // `sqlite3BtreeSetCacheSize`: clean unreferenced pages beyond the new
-                    // limit leave the cache at once; nothing is written out here.
-                    bt.set_cache_size(sz);
-                }
+                ctx.db_set.set_pragma_cache_size(db_id, sz);
                 Ok(QueryOutput::default())
             } else {
-                let cur = ctx
-                    .db_set
-                    .slot(db_id)
-                    .and_then(|s| s.btree.as_ref())
-                    .map_or(-2000, Btree::cache_size);
+                let cur = if db_id == DatabaseId::TEMP {
+                    ctx.db_set.temp_schema_cache_size()
+                } else {
+                    ctx.db_set
+                        .slot(db_id)
+                        .and_then(|s| s.btree.as_ref())
+                        .map_or(-2000, Btree::cache_size)
+                };
                 Ok(single_col("cache_size", Value::Integer(i64::from(cur))))
             }
         }

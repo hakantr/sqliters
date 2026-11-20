@@ -286,6 +286,8 @@ pub struct DatabaseSet {
     pub(crate) cache_spill: bool,
     next_schema_instance_id: u64,
     temp_store: TempStoreMode,
+    /// The connection-owned TEMP Schema survives its Btree being closed.
+    temp_schema_cache_size: i32,
     disk_vfs: Arc<dyn Vfs>,
     default_page_size: u32,
     /// Page size of a database file created by ATTACH: the library default the connection
@@ -416,6 +418,7 @@ impl DatabaseSet {
             trigger_depth_limit: SQLITE_MAX_TRIGGER_DEPTH,
             next_schema_instance_id: 3,
             temp_store,
+            temp_schema_cache_size: 0,
             disk_vfs,
             default_page_size,
             attach_page_size: default_page_size,
@@ -1049,6 +1052,14 @@ impl DatabaseSet {
 
     /// `sqlite3Init()` ran: all schemas are loaded.
     pub fn c_mark_schemas_loaded(&mut self) {
+        let temp = &mut self.slots[DatabaseId::TEMP.index()];
+        if !temp.c_loaded && self.temp_schema_cache_size == 0
+            && let Some(btree) = temp.btree.as_mut()
+        {
+            btree.reset_schema_cache_initialization();
+            btree.init_schema_cache_size();
+            self.temp_schema_cache_size = btree.schema_cache_size();
+        }
         let rev = self.c_flags_toggled & 0x1000 != 0;
         for slot in &mut self.slots {
             if !slot.c_loaded {
@@ -1398,6 +1409,19 @@ impl DatabaseSet {
     #[inline]
     pub fn temp_schema_instance_id(&self) -> SchemaInstanceId {
         self.slots[1].schema_instance_id
+    }
+
+    pub(crate) fn temp_schema_cache_size(&self) -> i32 {
+        self.temp_schema_cache_size
+    }
+
+    pub(crate) fn set_pragma_cache_size(&mut self, db_id: DatabaseId, size: i32) {
+        if db_id == DatabaseId::TEMP {
+            self.temp_schema_cache_size = size;
+        }
+        if let Some(btree) = self.slot_mut(db_id).and_then(|slot| slot.btree.as_mut()) {
+            btree.set_cache_size(size);
+        }
     }
 
     /// Returns `true` if slot `1` (`"temp"`) has already opened its [`Btree`].
