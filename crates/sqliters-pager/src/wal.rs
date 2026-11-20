@@ -1925,6 +1925,9 @@ impl Wal {
             return Ok(());
         }
         match &mut self.active_lock {
+            // walCleanupHash leaves an empty shared index alone. Appending
+            // frame 1 clears the entire page-number and hash region first.
+            ActiveShmLock::Writer(_) if max_frame == 0 => Ok(()),
             ActiveShmLock::Writer(wg) => wg.truncate_frames_above(max_frame),
             _ => Err(SqliteError::misuse(
                 "cleanup_hash_above requires OwnedWriterTxnGuard",

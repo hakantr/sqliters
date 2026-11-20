@@ -1272,3 +1272,8 @@ Etkin statement ön koşulu C gibi BUSY. Kabul edilen bağlantı kapanışında 
 ## V6b.193 — Birden çok ATTACH ile WAL çıkışı
 
 C WAL kapanışının doğrudan hata dönüşü önceki koşullarla tüm koordineli slotlara uygulanıyor. 630 C çift, 946 eski callback ve 56 OFF ilk satır dosya farkı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,260 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_193.md).
+
+
+## V6b.194 — WAL geri almada sıfır canlı frame
+
+Ortak indekste sıfır canlı frame durumunda erişilemeyen kayıtlar C gibi sonraki ilk yazıya kadar kalıyor. 432 doğal spill akışı, 45 bağlantı yaşamı ve 1.728 C yeniden açılışı eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,230 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_194.md).
