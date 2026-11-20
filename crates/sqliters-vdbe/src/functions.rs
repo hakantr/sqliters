@@ -1390,6 +1390,10 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 const UNIX_EPOCH_JULIAN_MS: i64 = 210_866_760_000_000;
 const JULIAN_MS_LIMIT: i64 = 464_269_060_800_000;
 
+fn valid_julian_unix_ms(unix_ms: i64) -> bool {
+    (-UNIX_EPOCH_JULIAN_MS..JULIAN_MS_LIMIT - UNIX_EPOCH_JULIAN_MS).contains(&unix_ms)
+}
+
 #[derive(Clone, Copy)]
 struct BareHour24 {
     offset_ms: i64,
@@ -1401,6 +1405,7 @@ struct ParsedDateTime {
     unix_ms: i64,
     raw_seconds: Option<f64>,
     is_utc: bool,
+    signed_hour24: bool,
     bare_hour24: Option<BareHour24>,
 }
 
@@ -1498,14 +1503,15 @@ fn parse_datetime_value(
                 continue;
             }
             time.unix_ms = apply_datetime_modifier_ms(&mut time, mt)?;
+            if time.signed_hour24 && !valid_julian_unix_ms(time.unix_ms) {
+                return None;
+            }
             time.raw_seconds = None;
         }
         break use_subsec;
     };
 
-    if check_julian_range
-        && !(-UNIX_EPOCH_JULIAN_MS..JULIAN_MS_LIMIT - UNIX_EPOCH_JULIAN_MS).contains(&time.unix_ms)
-    {
+    if check_julian_range && !valid_julian_unix_ms(time.unix_ms) {
         return None;
     }
     Some((time, use_subsec))
@@ -1614,7 +1620,7 @@ fn parse_iso_datetime(input: &str, allow_signed_year: bool) -> Option<ParsedDate
     if signed && (!canonical_date() || s.contains('\0')) {
         return None;
     }
-    let (days, clock) = if has_date {
+    let (days, clock, signed_year_end) = if has_date {
         let mut y: i64 = s.get(0..4)?.parse().ok()?;
         let m: u32 = s.get(5..7)?.parse().ok()?;
         let d: u32 = s.get(8..10)?.parse().ok()?;
@@ -1632,14 +1638,25 @@ fn parse_iso_datetime(input: &str, allow_signed_year: bool) -> Option<ParsedDate
                 return None;
             }
         }
-        (days_from_civil(y, m, d), s.get(10..)?)
+        (
+            days_from_civil(y, m, d),
+            s.get(10..)?,
+            (signed && m == 12 && d == 31).then_some(y),
+        )
     } else if s.contains(':') {
         // SQLite treats a bare time as being on 2000-01-01.
-        (days_from_civil(2000, 1, 1), s)
+        (days_from_civil(2000, 1, 1), s, None)
     } else {
         return None;
     };
     let midnight_ms = days * 86_400_000;
+    let local_clock_ms = |clock_ms| {
+        if let Some(year) = signed_year_end.filter(|_| clock_ms == 86_400_000) {
+            // SQLite advances the year magnitude before applying the minus sign.
+            return (year > -4713).then(|| days_from_civil(year - 1, 1, 1) * 86_400_000);
+        }
+        Some(midnight_ms + clock_ms)
+    };
 
     if let Some(offset_start) = clock.find(['+', '-']) {
         if input.trim_end_matches(is_date_time_space) != s {
@@ -1655,14 +1672,18 @@ fn parse_iso_datetime(input: &str, allow_signed_year: bool) -> Option<ParsedDate
         } else {
             clock
         };
-        let (clock_ms, raw_seconds) = parse_hms_ms(clock, true, !signed)?;
-        let local_ms = midnight_ms + clock_ms;
+        let (clock_ms, raw_seconds) = parse_hms_ms(clock, true, true)?;
+        let local_ms = local_clock_ms(clock_ms)?;
         // A 24:00 clock advances the local date before applying its offset.
         if local_ms >= YEAR_10000_MS {
             return None;
         }
         let offset_ms = parse_numeric_time_offset_ms(offset)?;
         let utc_ms = local_ms - offset_ms;
+        let signed_hour24 = signed && clock_ms == 86_400_000;
+        if signed_hour24 && !valid_julian_unix_ms(utc_ms) {
+            return None;
+        }
         let bare_hour24 = (!has_date && clock_ms == 86_400_000).then(|| BareHour24 {
             offset_ms,
             legacy_accepted: clock[3..]
@@ -1673,6 +1694,7 @@ fn parse_iso_datetime(input: &str, allow_signed_year: bool) -> Option<ParsedDate
             unix_ms: utc_ms,
             raw_seconds: if offset_ms == 0 { raw_seconds } else { None },
             is_utc: bare_hour24.is_none() || offset_ms == 0,
+            signed_hour24,
             bare_hour24,
         });
     }
@@ -1685,8 +1707,7 @@ fn parse_iso_datetime(input: &str, allow_signed_year: bool) -> Option<ParsedDate
         clock
     }
     .trim_end_matches(is_date_time_space);
-    let hour24 = !signed
-        && hour24_clock.starts_with("24:")
+    let hour24 = hour24_clock.starts_with("24:")
         && (!has_date || canonical_date())
         && input.trim_end_matches(is_date_time_space) == s;
     let clock = if hour24 || signed {
@@ -1703,14 +1724,16 @@ fn parse_iso_datetime(input: &str, allow_signed_year: bool) -> Option<ParsedDate
         return Some(ParsedDateTime::from_unix_ms(midnight_ms));
     }
     let (clock_ms, raw_seconds) = parse_hms_ms(clock, signed, hour24)?;
-    let unix_ms = midnight_ms + clock_ms;
-    if hour24 && unix_ms >= YEAR_10000_MS {
+    let unix_ms = local_clock_ms(clock_ms)?;
+    let signed_hour24 = signed && hour24;
+    if (hour24 && unix_ms >= YEAR_10000_MS) || (signed_hour24 && !valid_julian_unix_ms(unix_ms)) {
         return None;
     }
     Some(ParsedDateTime {
         unix_ms,
         raw_seconds,
         is_utc: without_z.is_some(),
+        signed_hour24,
         bare_hour24: (!has_date && clock_ms == 86_400_000).then_some(BareHour24 {
             offset_ms: 0,
             legacy_accepted: false,

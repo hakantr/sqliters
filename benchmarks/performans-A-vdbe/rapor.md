@@ -1522,3 +1522,8 @@ Olağan ilişkisel MAIN legacy V1 görünüm UPDATE işlemi gerçek Btree okuma 
 ## V6b.243 — Negatif ISO yıl ayrıştırması
 
 Canonical negatif ISO tarih ve olağan saatte geçerli yerel gün, dört ASCII yıl hanesi ve erken yıl sınırı mevcut Gregorian hesap ve son Julian denetimiyle çalışır. 54 hedef bağlam ve kip başına 972 ham kayıt C eş. 89 diğer bağlam ve önceki korumalar değişmedi. 54 gerçek saklama, C açılışları, 12 VDBE testi ve 6.803 strict final exact doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 242/245, determinism 244/245. Açık L1, L4 ve L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_243.md).
+
+
+## V6b.244 — Negatif tarihli ISO 24:00
+
+Canonical negatif tarihli 24:00, C'nin önce yıl büyüklüğünü ilerletip işareti uygulama kararını ve ham sıfır kesrini izler. Başlangıç ve değiştiricilerde Julian aralığı korunan 145 hedef, kip başına 2.610 ham kayıt C eş. 59 ana bağlam korundu. 145 gerçek saklama, 288 C açılışı, 12 VDBE ve 4.598 strict doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 242/245, determinism 244/245. Açık L1, L4 ve L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,248 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_244.md).
