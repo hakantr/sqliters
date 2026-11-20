@@ -340,6 +340,8 @@ pub struct Vdbe {
     pub change_cnt_on: bool,
     /// Compiler routing hint: LIKE was resolved, including an omitted range residual.
     pub references_like: bool,
+    /// A simple GROUP BY completes its input scan before emitting sorter results.
+    pub group_sorter_owns_rows: bool,
     /// `Parse.nTempReg` / `Parse.nRangeReg` are reset by [`Vdbe::end_coroutine`]; the code
     /// generator reads this flag after the call and clears its pools (C does it through
     /// `v->pParse`).
@@ -756,6 +758,7 @@ impl Vdbe {
             prep_flags: self.prep_flags,
             change_cnt_on: self.change_cnt_on,
             references_like: self.references_like,
+            group_sorter_owns_rows: self.group_sorter_owns_rows,
         }
     }
 }
@@ -810,6 +813,8 @@ pub struct Program {
     pub change_cnt_on: bool,
     /// Routing metadata from function resolution; not a C Vdbe field.
     pub references_like: bool,
+    /// A simple GROUP BY completes its input scan before emitting sorter results.
+    pub group_sorter_owns_rows: bool,
     /// `usesStmtJournal`
     pub uses_stmt_journal: bool,
     /// `explain`: 0 normal, 1 EXPLAIN, 2 EXPLAIN QUERY PLAN

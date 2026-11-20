@@ -1446,14 +1446,16 @@ fn test_group5_activity_tracker_lock_transitions_returning_lock7_drop_vacuum_and
     trip_vdbe.finalize().unwrap();
     trip_interp.finalize().unwrap();
 
-    // DDL rollback (`write_only == false`): both VDBE and interpreter `SELECT` return `SQLITE_ABORT_ROLLBACK`!
+    // DDL rollback trips the live table cursor. GROUP BY has already filled its
+    // sorter, which can finish without returning to that cursor.
     conn.execute("BEGIN;").unwrap();
+    let group_sql = "SELECT grp, COUNT(*) FROM t GROUP BY grp ORDER BY grp;";
     let mut abort_vdbe = conn.prepare("SELECT id FROM t ORDER BY id;").unwrap();
-    let mut abort_interp = conn
-        .prepare("SELECT grp, COUNT(*) FROM t GROUP BY grp ORDER BY grp;")
-        .unwrap();
+    let mut sorter = conn.prepare(group_sql).unwrap();
     assert!(matches!(abort_vdbe.step().unwrap(), StepResult::Row(_)));
-    assert!(matches!(abort_interp.step().unwrap(), StepResult::Row(_)));
+    let StepResult::Row(first_group) = sorter.step().unwrap() else {
+        panic!("GROUP BY must produce a row before rollback");
+    };
 
     conn.execute("CREATE TABLE transient_ddl(k INT);").unwrap();
     conn.execute("ROLLBACK;").unwrap();
@@ -1462,18 +1464,17 @@ fn test_group5_activity_tracker_lock_transitions_returning_lock7_drop_vacuum_and
     assert_eq!(err_v.code, ErrorCode::Abort);
     assert_eq!(err_v.extended_code, extended::SQLITE_ABORT_ROLLBACK);
 
-    let err_i = abort_interp.step().unwrap_err();
-    assert_eq!(err_i.code, ErrorCode::Abort);
-    assert_eq!(err_i.extended_code, extended::SQLITE_ABORT_ROLLBACK);
+    let mut groups = vec![first_group];
+    while let StepResult::Row(row) = sorter.step().unwrap() {
+        groups.push(row);
+    }
+    assert!(groups.len() > 1);
+    sorter.finalize().unwrap();
+    assert_eq!(groups, conn.query(group_sql, &[]).unwrap().rows);
 
-    // `sqlite3_finalize` without an intervening `reset()` surfaces the prior `step()` error
-    // while still unregistering the handle cleanly so `conn.try_close()` succeeds:
+    // Finalize returns the prior Btree step error and unregisters the handle.
     assert_eq!(
         abort_vdbe.finalize().unwrap_err().extended_code,
-        extended::SQLITE_ABORT_ROLLBACK
-    );
-    assert_eq!(
-        abort_interp.finalize().unwrap_err().extended_code,
         extended::SQLITE_ABORT_ROLLBACK
     );
     conn.try_close().unwrap();

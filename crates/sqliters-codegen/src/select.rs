@@ -4584,6 +4584,39 @@ fn sqlite3_select_body(p: &mut Parse, sel: SelectId, dest: &mut SelectDest, b_po
                 p.v.change_to_noop(s_sort.addr_sort_index);
             }
 
+            // A plain grouped column and count(*) only read the sorter after the input
+            // loop above ends. Leave more complex output expressions to the executor.
+            if group_by_sort
+                && dest.e_dest as i32 == SRT_Output
+                && n_group_by == 1
+                && key_info.a_coll.iter().flatten().all(|collation| {
+                    collation.name.eq_ignore_ascii_case("BINARY")
+                })
+                && p_where.is_null()
+                && having.is_null()
+                && s_sort.p_order_by.is_null()
+                && {
+                    let select = p.s(sel);
+                    select.p_prior.is_null() && select.p_next.is_null()
+                        && select.p_limit.is_null() && select.p_with.is_null()
+                        && select.p_win.is_null() && select.p_win_defn.is_null()
+                        && select.sel_flags & SF_Distinct == 0
+                }
+                && let [source] = p.src(tab_list).a.as_slice()
+                && source.p_s_tab.nn() && !source.is_subquery && !source.is_tab_func
+                && !p.tab(source.p_s_tab).is_view() && !p.tab(source.p_s_tab).is_virtual()
+                && let [column, count] = p.l(e_list).a.as_slice()
+                && p.e(column.p_expr).op == TK_AGG_COLUMN
+                && p.e(count.p_expr).op == TK_AGG_FUNCTION
+                && p.agg(agg).a_col.len() == 1
+                && let [aggregate] = p.agg(agg).a_func.as_slice()
+                && aggregate.p_func.as_ref().is_some_and(|function| {
+                    function.n_arg == 0 && function.name.eq_ignore_ascii_case("count")
+                })
+            {
+                p.v.group_sorter_owns_rows = true;
+            }
+
             // Evaluate the current GROUP BY terms and store in b0, b1, b2... (b0 is memory
             // location iBMem+0, b1 is iBMem+1, and so forth) Then compare the current GROUP
             // BY terms against the GROUP BY terms from the previous row currently stored in

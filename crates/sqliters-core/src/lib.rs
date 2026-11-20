@@ -5416,6 +5416,7 @@ pub struct Statement {
     write_vm_scratch: sqliters_vdbe::VdbeWriteScratch,
     compiled_schema_generation: u64,
     compiled_v1_expire_generation: u64,
+    c_sorter_owns_rows: bool,
     compiled_advisory_expire_generation: u64,
     compiled_c_expire_seq: u64,
     compiled_slot_cookies: Vec<(SchemaInstanceId, u32, bool)>,
@@ -8657,6 +8658,7 @@ impl Statement {
             write_vm_scratch: sqliters_vdbe::VdbeWriteScratch::default(),
             compiled_schema_generation: inner.schema_generation,
             compiled_v1_expire_generation: inner.v1_expire_generation,
+            c_sorter_owns_rows: select_schema_use.as_ref().is_some_and(|usage| usage.sorter_owns_rows),
             compiled_advisory_expire_generation: inner.advisory_expire_generation,
             compiled_c_expire_seq: inner.db_set.c_expire_seq(),
             compiled_slot_cookies: inner.snapshot_slot_cookies(),
@@ -9464,6 +9466,7 @@ impl Statement {
             self.category = artifacts.category;
             self.compiled_vdbe = artifacts.compiled_vdbe;
             self.compiled_fast_read = artifacts.compiled_fast_read;
+            self.c_sorter_owns_rows = select_schema_use.as_ref().is_some_and(|usage| usage.sorter_owns_rows);
             self.c_explain = c_explain;
             if self.c_machine_fixed {
                 // (a program handed in by `set_c_program` belongs to the schema it was
@@ -11923,6 +11926,12 @@ impl Statement {
                         continue;
                     };
                     if let Some(&BtreeCursorState::Fault(code)) = bt.cursor_state(cid) {
+                        // A fully fed C sorter advances without using this tripped Btree cursor.
+                        if code == extended::SQLITE_ABORT_ROLLBACK
+                            && self.c_sorter_owns_rows && self.deferred_error.is_none()
+                        {
+                            continue;
+                        }
                         let msg = if code == extended::SQLITE_ABORT_ROLLBACK {
                             "abort due to ROLLBACK"
                         } else {

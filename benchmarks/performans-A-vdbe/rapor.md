@@ -1302,3 +1302,8 @@ Codegen ve çalıştırma aynı C dönüşümünü kullanıyor. Geçerli hex, de
 ## V6b.199 — TEMP CREATE hazırlığı ve şema cookie ömrü
 
 Hazırlama TEMP Btree'yi açıyor, eski cookie ilk gerçek şema kontrolüne kadar saklanıyor. 1.608 native ve 72 opcode akışı, 1.680 bağımsız C açılışı eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_199.md).
+
+
+## V6b.200 — DDL geri alımında V2 sorter ve canlı okuyucu
+
+Tamamlanmış sorter satırı verir, canlı Btree okuyucusu 516 ile durur. 72 V2 profil iki kipte eş, Group5 odak testi iki kipte geçti. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,255 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_200.md).

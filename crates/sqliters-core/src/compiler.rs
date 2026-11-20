@@ -4829,6 +4829,24 @@ fn compile_single_table_select(
         },
         allow_wr_autoindex_covering,
     );
+    // A plain ascending rowid order can stream through the table, as C does.
+    // A covering scan of an unrelated index would otherwise materialize a sorter.
+    let plan = if !tbl.without_rowid && selection.is_none() && limit.is_none()
+        && indexed_by.is_none()
+        && let [term] = order_by
+        && !term.desc && term.nulls_last.is_none()
+        && let Some((_, resolved_order)) = resolve_order_by_source(&term.expr, &expanded, tbl)
+        && is_table_rowid_column_expr(&resolved_order, tbl, schema_name, alias)
+        && let AccessPlan::IndexFullScan { index, is_covering: true } = &plan
+        && !index.columns.first().is_some_and(|key| {
+            !key.sort_order.desc
+                && match_index_col_target(&resolved_order, key, tbl, schema_name, alias).is_some()
+        })
+    {
+        AccessPlan::FullScan
+    } else {
+        plan
+    };
 
     // Delegate range scans, IN-list seeks, and MULTI-INDEX OR to the relational engine with B-Tree range seeks
     if matches!(

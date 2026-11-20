@@ -516,6 +516,7 @@ pub(crate) struct SelectSchemaUse {
     pub btree_mask: Option<u32>,
     pub is_reader: Option<bool>,
     pub has_like: bool,
+    pub sorter_owns_rows: bool,
 }
 
 pub(crate) fn program_has_like(p: &sqliters_vdbe::vdbeaux::Program) -> bool {
@@ -529,8 +530,24 @@ pub(crate) fn program_has_like(p: &sqliters_vdbe::vdbeaux::Program) -> bool {
 pub(crate) fn select_schema_use(inner: &ConnectionInner, sql: &str) -> Option<SelectSchemaUse> {
     let (result, reads_schema) = select_schema_probe(inner, sql);
     match result {
-        PrepareResult::Program(p) => Some(SelectSchemaUse { reads_schema, btree_mask: Some(p.btree_mask), is_reader: Some(p.b_is_reader), has_like: program_has_like(&p) }),
-        PrepareResult::Error { .. } => Some(SelectSchemaUse { reads_schema, btree_mask: None, is_reader: None, has_like: false }),
+        PrepareResult::Program(p) => Some(SelectSchemaUse {
+            reads_schema,
+            btree_mask: Some(p.btree_mask),
+            is_reader: Some(p.b_is_reader),
+            has_like: program_has_like(&p),
+            sorter_owns_rows: p.group_sorter_owns_rows && p.explain == 0
+                && !inner.authorizer.is_some()
+                && inner.collations.get_custom("BINARY").is_none()
+                && !inner.functions.has_aggregate_name("count")
+                && !inner.functions.has_scalar_name("count"),
+        }),
+        PrepareResult::Error { .. } => Some(SelectSchemaUse {
+            reads_schema,
+            btree_mask: None,
+            is_reader: None,
+            has_like: false,
+            sorter_owns_rows: false,
+        }),
         PrepareResult::Unsupported(_) => None,
     }
 }
