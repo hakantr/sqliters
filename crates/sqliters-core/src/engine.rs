@@ -124,6 +124,8 @@ pub struct StmtTxTracker {
     pub(crate) prepared_reverse_order: bool,
     /// Named trigger recursion is fixed by the prepared program.
     pub(crate) prepared_recursive_triggers: Option<bool>,
+    /// The prepared DML result shape follows CountRows at compilation.
+    pub(crate) prepared_count_changes: Option<bool>,
     /// Bitmask of `DatabaseId` slots whose `Read` transaction was started from `Open` by this statement.
     pub started_read_mask: u16,
     /// Bitmask of `DatabaseId` slots whose `Write` transaction (and optional `stmt_sp_slot`) was entered in this statement.
@@ -508,6 +510,10 @@ impl ExecContext<'_> {
 
     fn prepared_recursive_triggers(&self) -> bool {
         self.stmt_tx.prepared_recursive_triggers.unwrap_or(*self.recursive_triggers)
+    }
+
+    fn prepared_count_changes(&self) -> bool {
+        self.stmt_tx.prepared_count_changes.unwrap_or(*self.count_changes)
     }
 
     fn prepared_ignore_checks(&self) -> bool {
@@ -2875,7 +2881,7 @@ pub(crate) fn try_execute_compiled_insert(
     scratch: &mut sqliters_vdbe::VdbeWriteScratch,
     params: &[Value],
 ) -> Result<Option<QueryOutput>> {
-    if *ctx.count_changes
+    if ctx.prepared_count_changes()
         || ctx.mutation_pipeline.has_update_hook()
         || ctx.mutation_pipeline.is_trace_enabled()
         || !ctx.stmt_tx.pinned_table_roots.is_empty()
@@ -27358,11 +27364,16 @@ fn exec_insert_xfer(
     Ok(true)
 }
 
+const INSERT_COUNT_COLUMN: &str = "rows inserted";
+const UPDATE_COUNT_COLUMN: &str = "rows updated";
+const DELETE_COUNT_COLUMN: &str = "rows deleted";
+
 fn finalize_dml_step_result(
     ctx: &mut ExecContext<'_>,
     step_res: Result<QueryOutput>,
     stmt_changes: u64,
     count_changes_rows: u64,
+    count_column: &str,
     is_top_level: bool,
 ) -> Result<QueryOutput> {
     if !is_top_level {
@@ -27390,9 +27401,11 @@ fn finalize_dml_step_result(
                 if *ctx.foreign_keys && !suspects.is_empty() {
                     verify_fk_suspects(ctx, &suspects)?;
                 }
-                if ctx.stmt_tx.defer_returning_changes
+                let count_row = ctx.prepared_count_changes() && out.column_names.is_empty();
+                if (ctx.stmt_tx.defer_returning_changes
+                    || (count_row && ctx.stmt_tx.prepared_count_changes.is_some()))
                     && ctx.stmt_tx.exec_depth == 1
-                    && !out.rows.is_empty()
+                    && (count_row || !out.rows.is_empty())
                 {
                     ctx.stmt_tx.pending_changes = Some(stmt_changes as i64);
                 } else {
@@ -27400,9 +27413,9 @@ fn finalize_dml_step_result(
                     ctx.runtime.total_changes += stmt_changes;
                     ctx.publish();
                 }
-                if *ctx.count_changes && out.column_names.is_empty() {
+                if count_row {
                     out = QueryOutput {
-                        column_names: vec!["count".to_owned()],
+                        column_names: vec![count_column.to_owned()],
                         rows: vec![vec![Value::Integer(count_changes_rows as i64)]],
                     };
                 }
@@ -27836,7 +27849,7 @@ fn prepare_insert_exec<'a>(
 
             // `xferOptimization` (insert.c): `INSERT INTO d SELECT * FROM s` between tables of
             // the same shape copies raw rows and index entries.
-            let xfer_args = (*ctx.foreign_keys, *ctx.count_changes);
+            let xfer_args = (*ctx.foreign_keys, ctx.prepared_count_changes());
             let mut xfer = xfer_optimization(
                 ins,
                 db_id,
@@ -29960,6 +29973,7 @@ fn exec_insert_internal(
                     Ok(out),
                     stmt_changes,
                     count_changes_rows,
+                    INSERT_COUNT_COLUMN,
                     is_top_level,
                 );
             }
@@ -29970,6 +29984,7 @@ fn exec_insert_internal(
                     Err(e),
                     stmt_changes,
                     count_changes_rows,
+                    INSERT_COUNT_COLUMN,
                     is_top_level,
                 );
             }
@@ -30023,6 +30038,7 @@ fn exec_insert_internal(
         step_res,
         stmt_changes,
         count_changes_rows,
+        INSERT_COUNT_COLUMN,
         is_top_level,
     )
 }
@@ -31787,6 +31803,7 @@ fn exec_update_internal(
         step_res,
         stmt_changes,
         count_changes_rows,
+        UPDATE_COUNT_COLUMN,
         is_top_level,
     )
 }
@@ -33006,6 +33023,7 @@ fn exec_delete_internal(
         step_res,
         stmt_changes,
         count_changes_rows,
+        DELETE_COUNT_COLUMN,
         is_top_level,
     )
 }
@@ -49952,7 +49970,7 @@ fn validate_insert_static_inner(
                 return Ok(ret_cols);
             }
             if count_changes {
-                Ok(vec!["count".to_owned()])
+                Ok(vec![INSERT_COUNT_COLUMN.to_owned()])
             } else {
                 Ok(Vec::new())
             }
@@ -50237,7 +50255,7 @@ fn validate_insert_static_inner(
             }
 
             if count_changes {
-                Ok(vec!["count".to_owned()])
+                Ok(vec![INSERT_COUNT_COLUMN.to_owned()])
             } else {
                 Ok(Vec::new())
             }
@@ -50358,7 +50376,7 @@ fn validate_insert_static_inner(
             }
 
             if count_changes {
-                Ok(vec!["count".to_owned()])
+                Ok(vec![INSERT_COUNT_COLUMN.to_owned()])
             } else {
                 Ok(Vec::new())
             }
@@ -50529,7 +50547,7 @@ fn validate_update_static_inner(
                 return Ok(ret_cols);
             }
             if count_changes {
-                Ok(vec!["count".to_owned()])
+                Ok(vec![UPDATE_COUNT_COLUMN.to_owned()])
             } else {
                 Ok(Vec::new())
             }
@@ -50775,7 +50793,7 @@ fn validate_update_static_inner(
             }
 
             if count_changes {
-                Ok(vec!["count".to_owned()])
+                Ok(vec![UPDATE_COUNT_COLUMN.to_owned()])
             } else {
                 Ok(Vec::new())
             }
@@ -50886,7 +50904,7 @@ fn validate_update_static_inner(
             }
 
             if count_changes {
-                Ok(vec!["count".to_owned()])
+                Ok(vec![UPDATE_COUNT_COLUMN.to_owned()])
             } else {
                 Ok(Vec::new())
             }
@@ -51009,7 +51027,7 @@ fn validate_delete_static_inner(
                 return Ok(ret_cols);
             }
             if count_changes {
-                Ok(vec!["count".to_owned()])
+                Ok(vec![DELETE_COUNT_COLUMN.to_owned()])
             } else {
                 Ok(Vec::new())
             }
@@ -51121,7 +51139,7 @@ fn validate_delete_static_inner(
             }
 
             if count_changes {
-                Ok(vec!["count".to_owned()])
+                Ok(vec![DELETE_COUNT_COLUMN.to_owned()])
             } else {
                 Ok(Vec::new())
             }
@@ -51185,7 +51203,7 @@ fn validate_delete_static_inner(
             }
 
             if count_changes {
-                Ok(vec!["count".to_owned()])
+                Ok(vec![DELETE_COUNT_COLUMN.to_owned()])
             } else {
                 Ok(Vec::new())
             }

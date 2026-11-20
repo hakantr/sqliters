@@ -5434,6 +5434,7 @@ pub struct Statement {
     compiled_ignore_checks: bool,
     compiled_reverse_order: bool,
     compiled_recursive_triggers: bool,
+    compiled_count_changes: bool,
     category: Option<StmtCategory>,
     compiled_vdbe: Option<Arc<VdbeProgram>>,
     compiled_fast_read: Option<Arc<fast_read::FastReadPlan>>,
@@ -8709,6 +8710,7 @@ impl Statement {
             compiled_reverse_order: inner.db_set.c_flags_toggled()
                 & sqliters_codegen::consts::SQLITE_ReverseOrder != 0,
             compiled_recursive_triggers: inner.recursive_triggers,
+            compiled_count_changes: inner.count_changes,
             category: artifacts.category,
             compiled_vdbe: artifacts.compiled_vdbe,
             compiled_fast_read: artifacts.compiled_fast_read,
@@ -9536,6 +9538,7 @@ impl Statement {
             self.compiled_reverse_order = inner.db_set.c_flags_toggled()
                 & sqliters_codegen::consts::SQLITE_ReverseOrder != 0;
             self.compiled_recursive_triggers = inner.recursive_triggers;
+            self.compiled_count_changes = inner.count_changes;
             self.c_is_reader = c_explain.as_ref().or(c_machine.as_ref()).or(c_write.as_ref())
                 .map(|p| p.b_is_reader).or_else(|| select_schema_use.as_ref().and_then(|u| u.is_reader))
                 .unwrap_or(artifacts.category.is_some_and(|c| c != StmtCategory::NoLockPragma));
@@ -10523,7 +10526,8 @@ impl Statement {
                     inner.advisory_expire_generation += 1;
                     if matches!(&stmt_clone, Stmt::Pragma { name, .. }
                         if name.eq_ignore_ascii_case("foreign_keys")
-                            || name.eq_ignore_ascii_case("recursive_triggers"))
+                            || name.eq_ignore_ascii_case("recursive_triggers")
+                            || name.eq_ignore_ascii_case("count_changes"))
                     {
                         inner.c_flag_pragma_expire_seq = Some(inner.db_set.c_expire_seq());
                     }
@@ -11707,6 +11711,7 @@ impl Statement {
                     prepared_ignore_checks: Some(self.compiled_ignore_checks),
                     prepared_reverse_order: self.compiled_reverse_order,
                     prepared_recursive_triggers: Some(self.compiled_recursive_triggers),
+                    prepared_count_changes: Some(self.compiled_count_changes),
                     allow_mixed_where_one: !inner.authorizer.is_some(),
                     stmt_sp_slot,
                     top_level_sql,

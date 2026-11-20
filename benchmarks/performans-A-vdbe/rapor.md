@@ -1372,3 +1372,8 @@ Gerçek TEMP dosyası açıkken sıfır yazılı geri alma önceki commit verisi
 ## V6b.213 — Hazırlanmış trigger yazısı
 
 24 OFF farkı kapandı. Önceden hazırlanmış yazı recursion kararını koruyor. 600 C açılışı doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_213.md).
+
+
+## V6b.214 — Hazırlanmış count_changes sonucu
+
+Hazır yazı biçimi, sütun adı ve changes() yaşamı C ile eş. 1.128 ana ve 144 INSERT SELECT profil doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,173 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_214.md).
