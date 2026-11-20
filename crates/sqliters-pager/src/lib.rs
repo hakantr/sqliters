@@ -6159,6 +6159,15 @@ impl Pager {
             self.cache.clean_all();
             self.page_size_fixed = self.page_count > 0;
             self.header_loaded = true;
+        } else if self.db_kind == DatabaseKind::PrivateTemporary
+            && self.file.is_none()
+            && self.journal_file.is_none()
+            && !self.cache_modified
+            && !self.db_file_modified
+        {
+            // WRITER_LOCKED without a page write keeps the private TEMP
+            // cache, including dirty pages from earlier transactions.
+            self.cache.clear_writable();
         } else if was_modified {
             // Disk DB with `journal_mode=OFF` (`savepoint-13.4`): discard dirty in-memory cache
             // and mark `header_loaded = false` so subsequent reads reload untouched pages from disk!
