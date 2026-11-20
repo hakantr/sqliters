@@ -1502,10 +1502,7 @@ fn parse_datetime_value(
                 }
                 continue;
             }
-            time.unix_ms = apply_datetime_modifier_ms(&mut time, mt)?;
-            if time.signed_hour24 && !valid_julian_unix_ms(time.unix_ms) {
-                return None;
-            }
+            time.unix_ms = apply_datetime_modifier_ms(&mut time, &mod_str)?;
             time.raw_seconds = None;
         }
         break use_subsec;
@@ -1681,9 +1678,6 @@ fn parse_iso_datetime(input: &str, allow_signed_year: bool) -> Option<ParsedDate
         let offset_ms = parse_numeric_time_offset_ms(offset)?;
         let utc_ms = local_ms - offset_ms;
         let signed_hour24 = signed && clock_ms == 86_400_000;
-        if signed_hour24 && !valid_julian_unix_ms(utc_ms) {
-            return None;
-        }
         let bare_hour24 = (!has_date && clock_ms == 86_400_000).then(|| BareHour24 {
             offset_ms,
             legacy_accepted: clock[3..]
@@ -1726,7 +1720,7 @@ fn parse_iso_datetime(input: &str, allow_signed_year: bool) -> Option<ParsedDate
     let (clock_ms, raw_seconds) = parse_hms_ms(clock, signed, hour24)?;
     let unix_ms = local_clock_ms(clock_ms)?;
     let signed_hour24 = signed && hour24;
-    if (hour24 && unix_ms >= YEAR_10000_MS) || (signed_hour24 && !valid_julian_unix_ms(unix_ms)) {
+    if hour24 && unix_ms >= YEAR_10000_MS {
         return None;
     }
     Some(ParsedDateTime {
@@ -1839,30 +1833,42 @@ fn parse_long_clock_fraction(second: u32, digits: &str) -> Option<(u32, f64)> {
     Some((millis, seconds))
 }
 
-fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, s: &str) -> Option<i64> {
+fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, modifier: &str) -> Option<i64> {
     let mut ms = time.unix_ms;
     let bare_hour24 = time.bare_hour24.take();
+    let signed_hour24 = time.signed_hour24;
+    let s = modifier.trim();
+    if signed_hour24 && (s != modifier || !s.is_ascii()) {
+        return None;
+    }
+    let calendar_input = (!signed_hour24 || valid_julian_unix_ms(ms)).then_some(());
+    let calendar_output =
+        |result| (!signed_hour24 || valid_julian_unix_ms(result)).then_some(result);
     let lower = s.to_ascii_lowercase();
     match lower.as_str() {
         "start of day" | "start of month" | "start of year" if bare_hour24.is_some() => {
             return Some(days_from_civil(2000, 1, 1) * 86_400_000);
         }
         "start of day" => {
+            calendar_input?;
             let (y, mo, d, _, _, _) = utc_ymdhms_from_unix_ms(ms);
-            return Some(days_from_civil(i64::from(y), mo, d) * 86_400_000);
+            return calendar_output(days_from_civil(i64::from(y), mo, d) * 86_400_000);
         }
         "start of month" => {
+            calendar_input?;
             let (y, mo, _, _, _, _) = utc_ymdhms_from_unix_ms(ms);
-            return Some(days_from_civil(i64::from(y), mo, 1) * 86_400_000);
+            return calendar_output(days_from_civil(i64::from(y), mo, 1) * 86_400_000);
         }
         "start of year" => {
+            calendar_input?;
             let (y, _, _, _, _, _) = utc_ymdhms_from_unix_ms(ms);
-            return Some(days_from_civil(i64::from(y), 1, 1) * 86_400_000);
+            return calendar_output(days_from_civil(i64::from(y), 1, 1) * 86_400_000);
         }
         _ => {}
     }
     if let Some(rest) = lower.strip_prefix("weekday") {
-        if rest.is_empty() || !rest.starts_with(char::is_whitespace) {
+        calendar_input?;
+        if !rest.starts_with(char::is_whitespace) || (signed_hour24 && !rest.starts_with(' ')) {
             return None;
         }
         let wf: f64 = rest.trim().parse().ok()?;
@@ -1877,11 +1883,20 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, s: &str) -> Option<i64>
         let days = ms.div_euclid(86_400_000);
         let dow = (days + 4).rem_euclid(7);
         let add_days = (target_dow - dow).rem_euclid(7);
-        return Some(ms.saturating_add(add_days * 86_400_000));
+        return calendar_output(ms.saturating_add(add_days * 86_400_000));
     }
 
     let mut parts = s.split_whitespace();
-    let num: f64 = parts.next()?.parse().ok()?;
+    let amount = parts.next()?;
+    let num: f64 = if signed_hour24 {
+        if !matches!(amount.as_bytes()[0], b'+' | b'-' | b'0'..=b'9') {
+            return None;
+        }
+        let (value, status) = sqliters_types::sqlite_atof(amount.as_bytes());
+        (status > 0).then_some(value)?
+    } else {
+        amount.parse().ok()?
+    };
     if !num.is_finite() {
         return None;
     }
@@ -1892,12 +1907,30 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, s: &str) -> Option<i64>
     if bare_hour24.is_some_and(|clock| clock.offset_ms != 0) {
         time.is_utc = true;
     }
-    match unit.trim_end_matches('s') {
-        "second" => Some(ms.saturating_add((num * 1_000.0).round() as i64)),
-        "minute" => Some(ms.saturating_add((num * 60_000.0).round() as i64)),
-        "hour" => Some(ms.saturating_add((num * 3_600_000.0).round() as i64)),
-        "day" => Some(ms.saturating_add((num * 86_400_000.0).round() as i64)),
+    let elapsed = |seconds: f64, limit: f32| {
+        if signed_hour24 {
+            // SQLite's duration table uses an exclusive binary32 limit and casts
+            // after adding the sign-dependent half millisecond.
+            if num.abs() >= f64::from(limit) {
+                return None;
+            }
+            let rounder = if num < 0.0 { -0.5 } else { 0.5 };
+            return ms.checked_add((num * 1_000.0 * seconds + rounder) as i64);
+        }
+        Some(ms.saturating_add((num * (seconds * 1_000.0)).round() as i64))
+    };
+    let unit = if signed_hour24 {
+        unit.strip_suffix('s').unwrap_or(&unit)
+    } else {
+        unit.trim_end_matches('s')
+    };
+    match unit {
+        "second" => elapsed(1.0, 4.6427e14),
+        "minute" => elapsed(60.0, 7.7379e12),
+        "hour" => elapsed(3_600.0, 1.2897e11),
+        "day" => elapsed(86_400.0, 5_373_485.0),
         "month" => {
+            calendar_input?;
             let whole_months = num.trunc() as i64;
             let frac_months = num - (whole_months as f64);
             let (y, mo, d, _, _, _) = utc_ymdhms_from_unix_ms(ms);
@@ -1907,7 +1940,7 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, s: &str) -> Option<i64>
             let new_m = (total_m0.rem_euclid(12) + 1) as u32;
             let base_days = days_from_civil(new_y, new_m, 1) + i64::from(d) - 1;
             let frac_ms = (frac_months * 30.0 * 86_400_000.0).round() as i64;
-            Some(
+            calendar_output(
                 base_days
                     .saturating_mul(86_400_000)
                     .saturating_add(tod_ms)
@@ -1915,6 +1948,7 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, s: &str) -> Option<i64>
             )
         }
         "year" => {
+            calendar_input?;
             let whole_years = num.trunc() as i64;
             let frac_years = num - (whole_years as f64);
             let (y, mo, d, _, _, _) = utc_ymdhms_from_unix_ms(ms);
@@ -1922,7 +1956,7 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, s: &str) -> Option<i64>
             let new_y = i64::from(y) + whole_years;
             let base_days = days_from_civil(new_y, mo, 1) + i64::from(d) - 1;
             let frac_ms = (frac_years * 365.0 * 86_400_000.0).round() as i64;
-            Some(
+            calendar_output(
                 base_days
                     .saturating_mul(86_400_000)
                     .saturating_add(tod_ms)
