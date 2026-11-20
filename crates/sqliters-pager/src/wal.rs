@@ -2821,8 +2821,11 @@ impl Wal {
             }
         }
 
+        // sqlite3WalClose keeps the lock/checkpoint result for SQL mode changes.
+        let report_cleanup_errors = !matches!(purpose, WalClosePurpose::SqlModeSwitch);
         if let Some(shm) = self.shm.take()
             && let Err(e) = shm.close_shared(is_delete)
+            && report_cleanup_errors
             && first_err.is_none()
         {
             first_err = Some(e);
@@ -2830,6 +2833,7 @@ impl Wal {
 
         if let Some(mut wal_fd) = self.wal_file.take()
             && let Err(e) = wal_fd.close()
+            && report_cleanup_errors
             && first_err.is_none()
         {
             first_err = Some(e);
@@ -2837,6 +2841,7 @@ impl Wal {
 
         if is_delete
             && let Err(e) = self.vfs.delete(&self.wal_path, false)
+            && report_cleanup_errors
             && first_err.is_none()
         {
             first_err = Some(e);

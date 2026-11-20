@@ -1257,3 +1257,8 @@ Normal yazılabilir tek dosyada WAL kapatma hatası C gibi doğrudan dönüyor. 
 ## V6b.190 — İki hedefli WAL çıkışında busy handler
 
 Bir ATTACH ile koordineli WAL kapanışı hatayı C gibi doğrudan döndürüyor. 540 C–Rust çifti, aynı statement tekrarları ve OFF ilk satır dosya ömrü doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,246 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_190.md).
+
+
+## V6b.191 — Tek hedefli SQL WAL temizleme sonucu
+
+Kilit ve checkpoint sonucu C gibi korunuyor. Yan dosya temizliği devam ederken ayrı hata statüsü artık SQL sonucu olarak dönmüyor. 120 dizin izin kontrolü, 120 yazılabilir dizin koruması ve 1.200 fiziksel DB/WAL/SHM fazı eş. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,017 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_191.md).
