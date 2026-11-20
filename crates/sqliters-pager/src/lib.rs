@@ -6418,7 +6418,12 @@ impl Pager {
         // wins). Where the target itself holds no image of a page (fetched NOCONTENT while
         // it was open) the earliest inner image therefore becomes the target's. A rollback
         // of the transaction savepoint plays the main journal only.
-        let fold_inner = index >= usize::from(self.transaction_savepoint);
+        // sqlite3PagerSavepoint drops younger slots even when a private
+        // TEMP pager in OFF has no journal handle to play back.
+        let skip_playback = self.db_kind == DatabaseKind::PrivateTemporary
+            && self.journal_mode == JournalMode::Off
+            && self.journal_file.is_none();
+        let fold_inner = !skip_playback && index >= usize::from(self.transaction_savepoint);
         let mut folded: FastPgnoMap<()> = FastPgnoMap::default();
         while self.subsavepoints.len() > index + 1 {
             let sp = self.subsavepoints.pop().expect("len checked");
@@ -6442,6 +6447,9 @@ impl Pager {
                 }
             }
             self.recycle_subsavepoint_slot(sp);
+        }
+        if skip_playback {
+            return Ok(());
         }
         if self.use_wal() {
             if !fold_inner {
