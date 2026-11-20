@@ -5420,6 +5420,9 @@ pub struct Statement {
     compiled_c_expire_seq: u64,
     compiled_slot_cookies: Vec<(SchemaInstanceId, u32, bool)>,
     expired: bool,
+    c_v1_expired_before_run: bool,
+    c_reprepare_count: u32,
+    c_reprepare_after_schema_check: bool,
     column_names: Vec<String>,
     /// Names from the current prepare of an ordinary SELECT using column-name flags.
     preserve_prepared_column_names: bool,
@@ -7867,6 +7870,8 @@ impl Statement {
     }
 
     fn reprepare_machine_vm(&mut self, counters: [u32; 9]) {
+        self.c_reprepare_count = self.c_reprepare_count.wrapping_add(1);
+        self.c_reprepare_after_schema_check = true;
         // vdbeaux.c:152–153: sqlite3VdbeSwap preserves aCounter and counts
         // the successful reprepare, including one before the first step.
         self.c_machine_vm = self.c_machine.as_ref().or(self.c_explain.as_ref()).map(|program| {
@@ -8644,6 +8649,9 @@ impl Statement {
             compiled_c_expire_seq: inner.db_set.c_expire_seq(),
             compiled_slot_cookies: inner.snapshot_slot_cookies(),
             expired: false,
+            c_v1_expired_before_run: false,
+            c_reprepare_count: 0,
+            c_reprepare_after_schema_check: false,
             column_names: artifacts.column_names,
             preserve_prepared_column_names,
             params: vec![Value::Null; artifacts.max_param],
@@ -8674,6 +8682,38 @@ impl Statement {
     #[inline]
     pub fn prepare_mode(&self) -> PrepareMode {
         self.mode
+    }
+
+    /// Reports the automatic reprepare count and whether the last one followed
+    /// a schema check during execution.
+    #[doc(hidden)]
+    pub fn c_reprepare_status(&self) -> (u32, bool) {
+        (self.c_reprepare_count, self.c_reprepare_after_schema_check)
+    }
+
+    /// Whether the legacy step failed before executing an instruction.
+    #[doc(hidden)]
+    pub fn c_v1_expired_before_run(&self) -> bool {
+        self.c_v1_expired_before_run
+    }
+
+    /// Whether SQLite's reset/finalize transfers this statement's diagnostic.
+    #[doc(hidden)]
+    pub fn c_cleanup_transfers_diagnostic(&self) -> bool {
+        !matches!(self.lifecycle, StatementLifecycle::Ready) && !self.c_v1_expired_before_run
+    }
+
+    /// A legacy step can autoreset a previously run statement before checking expiry.
+    #[doc(hidden)]
+    pub fn c_legacy_autoreset_transfers_diagnostic(&self) -> bool {
+        let StatementLifecycle::Halted { last_error } = &self.lifecycle else {
+            return false;
+        };
+        self.mode == PrepareMode::V1
+            && !self.c_v1_expired_before_run
+            && (self.is_journal_mode_pragma()
+                || self.expired
+                    && last_error.as_ref().is_some_and(|error| error.code == ErrorCode::Schema))
     }
 
     /// Number of bind parameters in this statement (`sqlite3_bind_parameter_count`).
@@ -9081,6 +9121,7 @@ impl Statement {
     /// active execution (`sqlite3VdbeReset`), while leaving the statement rewound to `Ready`
     /// (unless cleanup I/O poisoned the connection).
     pub fn reset(&mut self) -> Result<()> {
+        self.c_v1_expired_before_run = false;
         self.deferred_error = None;
         if (matches!(self.lifecycle, StatementLifecycle::Ready)
             || (self.category != Some(StmtCategory::Read)
@@ -9875,6 +9916,7 @@ impl Statement {
         if matches!(self.lifecycle, StatementLifecycle::Halted { .. }) {
             self.lifecycle = StatementLifecycle::Ready;
         }
+        self.c_v1_expired_before_run = false;
 
         // Empty / comment-only SQL (`stmt.is_none()` with no parsed statement)
         if self.stmt.is_none() && matches!(parse_one(&self.raw_sql), Ok((None, _))) {
@@ -10144,7 +10186,16 @@ impl Statement {
         if is_advisory_expired
             || (self.category != Some(StmtCategory::Control) && self.needs_reprepare(inner))
         {
+            let expired_before_run = is_advisory_expired
+                || self.compiled_c_expire_seq != inner.db_set.c_expire_seq()
+                || !self.slot_cookies_changed(inner);
             if self.mode == PrepareMode::V1 {
+                self.c_v1_expired_before_run = expired_before_run;
+                // A slot-cookie mismatch reaches OP_Transaction, which sets expired
+                // for subsequent steps. The first step transfers an execution error.
+                if !self.c_v1_expired_before_run {
+                    self.expired = true;
+                }
                 let err = SqliteError::new(ErrorCode::Schema, "database schema has changed");
                 self.lifecycle = StatementLifecycle::Halted {
                     last_error: Some(err.clone()),
@@ -10157,6 +10208,9 @@ impl Statement {
                     last_error: Some(e.clone()),
                 };
                 return Err(e);
+            }
+            if expired_before_run {
+                self.c_reprepare_after_schema_check = false;
             }
             mapped_program = self.mapped_read_program(inner);
             if mapped_program.is_none()

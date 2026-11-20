@@ -178,7 +178,8 @@ struct DbHandle {
     extended_result_codes: bool,
     last_errcode: i32,
     last_extended_errcode: i32,
-    last_errmsg: String,
+    // The saved pErr message is independent of the latest return status.
+    last_errmsg: Option<String>,
     cmd_registered: bool,
     eval_refs: usize,
     tx_depth: usize,
@@ -838,7 +839,7 @@ impl SqliteTestHost {
                 extended_result_codes: false,
                 last_errcode: 0,
                 last_extended_errcode: 0,
-                last_errmsg: "not an error".to_string(),
+                last_errmsg: None,
                 cmd_registered: true,
                 eval_refs: 0,
                 tx_depth: 0,
@@ -849,18 +850,20 @@ impl SqliteTestHost {
         (db_id, ptr_token)
     }
 
+    fn db_result_code(&self, db_id: DbId, code: i32, extended_code: i32) -> i32 {
+        match self.dbs.get(&db_id) {
+            Some(DbSlot::Present(h)) if h.extended_result_codes => extended_code & 0x7fff_ffff,
+            Some(DbSlot::Present(_)) => extended_code & 0xff,
+            _ => code,
+        }
+    }
+
     fn set_db_error(&mut self, db_id: DbId, code: i32, extended_code: i32, msg: String) -> i32 {
-        let mut effective = code;
+        let effective = self.db_result_code(db_id, code, extended_code);
         if let Some(DbSlot::Present(h)) = self.dbs.get_mut(&db_id) {
-            let mask = if h.extended_result_codes {
-                0x7fff_ffff
-            } else {
-                0xff
-            };
             h.last_errcode = extended_code & 0xff;
             h.last_extended_errcode = extended_code;
-            h.last_errmsg = msg;
-            effective = extended_code & mask;
+            h.last_errmsg = Some(msg);
         }
         effective
     }
@@ -869,9 +872,6 @@ impl SqliteTestHost {
         if let Some(DbSlot::Present(h)) = self.dbs.get_mut(&db_id) {
             h.last_errcode = status_code;
             h.last_extended_errcode = status_code;
-            h.last_errmsg = ErrorCode::from_raw_primary(status_code)
-                .as_str()
-                .to_string();
         }
     }
 
@@ -879,7 +879,7 @@ impl SqliteTestHost {
         if let Some(DbSlot::Present(h)) = self.dbs.get_mut(&db_id) {
             h.last_errcode = 0;
             h.last_extended_errcode = 0;
-            h.last_errmsg = "not an error".to_string();
+            h.last_errmsg = None;
         }
     }
 
@@ -1601,7 +1601,12 @@ fn dispatch_host_builtin(
                 let h = host.borrow();
                 h.resolve_db_id(dbn)
                     .and_then(|id| match h.dbs.get(&id) {
-                        Some(DbSlot::Present(db)) => Some(db.last_errmsg.clone()),
+                        Some(DbSlot::Present(db)) => Some(
+                            db.last_errmsg.as_deref()
+                                .filter(|_| db.last_extended_errcode != 0)
+                                .unwrap_or_else(|| ErrorCode::from_raw_primary(db.last_extended_errcode).as_str())
+                                .to_owned(),
+                        ),
                         _ => None,
                     })
                     .unwrap_or_else(|| "not an error".to_string())
@@ -2114,7 +2119,7 @@ fn db_close_cmd(host: &SharedHost, db_name: &str, db_id: DbId) -> TclResult<Stri
                                 extended_result_codes,
                                 last_errcode: error.code as i32,
                                 last_extended_errcode: error.extended_code,
-                                last_errmsg: errmsg.clone(),
+                                last_errmsg: Some(errmsg.clone()),
                                 cmd_registered,
                                 eval_refs,
                                 tx_depth,
@@ -3603,11 +3608,28 @@ fn cmd_step(host: &SharedHost, interp: &mut TclInterp, args: &[String]) -> TclRe
 
     let owner_db_id = rec.owner_db_id;
     let mode = rec.stmt.prepare_mode();
+    let (reprepare_count, _) = rec.stmt.c_reprepare_status();
     let step_res = {
         let _interp_guard = enter_interp_scope(interp);
+        if rec.stmt.c_legacy_autoreset_transfers_diagnostic() {
+            let reset = rec.stmt.reset();
+            cleanup_statement_result(host, owner_db_id, true, reset);
+        }
         rec.stmt.step()
     };
     rec.column_names = rec.stmt.column_names().to_vec();
+
+    let (new_reprepare_count, after_schema_check) = rec.stmt.c_reprepare_status();
+    if mode == PrepareMode::V2 && step_res.is_ok() && new_reprepare_count != reprepare_count {
+        let mut h = host.borrow_mut();
+        if after_schema_check {
+            // The executed OP_Transaction transferred its schema error before reprepare.
+            let schema = ErrorCode::Schema;
+            h.set_db_error(owner_db_id, schema as i32, schema as i32, schema.as_str().to_owned());
+        } else {
+            h.clear_db_error(owner_db_id);
+        }
+    }
 
     let ret_code_name = match step_res {
         Ok(StepResult::Row(row)) => {
@@ -3625,16 +3647,11 @@ fn cmd_step(host: &SharedHost, interp: &mut TclInterp, args: &[String]) -> TclRe
         Err(e) => {
             rec.current_row = None;
             if mode == PrepareMode::V1 && !matches!(e.code, ErrorCode::Busy | ErrorCode::Misuse) {
-                // Legacy `sqlite3_prepare` (`PrepareMode::V1`, `vdbeapi.c:968-972`):
-                // `sqlite3_step` returns generic `SQLITE_ERROR` (`db->errCode = SQLITE_ERROR`),
-                // while the underlying error (`SQLITE_SCHEMA`, `SQLITE_CONSTRAINT`, etc.) stays
-                // latched on `Statement` and surfaces on `sqlite3_reset` / `sqlite3_finalize`!
-                host.borrow_mut().set_db_error(
-                    owner_db_id,
-                    ErrorCode::Error as i32,
-                    ErrorCode::Error as i32,
-                    ErrorCode::Error.as_str().to_string(),
-                );
+                // The expired V1 early return leaves the connection diagnostic
+                // alone. An executed legacy error updates only db->errCode.
+                if !rec.stmt.c_v1_expired_before_run() {
+                    host.borrow_mut().set_db_step_status(owner_db_id, ErrorCode::Error as i32);
+                }
                 "SQLITE_ERROR".to_string()
             } else {
                 let msg = sqlite_err_text(&e);
@@ -3655,6 +3672,30 @@ fn cmd_step(host: &SharedHost, interp: &mut TclInterp, args: &[String]) -> TclRe
     }
     drop(h);
     Ok(ret_code_name)
+}
+
+fn cleanup_statement_result(
+    host: &SharedHost,
+    db_id: DbId,
+    transfer: bool,
+    result: sqliters_types::Result<()>,
+) -> &'static str {
+    match result {
+        Ok(()) => {
+            if transfer {
+                host.borrow_mut().clear_db_error(db_id);
+            }
+            "SQLITE_OK"
+        }
+        Err(e) => {
+            let result = if transfer {
+                host.borrow_mut().set_db_error(db_id, e.code as i32, e.extended_code, sqlite_err_text(&e))
+            } else {
+                host.borrow().db_result_code(db_id, e.code as i32, e.extended_code)
+            };
+            sqlite_err_name(result)
+        }
+    }
 }
 
 fn cmd_stmt_reset(host: &SharedHost, interp: &mut TclInterp, args: &[String]) -> TclResult<String> {
@@ -3690,30 +3731,18 @@ fn cmd_stmt_reset(host: &SharedHost, interp: &mut TclInterp, args: &[String]) ->
 
     rec.current_row = None;
     let owner_db_id = rec.owner_db_id;
+    let transfer = rec.stmt.c_cleanup_transfers_diagnostic();
     let reset_res = {
         let _interp_guard = enter_interp_scope(interp);
         rec.stmt.reset()
     };
-
-    let ret_name = match reset_res {
-        Ok(()) => {
-            host.borrow_mut().clear_db_error(owner_db_id);
-            "SQLITE_OK".to_string()
-        }
-        Err(e) => {
-            let msg = sqlite_err_text(&e);
-            let eff =
-                host.borrow_mut()
-                    .set_db_error(owner_db_id, e.code as i32, e.extended_code, msg);
-            sqlite_err_name(eff).to_string()
-        }
-    };
+    let ret_name = cleanup_statement_result(host, owner_db_id, transfer, reset_res);
 
     let mut h = host.borrow_mut();
     if h.stmts.contains_key(id) {
         h.stmts.insert(id.to_string(), StmtSlot::Present(rec));
     }
-    Ok(ret_name)
+    Ok(ret_name.to_owned())
 }
 
 fn cmd_stmt_finalize(
@@ -3744,23 +3773,12 @@ fn cmd_stmt_finalize(
     };
 
     let owner_db_id = rec.owner_db_id;
+    let transfer = rec.stmt.c_cleanup_transfers_diagnostic();
     let fin_res = {
         let _interp_guard = enter_interp_scope(interp);
         rec.stmt.finalize()
     };
-    match fin_res {
-        Ok(()) => {
-            host.borrow_mut().clear_db_error(owner_db_id);
-            Ok("SQLITE_OK".to_string())
-        }
-        Err(e) => {
-            let msg = sqlite_err_text(&e);
-            let eff =
-                host.borrow_mut()
-                    .set_db_error(owner_db_id, e.code as i32, e.extended_code, msg);
-            Ok(sqlite_err_name(eff).to_string())
-        }
-    }
+    Ok(cleanup_statement_result(host, owner_db_id, transfer, fin_res).to_owned())
 }
 
 fn cmd_col_count(host: &SharedHost, data_count_only: bool, args: &[String]) -> TclResult<String> {
@@ -5250,8 +5268,9 @@ fn dispatch_backup_method(
             };
             let ret_str = match res {
                 Ok(BackupStepResult::Done) => {
-                    host.borrow_mut()
-                        .set_db_step_status(dest_db_id, ErrorCode::Done as i32);
+                    let mut h = host.borrow_mut();
+                    h.clear_db_error(dest_db_id);
+                    h.set_db_step_status(dest_db_id, ErrorCode::Done as i32);
                     "SQLITE_DONE".to_string()
                 }
                 Ok(BackupStepResult::More) => {

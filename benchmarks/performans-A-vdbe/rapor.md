@@ -1192,3 +1192,8 @@ Uygun eşitlik aktif yazma görüntüsünde karma kökü seçer, diğer durumda 
 ## V6b.177 — Tek UPDATE ile iki indeks anahtarı
 
 İki kök aynı etkin yazma görüntüsünde doğrulanır, adaylar C sırasıyla bir kere yazılır. 768 native, 768 takip yazıcısı, 1.536 rollback ve 2.304 açılış doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,284 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_177.md).
+
+
+## V6b.178 — V1 statement bağlantı tanısı
+
+Çalışmadan expire olan V1 deyimi dönüşünü verir, C uyumlu bağlantı tanısı korunur. 266 C–Tcl çifti, 230 Rust Result koruması ve 845 C açılışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,249 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_178.md).
