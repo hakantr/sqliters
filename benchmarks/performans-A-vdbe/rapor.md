@@ -1252,3 +1252,8 @@ Rowid noktası ve düz VALUES üç kökün etkin işlem görüntüsü doğrulama
 ## V6b.189 — Tek hedefli WAL çıkışında busy handler
 
 Normal yazılabilir tek dosyada WAL kapatma hatası C gibi doğrudan dönüyor. 498 C–Rust çifti, 48 hazırlık ve 36 WAL giriş koruması ile yeniden deneme ömrü doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,262 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_189.md).
+
+
+## V6b.190 — İki hedefli WAL çıkışında busy handler
+
+Bir ATTACH ile koordineli WAL kapanışı hatayı C gibi doğrudan döndürüyor. 540 C–Rust çifti, aynı statement tekrarları ve OFF ilk satır dosya ömrü doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,246 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_190.md).

@@ -43885,6 +43885,7 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
     let allow_empty_main = target == JournalMode::Wal
         && ctx.db_set.attached_count() <= 1
         && ctx.db_set.main_btree().pager().page_count() == 0;
+    let allow_preserved_off = target == JournalMode::Off && ctx.db_set.attached_count() == 1;
     let mut has_wal_transition = false;
     for (index, slot) in ctx.db_set.slots().iter().enumerate() {
         let Some(bt) = slot.btree.as_ref() else {
@@ -43899,8 +43900,8 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
         let mode_after_busy = pager.has_sql_journal_mode_after_busy();
         // A journal-free rollback can invalidate the cached page count. A
         // preserved mode already equal to the target needs no page-one write.
-        let allow_zero_pages = allow_empty_main
-            && (index == DatabaseId::MAIN.index() || (mode_after_busy && previous == target));
+        let allow_zero_pages = (allow_empty_main && index == DatabaseId::MAIN.index())
+            || ((allow_empty_main || allow_preserved_off) && mode_after_busy && previous == target);
         let supported_previous = supported.contains(&previous)
             || (previous == JournalMode::Memory
                 && matches!(target, JournalMode::Memory | JournalMode::Wal | JournalMode::Off))
@@ -43968,6 +43969,7 @@ fn apply_journal_mode_on_slot(
     }
 
     let disallow_wal_transition = !is_in_autocommit(ctx) || ctx.activity.other_readers > 0;
+    let one_attached = ctx.db_set.attached_count() == 1;
     let slot = ctx
         .db_set
         .slot_mut(db_id)
@@ -44005,18 +44007,20 @@ fn apply_journal_mode_on_slot(
                 let pager = b.pager_mut();
                 let result = if pager.page_count() == 0 {
                     // The empty main uses the pager staging path that initializes page one.
-                    pager.stage_single_target_sql_journal_mode(target)
+                    pager.stage_single_target_sql_journal_mode(target).map(Ok)
+                } else if wal_exit && one_attached {
+                    pager.stage_sql_journal_mode_with_busy_retry(target)
                 } else {
-                    pager.stage_sql_journal_mode(target)
+                    pager.stage_sql_journal_mode(target).map(Ok)
                 };
-                if let Err(error) = &result
+                if let Err(error) | Ok(Err(error)) = &result
                     && let Err(cleanup) = pager.cleanup_failed_sql_journal_mode(previous)
                 {
                     cleanup_error = Some(cleanup);
                     // A failed cleanup is terminal even when the original operation was BUSY.
                     return Ok(Err(error.clone()));
                 }
-                result.map(Ok)
+                result
             })?;
             ctx.stmt_tx.journal_mode_cleanup_error = cleanup_error;
             outcome?

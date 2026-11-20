@@ -1,0 +1,3 @@
+# V6b.190 — Koordineli kilit ve işlem bitişi
+
+`sqlite3ReadSchema`, `sqlite3PagerCloseWal` ve `sqlite3BtreeSetVersion` ayrı ölçüldü. 24 C dal koşusu, soğuk ve sıcak hazırlık, iki slotta doğal eş kilidi ve üç sayfa boyutu kapsandı. Geçici OFF durumu korunmuş bağlı slot zaten hedef kipteyken yeni sayfa 1 yazımı gerekmiyor. Sonraki açık okuma mevcut geçici kipi C ile aynı sınırda yeniden değerlendiriyor. [C kilit evresi](/github/sqliters/target/perf-work/v189-coordinated-wal-exit-busy-independent/res/c-coordinated-close-branches.txt) · [OFF zaman çizelgesi](/github/sqliters/target/perf-work/v189-coordinated-wal-exit-busy-independent/res/off-repeat-sample.txt)

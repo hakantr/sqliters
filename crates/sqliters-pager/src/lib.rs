@@ -2551,6 +2551,15 @@ impl Pager {
         self.stage_journal_mode(mode, false)?
     }
 
+    /// Returns WAL-close errors in the statement result for a coordinated mode change.
+    #[doc(hidden)]
+    pub fn stage_sql_journal_mode_with_busy_retry(
+        &mut self,
+        mode: JournalMode,
+    ) -> Result<Result<(JournalMode, bool)>> {
+        self.stage_journal_mode(mode, false)
+    }
+
     /// Stages a mode change targeting one SQL database, including its WAL persistence policy.
     #[doc(hidden)]
     pub fn stage_single_target_sql_journal_mode(&mut self, mode: JournalMode) -> Result<(JournalMode, bool)> {
