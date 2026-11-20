@@ -2,6 +2,7 @@
 //! `sqlite3_backup_remaining`, `sqlite3_backup_pagecount` in `sqlite/src/backup.c`).
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -436,6 +437,7 @@ impl Backup {
             };
 
             let mut dirty_to_recopy: Vec<Pgno> = Vec::new();
+            let mut use_publications = self.has_started_copy;
             if self.has_started_copy {
                 let mut tr = self.tracker.lock().unwrap_or_else(PoisonError::into_inner);
                 // A change of the file's change counter that this connection did not commit
@@ -454,6 +456,7 @@ impl Backup {
                 // `sqlite3_backup_remaining()` goes negative.)
                 if tr.needs_restart || external_change || ps_changed {
                     self.i_next = 1;
+                    use_publications = false;
                     tr.needs_restart = false;
                     tr.all_dirty = false;
                     tr.dirty_pages.clear();
@@ -490,7 +493,22 @@ impl Backup {
                 tr.dirty_pages.clear();
             }
 
-            // Re-copy any dirty pages `< self.i_next` from the current source read snapshot.
+            let mut publications = BTreeMap::new();
+            if use_publications {
+                let src_bt = src_inner.db_set.slot(src_db_id).unwrap().btree.as_ref().unwrap();
+                if let Some(images) = src_bt.pager().backup_publications(&self.tracker) {
+                    publications.extend(images.range(..self.i_next)
+                        .filter(|&(&pgno, _)| pgno <= cur_src_pages)
+                        .map(|(&pgno, image)| (pgno, Arc::clone(image))));
+                }
+                if !publications.is_empty() {
+                    dirty_to_recopy.extend(publications.keys().copied());
+                    dirty_to_recopy.sort_unstable();
+                    dirty_to_recopy.dedup();
+                }
+            }
+
+            // Re-copy pages already backed up. Prefer the physical image sent to this handle.
             for dirty_pgno in dirty_to_recopy {
                 let is_lock_page = src_inner
                     .db_set
@@ -505,15 +523,19 @@ impl Backup {
                 if is_lock_page {
                     continue;
                 }
-                let page_bytes = src_inner
-                    .db_set
-                    .slot_mut(src_db_id)
-                    .unwrap()
-                    .btree
-                    .as_mut()
-                    .unwrap()
-                    .pager_mut()
-                    .read_page_unchecked(dirty_pgno)?;
+                let page_bytes = if let Some(image) = publications.get(&dirty_pgno) {
+                    image.as_ref()
+                } else {
+                    src_inner
+                        .db_set
+                        .slot_mut(src_db_id)
+                        .unwrap()
+                        .btree
+                        .as_mut()
+                        .unwrap()
+                        .pager_mut()
+                        .read_page_unchecked(dirty_pgno)?
+                };
                 dst_inner
                     .db_set
                     .slot_mut(dst_db_id)
@@ -641,12 +663,22 @@ impl Backup {
             }
         })();
 
-        // Always close the source read transaction if `step()` opened it (`bCloseTrans`).
-        if b_close_trans
-            && let Some(src_slot) = src_inner.db_set.slot_mut(src_db_id)
+        if let Some(src_slot) = src_inner.db_set.slot_mut(src_db_id)
             && let Some(ref mut src_bt) = src_slot.btree
         {
-            let _ = src_bt.end_read_if_unused();
+            let next_page = match &step_result {
+                Ok(BackupStepResult::More) => Some(self.i_next),
+                Ok(BackupStepResult::Done) => Some(1),
+                Err(error) if !matches!(error.code, ErrorCode::Busy | ErrorCode::Locked) => Some(1),
+                Err(_) => None,
+            };
+            if let Some(next_page) = next_page {
+                src_bt.pager_mut().advance_backup_copy(&self.tracker, next_page);
+            }
+            // Always close the source read transaction if step() opened it (bCloseTrans).
+            if b_close_trans {
+                let _ = src_bt.end_read_if_unused();
+            }
         }
 
         step_result

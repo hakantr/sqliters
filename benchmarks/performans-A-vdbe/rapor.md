@@ -1432,3 +1432,8 @@ Dört zaman işlevi kesirli SQL tipi ve biçimini C ile eşliyor. Kip başına 2
 ## V6b.225 — UTF-16 BLOB CAST metni
 
 Geçerli UTF-16LE/BE gömülü NUL ve devamını koruyor. 54 ayrı sonuç, 24 fiziksel profil C ile eşleşti. 444 C açılışı geçti. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,244 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_225.md).
+
+
+## V6b.226 — Backup fiziksel sayfa imajı
+
+Önceden kopyalanmış sayfa son fiziksel yayımdan yenileniyor. 48 hedef farkı kapandı. 744 eski ve 144 geniş profil doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_226.md).

@@ -254,6 +254,13 @@ pub struct BackupTracker {
     pub last_self_wal: Option<(u32, u32, u32)>,
 }
 
+struct BackupAttachment {
+    tracker: Arc<Mutex<BackupTracker>>,
+    // None keeps the legacy dirty-page notifications for callers of attach_backup_tracker.
+    next_page: Option<Pgno>,
+    publications: BTreeMap<Pgno, Arc<[u8]>>,
+}
+
 #[inline]
 fn derive_sidecar_path(canonical_db_path: &Path, suffix: &str) -> PathBuf {
     let mut os = canonical_db_path.as_os_str().to_os_string();
@@ -441,7 +448,7 @@ pub struct Pager {
     transaction_savepoint: bool,
     sp_slot_pool: Vec<SubsavepointSlot>,
     sp_page_buf_pool: Vec<Vec<u8>>,
-    backup_trackers: Vec<Arc<Mutex<BackupTracker>>>,
+    backup_trackers: Vec<BackupAttachment>,
     backup_raw_staging: Option<BTreeMap<Pgno, Vec<u8>>>,
     /// `mxPgno`: a page beyond it is not fetched (`getPageNormal`: SQLITE_FULL). Set by the
     /// port of C's VDBE for the statements it runs (`PRAGMA max_page_count`); the engine's
@@ -988,37 +995,89 @@ impl Pager {
         if !self
             .backup_trackers
             .iter()
-            .any(|existing| Arc::ptr_eq(existing, &tracker))
+            .any(|entry| Arc::ptr_eq(&entry.tracker, &tracker))
         {
-            self.backup_trackers.push(tracker);
+            self.backup_trackers.push(BackupAttachment {
+                tracker,
+                next_page: None,
+                publications: BTreeMap::new(),
+            });
         }
     }
 
     /// Detaches a previously registered [`BackupTracker`].
     pub fn detach_backup_tracker(&mut self, tracker: &Arc<Mutex<BackupTracker>>) {
         self.backup_trackers
-            .retain(|existing| !Arc::ptr_eq(existing, tracker));
+            .retain(|entry| !Arc::ptr_eq(&entry.tracker, tracker));
+    }
+
+    /// Records the range copied by a completed backup step and releases the consumed images.
+    #[doc(hidden)]
+    pub fn advance_backup_copy(&mut self, tracker: &Arc<Mutex<BackupTracker>>, next_page: Pgno) {
+        if let Some(entry) = self.backup_trackers.iter_mut()
+            .find(|entry| Arc::ptr_eq(&entry.tracker, tracker))
+        {
+            entry.next_page = Some(next_page);
+            entry.publications.clear();
+        }
+    }
+
+    /// Images physically written since this backup last advanced.
+    #[doc(hidden)]
+    pub fn backup_publications(
+        &self,
+        tracker: &Arc<Mutex<BackupTracker>>,
+    ) -> Option<&BTreeMap<Pgno, Arc<[u8]>>> {
+        self.backup_trackers.iter()
+            .find(|entry| Arc::ptr_eq(&entry.tracker, tracker))
+            .map(|entry| &entry.publications)
+    }
+
+    fn tracks_backup_publications(&self) -> bool {
+        !self.backup_trackers.is_empty()
+            && self.db_kind == DatabaseKind::NamedDisk
+            && !self.uses_temp_file_semantics()
+            && !self.use_wal()
+            && matches!(self.journal_mode, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate)
+    }
+
+    // sqlite3BackupUpdate() takes the exact write image, and backupUpdate() only uses it for
+    // pages already copied by that backup. DONT_WRITE may leave a newer image in the cache.
+    fn publish_backup_page(entries: &mut [BackupAttachment], pgno: Pgno, data: &[u8]) {
+        let mut image = None;
+        for entry in entries {
+            if entry.next_page.is_some_and(|next_page| pgno < next_page) {
+                let image = image.get_or_insert_with(|| Arc::<[u8]>::from(data));
+                entry.publications.insert(pgno, Arc::clone(image));
+                let mut guard = entry.tracker.lock().unwrap_or_else(|e| e.into_inner());
+                guard.dirty_pages.remove(&pgno);
+                guard.generation = guard.generation.wrapping_add(1);
+            }
+        }
     }
 
     #[inline]
-    fn notify_backup_page_write(&self, pgno: Pgno) {
-        if self.backup_trackers.is_empty() {
-            return;
-        }
-        for tracker in &self.backup_trackers {
-            let mut guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+    fn notify_backup_page_write(&mut self, pgno: Pgno) {
+        let tracks_publications = self.tracks_backup_publications();
+        for entry in &mut self.backup_trackers {
+            if tracks_publications && entry.next_page.is_some() {
+                continue;
+            }
+            entry.publications.remove(&pgno);
+            let mut guard = entry.tracker.lock().unwrap_or_else(|e| e.into_inner());
             guard.dirty_pages.insert(pgno);
             guard.generation = guard.generation.wrapping_add(1);
         }
     }
 
     #[inline]
-    fn notify_backup_restart(&self) {
-        if self.backup_trackers.is_empty() {
-            return;
-        }
-        for tracker in &self.backup_trackers {
-            let mut guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+    fn notify_backup_restart(&mut self) {
+        for entry in &mut self.backup_trackers {
+            entry.publications.clear();
+            if entry.next_page.is_some() {
+                entry.next_page = Some(1);
+            }
+            let mut guard = entry.tracker.lock().unwrap_or_else(|e| e.into_inner());
             guard.needs_restart = true;
             guard.dirty_pages.clear();
             guard.generation = guard.generation.wrapping_add(1);
@@ -1028,12 +1087,20 @@ impl Pager {
     /// Every page may have changed without the page-level tracking seeing it (bulk rewrite):
     /// the backups re-copy what they have copied so far, at their current position.
     #[inline]
-    fn notify_backup_all_dirty(&self) {
-        if self.backup_trackers.is_empty() {
-            return;
-        }
-        for tracker in &self.backup_trackers {
-            let mut guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+    fn notify_backup_all_dirty(&mut self) {
+        self.notify_backup_image_change(false);
+    }
+
+    // Truncating a rollback image only changes its size. Keep earlier publications in case
+    // the transaction rolls back or grows again before the next backup step reads the size.
+    fn notify_backup_image_change(&mut self, size_only: bool) {
+        let physical_truncation = size_only && self.tracks_backup_publications();
+        for entry in &mut self.backup_trackers {
+            if physical_truncation && entry.next_page.is_some() {
+                continue;
+            }
+            entry.publications.clear();
+            let mut guard = entry.tracker.lock().unwrap_or_else(|e| e.into_inner());
             guard.all_dirty = true;
             guard.generation = guard.generation.wrapping_add(1);
         }
@@ -1046,8 +1113,8 @@ impl Pager {
         }
         let cc = self.header.change_counter;
         let wal_sig = self.wal_snapshot_signature();
-        for tracker in &self.backup_trackers {
-            let mut guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in &self.backup_trackers {
+            let mut guard = entry.tracker.lock().unwrap_or_else(|e| e.into_inner());
             guard.last_self_cc = Some(cc);
             guard.last_self_wal = wal_sig;
             guard.generation = guard.generation.wrapping_add(1);
@@ -2319,6 +2386,11 @@ impl Pager {
                 }
                 self.a_stat[PAGER_STAT_WRITE] += 1;
                 write_result?;
+                if self.tracks_backup_publications() {
+                    Self::publish_backup_page(
+                        &mut self.backup_trackers, pgno, self.cache.entry_data(slot),
+                    );
+                }
             } else {
                 pcache::pctr!(
                     self.cache,
@@ -4606,7 +4678,7 @@ impl Pager {
                 let hdr_copy = self.header.clone();
                 hdr_copy.write_into(&mut self.cache.entry_data_mut(p1_slot)[0..DB_HEADER_SIZE]);
             }
-            self.notify_backup_all_dirty();
+            self.notify_backup_image_change(true);
         }
         Ok(())
     }
@@ -6034,6 +6106,9 @@ impl Pager {
                             let orig_data = self.tx_preimages.get(&pgno).expect("key exists");
                             let offset = u64::from(pgno - 1) * ps;
                             self.db_file()?.write_at(orig_data, offset)?;
+                            if self.tracks_backup_publications() {
+                                Self::publish_backup_page(&mut self.backup_trackers, pgno, orig_data);
+                            }
                         }
 
                         let orig_size = u64::from(orig_count) * ps;
@@ -6091,8 +6166,7 @@ impl Pager {
                 self.subsavepoints.clear();
                 // C plays the rollback journal back page by page and feeds each restored page
                 // to `sqlite3BackupUpdate()` (`pager_playback_one_page`); a backup is not
-                // restarted. The pages of this transaction are still in the trackers' dirty
-                // sets, so the next step copies their restored content again.
+                // restarted. The physical playback above publishes the restored images.
 
                 // Preserve the journal on a playback error. Finalize only
                 // after the original pages have been restored.
@@ -6627,6 +6701,9 @@ impl Pager {
                 if pgno != lock_byte {
                     let offset = u64::from(pgno - 1) * ps;
                     self.db_file()?.write_at(img, offset)?;
+                    if self.tracks_backup_publications() {
+                        Self::publish_backup_page(&mut self.backup_trackers, pgno, img);
+                    }
                 }
             } else if kind == 1 && slot.is_none() {
                 self.do_not_spill |= SPILLFLAG_ROLLBACK;
