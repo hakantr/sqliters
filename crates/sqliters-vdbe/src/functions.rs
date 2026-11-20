@@ -1415,16 +1415,19 @@ fn parse_datetime_value(
     } else if first_name.eq_ignore_ascii_case("auto") {
         (parse_auto_datetime_ms(val, ctx)?, &modifiers[1..], true)
     } else {
-        let ms = match val {
+        let (ms, check_julian_range) = match val {
             Value::Integer(jd) => {
                 // Julian day -> Unix ms (`2440587.5` JD = Unix epoch)
-                ((*jd as f64 - 2_440_587.5) * 86_400_000.0).round() as i64
+                (
+                    ((*jd as f64 - 2_440_587.5) * 86_400_000.0).round() as i64,
+                    false,
+                )
             }
-            Value::Real(jd) => ((*jd - 2_440_587.5) * 86_400_000.0).round() as i64,
+            Value::Real(jd) => (((*jd - 2_440_587.5) * 86_400_000.0).round() as i64, false),
             Value::Text(s) => parse_datetime_text_ms(s, ctx)?,
             Value::Null | Value::Blob(_) => return None,
         };
-        (ms, modifiers, false)
+        (ms, modifiers, check_julian_range)
     };
 
     let mut use_subsec = false;
@@ -1453,11 +1456,12 @@ fn datetime_c_string(text: &str) -> &str {
     text.split_once('\0').map_or(text, |(prefix, _)| prefix)
 }
 
-fn parse_datetime_text_ms(text: &str, ctx: &VmRuntimeContext) -> Option<i64> {
+fn parse_datetime_text_ms(text: &str, ctx: &VmRuntimeContext) -> Option<(i64, bool)> {
     if text.trim().eq_ignore_ascii_case("now") {
-        Some(ctx.effective_timestamp_ms())
+        Some((ctx.effective_timestamp_ms(), false))
     } else {
-        parse_iso_datetime_ms(text)
+        // Validate the ISO timestamp after all modifiers have run.
+        parse_iso_datetime_ms(text).map(|ms| (ms, true))
     }
 }
 
@@ -1488,7 +1492,7 @@ fn parse_auto_datetime_ms(val: &Value, ctx: &VmRuntimeContext) -> Option<i64> {
 
     match val {
         Value::Text(text) => parse_iso_datetime_ms(datetime_c_string(text))
-            .or_else(|| parse_datetime_text_ms(text, ctx)),
+            .or_else(|| parse_datetime_text_ms(text, ctx).map(|(ms, _)| ms)),
         Value::Blob(_) => {
             let text = value_to_text_in_encoding(val, ctx.text_encoding);
             parse_iso_datetime_ms(datetime_c_string(&text))

@@ -1467,3 +1467,8 @@ STRFTIME %J ortak Julian REAL hesabı ve C uyumlu %.16g biçimini kullanıyor. 5
 ## V6b.232 — Normal rollback küçültme sırası
 
 Normal D/P/T disk rollback büyümüş fiziksel dosyayı preimage yazısından önce özgün boyuta getiriyor. 36 sıra farkı kapandı. 324 C açılışı ve 216 fiziksel karşılaştırma doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,269 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_232.md).
+
+
+## V6b.233 — ISO son Julian aralığı
+
+Geçerli ayrıştırılmış ISO tarih ve saat, değiştiricilerden sonra Julian aralığı dışındaysa C gibi NULL veriyor. 29 ayrı sınır farkı kapandı. 905 C açılışı ve 12 VDBE testi geçti. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,239 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_233.md).
