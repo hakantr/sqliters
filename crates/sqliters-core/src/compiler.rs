@@ -5596,16 +5596,10 @@ fn resolve_order_by_source(
     }) = inner
     {
         let in_tbl = tbl.find_column(column).is_some() || tbl.is_implicit_rowid_name(column);
-        if let Some((idx, (proj_expr, _, al))) =
-            expanded.iter().enumerate().find(|(_, (_, label, alias))| {
-                alias
-                    .as_ref()
-                    .is_some_and(|a| a.eq_ignore_ascii_case(column))
-                    || label.eq_ignore_ascii_case(column)
-            })
-            && (al.is_some() || !in_tbl)
+        if let Some(idx) = crate::engine::order_by_result_column(ob_expr, expanded)
+            && (expanded[idx].2.is_some() || !in_tbl)
         {
-            return Some((OrderBySource::ProjCol(idx), proj_expr.clone()));
+            return Some((OrderBySource::ProjCol(idx), expanded[idx].0.clone()));
         }
     }
     if let Some((idx, (proj_expr, _, _))) = expanded

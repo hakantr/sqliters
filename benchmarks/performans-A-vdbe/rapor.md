@@ -1332,3 +1332,8 @@ Dış step 1. Canlı okuyucunun 516 ve stale deyimin 17 terminal kodu korunuyor.
 ## V6b.205 — Belirsiz SELECT sütunu byte ofseti
 
 Aynı genişletilmiş kod ve mesajda C çözümleyicisinin byte ofseti taşınıyor. OFF 240 tanı, 108 C açılışı ve 216 legacy tanı profili eş. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,255 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_205.md).
+
+
+## V6b.206 — ORDER BY açık çıktı alias önceliği
+
+Yalın ORDER BY adı ilk açık çıktı alias’ını çözümlüyor. İki kipte 24 profil, 108 C açılışı ve bağlama sonrası sıra C ile eş. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_206.md).

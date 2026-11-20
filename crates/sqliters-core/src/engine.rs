@@ -16158,6 +16158,36 @@ fn infer_expr_collation_from_cols(expr: &Expr, sample_cols: &[ScopedColumn]) -> 
     }
 }
 
+// A simple ORDER BY name prefers the first explicit result alias over
+// an implicit output name. Callers still resolve source columns as needed.
+pub(crate) fn order_by_result_column(
+    mut expr: &Expr,
+    projection: &[(Expr, String, Option<String>)],
+) -> Option<usize> {
+    while let Expr::Collate { expr: inner, .. } = expr {
+        expr = inner;
+    }
+    let Expr::Column(ColumnRef {
+        schema: None,
+        table: None,
+        column,
+        ..
+    }) = expr else {
+        return None;
+    };
+
+    let mut implicit = None;
+    for (index, (_, label, alias)) in projection.iter().enumerate() {
+        if alias.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(column)) {
+            return Some(index);
+        }
+        if implicit.is_none() && label.eq_ignore_ascii_case(column) {
+            implicit = Some(index);
+        }
+    }
+    implicit
+}
+
 fn infer_order_by_custom_collation(
     ob_expr: &Expr,
     expanded_proj: &[(Expr, String, Option<String>)],
@@ -16183,13 +16213,7 @@ fn infer_order_by_custom_collation(
         column,
         ..
     }) = ob_expr
-        && let Some((idx, _)) = expanded_proj
-            .iter()
-            .enumerate()
-            .find(|(_, (_, label, al))| {
-                al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column))
-                    || label.eq_ignore_ascii_case(column)
-            })
+        && let Some(idx) = order_by_result_column(ob_expr, expanded_proj)
     {
         let in_row = sample_cols
             .iter()
@@ -16221,13 +16245,7 @@ fn infer_order_by_collation(
         column,
         ..
     }) = ob_expr
-        && let Some((idx, _)) = expanded_proj
-            .iter()
-            .enumerate()
-            .find(|(_, (_, label, al))| {
-                al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column))
-                    || label.eq_ignore_ascii_case(column)
-            })
+        && let Some(idx) = order_by_result_column(ob_expr, expanded_proj)
     {
         let in_row = sample_cols
             .iter()
@@ -16266,13 +16284,7 @@ fn eval_order_term_in_scope(
         column,
         ..
     }) = inner
-        && let Some((idx, _)) = expanded_proj
-            .iter()
-            .enumerate()
-            .find(|(_, (_, label, al))| {
-                al.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(column))
-                    || label.eq_ignore_ascii_case(column)
-            })
+        && let Some(idx) = order_by_result_column(ob_expr, expanded_proj)
     {
         if expanded_proj[idx].2.is_some() || expanded_proj[idx].0 == *inner {
             return Ok(proj_vals[idx].clone());
@@ -51695,7 +51707,9 @@ fn validate_single_select_core_static(
                             ),
                         ));
                     }
-                } else {
+                } else if !order_by_result_column(&ob.expr, &expanded_proj)
+                    .is_some_and(|idx| expanded_proj[idx].2.is_some())
+                {
                     let subst = subst_order_by_aliases_static(
                         &ob.expr,
                         &expanded_proj,
