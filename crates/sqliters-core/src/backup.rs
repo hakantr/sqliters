@@ -551,35 +551,41 @@ impl Backup {
             let mut copied = 0i32;
             while (n_pages < 0 || copied < n_pages) && self.i_next <= cur_src_pages {
                 let src_pgno = self.i_next;
-                let is_lock_page = src_inner
+                let src_pager = src_inner
                     .db_set
-                    .slot(src_db_id)
+                    .slot_mut(src_db_id)
                     .unwrap()
                     .btree
-                    .as_ref()
+                    .as_mut()
                     .unwrap()
-                    .pager()
-                    .lock_byte_page()
-                    == src_pgno;
-                if !is_lock_page {
-                    let page_bytes = src_inner
-                        .db_set
-                        .slot_mut(src_db_id)
-                        .unwrap()
-                        .btree
-                        .as_mut()
-                        .unwrap()
-                        .pager_mut()
-                        .read_page_unchecked(src_pgno)?;
-                    dst_inner
+                    .pager_mut();
+                if src_pgno != src_pager.lock_byte_page() {
+                    let dst_pager = dst_inner
                         .db_set
                         .slot_mut(dst_db_id)
                         .unwrap()
                         .btree
                         .as_mut()
                         .unwrap()
-                        .pager_mut()
-                        .backup_write_page(src_pgno, src_ps, page_bytes)?;
+                        .pager_mut();
+                    if src_pager.db_kind() == DatabaseKind::NamedDisk
+                        && !src_pager.is_wal_mode()
+                        && matches!(
+                            src_pager.journal_mode(),
+                            JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate
+                        )
+                    {
+                        // sqlite3PagerGet(PAGER_GET_READONLY), backupOnePage, sqlite3PagerUnref.
+                        let pinned = src_pager.pin_readonly_page(src_pgno)?;
+                        let copied_page = src_pager.pinned_page(src_pgno, pinned).and_then(|bytes| {
+                            dst_pager.backup_write_page(src_pgno, src_ps, bytes)
+                        });
+                        src_pager.unpin_page(src_pgno, pinned);
+                        copied_page?;
+                    } else {
+                        let bytes = src_pager.read_page_unchecked(src_pgno)?;
+                        dst_pager.backup_write_page(src_pgno, src_ps, bytes)?;
+                    }
                 }
                 self.i_next += 1;
                 copied += 1;
