@@ -1392,3 +1392,8 @@ Sayım INSTEAD OF tetikleyicisinden önce yapılıyor. 94 OFF farkı kapandı ve
 ## V6b.217 — Bağlı sabit LIMIT okuyucusu
 
 İlk bağlı canlı tarama sabit LIMIT sayacını koruyor. 42 OFF farkı kapandı ve 4.650 C açılışı geçti. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,257 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_217.md).
+
+
+## V6b.218 — Aynı tablo INSERT SELECT kaynak aralığı
+
+48 OFF profili C ile eş. Seed 6240 kapanırken kalan dokuz ham DML farkı korundu. 8.018 C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,323 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_218.md).

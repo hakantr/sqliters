@@ -27621,6 +27621,189 @@ enum PreparedInsertSource<'a> {
     StreamingValues(&'a [Vec<Expr>]),
 }
 
+// Limit the INSERT source seek to bounds whose value and comparison affinity
+// belong to the scalar SELECT itself.
+fn insert_range_scalar_is_local(
+    ctx: &ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    key: &ColumnRef,
+    scalar: &SelectStmt,
+) -> bool {
+    if let SelectCore::Select {
+        distinct: false,
+        projection,
+        from: None,
+        selection: None,
+        group_by,
+        having: None,
+        windows,
+    } = &scalar.body.head
+        && scalar.ctes.is_empty()
+        && scalar.body.compounds.is_empty()
+        && scalar.order_by.is_empty()
+        && scalar.limit.is_none()
+        && group_by.is_empty()
+        && windows.is_empty()
+        && matches!(projection.as_slice(), [ResultColumn::Expr {
+            expr: Expr::Null | Expr::Integer(_) | Expr::Float(_), ..
+        }])
+    {
+        return true;
+    }
+
+    let Some((projection, source, _)) = single_table_select_projection(scalar) else {
+        return false;
+    };
+    let [ResultColumn::Expr {
+        expr: Expr::FunctionCall {
+            name,
+            distinct: false,
+            args: FunctionArgs::Exprs(args),
+            filter: None,
+            over: None,
+        },
+        ..
+    }] = projection else {
+        return false;
+    };
+    let [Expr::Column(arg)] = args.as_slice() else {
+        return false;
+    };
+    name.eq_ignore_ascii_case("min")
+        && arg.schema.is_none()
+        && arg.table.is_none()
+        && arg.column.eq_ignore_ascii_case(&key.column)
+        && ctx.db_set.find_table_in_set(source).ok().flatten().is_some_and(|(slot, inner)| {
+            slot == db_id && inner.root_pgno == tbl.root_pgno
+        })
+        && crate::dml_c::select_is_self_contained(ctx.db_set, scalar)
+}
+
+/// The ordinary materializer can seek with an independent scalar boundary.
+/// Keep the bound as a private parameter so the planner cannot infer a
+/// partial-index predicate from its execution-time value.
+fn insert_select_scalar_range<'a>(
+    ctx: &ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    source: &'a SelectStmt,
+    parameter: usize,
+    ctes: &CteStore,
+) -> Option<(SelectStmt, &'a Expr)> {
+    if tbl.without_rowid
+        || tbl.stat1.has_stat1
+        || ctx.stmt_tx.exec_depth != 1
+        || ctx.in_trigger_program()
+        || ctx.progress.is_enabled()
+        || ctx.functions.has_user_functions()
+        || tbl.columns.iter().any(|column| column.generated.is_some())
+        || !ctes.scopes.is_empty()
+        || ctx.collations.get_custom("BINARY").is_some()
+        || ctx.db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0
+        || !source.ctes.is_empty()
+        || !source.body.compounds.is_empty()
+        || !source.order_by.is_empty()
+        || source.limit.is_some()
+    {
+        return None;
+    }
+    let SelectCore::Select {
+        distinct: false,
+        projection,
+        from: Some(from),
+        selection: Some(Expr::Binary { left, op: BinaryOp::Gt, right }),
+        group_by,
+        having: None,
+        windows,
+    } = &source.body.head else {
+        return None;
+    };
+    let TableOrSubquery::Table { name, table_args: None, alias, indexed_by: None } = &from.head else {
+        return None;
+    };
+    let (Expr::Column(key), Expr::Subquery(scalar)) = (left.as_ref(), right.as_ref()) else {
+        return None;
+    };
+    if !from.joins.is_empty()
+        || !group_by.is_empty()
+        || !windows.is_empty()
+        || !is_simple_covering_projection(projection)
+        || projection.iter().any(|column| matches!(column, ResultColumn::Expr { alias: Some(_), .. }))
+    {
+        return None;
+    }
+
+    let (slot, scanned) = ctx.db_set.find_table_in_set(name).ok().flatten()?;
+    let (key_idx, column) = tbl.find_column(&key.column)?;
+    if slot != db_id
+        || scanned.root_pgno != tbl.root_pgno
+        || !matches!(column.affinity, TypeAffinity::Integer | TypeAffinity::Numeric | TypeAffinity::Real)
+        || column.collation != Collation::Binary
+        || column.custom_collation.is_some()
+        || !insert_range_scalar_is_local(ctx, db_id, tbl, key, scalar)
+    {
+        return None;
+    }
+    let predicate = Expr::Binary {
+        left: left.clone(),
+        op: BinaryOp::Gt,
+        right: Box::new(Expr::Bind(BindParam::Numbered(parameter))),
+    };
+    let slot = ctx.db_set.slot(db_id)?;
+    let scan = choose_access_plan_with_context(
+        tbl,
+        &slot.name,
+        alias.as_deref(),
+        Some(&predicate),
+        &slot.schema,
+        QueryPlanContext { projection: Some(projection), ..Default::default() },
+    );
+    let AccessPlan::IndexRangeScan {
+        index,
+        range_col_idx: Some(0),
+        lower: Some(_),
+        is_covering: true,
+        ..
+    } = scan else {
+        return None;
+    };
+    let [index_key] = index.columns.as_slice() else {
+        return None;
+    };
+    if !index.unique
+        || index.where_clause.is_some()
+        || index.stat1.as_ref().is_some_and(|stat| stat.has_stat1)
+        || index_key.col_idx != Some(key_idx)
+        || index_key.sort_order.desc
+        || index_key.sort_order.collation != Collation::Binary
+        || index_key.sort_order.custom_collation.is_some()
+    {
+        return None;
+    }
+
+    // A competing key can reverse the observed write order if C breaks an
+    // index cost tie differently. Require compatible ordering for this key.
+    if slot.schema.indexes.iter().any(|candidate| {
+        candidate.table_name.eq_ignore_ascii_case(&tbl.name)
+            && candidate.columns.first().is_some_and(|first| {
+                first.col_idx == Some(key_idx)
+                    && (first.sort_order.desc
+                        || first.sort_order.collation != Collation::Binary
+                        || first.sort_order.custom_collation.is_some())
+            })
+    }) {
+        return None;
+    }
+
+    let mut bounded = source.clone();
+    let SelectCore::Select { selection, .. } = &mut bounded.body.head else {
+        unreachable!("range source is a SELECT");
+    };
+    *selection = Some(predicate);
+    Some((bounded, right))
+}
+
 struct PreparedTableInsert<'a> {
     db_id: DatabaseId,
     tbl: TableSchema,
@@ -27958,7 +28141,26 @@ fn prepare_insert_exec<'a>(
                     }
                 }
                 InsertSource::Select(sel) => {
-                    let rows = exec_select(ctx, sel, params, outer_scopes, &dml_ctes)?.rows;
+                    let rewritten = if ins.returning.is_empty()
+                        && outer_scopes.is_empty()
+                        && let Some((source, scalar)) = insert_select_scalar_range(
+                            ctx, db_id, &initial_tbl, sel, params.len() + 1, &dml_ctes,
+                        )
+                    {
+                        let bound = eval_expr(ctx, scalar, params, outer_scopes, &dml_ctes, None)?;
+                        if matches!(bound, Value::Null | Value::Integer(_) | Value::Real(_)) {
+                            let mut args = params.to_vec();
+                            args.push(bound);
+                            Some((source, args))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let (source, args) = rewritten.as_ref().map_or((sel.as_ref(), params),
+                        |(source, args)| (source, args.as_slice()));
+                    let rows = exec_select(ctx, source, args, outer_scopes, &dml_ctes)?.rows;
                     PreparedInsertSource::Materialized(rows)
                 }
             };
