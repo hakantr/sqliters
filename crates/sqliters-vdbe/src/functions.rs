@@ -1956,6 +1956,7 @@ fn eval_strftime_function(args: &[Value], ctx: &VmRuntimeContext) -> Result<Valu
             'd' => out.push_str(&format!("{d:02}")),
             'e' => out.push_str(&format!("{d:2}")),
             'H' => out.push_str(&format!("{hh:02}")),
+            'k' => out.push_str(&format!("{hh:2}")),
             'I' => {
                 let h12 = match hh % 12 {
                     0 => 12,

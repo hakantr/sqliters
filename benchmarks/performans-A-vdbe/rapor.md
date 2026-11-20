@@ -1502,3 +1502,8 @@ Yalın 24:00 ayrıştırmasında ilk takvim değiştiricisine kadar C'nin tarih 
 ## V6b.239 — Görünüm UPDATE TEXT aralığı
 
 Doğrudan tek rowid kaynaklı görünüm UPDATE işleminde tek tam BINARY TEXT indeks ve tek kanonik TEXT literal aralığı C'nin tarama ve tetikleyici sıra anahtarını izler. 75 hedef profilde 300 API, sıra ve nihai dosya çifti eş. Önceki sekiz TEXT farkı, geniş matriste 126 OFF ve 84 ON ilişkisel geri dönüş farkı kapandı. 160 ayrı koruma karşılaştırması ve V97/V109 korundu. 14.809 strict kayıt doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,254 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_239.md).
+
+
+## V6b.240 — STRFTIME %k
+
+STRFTIME %k mevcut saat çıktısı ile aynı değeri iki karakter genişlikte boşlukla doldurur. 185 bağımsız bağlam iki kipte ham eş. 0–23 saatler, üç kodlama, UTC/ofset, tarihli ve yalın 24:00, NULL ve karışık biçimler ölçüldü. 198 gerçek saklama satırı, 654 C açılışı, 12 VDBE testi ve 6.895 strict doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,263 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_240.md).
