@@ -1447,3 +1447,8 @@ Geçerli UTF-16LE/BE gömülü NUL ve devamını koruyor. 54 ayrı sonuç, 24 fi
 ## V6b.228 — Backup ilk sayfa edinmesi
 
 İlk kopyada kaynak rollback pager sayfasının edinme ömrü C ile eş. 90 hedef dosya farkı kapandı. 840 normal ve 144 geniş profil doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,256 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_228.md).
+
+
+## V6b.229 — Açık julianday girdisi
+
+İlk explicit julianday ham sayısal Julian aralığını C ile eşliyor. 1.035 ana girdide 405 fark kapandı. 684 C açılışı doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,257 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_229.md).

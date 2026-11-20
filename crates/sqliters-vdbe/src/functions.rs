@@ -1409,6 +1409,9 @@ fn parse_datetime_value(
     let (mut ms, modifiers, check_julian_range) = if first_name.eq_ignore_ascii_case("unixepoch") {
         let seconds = parse_raw_datetime_number(val, ctx.text_encoding)?;
         (unix_seconds_to_ms(seconds)?, &modifiers[1..], true)
+    } else if first_name.eq_ignore_ascii_case("julianday") {
+        let days = parse_raw_datetime_number(val, ctx.text_encoding)?;
+        (julian_days_to_ms(days)?, &modifiers[1..], true)
     } else if first_name.eq_ignore_ascii_case("auto") {
         (parse_auto_datetime_ms(val, ctx)?, &modifiers[1..], true)
     } else {
@@ -1473,8 +1476,8 @@ fn parse_raw_datetime_number(val: &Value, encoding: TextEncoding) -> Option<f64>
 
 fn parse_auto_datetime_ms(val: &Value, ctx: &VmRuntimeContext) -> Option<i64> {
     if let Some(number) = parse_raw_datetime_number(val, ctx.text_encoding) {
-        if (0.0..5373484.5).contains(&number) {
-            return Some((number * 86_400_000.0 + 0.5) as i64 - UNIX_EPOCH_JULIAN_MS);
+        if let Some(ms) = julian_days_to_ms(number) {
+            return Some(ms);
         }
         // The auto Unix range ends at the last whole second of year 9999.
         if (-210_866_760_000.0..=253_402_300_799.0).contains(&number) {
@@ -1492,6 +1495,12 @@ fn parse_auto_datetime_ms(val: &Value, ctx: &VmRuntimeContext) -> Option<i64> {
         }
         _ => None,
     }
+}
+
+fn julian_days_to_ms(days: f64) -> Option<i64> {
+    (0.0..5373484.5)
+        .contains(&days)
+        .then(|| (days * 86_400_000.0 + 0.5) as i64 - UNIX_EPOCH_JULIAN_MS)
 }
 
 fn unix_seconds_to_ms(seconds: f64) -> Option<i64> {
