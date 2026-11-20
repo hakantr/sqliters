@@ -1227,3 +1227,8 @@ Soğuk yazılabilir NamedDisk setter ve EXPLAIN şemayı C ile aynı prepare aş
 ## V6b.184 — Boş ana dosyanın tek hedefli WAL girişi
 
 İlk ROW boyunca sıfır bayt DB ve EXCLUSIVE korunur, sayfa 1 sonlandırmada ofset sıfırdan yazılır. 1.308 fiziksel çift, 2.646 C açılışı ve 12 doğal eş bağlantı profili doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,255 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_184.md).
+
+
+## V6b.185 — Açık TEMP ile boş ana dosyanın WAL girişi
+
+Nitelemesiz WAL girişinde boş ana dosya ilk ROW boyunca sıfır kalır ve TEMP kipi korunur. 1.656 fiziksel çift, 2.772 C açılışı ve birleşik 24 canlı eş profili doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,342 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_185.md).

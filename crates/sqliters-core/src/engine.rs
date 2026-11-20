@@ -43825,6 +43825,9 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
     if !supported.contains(&target) && !matches!(target, JournalMode::Memory | JournalMode::Off) {
         return false;
     }
+    // This caller coordinates multiple open slots. With only main and TEMP
+    // present, main is the sole possible WAL participant.
+    let allow_empty_main = target == JournalMode::Wal && ctx.db_set.slot_count() == 2;
     let mut has_wal_transition = false;
     for (index, slot) in ctx.db_set.slots().iter().enumerate() {
         let Some(bt) = slot.btree.as_ref() else {
@@ -43844,7 +43847,7 @@ fn can_coordinate_journal_mode(ctx: &ExecContext<'_>, target: JournalMode) -> bo
             || pager.locking_mode() != LockingMode::Normal
             || pager.transaction_state() != TransactionState::Open
             || (!pager.is_header_loaded() && !pager.has_sql_journal_mode_after_busy())
-            || pager.page_count() == 0
+            || (pager.page_count() == 0 && !(allow_empty_main && index == DatabaseId::MAIN.index()))
             || pager.is_readonly()
             || !pager.ok_to_change_journal_mode()
             || !supported_previous
@@ -43938,7 +43941,12 @@ fn apply_journal_mode_on_slot(
             let mut cleanup_error = None;
             let outcome = ctx.busy_policy.retry_btree(bt, |b| {
                 let pager = b.pager_mut();
-                let result = pager.stage_sql_journal_mode(target);
+                let result = if pager.page_count() == 0 {
+                    // can_coordinate_journal_mode admits only the sole WAL participant here.
+                    pager.stage_single_target_sql_journal_mode(target)
+                } else {
+                    pager.stage_sql_journal_mode(target)
+                };
                 if let Err(error) = &result
                     && let Err(cleanup) = pager.cleanup_failed_sql_journal_mode(previous)
                 {
