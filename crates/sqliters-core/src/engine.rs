@@ -24770,16 +24770,22 @@ fn mixed_index_table_equality(
     (filter_column(left) && bound(right)) || (bound(left) && filter_column(right))
 }
 
+fn mixed_index_rowid_equality(table: &TableSchema, selection: Option<&Expr>) -> bool {
+    let Some(Expr::Binary { op: BinaryOp::Eq, left, right }) = selection else {
+        return false;
+    };
+    let rowid = |expr: &Expr| mixed_index_is_rowid(table, expr);
+    let bound = |expr: &Expr| matches!(expr, Expr::Integer(_) | Expr::Bind(_));
+    (rowid(left) && bound(right)) || (bound(left) && rowid(right))
+}
+
 fn mixed_index_rowid_selection(
     table: &TableSchema,
     selection: Option<&Expr>,
 ) -> bool {
     let rowid = |expr: &Expr| mixed_index_is_rowid(table, expr);
-    let equality_bound = |expr: &Expr| matches!(expr, Expr::Integer(_) | Expr::Bind(_));
-    if let Some(Expr::Binary { op: BinaryOp::Eq, left, right }) = selection {
-        return (rowid(left) && equality_bound(right)) || (equality_bound(left) && rowid(right));
-    }
     match selection {
+        Some(Expr::Binary { op: BinaryOp::Eq, .. }) => mixed_index_rowid_equality(table, selection),
         Some(Expr::InList { expr, list, negated: false }) => {
             rowid(expr)
                 && !list.is_empty()
@@ -24969,6 +24975,48 @@ struct MixedIndexWritePlan {
     scan_index: Option<(Pgno, Collation)>,
 }
 
+fn mixed_index_three_root_write(
+    write: MixedIndexWrite<'_>,
+    db_id: DatabaseId,
+    db_set: &DatabaseSet,
+    table: &TableSchema,
+    indexes: [&IndexSchema; 3],
+    collations: &CollationRegistry,
+) -> Option<MixedIndexWritePlan> {
+    let values = matches!(write, MixedIndexWrite::Insert(insert)
+        if matches!(insert.source, InsertSource::Values(_)));
+    if (!values && !mixed_index_rowid_equality(table, write.selection()))
+        || table.stat1.has_stat1
+        || indexes.iter().enumerate().any(|(pos, index)| {
+            index.root_pgno == table.root_pgno
+                || indexes[..pos].iter().any(|other| other.root_pgno == index.root_pgno)
+                || index.unique || index.is_autoindex || index.where_clause.is_some()
+                || index.stat1.as_ref().is_some_and(|stat| stat.has_stat1)
+        })
+    {
+        return None;
+    }
+
+    indexes.into_iter().find_map(|mixed| {
+        let declared = mixed_index_write_collation(db_id, db_set, table, mixed, collations)?;
+        let key = &mixed.columns[0];
+        let mut ordinary = indexes.into_iter().filter(|index| index.root_pgno != mixed.root_pgno);
+        let first = ordinary_single_column_index(table, ordinary.next()?)?;
+        let second = ordinary_single_column_index(table, ordinary.next()?)?;
+        if first == second || [first, second].into_iter().any(|column| {
+            key.col_idx == Some(column)
+                || !table.columns.get(column).is_some_and(|col| col.affinity == TypeAffinity::Text)
+        }) {
+            return None;
+        }
+        write.applies(table, mixed, key, db_set).then_some(MixedIndexWritePlan {
+            mixed_root: mixed.root_pgno,
+            mixed_declared: declared,
+            scan_index: None,
+        })
+    })
+}
+
 fn mixed_index_write_root<'a>(
     write: MixedIndexWrite<'_>,
     db_id: DatabaseId,
@@ -24990,8 +25038,14 @@ fn mixed_index_write_root<'a>(
                 scan_index: Some((first.root_pgno, declared)),
             });
     };
-    if indexes.next().is_some()
-        || first.root_pgno == second.root_pgno
+    if let Some(third) = indexes.next() {
+        return if indexes.next().is_none() {
+            mixed_index_three_root_write(write, db_id, db_set, table, [first, second, third], collations)
+        } else {
+            None
+        };
+    }
+    if first.root_pgno == second.root_pgno
         || table.stat1.has_stat1
         || [first, second]
             .iter()
