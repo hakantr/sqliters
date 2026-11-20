@@ -1562,3 +1562,8 @@ Normal MAIN kapsamındaki dolu, istatistiksiz tam indeks için varsayılan PRAGM
 ## V6b.251 — ISO saat alanlarının genişliği
 
 Ortak saat ayrıştırması saat, dakika ve saniye alanlarında C gibi iki ASCII rakam ister. 824 sorguluk matriste 84 fark kapandı, 740 eş kontrol ve önceki kesir sonuçları korundu. Üç kalıcı dosya ve 15 bağımsız C salt okunur açılışı eş. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 243/245, determinism 244/245. Açık L4 ve L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,268 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_251.md).
+
+
+## V6b.252 — STRFTIME biçim sonunda eşleşmemiş yüzde
+
+STRFTIME biçimi tek eşleşmemiş yüzde ile sona erdiğinde C gibi SQL NULL döner. 1.944 biçim girdisinde 399 fark kapandı. Kaçırılmış yüzde çiftleri, geçerli 741 önceki çıktı ve 1.536 tarih kontrolü eş. Üç fiziksel dosya ve 15 C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 243/245, determinism 244/245. Açık L4 ve L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,264 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_252.md).

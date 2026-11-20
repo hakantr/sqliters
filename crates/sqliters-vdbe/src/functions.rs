@@ -2074,7 +2074,7 @@ fn eval_strftime_function(args: &[Value], ctx: &VmRuntimeContext) -> Result<Valu
             continue;
         }
         let Some(spec) = chars.next() else {
-            break;
+            return Ok(Value::Null);
         };
         match spec {
             '%' => out.push('%'),
