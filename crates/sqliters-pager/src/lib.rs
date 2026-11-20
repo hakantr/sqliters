@@ -4999,6 +4999,54 @@ impl Pager {
         Ok(())
     }
 
+    /// Copies a new sequential source page through the rollback destination page cache.
+    #[doc(hidden)]
+    pub fn backup_write_sequential_page(
+        &mut self,
+        pgno: Pgno,
+        source_page_size: u32,
+        bytes: &[u8],
+    ) -> Result<()> {
+        if self.db_kind != DatabaseKind::NamedDisk
+            || self.uses_temp_file_semantics()
+            || self.is_wal_mode()
+            || !matches!(self.journal_mode, JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate)
+            || source_page_size != self.tx_orig_header.page_size
+            || pgno > self.page_count.saturating_add(1)
+            || pgno == self.lock_byte_page()
+        {
+            return self.backup_write_page(pgno, source_page_size, bytes);
+        }
+        self.ensure_not_closed()?;
+        if self.state != TransactionState::Write {
+            return Err(SqliteError::misuse(
+                "backup_write_page requires an active write transaction on destination",
+            ));
+        }
+        if self.readonly {
+            return Err(SqliteError::readonly("destination database is read-only"));
+        }
+
+        // Acquire before publishing the larger image, so pager_get returns a zeroed new page.
+        let slot = self.pager_get(pgno, false)?;
+        let old_count = self.page_count;
+        let old_header_count = self.header.database_size_pages;
+        if pgno > old_count {
+            self.page_count = pgno;
+            self.header.database_size_pages = pgno;
+            self.tx_journaled.grow_to(pgno);
+        }
+        let written = self.mark_page_writable(pgno).map(|writable| {
+            self.cache.entry_data_mut(writable).copy_from_slice(bytes);
+        });
+        self.cache.release(slot);
+        if written.is_err() {
+            self.page_count = old_count;
+            self.header.database_size_pages = old_header_count;
+        }
+        written
+    }
+
     /// Finalizes the destination database image at the end of [`Backup::step`] when all source
     /// pages have been copied (`rc == SQLITE_DONE` in `sqlite/src/backup.c:444-560`).
     pub fn backup_finalize(

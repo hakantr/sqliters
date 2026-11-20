@@ -1472,3 +1472,8 @@ Normal D/P/T disk rollback büyümüş fiziksel dosyayı preimage yazısından �
 ## V6b.233 — ISO son Julian aralığı
 
 Geçerli ayrıştırılmış ISO tarih ve saat, değiştiricilerden sonra Julian aralığı dışındaysa C gibi NULL veriyor. 29 ayrı sınır farkı kapandı. 905 C açılışı ve 12 VDBE testi geçti. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,239 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_233.md).
+
+
+## V6b.234 — Backup hedefi kısmi yazısı
+
+Olağan eş sayfa boyutlu named-disk DELETE, PERSIST ve TRUNCATE yedeğinde ilk ardışık hedef kopyası sayfalayıcı edinme/yazma/bırakma sırasını kullanır. 28 odak profilinde 56 C–Rust geçici yazı ve erken finish çifti eşleşti. Önceki 14 rollback sıra farkı kapandı. 504 backup korumasında 90 ilk kopya ve 48 fiziksel yayın eşliği korundu. 144 geniş profilde 864 son dosya çifti eş. 108 olağan rollback kontrolünde önceki işlem sırası korundu. 32.940 strict kayıt doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,248 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_234.md).

@@ -578,13 +578,13 @@ impl Backup {
                         // sqlite3PagerGet(PAGER_GET_READONLY), backupOnePage, sqlite3PagerUnref.
                         let pinned = src_pager.pin_readonly_page(src_pgno)?;
                         let copied_page = src_pager.pinned_page(src_pgno, pinned).and_then(|bytes| {
-                            dst_pager.backup_write_page(src_pgno, src_ps, bytes)
+                            dst_pager.backup_write_sequential_page(src_pgno, src_ps, bytes)
                         });
                         src_pager.unpin_page(src_pgno, pinned);
                         copied_page?;
                     } else {
                         let bytes = src_pager.read_page_unchecked(src_pgno)?;
-                        dst_pager.backup_write_page(src_pgno, src_ps, bytes)?;
+                        dst_pager.backup_write_sequential_page(src_pgno, src_ps, bytes)?;
                     }
                 }
                 self.i_next += 1;
