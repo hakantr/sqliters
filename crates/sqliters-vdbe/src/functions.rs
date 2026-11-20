@@ -1549,8 +1549,16 @@ fn unix_seconds_to_ms(seconds: f64) -> Option<i64> {
 }
 
 fn parse_iso_datetime(input: &str) -> Option<ParsedDateTime> {
+    const YEAR_10000_MS: i64 = 253_402_300_800_000;
     let s = input.trim();
     let has_date = s.len() >= 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-';
+    let unsigned_date = || {
+        has_date
+            && s.as_bytes()[..10]
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+    };
     let (days, clock) = if has_date {
         let y: i64 = s.get(0..4)?.parse().ok()?;
         let m: u32 = s.get(5..7)?.parse().ok()?;
@@ -1574,24 +1582,22 @@ fn parse_iso_datetime(input: &str) -> Option<ParsedDateTime> {
         let (clock, offset) = clock.split_at(offset_start);
         let clock = clock.trim_end_matches(is_date_time_space);
         let clock = if has_date {
-            if s.as_bytes()[..10]
-                .iter()
-                .enumerate()
-                .any(|(index, byte)| index != 4 && index != 7 && !byte.is_ascii_digit())
-            {
+            if !unsigned_date() {
                 return None;
             }
             clock.trim_start_matches(|c| c == 'T' || is_date_time_space(c))
         } else {
             clock
         };
-        let (clock_ms, raw_seconds) = parse_hms_ms(clock, true)?;
-        let offset_ms = parse_numeric_time_offset_ms(offset)?;
+        let (clock_ms, raw_seconds) = parse_hms_ms(clock, true, has_date)?;
         let local_ms = midnight_ms + clock_ms;
+        // A 24:00 clock advances the local date before applying its offset.
+        if local_ms >= YEAR_10000_MS {
+            return None;
+        }
+        let offset_ms = parse_numeric_time_offset_ms(offset)?;
         let utc_ms = local_ms - offset_ms;
-        // A 24:00 clock can advance the date before applying its offset.
-        const YEAR_10000_MS: i64 = 253_402_300_800_000;
-        return (local_ms < YEAR_10000_MS && utc_ms < YEAR_10000_MS).then_some(ParsedDateTime {
+        return (utc_ms < YEAR_10000_MS).then_some(ParsedDateTime {
             unix_ms: utc_ms,
             raw_seconds: if offset_ms == 0 { raw_seconds } else { None },
             is_utc: true,
@@ -1600,7 +1606,20 @@ fn parse_iso_datetime(input: &str) -> Option<ParsedDateTime> {
 
     let without_z = clock.strip_suffix(['Z', 'z']);
     let clock = without_z.unwrap_or(clock);
-    let clock = if has_date {
+    let dated_hour24 = has_date
+        .then(|| {
+            clock
+                .trim_start_matches(|c| c == 'T' || is_date_time_space(c))
+                .trim_end_matches(is_date_time_space)
+        })
+        .filter(|clock| {
+            clock.starts_with("24:")
+                && unsigned_date()
+                && input.trim_end_matches(is_date_time_space) == s
+        });
+    let clock = if let Some(clock) = dated_hour24 {
+        clock
+    } else if has_date {
         clock.trim_start_matches([' ', 'T', 't'])
     } else {
         clock
@@ -1608,9 +1627,13 @@ fn parse_iso_datetime(input: &str) -> Option<ParsedDateTime> {
     if has_date && clock.is_empty() {
         return Some(ParsedDateTime::from_unix_ms(midnight_ms));
     }
-    let (clock_ms, raw_seconds) = parse_hms_ms(clock, false)?;
+    let (clock_ms, raw_seconds) = parse_hms_ms(clock, false, dated_hour24.is_some())?;
+    let unix_ms = midnight_ms + clock_ms;
+    if dated_hour24.is_some() && unix_ms >= YEAR_10000_MS {
+        return None;
+    }
     Some(ParsedDateTime {
-        unix_ms: midnight_ms + clock_ms,
+        unix_ms,
         raw_seconds,
         is_utc: without_z.is_some(),
     })
@@ -1641,13 +1664,19 @@ fn parse_numeric_time_offset_ms(s: &str) -> Option<i64> {
     Some(if s.starts_with('-') { -ms } else { ms })
 }
 
-fn parse_hms_ms(s: &str, has_numeric_offset: bool) -> Option<(i64, Option<f64>)> {
+fn parse_hms_ms(
+    s: &str,
+    has_numeric_offset: bool,
+    allow_dated_hour24: bool,
+) -> Option<(i64, Option<f64>)> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() < 2 || parts.len() > 3 {
         return None;
     }
+    let dated_hour24 = allow_dated_hour24 && parts[0] == "24";
+    let strict = has_numeric_offset || dated_hour24;
     let parse_part = |part: &str| -> Option<u32> {
-        if has_numeric_offset {
+        if strict {
             parse_two_time_digits(part)
         } else {
             part.parse().ok()
@@ -1658,9 +1687,7 @@ fn parse_hms_ms(s: &str, has_numeric_offset: bool) -> Option<(i64, Option<f64>)>
     let (ss, ms, raw_seconds) = if parts.len() == 3 {
         if let Some((sec_part, frac_part)) = parts[2].split_once('.') {
             let sec = parse_part(sec_part)?;
-            if (has_numeric_offset && frac_part.is_empty())
-                || !frac_part.bytes().all(|b| b.is_ascii_digit())
-            {
+            if (strict && frac_part.is_empty()) || !frac_part.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
             }
             if frac_part.len() > 3 && [parts[0], parts[1], sec_part].iter().all(|p| p.len() == 2) {
@@ -1680,11 +1707,15 @@ fn parse_hms_ms(s: &str, has_numeric_offset: bool) -> Option<(i64, Option<f64>)>
         (0, 0, None)
     };
     if hh > 23 {
-        let midnight = has_numeric_offset
-            && hh == 24
-            && parts[1..]
-                .iter()
-                .all(|part| part.bytes().all(|b| matches!(b, b'0' | b'.')));
+        let midnight = if dated_hour24 {
+            mm == 0 && ss == 0 && ms == 0 && raw_seconds.is_none_or(|seconds| seconds == 0.0)
+        } else {
+            has_numeric_offset
+                && hh == 24
+                && parts[1..]
+                    .iter()
+                    .all(|part| part.bytes().all(|b| matches!(b, b'0' | b'.')))
+        };
         if !midnight {
             return None;
         }

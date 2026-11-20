@@ -1487,3 +1487,8 @@ Canonical ISO uzun saat kesrinde birikim, 0.999 üst sınırı ve tam saniye ile
 ## V6b.236 — SELECT üç parçalı yıldız tanısı
 
 SELECT projeksiyonunda şema ve tablo veya alias ile nitelenmiş yıldız C gibi prepare sırasında rc ve extended rc 1, aynı mesaj ve yıldızın bayt ofsetini döndürür. 64 OFF farkı kapandı. 136 negatif ve 112 geçerli C–Rust karşılaştırması, 372 C açılışı ve 56 gerçek ON izi doğrulandı. İki mevcut runtime testinin beklentisi C tanısıyla hizalandı ve bunların diğer kontrolleri korundu. İki runtime ve yapısal AST testi iki kipte 6/6 geçti. 4.722 strict doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_236.md).
+
+
+## V6b.237 — Tarihli ISO 24:00
+
+İşaretsiz ISO tarihli 24:00, canonical saat parçaları ve ham kesir sıfır olduğunda yerel ertesi güne taşınır. Yerel yıl sınırı ofsetten ve son Julian denetiminden ayrı uygulanır. 104 bağlam ve kip başına 1.872 ham kayıt C ile eşleşti. 460 diğer ana bağlam değişmedi. 61 gerçek saklama kontrolü, 923 C açılışı, 12 VDBE testi ve 9.102 strict doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_237.md).
