@@ -1782,7 +1782,7 @@ fn parse_hms_ms(s: &str, strict_clock: bool, allow_hour24: bool) -> Option<(i64,
     let (ss, ms, raw_seconds) = if parts.len() == 3 {
         if let Some((sec_part, frac_part)) = parts[2].split_once('.') {
             let sec = parse_part(sec_part)?;
-            if (strict && frac_part.is_empty()) || !frac_part.bytes().all(|b| b.is_ascii_digit()) {
+            if frac_part.is_empty() || !frac_part.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
             }
             if frac_part.len() > 3 && [parts[0], parts[1], sec_part].iter().all(|p| p.len() == 2) {

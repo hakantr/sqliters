@@ -1547,3 +1547,8 @@ Sabit şemada aynı BINARY NUMERIC anahtarını kullanan iki tam aralık indeksi
 ## V6b.248 — Negatif ISO 24:00 korunmuş takvim
 
 Kanonik negatif tarihli 24:00, C’nin geçerli ham takvim durumunu taşıdığı doğrulanmış geçişleri izliyor. Önceki 24 ve yeni 35 takvim vakası C ile eş. Diske yazılan önceki 24 vaka bayt eş ve 522 bağımsız C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 242/245, determinism 244/245. Açık L1, L4 ve L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,281 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_248.md).
+
+
+## V6b.249 — Rakamsız saniye kesri
+
+Saat metninde saniyeden sonraki nokta en az bir kesir rakamı gerektirir. Sabit C ile 648 sorgu karşılaştırmasındaki 36 fark ve beş ek odak farkı kapandı. Önceki 612 sonuç bayt eş. UTF8 DELETE ve UTF16LE WAL kalıcı dosyaları C ile bayt eş. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 242/245, determinism 244/245. Açık L1, L4 ve L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,276 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_249.md).
