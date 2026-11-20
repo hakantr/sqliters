@@ -24560,9 +24560,7 @@ impl<'a> MixedIndexWrite<'a> {
                 && ordinary_key.col_idx.and_then(|column| table.columns.get(column))
                     .is_some_and(|column| column.affinity == TypeAffinity::Text);
         }
-        let selection = self.selection();
-        !matches!(selection, Some(Expr::InList { .. }))
-            && mixed_index_rowid_selection(table, selection)
+        mixed_index_rowid_selection(table, self.selection())
     }
 
     fn selection(self) -> Option<&'a Expr> {
