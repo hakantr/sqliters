@@ -1337,3 +1337,8 @@ Aynı genişletilmiş kod ve mesajda C çözümleyicisinin byte ofseti taşını
 ## V6b.206 — ORDER BY açık çıktı alias önceliği
 
 Yalın ORDER BY adı ilk açık çıktı alias’ını çözümlüyor. İki kipte 24 profil, 108 C açılışı ve bağlama sonrası sıra C ile eş. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_206.md).
+
+
+## V6b.207 — TEMP CREATE eski cookie ile V1 step
+
+Eski TEMP cookie ilk yazma denetiminde saptandığında V1 step 1 ve terminal 17 döner. 2.612 C açılışı doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,262 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_207.md).

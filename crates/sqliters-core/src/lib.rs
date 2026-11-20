@@ -2064,8 +2064,10 @@ impl ConnectionInner {
         Ok(any_changed)
     }
 
-    fn refresh_open_tx_schemas(&mut self) -> Result<()> {
+    /// Returns whether a newly opened TEMP Btree had an old schema cookie in memory.
+    fn refresh_open_tx_schemas(&mut self) -> Result<bool> {
         let mut any_changed = false;
+        let mut temp_cookie_changed = false;
         // The same sqlite3Init order applies when transactions are already open.
         let slot_cnt = self.db_set.slot_count();
         for idx in std::iter::once(0).chain((1..slot_cnt).rev()) {
@@ -2088,6 +2090,7 @@ impl ConnectionInner {
                     slot.c_clear_schema();
                     slot.schema.schema_cookie = cur_cookie;
                     any_changed = true;
+                    temp_cookie_changed = true;
                 }
                 continue;
             }
@@ -2112,7 +2115,7 @@ impl ConnectionInner {
             self.schema_generation += 1;
             self.v1_expire_generation += 1;
         }
-        Ok(())
+        Ok(temp_cookie_changed)
     }
 
     fn maybe_run_wal_autocheckpoint(&mut self) {
@@ -11537,15 +11540,20 @@ impl Statement {
                         }
                     };
 
-                    if self.requires_schema
-                        && let Err(e) = inner.refresh_open_tx_schemas()
-                    {
-                        cleanup_unstarted_write(inner);
-                        self.lifecycle = StatementLifecycle::Halted {
-                            last_error: Some(e.clone()),
-                        };
-                        return Err(e);
-                    }
+                    let temp_cookie_changed = if self.requires_schema {
+                        match inner.refresh_open_tx_schemas() {
+                            Ok(changed) => changed,
+                            Err(e) => {
+                                cleanup_unstarted_write(inner);
+                                self.lifecycle = StatementLifecycle::Halted {
+                                    last_error: Some(e.clone()),
+                                };
+                                return Err(e);
+                            }
+                        }
+                    } else {
+                        false
+                    };
 
                     if self.needs_reprepare(inner) {
                         if self.mode == PrepareMode::V1 {
@@ -11555,6 +11563,14 @@ impl Statement {
                             self.lifecycle = StatementLifecycle::Halted {
                                 last_error: Some(err.clone()),
                             };
+                            if temp_cookie_changed && db_id == DatabaseId::TEMP
+                                && self.stmt.as_ref().is_some_and(creates_temp_table)
+                            {
+                                // OP_Transaction ran. Legacy step updates only the connection
+                                // code, and reset/finalize retain the statement's SQLITE_SCHEMA.
+                                inner.c_connection_diagnostic_code = ErrorCode::Error;
+                                return Err(inner.legacy_c_step_error());
+                            }
                             return Err(err);
                         }
                         if let Err(e) = self.reprepare_in_open_tx(inner) {
