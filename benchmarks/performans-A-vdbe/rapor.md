@@ -1282,3 +1282,8 @@ Ortak indekste sıfır canlı frame durumunda erişilemeyen kayıtlar C gibi son
 ## V6b.195 — Journal mode değerleri ve C önek eşlemesi
 
 Hazırlama ve SQL yürütmesi C kip adlarının aynı ASCII önek kuralını paylaşıyor. 672 tek, 72 bağlı dosya C çifti ve temiz dosya açılışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,254 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_195.md).
+
+
+## V6b.196 — WAL checkpoint kip adı
+
+Tanınmayan checkpoint kip adı C gibi PASSIVE oluyor. 360 C karşılaştırması, 96 önceki sonuç farkı ve 1.800 fiziksel evre doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,435 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_196.md).

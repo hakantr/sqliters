@@ -46945,7 +46945,7 @@ fn exec_pragma(
                 None => WalCheckpointMode::Passive,
                 Some(pv) => {
                     let s = pragma_to_string(pv);
-                    WalCheckpointMode::from_pragma_str(s.trim())
+                    WalCheckpointMode::from_pragma_str(&s)
                         .unwrap_or(WalCheckpointMode::Passive)
                 }
             };
