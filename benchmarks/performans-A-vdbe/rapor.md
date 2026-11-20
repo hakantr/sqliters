@@ -1527,3 +1527,8 @@ Canonical negatif ISO tarih ve olağan saatte geçerli yerel gün, dört ASCII y
 ## V6b.244 — Negatif tarihli ISO 24:00
 
 Canonical negatif tarihli 24:00, C'nin önce yıl büyüklüğünü ilerletip işareti uygulama kararını ve ham sıfır kesrini izler. Başlangıç ve değiştiricilerde Julian aralığı korunan 145 hedef, kip başına 2.610 ham kayıt C eş. 59 ana bağlam korundu. 145 gerçek saklama, 288 C açılışı, 12 VDBE ve 4.598 strict doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 242/245, determinism 244/245. Açık L1, L4 ve L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,248 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_244.md).
+
+
+## V6b.245 — Görünüm UPDATE iki tam indeks
+
+Sabit şemalı doğrudan rowid görünüm UPDATE’inde iki tam nonunique BINARY indeks arasından tek uyumlu literal aralığı mevcut aralık yoluyla izler. 644 sıra ve dosya farkı kapandı. 204 kapsam koruması ve 336 önceki native kontrol eş. 5.100 native ve 5.100 C açılışı, 34.934 strict doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 242/245, determinism 244/245. Açık L1, L4 ve L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,250 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_245.md).

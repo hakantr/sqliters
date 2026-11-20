@@ -32381,7 +32381,25 @@ fn view_dml_indexed_select(
         return None;
     }
     let mut indexes = schema.indexes_for_table(&table.name);
-    if max_eq && indexes.len() > 1 {
+    let two_index_range = indexes.len() == 2
+        && predicate == ViewDmlIndexPredicate::UpdateRange
+        && second_term.is_none()
+        && quoted_bound.is_none()
+        && !table.without_rowid
+        && column.affinity == TypeAffinity::Numeric
+        && !column.is_primary_key
+        && ctx.collations.get_custom("BINARY").is_none();
+    if two_index_range
+        && indexes.iter().any(|index| {
+            let [key] = index.columns.as_slice() else {
+                return true;
+            };
+            index.is_autoindex || index.unique || key.sort_order.collation != Collation::Binary
+        })
+    {
+        return None;
+    }
+    if indexes.len() > 1 && (max_eq || two_index_range) {
         // A literal can change partial-index eligibility. Leave those and
         // competing leading keys to the existing unpushed view path.
         if indexes.iter().any(|index| {
@@ -32393,6 +32411,8 @@ fn view_dml_indexed_select(
         }) {
             return None;
         }
+        // In the two-index range case both keys are single columns and the
+        // range column is not the rowid. A different key cannot cover the range.
         indexes.retain(|index| {
             index
                 .columns
