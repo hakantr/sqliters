@@ -392,8 +392,9 @@ impl Backup {
                 );
             }
 
-            // 4. Validate page-size compatibility with WAL destination (`backup.c:401-410`).
-            let (dst_orig_ps, dst_is_wal) = {
+            // 4. WAL and in-memory destinations require the source page size,
+            // even when this step copies zero pages (backup.c:401-410).
+            let (dst_orig_ps, dst_is_wal, dst_is_memdb) = {
                 let dst_bt = dst_inner
                     .db_set
                     .slot(dst_db_id)
@@ -401,37 +402,21 @@ impl Backup {
                     .btree
                     .as_ref()
                     .unwrap();
-                let is_wal =
-                    dst_bt.journal_mode() == JournalMode::Wal || dst_bt.pager().is_wal_mode();
-                (dst_bt.pager().tx_orig_page_size(), is_wal)
-            };
-            if dst_is_wal && src_ps != dst_orig_ps {
-                return Err(SqliteError::new(
-                    ErrorCode::ReadOnly,
-                    "destination database is in WAL mode and page sizes differ",
-                ));
-            }
-            // `backupOnePage` (`backup.c:249-254`): an in-memory destination cannot change its page
-            // size, so copying a page into one whose page size differs is `SQLITE_READONLY`. (An
-            // empty in-memory destination has already taken the source page size above.) The
-            // error is raised by the first page copy, not by a step that copies nothing.
-            let memdb_page_size_conflict = {
-                let dst_pager = dst_inner
-                    .db_set
-                    .slot(dst_db_id)
-                    .unwrap()
-                    .btree
-                    .as_ref()
-                    .unwrap()
-                    .pager();
-                dst_pager.is_memdb_backing() && src_ps != dst_orig_ps
-            };
-            let memdb_page_size_error = || {
-                SqliteError::new(
-                    ErrorCode::ReadOnly,
-                    "destination database is in-memory and page sizes differ",
+                let pager = dst_bt.pager();
+                (
+                    pager.tx_orig_page_size(),
+                    dst_bt.journal_mode() == JournalMode::Wal || pager.is_wal_mode(),
+                    pager.is_memdb_backing(),
                 )
             };
+            if src_ps != dst_orig_ps && (dst_is_wal || dst_is_memdb) {
+                let message = if dst_is_wal {
+                    "destination database is in WAL mode and page sizes differ"
+                } else {
+                    "destination database is in-memory and page sizes differ"
+                };
+                return Err(SqliteError::new(ErrorCode::ReadOnly, message));
+            }
 
             // 5. Inspect leaf `BackupTracker` and source snapshot metadata to determine whether
             // we must restart from page 1 or re-copy dirty pages `< self.i_next`.
@@ -520,9 +505,6 @@ impl Backup {
                 if is_lock_page {
                     continue;
                 }
-                if memdb_page_size_conflict {
-                    return Err(memdb_page_size_error());
-                }
                 let page_bytes = src_inner
                     .db_set
                     .slot_mut(src_db_id)
@@ -558,9 +540,6 @@ impl Backup {
                     .lock_byte_page()
                     == src_pgno;
                 if !is_lock_page {
-                    if memdb_page_size_conflict {
-                        return Err(memdb_page_size_error());
-                    }
                     let page_bytes = src_inner
                         .db_set
                         .slot_mut(src_db_id)
