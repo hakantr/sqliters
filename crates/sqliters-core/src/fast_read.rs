@@ -1554,7 +1554,7 @@ impl FastAggState {
         match spec {
             FastAggSpec::CountStar | FastAggSpec::Count(_) => Self::Count(0),
             FastAggSpec::Sum(_) | FastAggSpec::Total(_) | FastAggSpec::Avg(_) => {
-                Self::Sum(FastSumAccum::new())
+                Self::Sum(FastSumAccum::new().with_encoding(enc))
             }
             FastAggSpec::Min(_, coll) => Self::MinMax {
                 is_max: false,

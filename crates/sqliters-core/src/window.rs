@@ -3454,7 +3454,7 @@ fn evaluate_call_on_partition(
                                 item.win_vals[slot] = RuntimeValue::plain(Value::Integer(cnt));
                             }
                         } else {
-                            let mut acc = FastSumAccum::new();
+                            let mut acc = FastSumAccum::new().with_encoding(ctx.encoding());
                             let mut cur_s = 0usize;
                             let mut cur_e = 0usize;
                             for (i, item) in part_items.iter_mut().enumerate() {

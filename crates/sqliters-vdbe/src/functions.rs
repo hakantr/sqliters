@@ -2407,7 +2407,7 @@ impl SumCtx {
     }
 
     #[inline]
-    fn classify_numeric(v: &Value) -> Option<SumNumeric> {
+    fn classify_numeric(v: &Value, encoding: TextEncoding) -> Option<SumNumeric> {
         match v {
             Value::Null => None,
             Value::Integer(i) => Some(SumNumeric::Int(*i)),
@@ -2417,12 +2417,16 @@ impl SumCtx {
                 Some(Value::Real(r)) => Some(SumNumeric::Float(r)),
                 _ => Some(SumNumeric::Float(v.to_real_lossy())),
             },
-            Value::Blob(_) => Some(SumNumeric::Float(0.0)),
+            // sqlite3_value_numeric_type leaves BLOB intact. sumStep calls
+            // sqlite3_value_double with this cell's encoding in its REAL arm.
+            Value::Blob(bytes) => Some(SumNumeric::Float(
+                sqliters_types::fp::sqlite_atof_with_encoding(bytes, encoding).0,
+            )),
         }
     }
 
-    fn step_val(&mut self, v: &Value) {
-        let Some(num) = Self::classify_numeric(v) else {
+    fn step_val(&mut self, v: &Value, encoding: TextEncoding) {
+        let Some(num) = Self::classify_numeric(v, encoding) else {
             return;
         };
         if !self.approx {
@@ -2454,8 +2458,8 @@ impl SumCtx {
         }
     }
 
-    fn inverse_val(&mut self, v: &Value) {
-        let Some(num) = Self::classify_numeric(v) else {
+    fn inverse_val(&mut self, v: &Value, encoding: TextEncoding) {
+        let Some(num) = Self::classify_numeric(v, encoding) else {
             return;
         };
         if !self.approx
@@ -2504,6 +2508,7 @@ impl SumCtx {
 pub struct FastSumAccum {
     count: i64,
     ctx: SumCtx,
+    encoding: TextEncoding,
 }
 
 impl FastSumAccum {
@@ -2511,6 +2516,7 @@ impl FastSumAccum {
     pub const fn new() -> Self {
         Self {
             count: 0,
+            encoding: TextEncoding::Utf8,
             ctx: SumCtx {
                 r_sum: 0.0,
                 r_err: 0.0,
@@ -2519,6 +2525,12 @@ impl FastSumAccum {
                 ovrfl: false,
             },
         }
+    }
+
+    #[inline]
+    pub fn with_encoding(mut self, encoding: TextEncoding) -> Self {
+        self.encoding = encoding;
+        self
     }
 
     #[inline(always)]
@@ -2562,7 +2574,7 @@ impl FastSumAccum {
             return;
         }
         self.count += 1;
-        self.ctx.step_val(v);
+        self.ctx.step_val(v, self.encoding);
     }
 
     #[inline]
@@ -2571,7 +2583,7 @@ impl FastSumAccum {
             return;
         }
         self.count -= 1;
-        self.ctx.inverse_val(v);
+        self.ctx.inverse_val(v, self.encoding);
     }
 
     #[inline]
@@ -2580,7 +2592,9 @@ impl FastSumAccum {
             sqliters_types::RawField::Null => {}
             sqliters_types::RawField::Int(i) => self.step_i64(i),
             sqliters_types::RawField::Float(f) => self.step_f64(f),
-            sqliters_types::RawField::Blob(_) => self.step_f64(0.0),
+            sqliters_types::RawField::Blob(bytes) => {
+                self.step_f64(sqliters_types::fp::sqlite_atof_with_encoding(bytes, enc).0);
+            }
             sqliters_types::RawField::Text(b) => {
                 if enc == TextEncoding::Utf8
                     && let Ok(s) = std::str::from_utf8(b)
@@ -2829,7 +2843,7 @@ impl AggregateAccumulator {
             }
             AggregateKind::Sum | AggregateKind::Total | AggregateKind::Avg => {
                 self.count += 1;
-                self.sum_ctx.step_val(first);
+                self.sum_ctx.step_val(first, self.encoding);
             }
             AggregateKind::Min => {
                 let replace = match &self.best {
@@ -2918,7 +2932,7 @@ impl AggregateAccumulator {
                     && !first.is_null()
                 {
                     self.count -= 1;
-                    self.sum_ctx.inverse_val(first);
+                    self.sum_ctx.inverse_val(first, self.encoding);
                 }
             }
             AggregateKind::GroupConcat => {

@@ -1397,3 +1397,8 @@ Sayım INSTEAD OF tetikleyicisinden önce yapılıyor. 94 OFF farkı kapandı ve
 ## V6b.218 — Aynı tablo INSERT SELECT kaynak aralığı
 
 48 OFF profili C ile eş. Seed 6240 kapanırken kalan dokuz ham DML farkı korundu. 8.018 C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,323 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_218.md).
+
+
+## V6b.219 — Aggregate BLOB sayısal öneki
+
+SUM, TOTAL ve AVG üç metin kodlamasında BLOB sayısal önekini C ile aynı kullanıyor. Her kipte 1.816 çıktı farkı kapandı. 2.520 C açılışı doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,254 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_219.md).
