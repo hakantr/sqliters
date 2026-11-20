@@ -1403,7 +1403,11 @@ pub(crate) fn rollback_all_databases(
 /// OP_AutoCommit ROLLBACK (vdbe.c:4181). SQLite runs the rollback hook
 /// while autocommit is still off, then the caller ends the SQL transaction.
 pub(crate) fn rollback_before_autocommit(ctx: &mut ExecContext<'_>) -> Result<()> {
-    let _ = rollback_all_databases(ctx, true);
+    let schema_changed = *ctx.schema_changed_in_tx;
+    let result = rollback_all_databases(ctx, true);
+    if schema_changed && result.is_ok() {
+        ctx.db_set.c_note_explicit_ddl_rollback();
+    }
     *ctx.rollback_count += 1;
     *ctx.in_user_btree_tx = false;
     *ctx.schema_changed_in_tx = false;

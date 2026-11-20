@@ -1074,6 +1074,7 @@ pub(crate) struct ConnectionInner {
     pub(crate) c_error_byte_offset: i32,
     // An ordinary prepare or read error may outlive a later successful API call.
     c_retained_error_message: Option<String>,
+    c_connection_diagnostic_code: ErrorCode,
     pub(crate) default_locking_mode: LockingMode,
     pub(crate) writable_schema: bool,
     pub(crate) working_dir: Option<PathBuf>,
@@ -1765,15 +1766,20 @@ impl ConnectionInner {
     }
 
     fn legacy_c_step_error(&self) -> SqliteError {
+        self.legacy_c_step_error_with_diagnostic(ErrorCode::Error)
+    }
+
+    fn legacy_c_step_error_with_diagnostic(&self, fallback: ErrorCode) -> SqliteError {
         let message = self
             .c_retained_error_message
             .as_deref()
-            .unwrap_or(ErrorCode::Error.as_str());
+            .unwrap_or(fallback.as_str());
         let offset = usize::try_from(self.c_error_byte_offset).unwrap_or(SqliteError::NO_OFFSET);
         SqliteError::new(ErrorCode::Error, message).with_offset(offset)
     }
 
     fn record_c_prepare_error(&mut self, error: Option<&SqliteError>) {
+        self.c_connection_diagnostic_code = error.map_or(ErrorCode::Ok, |error| error.code);
         self.c_error_byte_offset = error
             .and_then(|e| e.offset)
             .and_then(|offset| i32::try_from(offset).ok())
@@ -1784,8 +1790,15 @@ impl ConnectionInner {
     }
 
     fn transfer_c_read_error(&mut self, error: Option<&SqliteError>) {
+        self.c_connection_diagnostic_code = error.map_or(ErrorCode::Ok, |error| error.code);
         self.c_error_byte_offset = -1;
         self.c_retained_error_message = error.map(|e| e.message.clone());
+    }
+
+    fn note_c_read_step_status(&mut self, status: ErrorCode) {
+        if self.db_set.c_ddl_rollback_expiry().is_some() {
+            self.c_connection_diagnostic_code = status;
+        }
     }
 
     #[inline]
@@ -3612,6 +3625,7 @@ impl Connection {
             wal_autocheckpoint_threshold: SQLITE_DEFAULT_WAL_AUTOCHECKPOINT,
             c_error_byte_offset: -1,
             c_retained_error_message: None,
+            c_connection_diagnostic_code: ErrorCode::Ok,
             default_locking_mode: LockingMode::Normal,
             writable_schema: false,
             working_dir: None,
@@ -3846,6 +3860,8 @@ impl Connection {
                 {
                     let inner = session.inner_mut();
                     inner.c_retained_error_message = None;
+                    inner.c_connection_diagnostic_code =
+                        res.as_ref().err().map_or(ErrorCode::Ok, |error| error.code);
                     inner.c_error_byte_offset = res.as_ref().err()
                         .and_then(|e| e.offset).and_then(|n| i32::try_from(n).ok()).unwrap_or(-1);
                     res?;
@@ -8983,6 +8999,7 @@ impl Statement {
         if error.code == ErrorCode::Range {
             // vdbeUnbind clears pErr, and sqlite3Error retains the previous byte offset.
             inner.c_retained_error_message = None;
+            inner.c_connection_diagnostic_code = ErrorCode::Range;
             let offset = usize::try_from(inner.c_error_byte_offset).unwrap_or(SqliteError::NO_OFFSET);
             return SqliteError::new(ErrorCode::Range, ErrorCode::Range.as_str()).with_offset(offset);
         }
@@ -9121,7 +9138,9 @@ impl Statement {
             Ok(()) => inner.transfer_c_read_error(None),
             Err(e)
                 if !self.read_io_during_prepare
-                    && matches!(e.code, ErrorCode::Error | ErrorCode::Interrupt) =>
+                    && (matches!(e.code, ErrorCode::Error | ErrorCode::Interrupt)
+                        || (self.legacy_ddl_rollback_reader(inner)
+                            && e.extended_code == extended::SQLITE_ABORT_ROLLBACK)) =>
             {
                 inner.transfer_c_read_error(Some(e));
             }
@@ -9520,6 +9539,7 @@ impl Statement {
                 last_error: fin_res.as_ref().err().cloned(),
             };
             fin_res.map_err(|e| Self::read_step_error(inner, &self.shared, self.mode, e))?;
+            inner.note_c_read_step_status(ErrorCode::Done);
             return Ok(StepResult::Done);
         }
 
@@ -9738,10 +9758,12 @@ impl Statement {
                         StatementLifecycle::Running(RunningExec::PointSelectRowYielded {
                             read_instances,
                         });
+                    inner.note_c_read_step_status(ErrorCode::Row);
                     return Ok(StepResult::Row(Row::new(vals)));
                 }
                 PointOutcome::Miss => {
                     self.lifecycle = StatementLifecycle::Halted { last_error: None };
+                    inner.note_c_read_step_status(ErrorCode::Done);
                     return Ok(StepResult::Done);
                 }
             }
@@ -9852,7 +9874,14 @@ impl Statement {
                         lifecycle,
                     )
                 };
-                result.map(|res| res.map_err(|e| Self::read_step_error(inner, shared, mode, e)))
+                result.map(|res| {
+                    match &res {
+                        Ok(StepResult::Row(_)) => inner.note_c_read_step_status(ErrorCode::Row),
+                        Ok(StepResult::Done) => inner.note_c_read_step_status(ErrorCode::Done),
+                        Err(_) => {}
+                    }
+                    res.map_err(|e| Self::read_step_error(inner, shared, mode, e))
+                })
             };
             if let Some(res) = fast_read_res {
                 return res;
@@ -9871,7 +9900,36 @@ impl Statement {
     ) -> Result<StepResult> {
         inner.ensure_usable()?;
         self.read_io_during_prepare = false;
+        let prior_diagnostic = self.legacy_ddl_rollback_reader(inner).then(|| {
+            (
+                inner.c_retained_error_message.clone(),
+                inner.c_error_byte_offset,
+                inner.c_connection_diagnostic_code,
+            )
+        });
         let result = self.step_in_session_impl(shared, inner);
+        if let (Some((message, offset, prior_code)), Err(error)) = (prior_diagnostic, &result)
+            && !self.read_io_during_prepare
+        {
+            let executed = error.extended_code == extended::SQLITE_ABORT_ROLLBACK;
+            let expired = self.c_v1_expired_before_run && error.code == ErrorCode::Schema;
+            if executed || expired {
+                // An executed V1 step sets db->errCode only. A V1 expiration
+                // returns before changing even that code (vdbeapi.c:838,951).
+                inner.c_retained_error_message = message;
+                inner.c_error_byte_offset = offset;
+                let diagnostic = if executed { ErrorCode::Error } else { prior_code };
+                inner.c_connection_diagnostic_code = diagnostic;
+                return Err(inner.legacy_c_step_error_with_diagnostic(diagnostic));
+            }
+        }
+        if self.category == Some(StmtCategory::Read) {
+            match &result {
+                Ok(StepResult::Row(_)) => inner.note_c_read_step_status(ErrorCode::Row),
+                Ok(StepResult::Done) => inner.note_c_read_step_status(ErrorCode::Done),
+                Err(_) => {}
+            }
+        }
         if self.mode == PrepareMode::V1
             && self.is_journal_mode_pragma()
             && result.as_ref().is_err_and(|error| {
@@ -9900,6 +9958,13 @@ impl Statement {
             return result.map_err(|e| Self::read_step_error(inner, shared, self.mode, e));
         }
         result
+    }
+
+    fn legacy_ddl_rollback_reader(&self, inner: &ConnectionInner) -> bool {
+        self.mode == PrepareMode::V1
+            && self.category == Some(StmtCategory::Read)
+            && inner.db_set.c_ddl_rollback_expiry()
+                .is_some_and(|generation| self.compiled_c_expire_seq != generation)
     }
 
     fn is_journal_mode_pragma(&self) -> bool {

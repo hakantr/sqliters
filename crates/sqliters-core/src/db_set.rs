@@ -326,6 +326,7 @@ pub struct DatabaseSet {
     /// machine that is running then fails with SQLITE_ABORT_ROLLBACK at its next
     /// `OP_OpenRead`.
     c_expire_seq: u64,
+    c_ddl_rollback_expire_seq: Option<u64>,
     /// sqlite3.nextPagesize, shared by every schema; invalid requests replace older ones.
     pub(crate) next_page_size: i32,
     /// sqlite3.nextAutovac: the last request, even if the Btree refused to change.
@@ -432,6 +433,7 @@ impl DatabaseSet {
             c_analyzed: Vec::new(),
             c_encoding_fixed: false,
             c_expire_seq: 0,
+            c_ddl_rollback_expire_seq: None,
             next_page_size: 0,
             next_auto_vacuum: None,
             mmap_limit: 0,
@@ -775,6 +777,15 @@ impl DatabaseSet {
     /// See [`Self::c_expire_all`].
     pub const fn c_expire_seq(&self) -> u64 {
         self.c_expire_seq
+    }
+
+    pub(crate) fn c_note_explicit_ddl_rollback(&mut self) {
+        self.c_ddl_rollback_expire_seq = Some(self.c_expire_seq);
+    }
+
+    /// The current C statement expiration was caused by a normal explicit DDL rollback.
+    pub(crate) fn c_ddl_rollback_expiry(&self) -> Option<u64> {
+        self.c_ddl_rollback_expire_seq.filter(|seq| *seq == self.c_expire_seq)
     }
 
     /// pragma.c mutates db->flags while preparing; OP_Expire runs on step.
