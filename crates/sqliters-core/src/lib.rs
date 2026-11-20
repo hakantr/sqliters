@@ -9758,6 +9758,7 @@ impl Statement {
             && self.compiled_vdbe.is_some()
         {
             let fast_write = {
+                let mode = self.mode;
                 let Self {
                     ref shared,
                     category,
@@ -9774,7 +9775,7 @@ impl Statement {
                 } = *self;
                 let mut session = shared.enter()?;
                 let inner = session.inner_mut();
-                if let Err(e) = inner.ensure_usable() {
+                let result = if let Err(e) = inner.ensure_usable() {
                     Some(Err(e))
                 } else {
                     inner.clear_idle_interrupt(shared);
@@ -9793,7 +9794,8 @@ impl Statement {
                         lifecycle,
                         write_vm_scratch,
                     )
-                }
+                };
+                result.map(|result| result.map_err(|error| Self::write_step_error(inner, mode, error)))
             };
             if let Some(res) = fast_write {
                 return res;
@@ -9891,6 +9893,9 @@ impl Statement {
             self.lifecycle = StatementLifecycle::Halted { last_error: Some(error.clone()) };
             return Err(error);
         }
+        if self.category == Some(StmtCategory::Write) {
+            return result.map_err(|error| Self::write_step_error(inner, self.mode, error));
+        }
         if self.category == Some(StmtCategory::Read) && !self.read_io_during_prepare {
             return result.map_err(|e| Self::read_step_error(inner, shared, self.mode, e));
         }
@@ -9899,6 +9904,14 @@ impl Statement {
 
     fn is_journal_mode_pragma(&self) -> bool {
         matches!(self.stmt.as_ref(), Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("journal_mode"))
+    }
+
+    fn write_step_error(inner: &ConnectionInner, mode: PrepareMode, error: SqliteError) -> SqliteError {
+        if mode == PrepareMode::V1 && error.code == ErrorCode::Full {
+            // V1 exposes SQLITE_ERROR. The halted statement retains SQLITE_FULL.
+            return inner.legacy_c_step_error();
+        }
+        error
     }
 
     fn read_step_error(
