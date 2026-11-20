@@ -32849,6 +32849,8 @@ fn run_view_delete_loop(
     let mut ret_rows = Vec::new();
     for old_vals in target_rows.iter() {
         ctx.step_tick()?;
+        // sqlite3DeleteFrom counts WHERE matches before running INSTEAD OF triggers.
+        *count_changes_rows += 1;
         let pscope = make_runtime_view_pseudo_scope(&p.col_specs, Some(old_vals), None);
         if fire_row_triggers(
             ctx,
@@ -32861,7 +32863,6 @@ fn run_view_delete_loop(
             effective_or_conflict,
         )? == TriggerOutcome::Continue
         {
-            *count_changes_rows += 1;
             if !p.ret_expanded.is_empty() {
                 let rscope = make_returning_view_scope(&p.view.name, &p.col_specs, old_vals);
                 let mut rrow = Vec::with_capacity(p.ret_expanded.len());
