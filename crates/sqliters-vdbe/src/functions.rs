@@ -1387,6 +1387,9 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + i64::from(doe) - 719_468
 }
 
+const UNIX_EPOCH_JULIAN_MS: i64 = 210_866_760_000_000;
+const JULIAN_MS_LIMIT: i64 = 464_269_060_800_000;
+
 fn parse_datetime_value(
     val: &Value,
     modifiers: &[Value],
@@ -1395,29 +1398,33 @@ fn parse_datetime_value(
     if val.is_null() || modifiers.iter().any(Value::is_null) {
         return None;
     }
-    let has_unixepoch = modifiers
-        .iter()
-        .any(|m| m.to_text_lossy().trim().eq_ignore_ascii_case("unixepoch"));
+    let has_unixepoch = modifiers.first().is_some_and(|modifier| {
+        let text = value_to_text_in_encoding(modifier, ctx.text_encoding);
+        let name = text
+            .split_once('\0')
+            .map_or(text.as_str(), |(name, _)| name);
+        name.eq_ignore_ascii_case("unixepoch")
+    });
 
-    let mut ms = match val {
-        Value::Integer(i) if has_unixepoch => i.saturating_mul(1_000),
-        Value::Real(r) if has_unixepoch => (*r * 1_000.0).round() as i64,
-        Value::Integer(jd) => {
-            // Julian day -> Unix ms (`2440587.5` JD = Unix epoch)
-            ((*jd as f64 - 2_440_587.5) * 86_400_000.0).round() as i64
-        }
-        Value::Real(jd) => ((*jd - 2_440_587.5) * 86_400_000.0).round() as i64,
-        Value::Text(s) => {
-            let t = s.trim();
-            if t.eq_ignore_ascii_case("now") {
-                ctx.effective_timestamp_ms()
-            } else if has_unixepoch && let Ok(f) = t.parse::<f64>() {
-                (f * 1_000.0).round() as i64
-            } else {
-                parse_iso_datetime_ms(s)?
+    let (mut ms, modifiers) = if has_unixepoch {
+        (parse_unixepoch_ms(val, ctx.text_encoding)?, &modifiers[1..])
+    } else {
+        let ms = match val {
+            Value::Integer(jd) => {
+                // Julian day -> Unix ms (`2440587.5` JD = Unix epoch)
+                ((*jd as f64 - 2_440_587.5) * 86_400_000.0).round() as i64
             }
-        }
-        Value::Null | Value::Blob(_) => return None,
+            Value::Real(jd) => ((*jd - 2_440_587.5) * 86_400_000.0).round() as i64,
+            Value::Text(s) => {
+                if s.trim().eq_ignore_ascii_case("now") {
+                    ctx.effective_timestamp_ms()
+                } else {
+                    parse_iso_datetime_ms(s)?
+                }
+            }
+            Value::Null | Value::Blob(_) => return None,
+        };
+        (ms, modifiers)
     };
 
     let mut use_subsec = false;
@@ -1428,15 +1435,39 @@ fn parse_datetime_value(
             continue;
         }
         let mt = mod_str.trim();
-        if mt.eq_ignore_ascii_case("unixepoch")
-            || mt.eq_ignore_ascii_case("utc")
-            || mt.eq_ignore_ascii_case("auto")
-        {
+        if mt.eq_ignore_ascii_case("utc") || mt.eq_ignore_ascii_case("auto") {
             continue;
         }
         ms = apply_datetime_modifier_ms(ms, mt)?;
     }
+
+    if has_unixepoch
+        && !(-UNIX_EPOCH_JULIAN_MS..JULIAN_MS_LIMIT - UNIX_EPOCH_JULIAN_MS).contains(&ms)
+    {
+        return None;
+    }
     Some((ms, use_subsec))
+}
+
+fn parse_unixepoch_ms(val: &Value, encoding: TextEncoding) -> Option<i64> {
+    let seconds = match val {
+        Value::Integer(value) => *value as f64,
+        Value::Real(value) => *value,
+        Value::Text(_) | Value::Blob(_) => {
+            let text = value_to_text_in_encoding(val, encoding);
+            let (value, result) = sqliters_types::sqlite_atof(text.as_bytes());
+            if result <= 0 {
+                return None;
+            }
+            value
+        }
+        Value::Null => return None,
+    };
+    // C checks the unrounded Julian value before applying any later modifiers.
+    let julian_ms = seconds * 1_000.0 + UNIX_EPOCH_JULIAN_MS as f64;
+    (0.0..JULIAN_MS_LIMIT as f64)
+        .contains(&julian_ms)
+        .then(|| (julian_ms + 0.5) as i64 - UNIX_EPOCH_JULIAN_MS)
 }
 
 fn parse_iso_datetime_ms(input: &str) -> Option<i64> {

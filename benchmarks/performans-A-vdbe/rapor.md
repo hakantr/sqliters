@@ -1422,3 +1422,8 @@ Farklı sayfa boyutlu dolu bellek hedefi step(0) sırasında READONLY 8 ve 0/0 b
 ## V6b.223 — subsec ve subsecond çıktısı
 
 Dört zaman işlevi kesirli SQL tipi ve biçimini C ile eşliyor. Kip başına 2.232 fark kapandı. 246 C açılışı doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,262 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_223.md).
+
+
+## V6b.224 — Açık unixepoch girdisi
+
+İlk explicit unixepoch girdi türü, sıra, yuvarlama ve tarih sınırı C ile eş. 384 ana ve 12 önceki fark kapandı. 423 C açılışı geçti. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,249 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_224.md).
