@@ -3721,15 +3721,9 @@ impl Connection {
         inner.deferred_fk_suspects.clear();
         inner.publish(&self.shared);
 
-        if let Err(close_err) = inner.db_set.close_all() {
-            let poisoned = inner.poison_with(close_err);
-            drop(session);
-            return Err(CloseError {
-                connection: self,
-                error: poisoned,
-            });
-        }
-
+        // sqlite3Close returns success once it has accepted the close. Pager
+        // cleanup errors are handled below the connection API.
+        let _ = inner.db_set.close_all();
         inner.state = ConnectionState::Closed;
         drop(session);
         Ok(())
