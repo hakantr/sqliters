@@ -1497,3 +1497,8 @@ SELECT projeksiyonunda şema ve tablo veya alias ile nitelenmiş yıldız C gibi
 ## V6b.238 — Yalın ISO 24:00
 
 Yalın 24:00 ayrıştırmasında ilk takvim değiştiricisine kadar C'nin tarih ve ofset durumu izlenir. 55 kabul ve 10 iJD farkında kip başına 1.170 ham kayıt eşleşti. 499 diğer ana bağlam ve 104 tarihli düzeltme korundu. İki TZ'de 54 mevcut host dönüşüm zinciri ham eş kaldı. 72 gerçek saklama, 1.055 C açılışı, 12 VDBE testi ve 10.273 strict doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,255 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_238.md).
+
+
+## V6b.239 — Görünüm UPDATE TEXT aralığı
+
+Doğrudan tek rowid kaynaklı görünüm UPDATE işleminde tek tam BINARY TEXT indeks ve tek kanonik TEXT literal aralığı C'nin tarama ve tetikleyici sıra anahtarını izler. 75 hedef profilde 300 API, sıra ve nihai dosya çifti eş. Önceki sekiz TEXT farkı, geniş matriste 126 OFF ve 84 ON ilişkisel geri dönüş farkı kapandı. 160 ayrı koruma karşılaştırması ve V97/V109 korundu. 14.809 strict kayıt doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,254 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_239.md).

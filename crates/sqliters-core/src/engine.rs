@@ -32198,8 +32198,8 @@ fn view_dml_index_term(term: &Expr) -> Option<(&ColumnRef, BinaryOp, &Expr)> {
     Some((column, *op, right))
 }
 
-fn view_dml_range_is_lower(op: BinaryOp, bound: &Expr) -> Option<bool> {
-    if !matches!(bound, Expr::Integer(_) | Expr::Float(_)) {
+fn view_dml_range_is_lower(op: BinaryOp, bound: &Expr, text_range: bool) -> Option<bool> {
+    if !text_range && !matches!(bound, Expr::Integer(_) | Expr::Float(_)) {
         return None;
     }
     match op {
@@ -32239,11 +32239,14 @@ fn view_dml_indexed_select(
         term => (term, None),
     };
     let (target_col, op, bound) = view_dml_index_term(term)?;
+    let text_range = predicate == ViewDmlIndexPredicate::UpdateRange
+        && second_term.is_none()
+        && matches!(bound, Expr::String(_));
     if !max_eq {
-        let is_lower = view_dml_range_is_lower(op, bound)?;
+        let is_lower = view_dml_range_is_lower(op, bound, text_range)?;
         if let Some((other_col, other_op, other_bound)) = second_term
             && (!target_col.column.eq_ignore_ascii_case(&other_col.column)
-                || is_lower == view_dml_range_is_lower(other_op, other_bound)?)
+                || is_lower == view_dml_range_is_lower(other_op, other_bound, false)?)
         {
             return None;
         }
@@ -32262,6 +32265,7 @@ fn view_dml_indexed_select(
     let table = schema.find_user_table(&name.name)?;
     if (max_eq && !table.without_rowid)
         || (table.without_rowid && predicate == ViewDmlIndexPredicate::DeleteRange)
+        || (text_range && (table.without_rowid || ctx.collations.get_custom("BINARY").is_some()))
         || table.stat1.has_stat1
         || !table.foreign_keys.is_empty()
         || table
@@ -32304,10 +32308,16 @@ fn view_dml_indexed_select(
         .iter()
         .position(|c| c.name.eq_ignore_ascii_case(column_name))?;
     let column = &table.columns[column_index];
-    if !matches!(
-        column.affinity,
-        TypeAffinity::Integer | TypeAffinity::Numeric | TypeAffinity::Real
-    ) || column.collation != Collation::Binary
+    let compatible_affinity = if text_range {
+        column.affinity == TypeAffinity::Text
+    } else {
+        matches!(
+            column.affinity,
+            TypeAffinity::Integer | TypeAffinity::Numeric | TypeAffinity::Real
+        )
+    };
+    if !compatible_affinity
+        || column.collation != Collation::Binary
         || column.custom_collation.is_some()
     {
         return None;
