@@ -1222,3 +1222,8 @@ Soğuk yazılabilir NamedDisk setter ve EXPLAIN şemayı C ile aynı prepare aş
 ## V6b.183 — İki kökte rowid aralığı ve sütun filtresi
 
 İki kök etkin yazma görüntüsünde doğrulanır, rowid aralığı ve özgün kalan filtre korunur. 396 native ve 396 takip yazıcısı, 792 rollback ve 1.188 açılış doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,255 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_183.md).
+
+
+## V6b.184 — Boş ana dosyanın tek hedefli WAL girişi
+
+İlk ROW boyunca sıfır bayt DB ve EXCLUSIVE korunur, sayfa 1 sonlandırmada ofset sıfırdan yazılır. 1.308 fiziksel çift, 2.646 C açılışı ve 12 doğal eş bağlantı profili doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,255 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_184.md).
