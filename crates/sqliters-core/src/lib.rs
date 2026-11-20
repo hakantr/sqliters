@@ -5129,9 +5129,10 @@ impl Connection {
         let Some(ref mut bt) = slot.btree else {
             return Err(SqliteError::new(ErrorCode::NotFound, "not found"));
         };
-        if mode >= 0 {
-            bt.pager_mut().set_persist_wal(mode != 0);
+        if mode < 0 {
+            return bt.pager().query_persist_wal(mode);
         }
+        bt.pager_mut().set_persist_wal(mode != 0);
         Ok(bt.pager().persist_wal())
     }
 

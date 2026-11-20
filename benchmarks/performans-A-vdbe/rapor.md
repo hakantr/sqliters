@@ -1287,3 +1287,8 @@ Hazırlama ve SQL yürütmesi C kip adlarının aynı ASCII önek kuralını pay
 ## V6b.196 — WAL checkpoint kip adı
 
 Tanınmayan checkpoint kip adı C gibi PASSIVE oluyor. 360 C karşılaştırması, 96 önceki sonuç farkı ve 1.800 fiziksel evre doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,435 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_196.md).
+
+
+## V6b.197 — Negatif PERSIST_WAL isteğinde VFS sonucu
+
+NamedDisk negatif sorgusu C gibi native VFS handle'ına gidiyor. Callback bulunmadığında mevcut Pager değeri kullanılıyor. 216 native, 144 fallback ve 36 DETACH akışı doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,261 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_197.md).

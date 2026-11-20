@@ -1333,6 +1333,20 @@ impl Pager {
         self.persist_wal
     }
 
+    /// Queries the native file flag when the VFS owns it.
+    #[doc(hidden)]
+    pub fn query_persist_wal(&self, request: i32) -> Result<bool> {
+        let mut mode = request.min(-1);
+        if self.db_kind == DatabaseKind::NamedDisk
+            && let Some(file) = self.file.as_deref()
+            && let Some(result) = file.persist_wal_mode(&mut mode)
+        {
+            result?;
+            return Ok(mode == 1);
+        }
+        Ok(self.persist_wal())
+    }
+
     /// Updates `SQLITE_FCNTL_PERSIST_WAL` (`true` keeps `-wal`/`-shm` on last-connection close).
     #[inline]
     pub fn set_persist_wal(&mut self, persist: bool) {
