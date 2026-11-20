@@ -2113,10 +2113,12 @@ impl<'a> Parser<'a> {
     fn parse_pragma(&mut self) -> Result<Stmt> {
         self.expect(TokenKind::Pragma)?;
         let qn = self.parse_qualified_name()?;
+        // MaxPgcnt decodes the signed token text, rather than an integer expression.
+        let keep_token_text = qn.name.eq_ignore_ascii_case("max_page_count");
         let value = if self.eat(TokenKind::Eq) {
-            Some(self.parse_pragma_value()?)
+            Some(self.parse_pragma_value(keep_token_text)?)
         } else if self.eat(TokenKind::Lp) {
-            let v = self.parse_pragma_value()?;
+            let v = self.parse_pragma_value(keep_token_text)?;
             self.expect(TokenKind::Rp)?;
             Some(v)
         } else {
@@ -2129,7 +2131,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_pragma_value(&mut self) -> Result<PragmaValue> {
+    fn parse_pragma_value(&mut self, keep_token_text: bool) -> Result<PragmaValue> {
         let sign = if self.eat(TokenKind::Minus) {
             Some(-1i64)
         } else if self.eat(TokenKind::Plus) {
@@ -2148,7 +2150,7 @@ impl<'a> Parser<'a> {
             return Err(self.syntax_err_at(tok, "invalid PRAGMA value"));
         }
         match tok.kind {
-            TokenKind::Integer => {
+            TokenKind::Integer if !keep_token_text => {
                 self.advance();
                 // parse.y nmnum is a token here, not an integer expression.
                 // PRAGMA accepts a hex token even when its value exceeds i64.
@@ -2162,7 +2164,7 @@ impl<'a> Parser<'a> {
                     })),
                 }
             }
-            TokenKind::Float => {
+            TokenKind::Integer | TokenKind::Float => {
                 self.advance();
                 let s = if neg < 0 {
                     format!("-{}", tok.text)
@@ -2175,15 +2177,15 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(PragmaValue::String(dequote(tok.text)))
             }
-            TokenKind::True => {
+            TokenKind::True if !keep_token_text => {
                 self.advance();
                 Ok(PragmaValue::Integer(1))
             }
-            TokenKind::False => {
+            TokenKind::False if !keep_token_text => {
                 self.advance();
                 Ok(PragmaValue::Integer(0))
             }
-            TokenKind::QuotedId | TokenKind::Id => {
+            TokenKind::QuotedId | TokenKind::Id | TokenKind::True | TokenKind::False => {
                 self.advance();
                 Ok(PragmaValue::Ident(dequote(tok.text)))
             }

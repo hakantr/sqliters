@@ -222,6 +222,14 @@ fn dec_or_hex(z: &str) -> Option<i64> {
     (rc == 0).then_some(value)
 }
 
+/// The request sent by `PRAGMA max_page_count` to OP_MaxPgcnt. Zero queries the current limit.
+#[doc(hidden)]
+pub fn max_page_count_request(value: &str) -> u32 {
+    dec_or_hex(value)
+        .unwrap_or(0)
+        .clamp(0, i64::from(SQLITE_MAX_PAGE_COUNT)) as u32
+}
+
 /// Matches a journal mode by its SQLite pragma prefix and returns its opcode value and name.
 #[doc(hidden)]
 pub fn resolve_journal_mode(value: &str) -> Option<(i32, &'static str)> {
@@ -606,10 +614,7 @@ pub fn sqlite3_pragma(
             if name.as_bytes()[0].eq_ignore_ascii_case(&b'p') {
                 p.v.add_op2(OP_Pagecount, i_db, p.n_mem);
             } else {
-                let n = right
-                    .and_then(dec_or_hex)
-                    .unwrap_or(0)
-                    .clamp(0, 0xffff_fffe) as u32 as i32;
+                let n = right.map_or(0, max_page_count_request) as i32;
                 p.v.add_op3(OP_MaxPgcnt, i_db, p.n_mem, n);
             }
             p.v.add_op2(OP_ResultRow, p.n_mem, 1);

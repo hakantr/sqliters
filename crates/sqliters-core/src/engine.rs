@@ -46844,13 +46844,9 @@ fn exec_pragma(
             let slot = ctx.db_set.slot_mut(db_id).unwrap();
             let cur_pc = slot.btree.as_ref().map_or(0, |bt| bt.pager().page_count());
             if let Some(pv) = value {
-                let req = pragma_to_i64(pv);
+                let req = sqliters_codegen::pragma::max_page_count_request(&pragma_to_string(pv));
                 if req > 0 {
-                    let clamped = u32::try_from(req)
-                        .unwrap_or(crate::db_set::SQLITE_MAX_PAGE_COUNT)
-                        .min(crate::db_set::SQLITE_MAX_PAGE_COUNT)
-                        .max(cur_pc.max(1));
-                    slot.max_page_count = clamped;
+                    slot.max_page_count = req.max(cur_pc.max(1));
                 }
             }
             Ok(single_col(
