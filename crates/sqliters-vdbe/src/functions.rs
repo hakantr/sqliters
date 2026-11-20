@@ -1820,15 +1820,14 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, modifier: &str) -> Opti
     let mut ms = time.unix_ms;
     let bare_hour24 = time.bare_hour24.take();
     let signed_hour24 = time.signed_hour24;
-    let s = modifier.trim();
-    if signed_hour24 && (s != modifier || !s.is_ascii()) {
+    if signed_hour24 && !modifier.is_ascii() {
         return None;
     }
     let calendar_in_range = !signed_hour24 || valid_julian_unix_ms(ms);
     let calendar_input = (calendar_in_range || time.calendar_retained).then_some(());
     let calendar_output =
         |result| (!signed_hour24 || valid_julian_unix_ms(result)).then_some(result);
-    let lower = s.to_ascii_lowercase();
+    let lower = modifier.to_ascii_lowercase();
     match lower.as_str() {
         "start of day" | "start of month" | "start of year" if bare_hour24.is_some() => {
             return Some(days_from_civil(2000, 1, 1) * 86_400_000);
@@ -1853,13 +1852,10 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, modifier: &str) -> Opti
         }
         _ => {}
     }
-    if let Some(rest) = lower.strip_prefix("weekday") {
+    if let Some(rest) = lower.strip_prefix("weekday ") {
         calendar_input?;
-        if !rest.starts_with(char::is_whitespace) || (signed_hour24 && !rest.starts_with(' ')) {
-            return None;
-        }
         let wf: f64 = if calendar_in_range {
-            rest.trim().parse().ok()?
+            rest.trim_matches(is_date_time_space).parse().ok()?
         } else {
             if rest.contains('-') {
                 return None;
@@ -1893,22 +1889,21 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, modifier: &str) -> Opti
         return calendar_output(ms.saturating_add(add_days * 86_400_000));
     }
 
-    let mut parts = s.split_whitespace();
-    let amount = parts.next()?;
+    let (amount, unit) = lower.split_at(lower.find(is_date_time_space)?);
+    if !matches!(
+        amount.as_bytes().first().copied()?,
+        b'+' | b'-' | b'0'..=b'9'
+    ) {
+        return None;
+    }
+    let unit = unit.trim_start_matches(is_date_time_space);
     let num: f64 = if signed_hour24 {
-        if !matches!(amount.as_bytes()[0], b'+' | b'-' | b'0'..=b'9') {
-            return None;
-        }
         let (value, status) = sqliters_types::sqlite_atof(amount.as_bytes());
         (status > 0).then_some(value)?
     } else {
         amount.parse().ok()?
     };
     if !num.is_finite() {
-        return None;
-    }
-    let unit = parts.next()?.to_ascii_lowercase();
-    if parts.next().is_some() {
         return None;
     }
     if bare_hour24.is_some_and(|clock| clock.offset_ms != 0) {
@@ -1927,7 +1922,7 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, modifier: &str) -> Opti
         }
         Some(ms.saturating_add((num * (seconds * 1_000.0)).round() as i64))
     };
-    let unit = unit.strip_suffix('s').unwrap_or(&unit);
+    let unit = unit.strip_suffix('s').unwrap_or(unit);
     match unit {
         "second" => elapsed(1.0, 4.6427e14),
         "minute" => elapsed(60.0, 7.7379e12),
