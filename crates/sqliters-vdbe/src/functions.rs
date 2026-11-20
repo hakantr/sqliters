@@ -1387,11 +1387,11 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + i64::from(doe) - 719_468
 }
 
-fn parse_time_value_to_unix_ms(
+fn parse_datetime_value(
     val: &Value,
     modifiers: &[Value],
     ctx: &VmRuntimeContext,
-) -> Option<i64> {
+) -> Option<(i64, bool)> {
     if val.is_null() || modifiers.iter().any(Value::is_null) {
         return None;
     }
@@ -1420,8 +1420,13 @@ fn parse_time_value_to_unix_ms(
         Value::Null | Value::Blob(_) => return None,
     };
 
+    let mut use_subsec = false;
     for m in modifiers {
         let mod_str = m.to_text_lossy();
+        if mod_str.eq_ignore_ascii_case("subsec") || mod_str.eq_ignore_ascii_case("subsecond") {
+            use_subsec = true;
+            continue;
+        }
         let mt = mod_str.trim();
         if mt.eq_ignore_ascii_case("unixepoch")
             || mt.eq_ignore_ascii_case("utc")
@@ -1431,7 +1436,7 @@ fn parse_time_value_to_unix_ms(
         }
         ms = apply_datetime_modifier_ms(ms, mt)?;
     }
-    Some(ms)
+    Some((ms, use_subsec))
 }
 
 fn parse_iso_datetime_ms(input: &str) -> Option<i64> {
@@ -1580,7 +1585,6 @@ fn apply_datetime_modifier_ms(ms: i64, s: &str) -> Option<i64> {
             let (y, _, _, _, _, _) = utc_ymdhms_from_unix_ms(ms);
             return Some(days_from_civil(i64::from(y), 1, 1) * 86_400_000);
         }
-        "subsec" | "subsecond" => return Some(ms),
         _ => {}
     }
     if let Some(rest) = lower.strip_prefix("weekday") {
@@ -1653,19 +1657,29 @@ fn eval_datetime_function(
     args: &[Value],
     ctx: &VmRuntimeContext,
 ) -> Result<Value> {
-    let unix_ms = if args.is_empty() {
-        ctx.effective_timestamp_ms()
+    let (unix_ms, use_subsec) = if args.is_empty() {
+        (ctx.effective_timestamp_ms(), false)
     } else {
-        let Some(ms) = parse_time_value_to_unix_ms(&args[0], &args[1..], ctx) else {
+        let Some(parsed) = parse_datetime_value(&args[0], &args[1..], ctx) else {
             return Ok(Value::Null);
         };
-        ms
+        parsed
     };
 
     match upper_name {
         "DATE" => Ok(Value::Text(format_utc_date(unix_ms))),
-        "TIME" => Ok(Value::Text(format_utc_time(unix_ms))),
-        "DATETIME" => Ok(Value::Text(format_utc_timestamp(unix_ms))),
+        "TIME" | "DATETIME" => {
+            let mut text = if upper_name == "TIME" {
+                format_utc_time(unix_ms)
+            } else {
+                format_utc_timestamp(unix_ms)
+            };
+            if use_subsec {
+                text.push_str(&format!(".{:03}", unix_ms.rem_euclid(1_000)));
+            }
+            Ok(Value::Text(text))
+        }
+        "UNIXEPOCH" if use_subsec => Ok(Value::real(unix_ms as f64 / 1_000.0)),
         "UNIXEPOCH" => Ok(Value::Integer(unix_ms.div_euclid(1_000))),
         "JULIANDAY" => Ok(Value::real((unix_ms as f64) / 86_400_000.0 + 2_440_587.5)),
         _ => unreachable!(),
@@ -1680,13 +1694,13 @@ fn eval_strftime_function(args: &[Value], ctx: &VmRuntimeContext) -> Result<Valu
         return Ok(Value::Null);
     }
     let fmt = args[0].to_text_lossy();
-    let unix_ms = if args.len() == 1 {
-        ctx.effective_timestamp_ms()
+    let (unix_ms, use_subsec) = if args.len() == 1 {
+        (ctx.effective_timestamp_ms(), false)
     } else {
-        let Some(ms) = parse_time_value_to_unix_ms(&args[1], &args[2..], ctx) else {
+        let Some(parsed) = parse_datetime_value(&args[1], &args[2..], ctx) else {
             return Ok(Value::Null);
         };
-        ms
+        parsed
     };
     let (y, m, d, hh, mm, ss) = utc_ymdhms_from_unix_ms(unix_ms);
     let ms_rem = unix_ms.rem_euclid(1_000) as u32;
@@ -1729,6 +1743,13 @@ fn eval_strftime_function(args: &[Value], ctx: &VmRuntimeContext) -> Result<Valu
             'R' => out.push_str(&format!("{hh:02}:{mm:02}")),
             'j' => out.push_str(&format!("{doy_1_based:03}")),
             'J' => out.push_str(&format!("{jd:.9}")),
+            's' if use_subsec => {
+                let sign = if unix_ms < 0 { "-" } else { "" };
+                let magnitude = unix_ms.unsigned_abs();
+                let seconds = magnitude / 1_000;
+                let fraction = magnitude % 1_000;
+                out.push_str(&format!("{sign}{seconds}.{fraction:03}"));
+            }
             's' => out.push_str(&format!("{total_secs}")),
             'w' => out.push_str(&format!("{dow}")),
             'u' => out.push_str(&format!("{}", if dow == 0 { 7 } else { dow })),
