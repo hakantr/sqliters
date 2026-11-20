@@ -24538,9 +24538,27 @@ impl<'a> MixedIndexWrite<'a> {
         }
     }
 
-    fn applies_with_second_index(self, table: &TableSchema) -> bool {
+    fn applies_with_second_index(
+        self,
+        table: &TableSchema,
+        mixed_key: &IndexedColSchema,
+        ordinary_key: &IndexedColSchema,
+    ) -> bool {
         if let Self::Insert(insert) = self {
-            return matches!(insert.source, InsertSource::Values(_));
+            if matches!(insert.source, InsertSource::Values(_)) {
+                return true;
+            }
+            let (InsertSource::Select(_), Some([rowid, mixed, ordinary])) =
+                (&insert.source, insert.columns.as_deref())
+            else {
+                return false;
+            };
+            return table.rowid_alias_col.and_then(|column| table.columns.get(column))
+                .is_some_and(|column| column.name.eq_ignore_ascii_case(rowid))
+                && mixed.eq_ignore_ascii_case(&mixed_key.name)
+                && ordinary.eq_ignore_ascii_case(&ordinary_key.name)
+                && ordinary_key.col_idx.and_then(|column| table.columns.get(column))
+                    .is_some_and(|column| column.affinity == TypeAffinity::Text);
         }
         let selection = self.selection();
         !matches!(selection, Some(Expr::InList { .. }))
@@ -24998,7 +25016,7 @@ fn mixed_index_write_root<'a>(
             let writes_both_keys = table.columns[column].affinity == TypeAffinity::Text
                 && (mixed_scan.is_some() || (ordinary_scan.is_some() && ordinary_equality))
                 && write.writes_both_keys(mixed_key, key);
-            if (scan_index.is_some() || write.applies_with_second_index(table))
+            if (scan_index.is_some() || write.applies_with_second_index(table, mixed_key, key))
                 && (write.applies(table, mixed, mixed_key, db_set) || writes_scan_key || writes_both_keys)
             {
                 return Some(MixedIndexWritePlan {
