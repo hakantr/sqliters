@@ -1212,3 +1212,8 @@ Soğuk yazılabilir ana NamedDisk üzerinde değersiz sorgu ve EXPLAIN şemayı 
 ## V6b.181 — İki kökte rowid IN yazımı
 
 Düz rowid/IPK listesi uygun iki kökün etkin yazma görüntüsü doğrulamasından geçer. 396 native ve 396 takip yazıcısı, 792 rollback, 1.188 açılış doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,256 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_181.md).
+
+
+## V6b.182 — Yazılabilir journal_mode setter hazırlığı
+
+Soğuk yazılabilir NamedDisk setter ve EXPLAIN şemayı C ile aynı prepare aşamasında hazırlar. 940 fiziksel hazırlık çifti ve 48 doğal prepare çekişmesi profili doğrulandı. OFF 1186/1/337, ON 1178/9/337. DML OFF 390/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,332 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_182.md).

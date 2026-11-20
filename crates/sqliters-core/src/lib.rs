@@ -1933,13 +1933,13 @@ impl ConnectionInner {
     }
 
     // sqlite3Pragma() loads the schema for journal_mode while preparing
-    // the query or EXPLAIN, before OP_JournalMode can run.
+    // the statement, before OP_JournalMode can query or change the mode.
     fn journal_mode_needs_schema(&self, stmt: &Stmt) -> bool {
         let stmt = match stmt {
             Stmt::Explain { stmt, .. } => stmt.as_ref(),
             stmt => stmt,
         };
-        let Stmt::Pragma { schema, name, value } = stmt else {
+        let Stmt::Pragma { schema, name, .. } = stmt else {
             return false;
         };
         if !name.eq_ignore_ascii_case("journal_mode")
@@ -1950,10 +1950,7 @@ impl ConnectionInner {
 
         let main = self.db_set.main_slot();
         !main.schema.loaded
-            && main.btree.as_ref().is_some_and(|bt| {
-                let pager = bt.pager();
-                pager.db_kind() == DatabaseKind::NamedDisk && (value.is_none() || pager.is_readonly())
-            })
+            && main.btree.as_ref().is_some_and(|bt| bt.pager().db_kind() == DatabaseKind::NamedDisk)
     }
 
     /// Ensures `sqlite_schema` catalogs across open database slots are loaded for `prepare`,
