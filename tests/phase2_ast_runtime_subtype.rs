@@ -809,7 +809,7 @@ fn group64_ast_structural_qualified_names_and_attach_detach() {
     ));
 
     let (s_sel, _) = parse_one(
-        "SELECT main.\"a.b\".\"c.d\", \"a.b\".*, main.\"a.b\".*
+        "SELECT main.\"a.b\".\"c.d\", \"a.b\".*
          FROM main.\"a.b\"
          WHERE \"c.d\" IN main.\"t.2\";",
     )
@@ -846,13 +846,12 @@ fn group64_ast_structural_qualified_names_and_attach_detach() {
             table: "a.b".into(),
         }
     );
-    assert_eq!(
-        projection[2],
-        ResultColumn::TableStar {
-            schema: Some("main".into()),
-            table: "a.b".into(),
-        }
-    );
+    let invalid_projection = "SELECT main.\"a.b\".* FROM main.\"a.b\";";
+    let error = parse_one(invalid_projection).unwrap_err();
+    assert_eq!(error.code, ErrorCode::Error);
+    assert_eq!(error.extended_code, 1);
+    assert_eq!(error.message, "near \"*\": syntax error");
+    assert_eq!(error.offset, invalid_projection.find('*'));
     assert!(matches!(
         from.as_ref().unwrap().head,
         TableOrSubquery::Table { ref name, .. }
@@ -894,14 +893,22 @@ fn group64_quoted_dots_three_part_refs_in_table_and_catalog_sql_c_parity() {
     let r_rows = run_rust_script(&conn, script).expect("Rust script should succeed");
     assert_eq!(r_rows, c_rows);
 
-    // Verify 3-part schema-qualified `TableStar` (`SELECT main."a.b".*` / `SELECT main.al.*`)
-    let three_part_star = run_rust_script(
-        &conn,
-        "SELECT main.\"a.b\".* FROM main.\"a.b\" ORDER BY plain;
-         SELECT main.al.* FROM main.\"a.b\" AS al ORDER BY plain;",
-    )
-    .unwrap();
-    assert_eq!(three_part_star, vec!["7|70", "8|80", "7|70", "8|80"]);
+    for sql in [
+        "SELECT main.\"a.b\".* FROM main.\"a.b\" ORDER BY plain;",
+        "SELECT main.al.* FROM main.\"a.b\" AS al ORDER BY plain;",
+    ] {
+        let expected = "near \"*\": syntax error";
+        let c_error = run_c_sql(sql).expect_err("C rejects the SELECT projection");
+        assert!(c_error.contains(expected), "{c_error}");
+        let error = conn
+            .prepare(sql)
+            .err()
+            .expect("Rust rejects the SELECT projection");
+        assert_eq!(error.code, ErrorCode::Error);
+        assert_eq!(error.extended_code, 1);
+        assert_eq!(error.message, expected);
+        assert_eq!(error.offset, sql.find('*'));
+    }
 
     // Negative cases differentially verified against C SQLite 3.54.1:
     let error_cases = [

@@ -1253,20 +1253,23 @@ fn test_gate2_3_name_resolution_vdbe_vs_interpreter_c_parity_and_autovacuum() {
             explain.rows
         );
 
-        // Verify 3-part `SELECT aux.items.*` parity between `VdbeVm` and `engine.rs` interpreter.
-        let q_3part_star = "SELECT aux.items.* FROM aux.items WHERE aux.items.code = 'BETA';";
-        let vdbe_3part = format_rows_pipe(&r_conn.query(q_3part_star, &[]).unwrap().rows);
-        let interp_3part = format_rows_pipe(
-            &r_conn
-                .query(
-                    &format!("WITH _force_interp(z) AS (VALUES(1)) {q_3part_star}"),
-                    &[],
-                )
-                .unwrap()
-                .rows,
-        );
-        assert_eq!(vdbe_3part, "2|BETA|25\n");
-        assert_eq!(vdbe_3part, interp_3part);
+        let qualified_star = "SELECT aux.items.* FROM aux.items WHERE aux.items.code = 'BETA';";
+        for sql in [
+            qualified_star.to_owned(),
+            format!("WITH _force_interp(z) AS (VALUES(1)) {qualified_star}"),
+        ] {
+            let error = r_conn
+                .prepare(&sql)
+                .err()
+                .expect("Rust rejects the SELECT projection");
+            let expected = "near \"*\": syntax error";
+            assert_eq!(error.code, ErrorCode::Error);
+            assert_eq!(error.extended_code, 1);
+            assert_eq!(error.message, expected);
+            assert_eq!(error.offset, sql.find('*'));
+            let (c_ok, _, c_error) = run_c_sqlite_in_dir(&c_dir, ":memory:", &sql);
+            assert!(!c_ok && c_error.contains(expected), "{c_error}");
+        }
 
         let queries = [
             "SELECT items.* FROM aux.items WHERE aux.items.code = 'BETA';",

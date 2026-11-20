@@ -1482,3 +1482,8 @@ Olağan eş sayfa boyutlu named-disk DELETE, PERSIST ve TRUNCATE yedeğinde ilk 
 ## V6b.235 — ISO uzun saat kesri
 
 Canonical ISO uzun saat kesrinde birikim, 0.999 üst sınırı ve tam saniye ile milisaniyeye yuvarlama C binary64 işlem sırasına uyar. 97 kesir ve bir son aralık bağlamında kip başına 3.528 ham kayıt eşleşti. Ek 288 ham %f/iJD bağlamı eş ve önceki C eş 60 %f çıktısı korundu. 73 çok uzun girdi için sonlu, sonsuz ölçek ve NaN davranışı ölçüldü. 1.144 C salt okunur açılışı, 12 VDBE testi ve 10.789 strict kayıt doğrulandı. OFF 1186/1/337, ON 1179/8/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,256 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_235.md).
+
+
+## V6b.236 — SELECT üç parçalı yıldız tanısı
+
+SELECT projeksiyonunda şema ve tablo veya alias ile nitelenmiş yıldız C gibi prepare sırasında rc ve extended rc 1, aynı mesaj ve yıldızın bayt ofsetini döndürür. 64 OFF farkı kapandı. 136 negatif ve 112 geçerli C–Rust karşılaştırması, 372 C açılışı ve 56 gerçek ON izi doğrulandı. İki mevcut runtime testinin beklentisi C tanısıyla hizalandı ve bunların diğer kontrolleri korundu. İki runtime ve yapısal AST testi iki kipte 6/6 geçti. 4.722 strict doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Ayrışma bulucu ve önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,253 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_236.md).
