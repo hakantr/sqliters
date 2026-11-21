@@ -1551,6 +1551,19 @@ fn parse_datetime_value(
             })?,
             Value::Null | Value::Blob(_) => return None,
         };
+        if let Value::Text(stamp) = val {
+            let mut date_modifiers = modifiers.iter().filter(|m| !is_output_precision(m));
+            if let (Some(Value::Text(modifier)), None) =
+                (date_modifiers.next(), date_modifiers.next())
+                && modifier
+                    .get(..7)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("end of "))
+            {
+                let unix_ms = end_of_iso_period_ms(time.unix_ms, stamp, modifier)?;
+                return valid_julian_unix_ms(unix_ms)
+                    .then_some((ParsedDateTime::from_unix_ms(unix_ms), modifiers.len() > 1));
+            }
+        }
         // A canonical date is already normalized and has no raw clock fields.
         let modifiers = if let Value::Text(date) = val
             && matches!(date.as_bytes(), [_, _, _, _, b'-', _, _, b'-', _, _])
@@ -1632,7 +1645,7 @@ fn parse_datetime_value(
         if !check_julian_range
             || time.bare_hour24.is_some()
             || time.signed_hour24
-            || has_raw_calendar_overflow(val)
+            || matches!(val, Value::Text(text) if has_raw_calendar_overflow(text))
         {
             return None;
         }
@@ -2082,10 +2095,7 @@ fn parse_packed_hms_modifier(text: &str) -> Option<(PackedCalendarShift, i64)> {
     Some((shift, clock_ms))
 }
 
-fn has_raw_calendar_overflow(value: &Value) -> bool {
-    let Value::Text(text) = value else {
-        return false;
-    };
+fn has_raw_calendar_overflow(text: &str) -> bool {
     let Some(date) = text.get(..10) else {
         return false;
     };
@@ -2098,6 +2108,39 @@ fn has_raw_calendar_overflow(value: &Value) -> bool {
     };
     parse_iso_datetime(date, false)
         .is_some_and(|local| utc_ymdhms_from_unix_ms(local.unix_ms).2 != raw_day)
+}
+
+fn end_of_iso_period_ms(unix_ms: i64, stamp: &str, modifier: &str) -> Option<i64> {
+    let (date, clock) = stamp.split_at_checked(10)?;
+    let canonical_clock = match clock.as_bytes() {
+        [] => true,
+        [b' ' | b'T', _, _, b':', ..] => {
+            parse_two_time_digits(clock.get(1..3)?).is_some_and(|hour| hour < 24)
+        }
+        _ => false,
+    };
+    if !matches!(
+        date.as_bytes(),
+        [b'0'..=b'9', _, _, _, b'-', _, _, b'-', _, _]
+    ) || !canonical_clock
+        || has_raw_calendar_overflow(stamp)
+        || !valid_julian_unix_ms(unix_ms)
+    {
+        return None;
+    }
+
+    let (year, month, day, _, _, _) = utc_ymdhms_from_unix_ms(unix_ms);
+    let year = i64::from(year);
+    let next_day = match modifier.to_ascii_lowercase().as_str() {
+        "end of day" => days_from_civil(year, month, day) + 1,
+        // SQLite computes the following month first, including its civil year check.
+        "end of month" if (year, month) != (9999, 12) => {
+            days_from_civil(year + i64::from(month == 12), month % 12 + 1, 1)
+        }
+        "end of year" => days_from_civil(year, 12, 31) + 1,
+        _ => return None,
+    };
+    Some(next_day * 86_400_000 - 1)
 }
 
 fn apply_packed_calendar_shift(

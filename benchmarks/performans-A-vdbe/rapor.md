@@ -1747,3 +1747,8 @@ Tek typed Julian ve tam ay veya yıl değiştiricisi, C miktar ve Julian aralık
 ## V6b.288 — WITHOUT ROWID görünümü iki tam indeks
 
 Kapsayıcı olmayan iki sıradan tam BINARY ikincil indeksli WR görünüm aralığı, C ile eş kökü seçer. 360 eski log veya dosya farkı kapandı. 1.632 iki indeks profili ve 7.728 C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,260 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_288.md).
+
+
+## V6b.289 — Gün ay ve yıl sonu tarih değiştiricileri
+
+Normal ISO tarih metninde end of day/month/year, C'nin son milisaniye ve civil yıl aralığı kararını kullanır. Dokuz Tcl vakası, kodlama başına 976 hedef ve 30 C salt okunur açılışı eş. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,293 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_289.md).
