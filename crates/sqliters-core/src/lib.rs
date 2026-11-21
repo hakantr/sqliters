@@ -10282,7 +10282,10 @@ impl Statement {
         );
         let mut vm_rt = inner.runtime;
         vm_rt.text_encoding = inner.effective_encoding();
-        if vm_rt.stmt_timestamp_ms.is_none() && prog.needs_stmt_timestamp() {
+        if vm_rt.stmt_timestamp_ms.is_none()
+            && prog.needs_stmt_timestamp()
+            && !prog.uses_step_clock(inner.db_set.main_btree().pager().db_kind())
+        {
             vm_rt.stmt_timestamp_ms = Some(
                 inner
                     .db_set
@@ -10953,7 +10956,10 @@ impl Statement {
                         );
                         let mut vm_rt = inner.runtime;
                         vm_rt.text_encoding = inner.effective_encoding();
-                        if vm_rt.stmt_timestamp_ms.is_none() && prog_final.needs_stmt_timestamp() {
+                        if vm_rt.stmt_timestamp_ms.is_none()
+                            && prog_final.needs_stmt_timestamp()
+                            && !prog_final.uses_step_clock(inner.db_set.main_btree().pager().db_kind())
+                        {
                             vm_rt.stmt_timestamp_ms = Some(
                                 inner
                                     .db_set

@@ -265,6 +265,17 @@ pub trait ExecutionServices {
     /// `FunctionFlags::RESULT_SUBTYPE` strict validation.
     fn call_scalar(&mut self, name: &str, args: &[RuntimeValue]) -> Result<RuntimeValue>;
 
+    /// Calls a scalar in a streaming read with an on-demand clock shared by this VM step.
+    #[doc(hidden)]
+    fn call_scalar_with_step_clock(
+        &mut self,
+        name: &str,
+        args: &[RuntimeValue],
+        _clock: &mut dyn FnMut() -> i64,
+    ) -> Result<RuntimeValue> {
+        self.call_scalar(name, args)
+    }
+
     /// Compares two UTF-8 strings under the named collation sequence (`BINARY`, `NOCASE`, `RTRIM`,
     /// or user-registered collation).
     fn compare_collated(

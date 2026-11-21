@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 pub use sqliters_btree::PointProjCol;
 use sqliters_btree::{Btree, CursorId};
 use sqliters_types::{
-    AggregateStepId, Collation, DatabaseId, ErrorCode, ExecutionServices, KeySortOrder, Pgno,
-    Result, RuntimeValue, SqliteError, TextEncoding, TypeAffinity, Value,
+    AggregateStepId, Collation, DatabaseId, DatabaseKind, ErrorCode, ExecutionServices, KeySortOrder,
+    Pgno, Result, RuntimeValue, SqliteError, TextEncoding, TypeAffinity, Value,
     decode_record_with_encoding, encode_runtime_record_into, fallible_sort_by,
 };
 
@@ -558,6 +558,7 @@ pub struct VdbeProgram {
     primary_write_db: Option<DatabaseId>,
     has_function_call: bool,
     needs_stmt_timestamp: bool,
+    step_clock: bool,
     needs_stmt_subsavepoint: bool,
     abort_safe_without_stmt_journal: bool,
     rowid_point_select: Option<RowidPointSelectPlan>,
@@ -578,6 +579,7 @@ impl VdbeProgram {
             primary_write_db: None,
             has_function_call: false,
             needs_stmt_timestamp: false,
+            step_clock: false,
             needs_stmt_subsavepoint: true,
             abort_safe_without_stmt_journal: true,
             rowid_point_select: None,
@@ -737,6 +739,16 @@ impl VdbeProgram {
     #[inline(always)]
     pub fn needs_stmt_timestamp(&self) -> bool {
         self.needs_stmt_timestamp
+    }
+
+    #[doc(hidden)]
+    pub fn enable_step_clock(&mut self) {
+        self.step_clock = true;
+    }
+
+    #[doc(hidden)]
+    pub fn uses_step_clock(&self, kind: DatabaseKind) -> bool {
+        self.step_clock && kind == DatabaseKind::NamedDisk
     }
 
     pub fn patch_p2(&mut self, addr: usize, target: usize) {
@@ -1195,6 +1207,7 @@ impl VdbeVm {
             runtime_ctx,
             storage,
             services,
+            false,
         );
         close_cursors_vec(&mut scratch.cursors, storage);
         scratch.pool.clear_registers(&mut scratch.regs[..n_regs]);
@@ -1245,6 +1258,11 @@ impl VdbeVm {
         if self.halted {
             return Ok(VmStep::Done);
         }
+        let step_clock = self.program.step_clock
+            && self.runtime_ctx.stmt_timestamp_ms.is_none()
+            && storage
+                .btree_ref(DatabaseId::MAIN)
+                .is_ok_and(|btree| self.program.uses_step_clock(btree.pager().db_kind()));
         match step_ops(
             &self.program.ops,
             &mut self.pc,
@@ -1256,6 +1274,7 @@ impl VdbeVm {
             &mut self.runtime_ctx,
             storage,
             services,
+            step_clock,
         ) {
             Ok(VmStep::Row(row)) => Ok(VmStep::Row(row)),
             Ok(VmStep::Done) => {
@@ -1284,6 +1303,7 @@ fn step_ops(
     runtime_ctx: &mut VmRuntimeContext,
     storage: &mut dyn BtreeAccess,
     services: &mut dyn ExecutionServices,
+    step_clock: bool,
 ) -> Result<VmStep> {
     let mut local_ticks = 0u64;
     let res = step_ops_loop(
@@ -1297,6 +1317,7 @@ fn step_ops(
         runtime_ctx,
         storage,
         services,
+        step_clock,
         &mut local_ticks,
     );
     if local_ticks != 0 {
@@ -1317,8 +1338,10 @@ fn step_ops_loop(
     runtime_ctx: &mut VmRuntimeContext,
     storage: &mut dyn BtreeAccess,
     services: &mut dyn ExecutionServices,
+    step_clock: bool,
     local_ticks: &mut u64,
 ) -> Result<VmStep> {
+    let mut step_timestamp = None;
     let empty_orders: Arc<[KeySortOrder]> = Arc::from([]);
     let truthiness = |value: &Value, storage: &dyn BtreeAccess| {
         let encoding = storage
@@ -2238,7 +2261,16 @@ fn step_ops_loop(
                 let P4::Func { ref name, argc } = ins.p4 else {
                     return Err(SqliteError::misuse("Function missing P4::Func"));
                 };
-                let res = services.call_scalar(name, &regs[start..start + argc])?;
+                let args = &regs[start..start + argc];
+                let res = if step_clock {
+                    let vfs = storage.btree_ref(DatabaseId::MAIN)?.pager().vfs();
+                    let mut now = || {
+                        *step_timestamp.get_or_insert_with(|| vfs.current_unix_millis())
+                    };
+                    services.call_scalar_with_step_clock(name, args, &mut now)?
+                } else {
+                    services.call_scalar(name, args)?
+                };
                 fast_poll = services.fast_interrupt_and_no_progress();
                 regs[dest] = res;
             }

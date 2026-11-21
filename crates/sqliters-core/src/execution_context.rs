@@ -1067,6 +1067,12 @@ impl ExecutionContext<'_> {
     }
 }
 
+pub(crate) fn step_clock_date_scalar(name: &str) -> bool {
+    ["date", "time", "datetime", "julianday", "unixepoch"]
+        .iter()
+        .any(|builtin| name.eq_ignore_ascii_case(builtin))
+}
+
 impl ExecutionServices for ExecutionContext<'_> {
     #[inline(always)]
     fn fast_interrupt_and_no_progress(&self) -> Option<&AtomicBool> {
@@ -1094,6 +1100,26 @@ impl ExecutionServices for ExecutionContext<'_> {
     fn call_scalar(&mut self, name: &str, args: &[RuntimeValue]) -> Result<RuntimeValue> {
         self.functions
             .call_scalar(name, args, self.runtime, self.strict_subtype)
+    }
+
+    fn call_scalar_with_step_clock(
+        &mut self,
+        name: &str,
+        args: &[RuntimeValue],
+        clock: &mut dyn FnMut() -> i64,
+    ) -> Result<RuntimeValue> {
+        if step_clock_date_scalar(name)
+            && matches!(args.first().map(|arg| &arg.value), Some(Value::Text(s))
+                if s.trim().eq_ignore_ascii_case("now"))
+            && self.functions.find_scalar(name, args.len()).is_none()
+        {
+            let runtime = VmRuntimeContext {
+                stmt_timestamp_ms: Some(clock()),
+                ..*self.runtime
+            };
+            return self.functions.call_scalar(name, args, &runtime, self.strict_subtype);
+        }
+        self.call_scalar(name, args)
     }
 
     fn compare_collated(

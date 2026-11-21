@@ -22,7 +22,7 @@ use sqliters_vdbe::{
 };
 
 use crate::db_set::{DatabaseSet, ResolvedRelation};
-use crate::execution_context::FunctionRegistry;
+use crate::execution_context::{FunctionRegistry, step_clock_date_scalar};
 use crate::schema::{
     IndexSchema, IndexedColSchema, Schema, TableSchema, ViewSchema, fix_permanent_view_select,
     sqlite_log_est, sqlite_log_est_add,
@@ -4752,6 +4752,60 @@ struct SingleTableSource<'a> {
     allow_wr_autoindex_covering: bool,
 }
 
+fn step_clock_projection(expr: &Expr, functions: &FunctionRegistry) -> Option<bool> {
+    match expr {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Integer(_)
+        | Expr::Float(_)
+        | Expr::String(_)
+        | Expr::Blob(_)
+        | Expr::Bind(_)
+        | Expr::Column(_) => Some(false),
+        Expr::Binary { left, right, .. } => Some(
+            step_clock_projection(left, functions)? | step_clock_projection(right, functions)?,
+        ),
+        Expr::FunctionCall {
+            name,
+            args: FunctionArgs::Exprs(args),
+            distinct: false,
+            filter: None,
+            over: None,
+        } => {
+            if [
+                "strftime", "timediff", "current_date", "current_time", "current_timestamp",
+            ]
+            .iter()
+            .any(|builtin| name.eq_ignore_ascii_case(builtin))
+            {
+                return None;
+            }
+            let date = step_clock_date_scalar(name);
+            if date {
+                let input = match args.as_slice() {
+                    [input] => input,
+                    [input, Expr::String(modifier)]
+                        if modifier.eq_ignore_ascii_case("subsec")
+                            || modifier.eq_ignore_ascii_case("subsecond") =>
+                    {
+                        input
+                    }
+                    _ => return None,
+                };
+                if expr_is_table_independent(input)
+                    || functions.find_scalar(name, args.len()).is_some()
+                {
+                    return None;
+                }
+            }
+            args.iter().try_fold(date, |has_date, arg| {
+                Some(has_date | step_clock_projection(arg, functions)?)
+            })
+        }
+        _ => None,
+    }
+}
+
 fn compile_single_table_select(
     source: SingleTableSource<'_>,
     projection: &[ResultColumn],
@@ -5319,6 +5373,21 @@ fn compile_single_table_select(
             total_cols as i32,
         ));
     } else {
+        // Only the natural row stream can give each projection its own step clock.
+        // A constant date expression may have C's Once lifetime even in that stream.
+        if db_id == DatabaseId::MAIN
+            && !tbl.without_rowid
+            && matches!(plan, AccessPlan::FullScan)
+            && selection.is_none()
+            && limit.is_none()
+            && indexed_by.is_none()
+            && tbl.columns.iter().all(|col| col.generated.is_none())
+            && expanded.iter().try_fold(false, |has_date, (expr, _, _)| {
+                Some(has_date | step_clock_projection(expr, functions)?)
+            }) == Some(true)
+        {
+            prog.enable_step_clock();
+        }
         // Streaming OFFSET / LIMIT check before ResultRow
         if let Some((rem_reg, off_reg_opt, one_reg, zero_reg)) = limit_regs {
             if let Some(off_reg) = off_reg_opt {

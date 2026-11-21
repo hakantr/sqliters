@@ -1807,3 +1807,8 @@ INTEGER sorgu ve çıplak REAL kısmi koşulunda C’nin tam indeks seçimi uygu
 ## V6b.300 — WITHOUT ROWID farklı anahtarlı REAL koşulu
 
 Farklı ilk sütunlu kısmi indeksin çıplak REAL koşulu C gibi maliyet öncesinde elenir. 160 eski ve 200 ek sonuç C ile aynı. 23.928 C salt okunur bütünlük kontrolü geçti. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_300.md).
+
+
+## V6b.301 — Doğal SELECT akışında adım saati
+
+Exact birleşik tabanda ölçülen doğal legacy projeksiyonlar zamanı ilk ihtiyaçta ve aynı adım boyunca tek değer olarak alır. Beş sorgu biçiminde 100 C eş sonuç, 209 C salt okunur açılış ve 840 native matris kaydı yeniden doğrulandı. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,270 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_301.md).
