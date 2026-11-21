@@ -615,3 +615,36 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_materialized_limit_constraints() {
+    sqliters_tcltest::run_test_script(
+        "materialized_limit",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE item(id INTEGER PRIMARY KEY, label TEXT);
+  INSERT INTO item VALUES(1,'a'),(2,'b'),(3,'a'),(4,'c');
+}
+do_execsql_test materialized-limit-1 {
+  SELECT DISTINCT label FROM item ORDER BY label LIMIT '2e0' OFFSET '1.0';
+} {b c}
+do_catchsql_test materialized-limit-2 {
+  SELECT DISTINCT label FROM item ORDER BY label LIMIT 1.5;
+} {1 {datatype mismatch}}
+do_catchsql_test materialized-limit-3 {
+  SELECT label,count(*) FROM item GROUP BY label ORDER BY label LIMIT 1 OFFSET NULL;
+} {1 {datatype mismatch}}
+do_execsql_test materialized-limit-4 {
+  SELECT id FROM item UNION ALL SELECT id FROM item ORDER BY 1 LIMIT 0 OFFSET 'unused';
+} {}
+do_execsql_test materialized-limit-5 {
+  WITH RECURSIVE seq(x) AS (
+    VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<5 LIMIT '2e0' OFFSET '1'
+  ) SELECT x FROM seq ORDER BY x;
+} {2 3}
+finish_test
+"#,
+    );
+}

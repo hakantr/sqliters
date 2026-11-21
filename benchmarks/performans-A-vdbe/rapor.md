@@ -1902,3 +1902,8 @@ Mevcut NOT NULL paketi iki çalışma kipinde etkin. 106/106 ham Tcl kontrolü, 
 ## V6b.319 — LIMIT ve OFFSET tam sayı kurallarını C ile eşle
 
 Tek tablo ve tablosuz SELECT yürütmesinde C kayıpsız tam sayı dönüşümü, negatif LIMIT ve sıfır LIMIT sırası uygulandı. 31 geçerli sorgu, kip başına 180 hata girdisi ve 18 C salt okunur açılış eş. LIMIT Tcl paketi iki kipte 122/122 ile etkin. OFF 1195/1/329, ON 1192/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,270 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_319.md).
+
+
+## V6b.320 — Materyalize SELECT LIMIT ve OFFSET değerlerini C ile eşle
+
+Materyalize SELECT ve CTE sınırları kayıpsız tam sayı dönüşümünü kullanır. Üç kodlama ve iki günlük kipinde 510 başlangıç farkı kapandı. Kip başına 540 C karşılaştırması ve 18 C salt okunur açılış eş. Beş davranışı kapsayan yeni test iki çalışma kipinde geçti. OFF 1196/1/329, ON 1193/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,279 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_320.md).

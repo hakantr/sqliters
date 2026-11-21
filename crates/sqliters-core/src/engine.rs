@@ -31,6 +31,7 @@ use sqliters_types::{
     TypeAffinity, Value, decode_record_with_encoding, encode_record_with_encoding, extended,
     fallible_sort_by,
 };
+use sqliters_vdbe::vdbemem::Mem;
 use sqliters_vdbe::{
     AggregateAccumulator, AggregateKind, Opcode, VmRuntimeContext, builtin_window_arity,
     eval_cast_rt_with_encoding, eval_comparison_with_affinity, eval_comparison_with_encoding,
@@ -5941,21 +5942,17 @@ fn exec_select(
         && ctes.scopes[s_idx][c_idx].materialized != Some(true)
         && count_table_refs_in_core(&stmt.body.head, &name.name) == 1
     {
-        let lim_val =
-            eval_expr(ctx, &lim.limit, params, outer_scopes, &ctes, None)?.to_integer_lossy();
+        let lim_val = select_limit_integer(eval_expr(
+            ctx, &lim.limit, params, outer_scopes, &ctes, None,
+        )?)?;
         if lim_val >= 0 {
-            let off_val = match &lim.offset {
-                Some(oe) => eval_expr(ctx, oe, params, outer_scopes, &ctes, None)?
-                    .to_integer_lossy()
-                    .max(0) as usize,
-                None => 0,
-            };
+            let off_val = eval_select_offset(ctx, lim, lim_val, params, outer_scopes, &ctes)?;
             ctes.limit_hint = Some(CteStreamHint {
                 s_idx,
                 c_idx,
                 eff_alias: alias.clone().unwrap_or_else(|| name.name.clone()),
                 where_expr: selection.clone(),
-                max_kept: off_val.saturating_add(lim_val as usize),
+                max_kept: off_val.saturating_add(usize::try_from(lim_val).unwrap_or(usize::MAX)),
             });
         }
     }
@@ -6709,18 +6706,14 @@ fn exec_recursive_cte(
 
     // Evaluate optional CTE-level `LIMIT` / `OFFSET`
     let (cte_limit_opt, cte_offset) = if let Some(ref lim) = cte.query.limit {
-        let lv =
-            eval_expr(ctx, &lim.limit, params, outer_scopes, &rec_ctes, None)?.to_integer_lossy();
-        let ov = match &lim.offset {
-            Some(oe) => eval_expr(ctx, oe, params, outer_scopes, &rec_ctes, None)?
-                .to_integer_lossy()
-                .max(0) as usize,
-            None => 0,
-        };
+        let lv = select_limit_integer(eval_expr(
+            ctx, &lim.limit, params, outer_scopes, &rec_ctes, None,
+        )?)?;
+        let ov = eval_select_offset(ctx, lim, lv, params, outer_scopes, &rec_ctes)?;
         if lv < 0 {
             (None, ov)
         } else {
-            (Some(lv as usize), ov)
+            (Some(usize::try_from(lv).unwrap_or(usize::MAX)), ov)
         }
     } else {
         (None, 0usize)
@@ -16702,6 +16695,32 @@ fn sort_materialized_output(
     fallible_sort_by(rows, |a, b| compare_compound_order_rows(a, b, &specs, enc))
 }
 
+fn select_limit_integer(value: Value) -> Result<i64> {
+    let mut mem = Mem::from_value(&value);
+    if !mem.must_be_integer() {
+        return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
+    }
+    Ok(mem.i)
+}
+
+fn eval_select_offset(
+    ctx: &mut ExecContext<'_>,
+    limit: &LimitClause,
+    limit_value: i64,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    ctes: &CteStore,
+) -> Result<usize> {
+    if limit_value == 0 {
+        return Ok(0);
+    }
+    let Some(offset) = &limit.offset else {
+        return Ok(0);
+    };
+    let offset = select_limit_integer(eval_expr(ctx, offset, params, outer_scopes, ctes, None)?)?;
+    Ok(usize::try_from(offset.max(0)).unwrap_or(usize::MAX))
+}
+
 fn apply_limit_offset(
     ctx: &mut ExecContext<'_>,
     rows: Vec<Vec<Value>>,
@@ -16713,19 +16732,15 @@ fn apply_limit_offset(
     let Some(lim) = limit else {
         return Ok(rows);
     };
-    let lim_val = eval_expr(ctx, &lim.limit, params, outer_scopes, ctes, None)?.to_integer_lossy();
-    let off_val = match &lim.offset {
-        Some(oe) => eval_expr(ctx, oe, params, outer_scopes, ctes, None)?
-            .to_integer_lossy()
-            .max(0) as usize,
-        None => 0,
-    };
-
+    let lim_val = select_limit_integer(eval_expr(
+        ctx, &lim.limit, params, outer_scopes, ctes, None,
+    )?)?;
+    let off_val = eval_select_offset(ctx, lim, lim_val, params, outer_scopes, ctes)?;
     let iter = rows.into_iter().skip(off_val);
     if lim_val < 0 {
         Ok(iter.collect())
     } else {
-        Ok(iter.take(lim_val as usize).collect())
+        Ok(iter.take(usize::try_from(lim_val).unwrap_or(usize::MAX)).collect())
     }
 }
 
