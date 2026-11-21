@@ -5464,6 +5464,8 @@ pub struct Statement {
     expired: bool,
     c_v1_expired_before_run: bool,
     c_v1_flag_pragma_expired: bool,
+    // A bind-triggered generated reprepare may consider a scoped partial-index value.
+    c_write_expired_by_binding: bool,
     c_reprepare_count: u32,
     c_reprepare_after_schema_check: bool,
     column_names: Vec<String>,
@@ -7867,7 +7869,10 @@ impl Statement {
     /// including binding NULL again. An active VM applies this on its next run.
     fn expire_for_binding(&mut self, index_1_based: usize) {
         let bit = if index_1_based >= 32 { 0x8000_0000 } else { 1 << (index_1_based - 1) };
-        if self.c_bind_expmask() & bit != 0 { self.expired = true; }
+        if self.c_bind_expmask() & bit != 0 {
+            self.c_write_expired_by_binding |= !self.expired && self.c_machine_write.is_some();
+            self.expired = true;
+        }
     }
 
     /// Test oracle of the port of C's virtual machine: `prog` is the program C SQLite
@@ -8166,6 +8171,7 @@ impl Statement {
         inner: &mut ConnectionInner,
         stmt: Option<&Stmt>,
         raw_sql: &str,
+        bound_partial: Option<(u32, &Value)>,
     ) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
         if !vdbe_host::exec_switch_on()
             || !matches!(
@@ -8191,7 +8197,7 @@ impl Statement {
                 crate::vtab::ensure_stmt_vtabs_connected(ctx, st)
             });
         }
-        let (route, loaded) = vdbe_host::machine_write_program(inner, stmt, raw_sql);
+        let (route, loaded) = vdbe_host::machine_write_program(inner, stmt, raw_sql, bound_partial);
         match route {
             vdbe_host::WriteRoute::Engine => Ok(None),
             vdbe_host::WriteRoute::Program(p) => Ok(Some(p)),
@@ -8496,7 +8502,7 @@ impl Statement {
 
         // Diagnostic switch SQLITERS_VDBE_EXEC: C's compile result of an INSERT / UPDATE /
         // DELETE decides before the engine's prepare (C's error is the error of the prepare).
-        let c_write = Self::c_write_of(shared, inner, stmt_opt.as_ref(), &raw_sql)?;
+        let c_write = Self::c_write_of(shared, inner, stmt_opt.as_ref(), &raw_sql, None)?;
 
         let try_compile =
             |inner: &mut ConnectionInner, stmt_opt: Option<Stmt>| -> Result<CompiledArtifacts> {
@@ -8730,6 +8736,7 @@ impl Statement {
             expired: false,
             c_v1_expired_before_run: false,
             c_v1_flag_pragma_expired: false,
+            c_write_expired_by_binding: false,
             c_reprepare_count: 0,
             c_reprepare_after_schema_check: false,
             column_names: artifacts.column_names,
@@ -8959,6 +8966,7 @@ impl Statement {
     #[inline]
     pub fn expire(&mut self) {
         self.expired = true;
+        self.c_write_expired_by_binding = false;
     }
 
     fn ensure_ready_for_bind(&self) -> Result<()> {
@@ -9468,7 +9476,30 @@ impl Statement {
             let c_write = if self.c_machine_fixed {
                 None
             } else {
-                Self::c_write_of(&shared, inner, parsed_stmt.as_ref(), &self.raw_sql)?
+                let bound_partial = if self.c_write_expired_by_binding
+                    && self.mode == PrepareMode::V2
+                    && self.c_machine_write.is_some()
+                    && inner.explicit_tx
+                    && inner.db_set.main_btree().transaction_state() == TransactionState::Write
+                    && inner.effective_encoding() == TextEncoding::Utf8
+                    && self.compiled_schema_generation == inner.schema_generation
+                    && self.compiled_v1_expire_generation == inner.v1_expire_generation
+                    && self.compiled_advisory_expire_generation == inner.advisory_expire_generation
+                    && self.compiled_c_expire_seq == inner.db_set.c_expire_seq()
+                    && let [value @ (Value::Integer(_) | Value::Real(_))] = self.params.as_slice()
+                {
+                    parsed_stmt.as_ref()
+                        .and_then(|stmt| engine::bound_view_partial_index(stmt, &inner.db_set, &self.raw_sql))
+                        .filter(|_| {
+                            inner.collations.get_custom("BINARY").is_none()
+                                && !self.has_detached_slot(inner)
+                                && !self.slot_cookies_changed(inner)
+                        })
+                        .map(|root| (root, value))
+                } else {
+                    None
+                };
+                Self::c_write_of(&shared, inner, parsed_stmt.as_ref(), &self.raw_sql, bound_partial)?
             };
             let mut schema_free_fallback = None;
             let mut artifacts = match try_compile(inner, &parsed_stmt) {
@@ -9570,6 +9601,7 @@ impl Statement {
             self.compiled_c_expire_seq = inner.db_set.c_expire_seq();
             self.compiled_slot_cookies = inner.snapshot_slot_cookies();
             self.expired = false;
+            self.c_write_expired_by_binding = false;
             if !self.needs_reprepare(inner) {
                 return Ok(());
             }

@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
+use sqliters_types::Value;
 use sqliters_vdbe::vdbeaux::{CollSeq, FuncDef};
+use sqliters_vdbe::vdbemem::{Mem, sqlite3_mem_compare};
 
 use crate::callback::*;
 use crate::consts::*;
@@ -1929,6 +1931,22 @@ pub fn sqlite3_is_rowid(z: &str) -> bool {
 /// stands for a non-NULL pParse (bound parameters are then compared by value; on a first
 /// prepare there are no bound values, so a parameter only equals the same parameter).
 pub fn sqlite3_expr_compare(p: &Parse, use_parse: bool, a: ExprId, b: ExprId, i_tab: i32) -> i32 {
+    expr_compare(p, use_parse, a, b, i_tab, None)
+}
+
+pub(crate) fn sqlite3_partial_bound_eq(p: &Parse, term: ExprId, partial: ExprId, i_tab: i32, value: &Value) -> bool {
+    let (term_expr, partial_expr) = (p.e(term), p.e(partial));
+    term_expr.op == TK_EQ
+        && partial_expr.op == TK_EQ
+        && [term_expr.p_left, partial_expr.p_left].iter().all(|&id| id.nn() && p.e(id).op == TK_COLUMN)
+        && term_expr.p_right.nn() && p.e(term_expr.p_right).op == TK_VARIABLE
+        && p.e(term_expr.p_right).i_column == 1
+        && partial_expr.p_right.nn() && p.e(partial_expr.p_right).op == TK_INTEGER
+        && p.e(partial_expr.p_right).has(EP_IntValue)
+        && expr_compare(p, true, term, partial, i_tab, Some(value)) == 0
+}
+
+fn expr_compare(p: &Parse, use_parse: bool, a: ExprId, b: ExprId, i_tab: i32, bound: Option<&Value>) -> i32 {
     if a.is_null() || b.is_null() {
         return if a == b { 0 } else { 2 };
     }
@@ -1941,13 +1959,20 @@ pub fn sqlite3_expr_compare(p: &Parse, use_parse: bool, a: ExprId, b: ExprId, i_
         if (p.db.flags & SQLITE_EnableQPSG) != 0 {
             return 2;
         }
-        if crate::build_tab::sqlite3_value_from_expr(p, b, SQLITE_AFF_BLOB).is_some() {
+        if let Some(literal) = crate::build_tab::sqlite3_value_from_expr(p, b, SQLITE_AFF_BLOB) {
             // sqlite3VdbeReprepareOnBind(pParse->pVdbe, iVar, 0): binding a new value to the
-            // variable may change the plan (the statement has no bound values yet, so the
-            // comparison result stays 2)
+            // variable may change the plan. Only a scoped reprepare can compare it to
+            // the literal at compile time.
             let i_var = pa.i_column as i32;
             let m: u32 = if i_var >= 32 { 0x8000_0000 } else { 1u32 << (i_var - 1) };
             p.pending_expmask.set(p.pending_expmask.get() | m);
+            if i_var == 1 && let Some(value) = bound {
+                return if sqlite3_mem_compare(&Mem::from_value(value), &Mem::from_value(&literal), None) == 0 {
+                    0
+                } else {
+                    2
+                };
+            }
         }
         return 2;
     }
@@ -1959,10 +1984,10 @@ pub fn sqlite3_expr_compare(p: &Parse, use_parse: bool, a: ExprId, b: ExprId, i_
         return 2;
     }
     if pa.op != pb.op || pa.op == TK_RAISE {
-        if pa.op == TK_COLLATE && sqlite3_expr_compare(p, use_parse, pa.p_left, b, i_tab) < 2 {
+        if pa.op == TK_COLLATE && expr_compare(p, use_parse, pa.p_left, b, i_tab, bound) < 2 {
             return 1;
         }
-        if pb.op == TK_COLLATE && sqlite3_expr_compare(p, use_parse, a, pb.p_left, i_tab) < 2 {
+        if pb.op == TK_COLLATE && expr_compare(p, use_parse, a, pb.p_left, i_tab, bound) < 2 {
             return 1;
         }
         if pa.op == TK_AGG_COLUMN && pb.op == TK_COLUMN && pb.i_table < 0 && pa.i_table == i_tab {
@@ -1999,10 +2024,10 @@ pub fn sqlite3_expr_compare(p: &Parse, use_parse: bool, a: ExprId, b: ExprId, i_
         if combined_flags & EP_xIsSelect != 0 {
             return 2;
         }
-        if (combined_flags & EP_FixedCol) == 0 && sqlite3_expr_compare(p, use_parse, pa.p_left, pb.p_left, i_tab) != 0 {
+        if (combined_flags & EP_FixedCol) == 0 && expr_compare(p, use_parse, pa.p_left, pb.p_left, i_tab, bound) != 0 {
             return 2;
         }
-        if sqlite3_expr_compare(p, use_parse, pa.p_right, pb.p_right, i_tab) != 0 {
+        if expr_compare(p, use_parse, pa.p_right, pb.p_right, i_tab, bound) != 0 {
             return 2;
         }
         if sqlite3_expr_list_compare(p, pa.x_list(), pb.x_list(), i_tab) != 0 {

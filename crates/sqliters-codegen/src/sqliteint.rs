@@ -1144,6 +1144,11 @@ pub trait Host {
     /// Initial preparation has no previous statement; NULL is returned as None.
     fn bound_value(&self, _i_var: usize) -> Option<sqliters_types::Value> { None }
 
+    /// A scoped generated UPDATE reprepare binding for this MAIN partial-index root.
+    fn partial_index_bound_value(&self, _root_pgno: u32) -> Option<&sqliters_types::Value> {
+        None
+    }
+
     /// A connection/pager value read at prepare time by pragma.c. `None` means that
     /// the host does not represent this state; the generator must not approximate it.
     fn pragma_int(&self, _i_db: usize, _name: &str) -> Option<i64> {

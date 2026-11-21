@@ -1896,13 +1896,15 @@ fn index_might_help_with_order_by(p: &mut Parse, w: &WhereInfo, index: IndexId, 
 /// `whereUsablePartialIndex(iTab, jointype, pWC, pWhere)`: check to see if a partial index
 /// with pPartIndexWhere can be used in the current query. Return true if it can be and false
 /// if not.
-fn where_usable_partial_index(p: &mut Parse, w: &WhereInfo, i_tab: i32, jointype: u8, wc: WcId, mut p_where: ExprId) -> bool {
+fn where_usable_partial_index(
+    p: &mut Parse, w: &WhereInfo, i_tab: i32, jointype: u8, wc: WcId, mut p_where: ExprId, bound: Option<&Value>,
+) -> bool {
     if jointype as i32 & JT_LTORJ != 0 {
         return false;
     }
     while p.e(p_where).op == TK_AND {
         let l = p.e(p_where).p_left;
-        if !where_usable_partial_index(p, w, i_tab, jointype, wc, l) {
+        if !where_usable_partial_index(p, w, i_tab, jointype, wc, l, bound) {
             return false;
         }
         p_where = p.e(p_where).p_right;
@@ -1912,10 +1914,14 @@ fn where_usable_partial_index(p: &mut Parse, w: &WhereInfo, i_tab: i32, jointype
             let t = &w.a_wc[wc].a[i];
             (t.p_expr, t.wt_flags)
         };
+        let implies = |p: &mut Parse, tab| {
+            sqlite3_expr_implies_expr(p, e, p_where, tab)
+                || bound.is_some_and(|value| sqlite3_partial_bound_eq(p, e, p_where, tab, value))
+        };
         if (!p.e(e).has(EP_OuterON) || p.e(e).w == i_tab)
             && ((jointype as i32 & JT_OUTER) == 0 || p.e(e).has(EP_OuterON))
-            && sqlite3_expr_implies_expr(p, e, p_where, i_tab)
-            && !sqlite3_expr_implies_expr(p, e, p_where, -1)
+            && implies(p, i_tab)
+            && !implies(p, -1)
             && (wt_flags & TERM_VNULL) == 0
         {
             return true;
@@ -2241,8 +2247,15 @@ fn where_loop_add_btree(p: &mut Parse, w: &mut WhereInfo, b: &mut WhereLoopBuild
         let this_sort_idx = i_sort_idx;
         i_sort_idx += 1;
         let part = p.idx(probe).p_part_idx_where;
-        if part.nn() && !where_usable_partial_index(p, w, src.i_cursor, src.jointype, wc, part) {
-            continue; // Partial index inappropriate for this query
+        if part.nn() {
+            let bound = if p.is_toplevel() && p.tab(tab).i_db == 0 {
+                p.db.host.partial_index_bound_value(p.idx(probe).tnum)
+            } else {
+                None
+            };
+            if !where_usable_partial_index(p, w, src.i_cursor, src.jointype, wc, part, bound) {
+                continue; // Partial index inappropriate for this query
+            }
         }
         if p.idx(probe).b_no_query {
             continue;

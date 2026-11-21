@@ -46,7 +46,7 @@ use crate::compiler::{
     expr_contains_subquery, expr_implies_partial_where,
 };
 use crate::SmallInstVec;
-use crate::db_set::{DatabaseSet, ResolvedRelation, SchemaInstanceId, TempStoreMode};
+use crate::db_set::{DatabaseSet, RelationRef, ResolvedRelation, SchemaInstanceId, TempStoreMode};
 use crate::execution_context::{
     CollationRegistry, CommitCoordinatorHooks, ExecutionContext, FunctionRegistry, MutationContext,
     MutationOrigin, MutationPipeline, MutationRow, ProgressTracker, catch_callback_panic,
@@ -32107,48 +32107,41 @@ fn single_table_select_projection(
 }
 
 pub(crate) fn is_main_rowid_view_update(stmt: &Stmt, db_set: &DatabaseSet) -> bool {
-    let Stmt::Update(update) = stmt else {
-        return false;
-    };
+    main_rowid_view_update_source(stmt, db_set).is_some_and(|(_, _, projection, _)| {
+        projection.iter().all(|column| {
+            matches!(column, ResultColumn::Star | ResultColumn::Expr { expr: Expr::Column(_), .. })
+        })
+    })
+}
+
+fn main_rowid_view_update_source<'db>(
+    stmt: &Stmt,
+    db_set: &'db DatabaseSet,
+) -> Option<(&'db ViewSchema, &'db TableSchema, &'db [ResultColumn], Option<&'db str>)> {
+    let Stmt::Update(update) = stmt else { return None };
     if update.from.is_some()
         || update.alias.is_some()
         || update.indexed_by.is_some()
         || !update.ctes.is_empty()
         || !update.returning.is_empty()
     {
-        return false;
+        return None;
     }
-    let Ok(Some((DatabaseId::MAIN, ResolvedRelation::View(view)))) =
-        db_set.find_relation_in_set(&update.table)
+    let (DatabaseId::MAIN, RelationRef::View(view)) =
+        db_set.find_relation_ref_in_set(&update.table).ok()??
     else {
-        return false;
+        return None;
     };
-    let Some((projection, source, _)) = single_table_select_projection(&view.select) else {
-        return false;
-    };
+    let (projection, source, alias) = single_table_select_projection(&view.select)?;
     let main = db_set.main_slot();
-    source
-        .schema
-        .as_ref()
-        .is_none_or(|schema| schema.eq_ignore_ascii_case(&main.name))
-        && projection.iter().all(|column| {
-            matches!(
-                column,
-                ResultColumn::Star
-                    | ResultColumn::Expr {
-                        expr: Expr::Column(_),
-                        ..
-                    }
-            )
-        })
-        && main
-            .schema
-            .find_user_table(&source.name)
-            .is_some_and(|table| !table.without_rowid)
-        && main
-            .btree
-            .as_ref()
-            .is_some_and(|bt| bt.pager().db_kind() == DatabaseKind::NamedDisk)
+    let table = main.schema.find_user_table(&source.name)?;
+    if table.without_rowid
+        || source.schema.as_ref().is_some_and(|schema| !schema.eq_ignore_ascii_case(&main.name))
+        || main.btree.as_ref()?.pager().db_kind() != DatabaseKind::NamedDisk
+    {
+        return None;
+    }
+    Some((view, table, projection, alias))
 }
 
 // The source of the MAX must resolve to this very view without using the
@@ -32281,6 +32274,102 @@ fn has_plain_integer_tokens(sql: &str, forbid_parameters: bool) -> bool {
             _ => true,
         })
     })
+}
+
+/// The one partial index that may use a bound value during a generated UPDATE reprepare.
+pub(crate) fn bound_view_partial_index(
+    stmt: &Stmt,
+    db_set: &DatabaseSet,
+    sql: &str,
+) -> Option<u32> {
+    if db_set.slots().iter().skip(1).any(|slot| slot.btree.is_some()) {
+        return None;
+    }
+    let Stmt::Update(update) = stmt else { return None };
+    let Expr::Binary { left, op: BinaryOp::And, right } = update.selection.as_ref()? else {
+        return None;
+    };
+    let first = view_dml_index_term(left)?;
+    let second = view_dml_index_term(right)?;
+    let terms = if first.1 == BinaryOp::Eq { (first, second) } else { (second, first) };
+    let ((equality, BinaryOp::Eq, bound), (range, BinaryOp::Ge, Expr::Integer(lower))) = terms else {
+        return None;
+    };
+    if equality.double_quoted
+        || range.double_quoted
+        || !matches!(
+            bound,
+            Expr::Bind(sqliters_syntax::BindParam::Anonymous(1) | sqliters_syntax::BindParam::Numbered(1))
+        )
+        || !(0..=i64::from(i32::MAX)).contains(lower)
+        || !has_plain_integer_tokens(sql, false)
+        || tokenize(sql).ok()?.iter().filter(|tok| tok.kind == TokenKind::Variable).count() != 1
+    {
+        return None;
+    }
+    let (view, table, projection, alias) = main_rowid_view_update_source(stmt, db_set)?;
+    if view.columns.is_some()
+        || alias.is_some()
+        || table.stat1.has_stat1
+        || !table.foreign_keys.is_empty()
+        || table.columns.iter().any(|col| col.generated.is_some())
+    {
+        return None;
+    }
+    let projected = projection.iter().map(|item| match item {
+        ResultColumn::Expr { expr: Expr::Column(column), alias: None, .. }
+            if !column.double_quoted && column.schema.is_none() && column.table.is_none() =>
+        {
+            Some(column.column.as_str())
+        }
+        _ => None,
+    }).collect::<Option<Vec<_>>>()?;
+    let key_column = |reference: &ColumnRef, affinity| {
+        table.columns.iter().position(|column| {
+            column.name.eq_ignore_ascii_case(&reference.column)
+                && projected.iter().any(|name| name.eq_ignore_ascii_case(&column.name))
+                && column.affinity == affinity
+                && !column.is_primary_key
+                && column.collation == Collation::Binary
+                && column.custom_collation.is_none()
+        })
+    };
+    let equality_col = key_column(equality, TypeAffinity::Integer)?;
+    let range_col = key_column(range, TypeAffinity::Numeric)?;
+    let indexes = db_set.main_slot().schema.indexes_for_table(&table.name);
+    if indexes.len() != 2 {
+        return None;
+    }
+    let find_key = |index_col| {
+        indexes.iter().find(|index| {
+            matches!(index.columns.as_slice(), [key] if key.col_idx == Some(index_col)
+                && key.sort_order.collation == Collation::Binary
+                && key.sort_order.custom_collation.is_none())
+                && !index.unique
+                && !index.is_autoindex
+                && index.stat1.is_none()
+        })
+    };
+    let full = find_key(range_col)?;
+    let partial = find_key(equality_col)?;
+    let (column, BinaryOp::Eq, Expr::Integer(literal)) =
+        view_dml_index_term(partial.where_clause.as_ref()?)?
+    else {
+        return None;
+    };
+    if full.where_clause.is_some()
+        || column.double_quoted
+        || !column.column.eq_ignore_ascii_case(&equality.column)
+        || !(0..=i64::from(i32::MAX)).contains(literal)
+        || !has_plain_integer_tokens(partial.raw_sql.as_deref()?, true)
+        || !matches!(db_set.matching_triggers(
+            DatabaseId::MAIN, &view.name, TriggerTiming::InsteadOf, TriggerEventKind::Update,
+            Some(&collect_set_assignment_col_names(&update.assignments)),
+        ).as_slice(), [(DatabaseId::MAIN, _, _)])
+    {
+        return None;
+    }
+    Some(partial.root_pgno)
 }
 
 pub(crate) fn view_update_range_tokens(stmt: &Stmt, db_set: &DatabaseSet, sql: &str) -> bool {

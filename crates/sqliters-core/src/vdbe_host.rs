@@ -606,7 +606,12 @@ pub(crate) enum WriteRoute {
 /// the program or C's error — decides before the engine's own prepare (diagnostic switch
 /// `SQLITERS_VDBE_EXEC`). The second value: C's `sqlite3Init()` loaded the schemas during the
 /// compilation.
-pub(crate) fn machine_write_program(inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str) -> (WriteRoute, bool) {
+pub(crate) fn machine_write_program(
+    inner: &ConnectionInner,
+    stmt: Option<&Stmt>,
+    raw_sql: &str,
+    bound_partial: Option<(u32, &Value)>,
+) -> (WriteRoute, bool) {
     if !exec_switch_on() {
         return (WriteRoute::Engine, false);
     }
@@ -658,7 +663,10 @@ pub(crate) fn machine_write_program(inner: &ConnectionInner, stmt: Option<&Stmt>
         trace("fallback: UTF-16 database", raw_sql);
         return (WriteRoute::Engine, false);
     }
-    let (r, _, loaded) = crate::cgen::c_prepare(inner, raw_sql);
+    let (r, _, loaded) = match bound_partial {
+        Some((root, value)) => crate::cgen::c_prepare_bound_partial_index(inner, raw_sql, root, value),
+        None => crate::cgen::c_prepare(inner, raw_sql),
+    };
     let route = match r {
         PrepareResult::Program(p) => {
             if p.explain != 0 {

@@ -26,8 +26,15 @@ use crate::execution_context::{CollationRegistry, FunctionRegistry};
 /// `SQLITE_FUNC_UNSAFE` (the same bit as `SQLITE_INNOCUOUS`, with the meaning inverted)
 const SQLITE_FUNC_UNSAFE: u32 = 0x0020_0000;
 
+#[derive(Clone, Copy)]
+enum PrepareBindings<'a> {
+    Unbound,
+    Read(&'a [Value]),
+    PartialIndex { root: u32, value: &'a Value },
+}
+
 struct EngineHost<'a> {
-    bound_values: Option<&'a [Value]>,
+    bindings: PrepareBindings<'a>,
     functions: &'a FunctionRegistry,
     collations: &'a CollationRegistry,
     db_set: &'a crate::db_set::DatabaseSet,
@@ -105,8 +112,16 @@ impl Host for EngineHost<'_> {
     }
 
     fn bound_value(&self, i_var: usize) -> Option<Value> {
-        self.bound_values?.get(i_var.checked_sub(1)?)
+        let PrepareBindings::Read(values) = self.bindings else { return None };
+        values.get(i_var.checked_sub(1)?)
             .filter(|v| !matches!(v, Value::Null)).cloned()
+    }
+
+    fn partial_index_bound_value(&self, root_pgno: u32) -> Option<&Value> {
+        match self.bindings {
+            PrepareBindings::PartialIndex { root, value } if root == root_pgno => Some(value),
+            _ => None,
+        }
     }
 
     fn pragma_collations(&self) -> Option<Vec<String>> {
@@ -489,18 +504,28 @@ pub(crate) fn c_prepare_quiet(inner: &ConnectionInner, sql: &str) -> (PrepareRes
 /// Run C's parser and code generator over one statement (`sqlite3Prepare`).
 /// The third value: C's `sqlite3Init()` loaded the schemas during this prepare.
 pub(crate) fn c_prepare(inner: &ConnectionInner, sql: &str) -> (PrepareResult, usize, bool) {
-    c_prepare_impl(inner, sql, false, None, None, false, None)
+    c_prepare_impl(inner, sql, false, PrepareBindings::Unbound, None, false, None)
 }
 
 /// Recompile with the old statement's parameter values (pParse->pReprepare).
 pub(crate) fn c_prepare_bound(inner: &ConnectionInner, sql: &str, values: &[Value]) -> (PrepareResult, usize, bool) {
-    c_prepare_impl(inner, sql, false, Some(values), None, false, None)
+    c_prepare_impl(inner, sql, false, PrepareBindings::Read(values), None, false, None)
+}
+
+pub(crate) fn c_prepare_bound_partial_index(
+    inner: &ConnectionInner,
+    sql: &str,
+    root: u32,
+    value: &Value,
+) -> (PrepareResult, usize, bool) {
+    c_prepare_impl(inner, sql, false, PrepareBindings::PartialIndex { root, value }, None, false, None)
 }
 
 pub(crate) fn c_prepare_table_scan(
     inner: &ConnectionInner, sql: &str, values: Option<&[Value]>, root: u32,
 ) -> PrepareResult {
-    c_prepare_impl(inner, sql, false, values, None, false, Some(root)).0
+    let bindings = values.map_or(PrepareBindings::Unbound, PrepareBindings::Read);
+    c_prepare_impl(inner, sql, false, bindings, None, false, Some(root)).0
 }
 
 pub(crate) fn c_explain_bound(inner: &ConnectionInner, sql: &str, values: &[Value]) -> CExplain {
@@ -594,7 +619,9 @@ fn c_prepare_probe(
     let temp = take_c_temp_opened();
     let rowest = take_c_rowest_clamped();
     let quiet = C_QUIET.with(|c| c.replace(true));
-    let (result, _, reads_schema) = c_prepare_impl(inner, sql, schema_probe, None, deferred_vtab_connect, true, None);
+    let (result, _, reads_schema) = c_prepare_impl(
+        inner, sql, schema_probe, PrepareBindings::Unbound, deferred_vtab_connect, true, None,
+    );
     C_QUIET.with(|c| c.set(quiet));
     C_PRAGMA_EFFECTS.with(|c| *c.borrow_mut() = effects);
     C_TEMP_OPENED.with(|c| c.set(temp));
@@ -606,14 +633,14 @@ fn c_prepare_impl(
     inner: &ConnectionInner,
     sql: &str,
     schema_probe: bool,
-    bound_values: Option<&[Value]>,
+    bindings: PrepareBindings<'_>,
     deferred_vtab_connect: Option<&std::cell::Cell<bool>>,
     suppress_vtab_callbacks: bool,
     table_scan_root: Option<u32>,
 ) -> (PrepareResult, usize, bool) {
     let interrupted = deferred_vtab_connect.is_some();
     let host = EngineHost {
-        bound_values,
+        bindings,
         functions: &inner.functions,
         collations: &inner.collations,
         db_set: &inner.db_set,
