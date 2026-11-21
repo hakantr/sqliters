@@ -6942,10 +6942,16 @@ fn exec_compound_select(
     } else {
         None
     };
+    // SQLite's unordered UNION with a literal LIMIT 1 reads the arms in order.
+    let union_limit_one = evaluated_limit.is_some()
+        && order_by.is_empty()
+        && matches!(body.compounds.as_slice(), [(CompoundOp::Union, _)])
+        && limit.is_some_and(is_literal_limit_one);
     let rows_needed = evaluated_limit.and_then(|(limit, offset)| {
         (limit > 0
             && order_by.is_empty()
-            && body.compounds.iter().all(|(op, _)| matches!(op, CompoundOp::UnionAll)))
+            && (union_limit_one
+                || body.compounds.iter().all(|(op, _)| matches!(op, CompoundOp::UnionAll))))
             .then(|| offset.saturating_add(usize::try_from(limit).unwrap_or(usize::MAX)))
     });
     // Even skipped arms supply their column names for the compound result.
@@ -6991,6 +6997,10 @@ fn exec_compound_select(
             ));
         }
         all_arm_col_names.push(rhs_out.column_names);
+        if union_limit_one {
+            acc_rows.extend(rhs_out.rows);
+            continue;
+        }
         let enc = ctx.encoding();
         match op {
             CompoundOp::UnionAll => {
@@ -7109,6 +7119,25 @@ fn exec_compound_select(
         column_names: col_names,
         rows: acc_rows,
     })
+}
+
+fn is_literal_limit_one(limit: &LimitClause) -> bool {
+    if limit.offset.is_some() {
+        return false;
+    }
+    let mut expr = &limit.limit;
+    let mut expected = 1;
+    loop {
+        match expr {
+            Expr::Integer(value) => return *value == expected,
+            Expr::Unary { op: UnaryOp::Plus, expr: inner } => expr = inner,
+            Expr::Unary { op: UnaryOp::Negate, expr: inner } => {
+                expected = -expected;
+                expr = inner;
+            }
+            _ => return false,
+        }
+    }
 }
 
 fn strip_collate_and_unary_plus(mut e: &Expr) -> Option<i64> {

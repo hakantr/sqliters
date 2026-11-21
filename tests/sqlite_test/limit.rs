@@ -994,3 +994,42 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_union_literal_limit_one() {
+    sqliters_tcltest::run_test_script(
+        "union_literal_limit_one",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE first_arm(id INTEGER PRIMARY KEY, label TEXT);
+  INSERT INTO first_arm VALUES(10,'delta'),(20,'alpha'),(30,'omega');
+  CREATE TABLE second_arm(id INTEGER PRIMARY KEY, label TEXT);
+  INSERT INTO second_arm VALUES(10,'beta'),(20,'aardvark');
+}
+do_execsql_test union-limit-one-1 {
+  SELECT label FROM first_arm UNION SELECT label FROM second_arm LIMIT 1;
+} {delta}
+do_execsql_test union-limit-one-2 {
+  SELECT label FROM first_arm UNION SELECT label FROM second_arm LIMIT -(-1);
+} {delta}
+do_execsql_test union-limit-one-3 {
+  SELECT label FROM first_arm UNION SELECT label FROM second_arm LIMIT 1 OFFSET 0;
+} {aardvark}
+do_execsql_test union-limit-one-4 {
+  SELECT label FROM first_arm UNION SELECT label FROM second_arm LIMIT '1';
+} {aardvark}
+do_execsql_test union-limit-one-5 {
+  SELECT label FROM first_arm UNION SELECT abs(-9223372036854775808) FROM second_arm LIMIT 1;
+} {delta}
+do_execsql_test union-limit-one-6 {
+  SELECT label FROM first_arm WHERE id<0 UNION SELECT label FROM second_arm LIMIT 1;
+} {beta}
+do_execsql_test union-limit-one-7 {
+  SELECT label FROM first_arm UNION SELECT label FROM second_arm ORDER BY 1 LIMIT 1;
+} {aardvark}
+finish_test
+"#,
+    );
+}
