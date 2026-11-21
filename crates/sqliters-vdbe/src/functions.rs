@@ -1556,9 +1556,10 @@ fn parse_datetime_value(
                 let stamp = ctx.text_encoding.decode_bytes(bytes);
                 let digits =
                     |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
-                let julian_number = match stamp.split_once('.') {
+                let number = stamp.strip_prefix(['+', '-']).unwrap_or(&stamp);
+                let julian_number = match number.split_once('.') {
                     Some((whole, fraction)) => digits(whole) && digits(fraction),
-                    None => digits(&stamp),
+                    None => digits(number),
                 };
                 let time = if julian_number {
                     let days = parse_datetime_number_text(&stamp)?;
