@@ -347,3 +347,41 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_union_merge_representatives() {
+    sqliters_tcltest::run_test_script(
+        "union_merge_representatives",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE spaces(id INTEGER PRIMARY KEY, value COLLATE RTRIM);
+  INSERT INTO spaces VALUES(1,''),(2,' '),(3,'  ');
+  CREATE TABLE reversed(id INTEGER PRIMARY KEY, value COLLATE RTRIM);
+  INSERT INTO reversed VALUES(1,'  '),(2,' '),(3,'');
+  CREATE TABLE numbers(id INTEGER PRIMARY KEY, value);
+  INSERT INTO numbers VALUES(1,1),(2,1.0),(3,2),(4,2.0);
+}
+do_execsql_test union-merge-representatives-1 {
+  SELECT typeof(x), hex(x) FROM (SELECT value AS x FROM spaces UNION SELECT 1);
+} {integer 31 text {}}
+do_execsql_test union-merge-representatives-2 {
+  SELECT hex(x) FROM (SELECT value AS x FROM spaces UNION SELECT value FROM reversed);
+} {2020}
+do_execsql_test union-merge-representatives-3 {
+  SELECT typeof(x), x FROM (SELECT value AS x FROM numbers UNION SELECT 3);
+} {integer 1 integer 2 integer 3}
+do_execsql_test union-merge-representatives-4 {
+  SELECT typeof(x) FROM (SELECT 1 AS x UNION SELECT 1.0);
+} {real}
+do_execsql_test union-merge-representatives-5 {
+  SELECT hex(x) FROM (SELECT value AS x FROM reversed UNION SELECT 1 ORDER BY 1 DESC);
+} {2020 31}
+do_execsql_test union-merge-representatives-6 {
+  SELECT hex(x) FROM (SELECT value AS x FROM reversed INTERSECT SELECT '');
+} {2020}
+finish_test
+"#,
+    );
+}

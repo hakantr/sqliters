@@ -6997,21 +6997,30 @@ fn exec_compound_select(
                 acc_rows.extend(rhs_out.rows);
             }
             CompoundOp::Union => {
-                acc_rows.extend(rhs_out.rows);
-                fallible_sort_by(&mut acc_rows, |a, b| {
-                    compare_value_slices(a, b, &default_specs, enc)
+                let mut rows: Vec<_> = acc_rows
+                    .into_iter()
+                    .map(|row| (row, false))
+                    .chain(rhs_out.rows.into_iter().map(|row| (row, true)))
+                    .collect();
+                fallible_sort_by(&mut rows, |(left, _), (right, _)| {
+                    compare_value_slices(left, right, &default_specs, enc)
                 })?;
-                let mut deduped: Vec<Vec<Value>> = Vec::with_capacity(acc_rows.len());
-                for row in acc_rows {
-                    if let Some(last) = deduped.last_mut()
+
+                // SQLite's merge keeps the first row in each arm and takes the right arm on a tie.
+                let mut deduped: Vec<(Vec<Value>, bool)> = Vec::with_capacity(rows.len());
+                for (row, from_right) in rows {
+                    if let Some((last, last_from_right)) = deduped.last_mut()
                         && compare_value_slices(&row, last, &default_specs, enc)? == Ordering::Equal
                     {
-                        *last = row;
-                    } else {
-                        deduped.push(row);
+                        if from_right && !*last_from_right {
+                            *last = row;
+                            *last_from_right = true;
+                        }
+                        continue;
                     }
+                    deduped.push((row, from_right));
                 }
-                acc_rows = deduped;
+                acc_rows = deduped.into_iter().map(|(row, _)| row).collect();
             }
             CompoundOp::Intersect => {
                 let mut rhs_sorted = rhs_out.rows;

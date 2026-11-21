@@ -1947,3 +1947,8 @@ VALUES başlangıçlı ve tek özyinelemeli kollu sıralı CTE'lerde dış LIMIT
 ## V6b.328 — Özyinelemeli CTE akışında WHERE çağrı sayısı
 
 Sınırlı olağan özyinelemeli CTE akışında WHERE aynı satır için bir kez çalışır. Beş çağrı sayısı farkı kapandı. 62 sorgu biçimi ve 18 C salt okunur açılış aynı, altı Rust kontrolü iki kipte geçti. OFF 1204/1/329, ON 1201/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,252 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_328.md).
+
+
+## V6b.329 — UNION eşdeğer satır temsili
+
+Materyalize UNION aynı kolda ilk temsilciyi korur ve eşitlikte sağ kolu seçer. 120 değer ve tür farkı kapandı. 27 sorgu biçimi, 18 C salt okunur açılış ve altı Rust kontrolü doğrulandı. OFF 1205/1/329, ON 1202/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,264 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_329.md).
