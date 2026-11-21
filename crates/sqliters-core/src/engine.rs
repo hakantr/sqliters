@@ -32132,11 +32132,21 @@ fn main_rowid_view_update_source<'db>(
     db_set: &'db DatabaseSet,
 ) -> Option<(&'db ViewSchema, &'db TableSchema, &'db [ResultColumn], Option<&'db str>)> {
     let Stmt::Update(update) = stmt else { return None };
+    if !update.returning.is_empty() {
+        return None;
+    }
+    let source = main_direct_view_update_source(update, db_set)?;
+    (!source.1.without_rowid).then_some(source)
+}
+
+fn main_direct_view_update_source<'db>(
+    update: &UpdateStmt,
+    db_set: &'db DatabaseSet,
+) -> Option<(&'db ViewSchema, &'db TableSchema, &'db [ResultColumn], Option<&'db str>)> {
     if update.from.is_some()
         || update.alias.is_some()
         || update.indexed_by.is_some()
         || !update.ctes.is_empty()
-        || !update.returning.is_empty()
     {
         return None;
     }
@@ -32148,8 +32158,7 @@ fn main_rowid_view_update_source<'db>(
     let (projection, source, alias) = single_table_select_projection(&view.select)?;
     let main = db_set.main_slot();
     let table = main.schema.find_user_table(&source.name)?;
-    if table.without_rowid
-        || source.schema.as_ref().is_some_and(|schema| !schema.eq_ignore_ascii_case(&main.name))
+    if source.schema.as_ref().is_some_and(|schema| !schema.eq_ignore_ascii_case(&main.name))
         || main.btree.as_ref()?.pager().db_kind() != DatabaseKind::NamedDisk
     {
         return None;
@@ -32427,6 +32436,21 @@ pub(crate) fn view_update_range_tokens(stmt: &Stmt, db_set: &DatabaseSet, sql: &
     let integer_bound = |bound: &Expr| {
         matches!(bound, Expr::Integer(value) if (0..=i64::from(i32::MAX)).contains(value))
     };
+    if let Some((column, BinaryOp::Ge | BinaryOp::Lt, bound)) = view_dml_index_term(selection)
+        && !column.double_quoted
+        && integer_bound(bound)
+        && main_direct_view_update_source(update, db_set).is_some_and(|(_, table, projection, alias)| {
+            table.without_rowid
+                && alias.is_none()
+                && projection.iter().all(|item| view_dml_named_column(item).is_some())
+                && update.returning.iter().all(|item| view_dml_named_column(item).is_some())
+                && db_set.main_slot().schema.indexes.iter().any(|index| {
+                    index.table_name.eq_ignore_ascii_case(&table.name) && index.where_clause.is_some()
+                })
+        })
+    {
+        return has_plain_integer_tokens(sql, true);
+    }
     let (comparable, literal_equality) = if let Expr::Binary {
         left,
         op: BinaryOp::And,
@@ -32698,7 +32722,6 @@ fn view_dml_indexed_select(
             predicate,
             ViewDmlIndexPredicate::UpdateRange | ViewDmlIndexPredicate::UpdateReturningRange
         )
-        && !has_partial
         && second_term.is_none()
         && matches!(bound, Expr::Integer(_))
         && !column.is_primary_key
@@ -32718,6 +32741,31 @@ fn view_dml_indexed_select(
     {
         return None;
     }
+    let wr_partial_root = if wr_index_pair && has_partial {
+        let [first, second] = indexes.as_slice() else {
+            return None;
+        };
+        let (partial, where_clause) = match (&first.where_clause, &second.where_clause) {
+            (Some(clause), None) => (first, clause),
+            (None, Some(clause)) => (second, clause),
+            _ => return None,
+        };
+        let (partial_col, partial_op, partial_bound) = view_dml_index_term(where_clause)?;
+        if !ctx.stmt_tx.view_update_range_tokens
+            || !matches!(op, BinaryOp::Ge | BinaryOp::Lt)
+            || indexes.iter().any(|index| !matches_key(index.columns[0].col_idx))
+            || partial_col.double_quoted
+            || !partial_col.column.eq_ignore_ascii_case(&column.name)
+            || op != partial_op
+            || !matches!((bound, partial_bound), (Expr::Integer(query), Expr::Integer(index)) if query == index)
+            || !has_plain_integer_tokens(partial.raw_sql.as_deref()?, true)
+        {
+            return None;
+        }
+        Some(partial.root_pgno)
+    } else {
+        None
+    };
     let partial_range = two_index_range && has_partial;
     // These two-term shapes use only the proven partial-index path.
     if (same_range_direction || distinct_columns) && !partial_range {
@@ -32736,7 +32784,7 @@ fn view_dml_indexed_select(
     if indexes.len() > 1 && (max_eq || two_index_range || wr_index_pair) {
         // Keep the proven partial range separate from statistics and expression indexes.
         if indexes.iter().any(|index| {
-            (index.where_clause.is_some() && !partial_range)
+            (index.where_clause.is_some() && !partial_range && wr_partial_root.is_none())
                 || index.stat1.is_some()
                 || index.columns.iter().any(|col| {
                     col.col_idx.is_none() || col.sort_order.custom_collation.is_some()
@@ -32851,14 +32899,19 @@ fn view_dml_indexed_select(
         }
     }
     if wr_index_pair {
-        // Equal single-key ranges keep the first entry in C's pTab->pIndex order.
-        indexes = ordered_table_indexes(table, &indexes);
-        let expected = indexes.iter().find(|index| !index.is_autoindex)?;
+        let expected = if let Some(root) = wr_partial_root {
+            // C's default estimate favors the structurally eligible partial range.
+            indexes.iter().find(|index| index.root_pgno == root)?
+        } else {
+            // Equal single-key ranges keep the first entry in C's pTab->pIndex order.
+            indexes = ordered_table_indexes(table, &indexes);
+            indexes.iter().find(|index| !index.is_autoindex)?
+        };
         let indexed_by = IndexHint::IndexedBy(expected.name.clone());
         let AccessPlan::IndexRangeScan {
             index,
             range_col_idx: Some(0),
-            is_covering: false,
+            is_covering,
             skip_scan_cols: 0,
             ..
         } = choose_access_plan_with_context(
@@ -32875,7 +32928,7 @@ fn view_dml_indexed_select(
         ) else {
             return None;
         };
-        if index.root_pgno != expected.root_pgno {
+        if index.root_pgno != expected.root_pgno || (is_covering && wr_partial_root.is_none()) {
             return None;
         }
         indexes.retain(|candidate| candidate.root_pgno == index.root_pgno);
@@ -32886,7 +32939,7 @@ fn view_dml_indexed_select(
     let key = index.columns.first()?;
     let without_rowid_range = table.without_rowid && !max_eq;
     let expected_keys = if max_eq { 2 } else { 1 };
-    if (index.where_clause.is_some() && !partial_range)
+    if (index.where_clause.is_some() && !partial_range && wr_partial_root.is_none())
         || (returning_range && index.unique)
         || index.is_unordered()
         || index.columns.len() != expected_keys
