@@ -1907,3 +1907,8 @@ Tek tablo ve tablosuz SELECT yürütmesinde C kayıpsız tam sayı dönüşümü
 ## V6b.320 — Materyalize SELECT LIMIT ve OFFSET değerlerini C ile eşle
 
 Materyalize SELECT ve CTE sınırları kayıpsız tam sayı dönüşümünü kullanır. Üç kodlama ve iki günlük kipinde 510 başlangıç farkı kapandı. Kip başına 540 C karşılaştırması ve 18 C salt okunur açılış eş. Beş davranışı kapsayan yeni test iki çalışma kipinde geçti. OFF 1196/1/329, ON 1193/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,279 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_320.md).
+
+
+## V6b.321 — Olağan SELECT LIMIT ve OFFSET değerlendirme sırası
+
+Olağan tablolardaki DISTINCT GROUP BY ve JOIN sorguları LIMIT ve OFFSET değerlerini satır hazırlamadan önce değerlendirir. 180 başlangıç farkı kapandı. 54 sorgu, 18 C salt okunur açılış ve beş odaklı Rust karşılaştırması doğrulandı. OFF 1197/1/329, ON 1194/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_321.md).

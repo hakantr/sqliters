@@ -648,3 +648,36 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_ordinary_limit_evaluation_order() {
+    sqliters_tcltest::run_test_script(
+        "ordinary_limit_order",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE item(id INTEGER PRIMARY KEY, label TEXT);
+  INSERT INTO item VALUES(1,'a'),(2,'b'),(3,'a');
+  CREATE TABLE detail(id INTEGER PRIMARY KEY);
+  INSERT INTO detail VALUES(1),(2);
+}
+do_execsql_test ordinary-limit-order-1 {
+  SELECT DISTINCT abs(-9223372036854775808) FROM item LIMIT 0 OFFSET NULL;
+} {}
+do_catchsql_test ordinary-limit-order-2 {
+  SELECT abs(-9223372036854775808),count(*) FROM item GROUP BY label LIMIT 1.5;
+} {1 {datatype mismatch}}
+do_catchsql_test ordinary-limit-order-3 {
+  SELECT abs(-9223372036854775808) FROM item JOIN detail USING(id) LIMIT 1 OFFSET NULL;
+} {1 {datatype mismatch}}
+do_execsql_test ordinary-limit-order-4 {
+  SELECT DISTINCT i.* FROM item AS i JOIN detail AS d ON d.id=i.id ORDER BY i.id LIMIT 0;
+} {}
+do_execsql_test ordinary-limit-order-5 {
+  SELECT label,count(*) FROM item GROUP BY label ORDER BY label LIMIT '1e0' OFFSET 1;
+} {b 1}
+finish_test
+"#,
+    );
+}

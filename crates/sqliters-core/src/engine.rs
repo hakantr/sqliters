@@ -7263,10 +7263,19 @@ fn exec_single_select_core_inner(
                     None
                 };
 
+            let evaluated_limit = match (limit, from) {
+                (Some(limit), Some(from)) if has_ordinary_limit_sources(ctx.db_set, from, ctes) => {
+                    Some(eval_select_limit_offset(ctx, limit, params, outer_scopes, ctes)?)
+                }
+                _ => None,
+            };
+            let empty_limit = matches!(evaluated_limit, Some((0, _)));
+
             // 1. Evaluate FROM & JOINs
             let mut omitted_vtab_conjuncts: Vec<Expr> = Vec::new();
             let preset = ctx.stmt_tx.lazy_vtab_preset.take();
             let source_rows = match from {
+                _ if empty_limit => Vec::new(),
                 Some(_) if preset.is_some() => {
                     let (rows, omitted) = preset.unwrap_or_default();
                     omitted_vtab_conjuncts = omitted;
@@ -7389,6 +7398,12 @@ fn exec_single_select_core_inner(
                     ErrorCode::Error,
                     "too many columns in result set",
                 ));
+            }
+            if empty_limit {
+                return Ok(QueryOutput {
+                    column_names: col_names,
+                    rows: Vec::new(),
+                });
             }
 
             let window_aliases: Vec<String> = projection
@@ -8021,7 +8036,11 @@ fn exec_single_select_core_inner(
 
             let out_rows: Vec<Vec<Value>> =
                 result_rows_with_sort.into_iter().map(|(p, _)| p).collect();
-            let out_rows = apply_limit_offset(ctx, out_rows, limit, params, outer_scopes, ctes)?;
+            let out_rows = if let Some((limit, offset)) = evaluated_limit {
+                slice_select_rows(out_rows, limit, offset)
+            } else {
+                apply_limit_offset(ctx, out_rows, limit, params, outer_scopes, ctes)?
+            };
 
             Ok(QueryOutput {
                 column_names: col_names,
@@ -16721,6 +16740,50 @@ fn eval_select_offset(
     Ok(usize::try_from(offset.max(0)).unwrap_or(usize::MAX))
 }
 
+fn has_ordinary_limit_sources(db_set: &DatabaseSet, from: &FromClause, ctes: &CteStore) -> bool {
+    std::iter::once(&from.head)
+        .chain(from.joins.iter().map(|join| &join.right))
+        .all(|source| {
+            let TableOrSubquery::Table {
+                name,
+                table_args: None,
+                indexed_by: None,
+                ..
+            } = source else {
+                return false;
+            };
+            if name.schema.is_none() && ctes.locate(&name.name).is_some() {
+                return false;
+            }
+            matches!(
+                db_set.find_relation_ref_in_set(name),
+                Ok(Some((_, crate::db_set::RelationRef::Table(_))))
+            )
+        })
+}
+
+fn eval_select_limit_offset(
+    ctx: &mut ExecContext<'_>,
+    limit: &LimitClause,
+    params: &[Value],
+    outer_scopes: &[EvalRow],
+    ctes: &CteStore,
+) -> Result<(i64, usize)> {
+    let value = eval_expr(ctx, &limit.limit, params, outer_scopes, ctes, None)?;
+    let limit_value = select_limit_integer(value)?;
+    let offset = eval_select_offset(ctx, limit, limit_value, params, outer_scopes, ctes)?;
+    Ok((limit_value, offset))
+}
+
+fn slice_select_rows(rows: Vec<Vec<Value>>, limit: i64, offset: usize) -> Vec<Vec<Value>> {
+    let iter = rows.into_iter().skip(offset);
+    if limit < 0 {
+        iter.collect()
+    } else {
+        iter.take(usize::try_from(limit).unwrap_or(usize::MAX)).collect()
+    }
+}
+
 fn apply_limit_offset(
     ctx: &mut ExecContext<'_>,
     rows: Vec<Vec<Value>>,
@@ -16732,16 +16795,8 @@ fn apply_limit_offset(
     let Some(lim) = limit else {
         return Ok(rows);
     };
-    let lim_val = select_limit_integer(eval_expr(
-        ctx, &lim.limit, params, outer_scopes, ctes, None,
-    )?)?;
-    let off_val = eval_select_offset(ctx, lim, lim_val, params, outer_scopes, ctes)?;
-    let iter = rows.into_iter().skip(off_val);
-    if lim_val < 0 {
-        Ok(iter.collect())
-    } else {
-        Ok(iter.take(usize::try_from(lim_val).unwrap_or(usize::MAX)).collect())
-    }
+    let (limit, offset) = eval_select_limit_offset(ctx, lim, params, outer_scopes, ctes)?;
+    Ok(slice_select_rows(rows, limit, offset))
 }
 
 pub(crate) fn col_in_scoped_cols_pub(column: &str, sample_cols: &[ScopedColumn]) -> bool {
