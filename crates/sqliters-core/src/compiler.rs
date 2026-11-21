@@ -4654,8 +4654,7 @@ where
                     alias: alias.as_deref(),
                     indexed_by: indexed_by.as_ref(),
                     allow_wr_autoindex_covering: allow_wr_autoindex_covering
-                        && db_id == DatabaseId::MAIN
-                        && stmt.limit.is_none(),
+                        && db_id == DatabaseId::MAIN,
                 },
                 projection,
                 selection.as_ref(),

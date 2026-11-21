@@ -791,3 +791,51 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_without_rowid_covering_with_limit() {
+    sqliters_tcltest::run_test_script(
+        "without_rowid_covering_with_limit",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent(a INTEGER PRIMARY KEY);
+  INSERT INTO parent VALUES(5),(6),(11);
+  CREATE TABLE records(
+    id INT, a INT UNIQUE, b NUM, PRIMARY KEY(id,a), FOREIGN KEY(a) REFERENCES parent(a)
+  ) WITHOUT ROWID;
+  CREATE INDEX records_bb ON records(b,b);
+  CREATE INDEX records_b ON records(b);
+  CREATE INDEX records_a_partial ON records(a) WHERE a>4;
+  INSERT INTO records VALUES(10,5,6),(7,11,4),(8,6,1);
+}
+do_execsql_test wr-cover-limit-1 {
+  SELECT id%3,a+2 FROM records LIMIT 2;
+} {2 8 1 13}
+do_execsql_test wr-cover-limit-2 {
+  SELECT id%3,a+2 FROM records LIMIT 0;
+} {}
+do_execsql_test wr-cover-limit-3 {
+  SELECT id%3,a+2 FROM records LIMIT -1;
+} {2 8 1 13 1 7}
+do_execsql_test wr-cover-limit-4 {
+  SELECT id%3,a+2 FROM records LIMIT 1 OFFSET 1;
+} {1 13}
+do_execsql_test wr-cover-limit-5 {
+  SELECT id%3,a+2 FROM records LIMIT 1,1;
+} {1 13}
+do_execsql_test wr-cover-limit-6 {
+  SELECT r.id%3,r.a+2 FROM records r LIMIT '2';
+} {2 8 1 13}
+do_execsql_test wr-cover-limit-7 {
+  SELECT id%3,a+2 FROM records ORDER BY id LIMIT 2;
+} {1 13 2 8}
+do_execsql_test wr-cover-limit-8 {
+  SELECT count(*) FROM records LIMIT 1;
+} {3}
+finish_test
+"#,
+    );
+}

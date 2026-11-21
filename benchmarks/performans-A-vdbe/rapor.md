@@ -1992,3 +1992,8 @@ Filtresiz tek sütun MIN/MAX tekrarları C gibi ilk akümülatör konumunu koruy
 ## V6b.337 — Yabancı anahtarlı WITHOUT ROWID kaynağında kapsayan indeks
 
 Kapsama hesabı yabancı anahtar tanımlı WITHOUT ROWID kaynaklarında C ile aynı taramayı seçiyor. 54 profilde 420 fark kapandı ve 162 C salt okunur yeniden açılışı doğrulandı. DML OFF 6189 kapandı, kalan sekiz ham kayıt aynı. OFF 1213/1/329, ON 1210/4/329. DML OFF 392/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,262 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_337.md).
+
+
+## V6b.338 — LIMIT ile WITHOUT ROWID kapsayan tam tarama
+
+Filtresiz ve sıralamasız tek tablo okumalarında LIMIT ve OFFSET C ile aynı kapsayan taramayı seçiyor. 54 profilde 590 fark kapandı ve 162 C yeniden açılışı doğrulandı. Sekiz odaklı C ve Rust kontrolü geçti. OFF 1214/1/329, ON 1211/4/329. DML OFF 392/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,292 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_338.md).

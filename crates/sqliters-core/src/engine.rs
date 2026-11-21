@@ -7440,9 +7440,8 @@ fn exec_single_select_core_inner(
                                 && limit.is_none()
                                 && matches!(selection, Some(Expr::Exists { negated: false, .. }))
                                 && is_simple_covering_projection(projection);
-                            single_qinfo.allow_wr_autoindex_covering = !*distinct
-                                && selection.is_none()
-                                && limit.is_none();
+                            single_qinfo.allow_wr_autoindex_covering =
+                                !*distinct && selection.is_none();
                             single_qinfo.allow_reverse_index_order =
                                 !*distinct && (order_by.is_empty() || !has_proj_aliases);
                             eval_table_or_subquery(
