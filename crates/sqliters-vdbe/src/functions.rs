@@ -1692,8 +1692,7 @@ fn parse_datetime_value(
                 use_subsec = true;
                 continue;
             }
-            let mt = mod_str.trim();
-            if mt.eq_ignore_ascii_case("utc") {
+            if mod_str.eq_ignore_ascii_case("utc") {
                 if !time.is_utc {
                     // Continue to use the previous path for host timezone conversion.
                     if let Some(clock) = bare_hour24.take() {
