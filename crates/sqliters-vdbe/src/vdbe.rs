@@ -2594,27 +2594,12 @@ impl Vdbe {
                 }
 
                 OP_MustBeInt => {
-                    let m = &mut self.a_mem[op.p1 as usize];
-                    if m.flags & MEM_INT == 0 {
-                        if m.flags & MEM_REAL != 0 {
-                            if m.r >= -9223372036854775808.0 && m.r < 9223372036854775808.0 {
-                                let ix = sqlite3_real_to_i64(m.r);
-                                if ix as f64 == m.r {
-                                    m.i = ix;
-                                    m.set_type_flag(MEM_INT);
-                                }
-                            }
-                        } else {
-                            m.apply_affinity(SQLITE_AFF_NUMERIC);
+                    if !self.a_mem[op.p1 as usize].must_be_integer() {
+                        if op.p2 == 0 {
+                            return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
                         }
-                        if m.flags & MEM_INT == 0 {
-                            if op.p2 == 0 {
-                                return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
-                            }
-                            jump!(op.p2);
-                        }
+                        jump!(op.p2);
                     }
-                    m.set_type_flag(MEM_INT);
                 }
 
                 OP_RealAffinity => {

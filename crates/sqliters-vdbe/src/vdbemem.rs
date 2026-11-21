@@ -471,6 +471,28 @@ impl Mem {
         self.flags &= !MEM_STR;
     }
 
+    /// Applies the lossless integer coercion used by SQLite's `OP_MustBeInt`.
+    pub fn must_be_integer(&mut self) -> bool {
+        if self.flags & MEM_INT == 0 {
+            if self.flags & MEM_REAL != 0 {
+                if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&self.r) {
+                    let integer = sqlite3_real_to_i64(self.r);
+                    if integer as f64 == self.r {
+                        self.i = integer;
+                        self.set_type_flag(MEM_INT);
+                    }
+                }
+            } else {
+                self.apply_affinity(SQLITE_AFF_NUMERIC);
+            }
+            if self.flags & MEM_INT == 0 {
+                return false;
+            }
+        }
+        self.set_type_flag(MEM_INT);
+        true
+    }
+
     /// `applyAffinity(pRec, affinity, enc)` (vdbe.c), also `sqlite3ValueApplyAffinity`.
     pub fn apply_affinity(&mut self, affinity: u8) {
         self.apply_affinity_with_encoding(affinity, 1);

@@ -4702,17 +4702,17 @@ fn compile_tableless_select(
         if compile_expr(&mut prog, &lim.limit, None, functions, lim_reg).is_err() {
             return Ok(None);
         }
-        let zero_reg = prog.alloc_register();
-        prog.emit(Instruction::new(Opcode::Integer, 0, zero_reg, 0));
-        let le_reg = prog.alloc_register();
-        prog.emit(Instruction::new(Opcode::Le, lim_reg, zero_reg, le_reg));
-        jumps_to_halt.push(prog.emit(Instruction::new(Opcode::JumpIfTrue, le_reg, 0, 0)));
+        prog.emit(Instruction::new(Opcode::MustBeInt, lim_reg, 0, 0));
+        jumps_to_halt.push(prog.emit(Instruction::new(Opcode::JumpIfFalse, lim_reg, 0, 0)));
 
         if let Some(off_expr) = &lim.offset {
             let off_reg = prog.alloc_register();
             if compile_expr(&mut prog, off_expr, None, functions, off_reg).is_err() {
                 return Ok(None);
             }
+            prog.emit(Instruction::new(Opcode::MustBeInt, off_reg, 0, 0));
+            let zero_reg = prog.alloc_register();
+            prog.emit(Instruction::new(Opcode::Integer, 0, zero_reg, 0));
             let gt_reg = prog.alloc_register();
             prog.emit(Instruction::new(Opcode::Gt, off_reg, zero_reg, gt_reg));
             jumps_to_halt.push(prog.emit(Instruction::new(Opcode::JumpIfTrue, gt_reg, 0, 0)));
@@ -4984,6 +4984,30 @@ fn compile_single_table_select(
     let body_start = prog.current_addr();
     prog.emit(Instruction::new(Opcode::Transaction, db_id.index() as i32, 0, 0).with_db(db_id));
 
+    // LIMIT 0 skips OFFSET evaluation and the scan, including any sorter.
+    let mut zero_limit_jump = None;
+    let limit_regs = if let Some(lim) = limit {
+        let rem_reg = prog.alloc_register();
+        compile_expr(&mut prog, &lim.limit, None, functions, rem_reg)?;
+        prog.emit(Instruction::new(Opcode::MustBeInt, rem_reg, 0, 0));
+        zero_limit_jump = Some(prog.emit(Instruction::new(Opcode::JumpIfFalse, rem_reg, 0, 0)));
+        let off_reg = if let Some(off_e) = &lim.offset {
+            let r = prog.alloc_register();
+            compile_expr(&mut prog, off_e, None, functions, r)?;
+            prog.emit(Instruction::new(Opcode::MustBeInt, r, 0, 0));
+            Some(r)
+        } else {
+            None
+        };
+        let one_reg = prog.alloc_register();
+        prog.emit(Instruction::new(Opcode::Integer, 1, one_reg, 0));
+        let zero_reg = prog.alloc_register();
+        prog.emit(Instruction::new(Opcode::Integer, 0, zero_reg, 0));
+        Some((rem_reg, off_reg, one_reg, zero_reg))
+    } else {
+        None
+    };
+
     let covering_binding = if let Some(cov_idx) = covering_secondary_idx {
         let icur = prog.alloc_cursor();
         idx_cursor_opt = Some(icur);
@@ -5023,26 +5047,6 @@ fn compile_single_table_select(
         alias,
         cursor: tbl_cursor,
         covering_index: covering_binding,
-    };
-
-    // Optional LIMIT / OFFSET registers initialized before loop
-    let limit_regs = if let Some(lim) = limit {
-        let rem_reg = prog.alloc_register();
-        compile_expr(&mut prog, &lim.limit, None, functions, rem_reg)?;
-        let off_reg = if let Some(off_e) = &lim.offset {
-            let r = prog.alloc_register();
-            compile_expr(&mut prog, off_e, None, functions, r)?;
-            Some(r)
-        } else {
-            None
-        };
-        let one_reg = prog.alloc_register();
-        prog.emit(Instruction::new(Opcode::Integer, 1, one_reg, 0));
-        let zero_reg = prog.alloc_register();
-        prog.emit(Instruction::new(Opcode::Integer, 0, zero_reg, 0));
-        Some((rem_reg, off_reg, one_reg, zero_reg))
-    } else {
-        None
     };
 
     // Optional Sorter setup for ORDER BY (elided when a natural ascending rowid scan,
@@ -5134,15 +5138,6 @@ fn compile_single_table_select(
     let mut jumps_after_scan = Vec::new();
     let mut jumps_next_row = Vec::new();
     let mut seek_advance_cursor = None;
-
-    // Early check: if LIMIT == 0 and no sorter needed, jump straight past scan
-    if sorter_setup.is_none()
-        && let Some((rem_reg, _, _, zero_reg)) = limit_regs
-    {
-        let cmp_r = prog.alloc_register();
-        prog.emit(Instruction::new(Opcode::Eq, rem_reg, zero_reg, cmp_r));
-        jumps_after_scan.push(prog.emit(Instruction::new(Opcode::JumpIfTrue, cmp_r, 0, 0)));
-    }
 
     let loop_top = match &plan {
         AccessPlan::FullScan => {
@@ -5569,7 +5564,10 @@ fn compile_single_table_select(
         prog.emit(Instruction::new(Opcode::Close, s_cursor, 0, 0));
     }
 
-    prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
+    let halt_addr = prog.emit(Instruction::new(Opcode::Halt, 0, 0, 0));
+    if let Some(jump) = zero_limit_jump {
+        prog.patch_p2(jump, halt_addr);
+    }
     prog.patch_p2(init_addr, body_start);
 
     if can_attach_point_plan && let AccessPlan::RowidSeek { ref key_expr } = plan {

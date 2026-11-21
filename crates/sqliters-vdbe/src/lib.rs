@@ -2214,16 +2214,14 @@ fn step_ops_loop(
             Opcode::MustBeInt => {
                 // p1 = reg, p2 = jump_if_not_int (0 = raise SQLITE_MISMATCH)
                 let reg = ins.p1 as usize;
-                let cur = std::mem::replace(&mut regs[reg].value, Value::Null);
-                let coerced = TypeAffinity::Integer.apply(cur);
-                if let Value::Integer(i) = coerced {
-                    regs[reg] = RuntimeValue::plain(Value::Integer(i));
-                } else if ins.p2 > 0 {
-                    regs[reg] = RuntimeValue::plain(coerced);
+                let mut value = vdbemem::Mem::from_value(&regs[reg].value);
+                let valid = value.must_be_integer();
+                regs[reg] = RuntimeValue::plain(value.to_value());
+                if !valid {
+                    if ins.p2 == 0 {
+                        return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
+                    }
                     next_pc = ins.p2 as usize;
-                } else {
-                    regs[reg] = RuntimeValue::plain(coerced);
-                    return Err(SqliteError::new(ErrorCode::Mismatch, "datatype mismatch"));
                 }
             }
             Opcode::Affinity => {
