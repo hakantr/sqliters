@@ -1727,3 +1727,8 @@ C'nin paylaşılan yüksek bağ biti gerçek equality yuvasından ayrı kullanı
 ## V6b.284 — Saatli işaretli tarih değiştiricisi
 
 Tek normal signed tarih ve saat değiştiricisi C'nin yıl, ay, gün ve saat sırasını uygular. 62 geçerli timediff çiftinin iç içe tarih, Julian ve milisaniye çıktısı eş. İki Tcl vakası ve 18 C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,261 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_284.md).
+
+
+## V6b.285 — strftime Pazar başlangıçlı hafta
+
+Açık TEXT biçimi ve tek sabit tarihle yüzde U, C'nin Pazar başlangıçlı haftasını üretir. İki Tcl vakası kapandı ve date-23 adayı 22/22 oldu. Üç kodlamada 2.433 sonuç ve 18 C salt okunur açılışı eş. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,262 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_285.md).

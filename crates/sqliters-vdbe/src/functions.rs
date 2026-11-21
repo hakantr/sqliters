@@ -2452,9 +2452,9 @@ fn eval_strftime_function(args: &[Value], ctx: &VmRuntimeContext) -> Result<Valu
             's' => out.push_str(&format!("{total_secs}")),
             'w' => out.push_str(&format!("{dow}")),
             'u' => out.push_str(&format!("{}", if dow == 0 { 7 } else { dow })),
-            'W' if is_fixed_text_format() => {
-                let monday_index = (dow + 6) % 7;
-                let week = (doy_1_based + 6 - monday_index) / 7;
+            'W' | 'U' if is_fixed_text_format() => {
+                let weekday_index = if spec == 'W' { (dow + 6) % 7 } else { dow };
+                let week = (doy_1_based + 6 - weekday_index) / 7;
                 out.push_str(&format!("{week:02}"));
             }
             'P' => out.push_str(if hh < 12 { "am" } else { "pm" }),
