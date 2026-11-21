@@ -33167,9 +33167,17 @@ fn view_dml_indexed_select(
     {
         return None;
     }
-    if returning_range
-        && (alias.is_some() || projection.iter().any(|item| view_dml_named_column(item).is_none()))
-    {
+    let direct_projection = projection.iter().all(|item| {
+        let ResultColumn::Expr { expr: Expr::Column(column), .. } = item else {
+            return false;
+        };
+        column.schema.is_none()
+            && column.table.as_deref().is_none_or(|qualifier| {
+                qualifier.eq_ignore_ascii_case(alias.unwrap_or(&name.name))
+            })
+            && table.find_column(&column.column).is_some()
+    });
+    if returning_range && !direct_projection {
         return None;
     }
     let star = matches!(projection, [ResultColumn::Star]);
@@ -33302,8 +33310,9 @@ fn view_dml_indexed_select(
         && (matches!(bound, Expr::Integer(_))
             || (returning_range && finite_real_bound && !has_partial))
         && !column.is_primary_key
-        && alias.is_none()
-        && projection.iter().all(|item| view_dml_named_column(item).is_some())
+        && ((alias.is_none()
+            && projection.iter().all(|item| view_dml_named_column(item).is_some()))
+            || (returning_range && !has_partial && direct_projection))
         && ctx.collations.get_custom("BINARY").is_none()
         && table.without_rowid_pk_cols.iter().all(|key| {
             key.sort_order.collation == Collation::Binary && key.sort_order.custom_collation.is_none()

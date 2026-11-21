@@ -575,3 +575,44 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_returning_without_rowid_view_projected_range_columns() {
+    sqliters_tcltest::run_test_script(
+        "returning_without_rowid_view_projected_range_columns",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach {layout declaration selection} {
+  renamed {} {SELECT id AS pk,k AS val,label AS item FROM base}
+  qualified {} {SELECT base.id AS pk,base.k AS val,base.label AS item FROM base}
+  source_alias {} {SELECT b.id AS pk,b.k AS val,b.label AS item FROM base b}
+  reordered {} {SELECT label AS "item",id AS "pk","k" AS "val" FROM base}
+  declared {(pk,val,item)} {SELECT id,k,label FROM base}
+} {
+  reset_db
+  execsql {
+    CREATE TABLE base(id INTEGER PRIMARY KEY, k INTEGER, label TEXT) WITHOUT ROWID;
+    CREATE TABLE seen(seq INTEGER PRIMARY KEY, id INTEGER);
+    INSERT INTO base VALUES (1,5,'one'),(2,2,'two'),(3,1,'three'),(4,3,'four'),(5,4,'five');
+    CREATE INDEX shifted ON base(k+1);
+    CREATE INDEX keyed ON base(k);
+  }
+  execsql "CREATE VIEW projected$declaration AS $selection;"
+  execsql {
+    CREATE TRIGGER revise INSTEAD OF UPDATE ON projected BEGIN
+      INSERT INTO seen(id) VALUES(old.pk);
+      UPDATE base SET label=new.item WHERE id=old.pk;
+    END;
+  }
+  do_execsql_test returning-projected-range-$layout.1 {
+    UPDATE projected SET item=item||'!' WHERE val>=2 RETURNING pk;
+    SELECT id FROM seen ORDER BY seq;
+    SELECT id,label FROM base ORDER BY id;
+    PRAGMA integrity_check;
+  } {2 4 5 1 2 4 5 1 1 one! 2 two! 3 three 4 four! 5 five! ok}
+}
+finish_test
+"#,
+    );
+}
