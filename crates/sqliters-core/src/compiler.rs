@@ -1011,7 +1011,6 @@ fn choose_unordered_without_rowid_scan(
             || !index.is_autoindex
             || index.origin != "u"
             || index.trailing_pk_cols.is_empty()
-            || !tbl.foreign_keys.is_empty()
             || tbl.columns.len() > 63
             || tbl.columns.iter().any(|col| {
                 col.generated.is_some() || col.custom_collation.is_some()

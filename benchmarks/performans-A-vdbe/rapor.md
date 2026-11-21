@@ -1987,3 +1987,8 @@ Skaler işlev içinde aynı SELECT kapsamında çağrılan MIN/MAX, grup satır�
 ## V6b.336 — Tekrarlanan sütun MIN/MAX işleminde grup satırı
 
 Filtresiz tek sütun MIN/MAX tekrarları C gibi ilk akümülatör konumunu koruyor. Üç kodlama ve iki journal kipinde 90 fark kapandı. Ayrı DISTINCT, FILTER ve farklı literal yazımları dahil sekiz odaklı kontrol geçti. OFF 1212/1/329, ON 1209/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_336.md).
+
+
+## V6b.337 — Yabancı anahtarlı WITHOUT ROWID kaynağında kapsayan indeks
+
+Kapsama hesabı yabancı anahtar tanımlı WITHOUT ROWID kaynaklarında C ile aynı taramayı seçiyor. 54 profilde 420 fark kapandı ve 162 C salt okunur yeniden açılışı doğrulandı. DML OFF 6189 kapandı, kalan sekiz ham kayıt aynı. OFF 1213/1/329, ON 1210/4/329. DML OFF 392/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,262 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_337.md).
