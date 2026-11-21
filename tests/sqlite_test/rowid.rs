@@ -1175,3 +1175,47 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_reverse_unordered_filtered_left_join() {
+    sqliters_tcltest::run_test_script(
+        "reverse_unordered_filtered_left_join",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE source_rows(id INTEGER PRIMARY KEY, value TEXT);
+  CREATE TABLE tags(id INTEGER PRIMARY KEY, name TEXT);
+  INSERT INTO source_rows VALUES(1,'r1'),(2,'r2'),(3,'r3');
+  INSERT INTO tags VALUES(1,'a'),(3,'c'),(4,'d');
+  PRAGMA reverse_unordered_selects=ON;
+}
+do_execsql_test reverse-filtered-left-1 {
+  SELECT r.id,t.id FROM source_rows r LEFT JOIN tags t ON t.id=r.id WHERE r.id<>2;
+} {3 3 1 1}
+do_execsql_test reverse-filtered-left-2 {
+  SELECT r.id,t.id FROM source_rows r LEFT JOIN tags t ON t.id=r.id WHERE 2<>r.id;
+} {3 3 1 1}
+do_execsql_test reverse-filtered-left-3 {
+  SELECT * FROM source_rows r LEFT JOIN tags t ON t.id=r.id WHERE r.id<>3;
+} {2 r2 {} {} 1 r1 1 a}
+do_execsql_test reverse-filtered-left-4 {
+  SELECT r.id,t.id FROM source_rows r LEFT JOIN tags t ON t.id=r.id WHERE r.id<>9 LIMIT 2 OFFSET 1;
+} {2 {} 1 1}
+do_execsql_test reverse-filtered-left-5 {
+  SELECT id,r.value,t.name FROM source_rows r LEFT JOIN tags t USING(id) WHERE r.id<>2;
+} {3 r3 c 1 r1 a}
+do_execsql_test reverse-filtered-left-6 {
+  SELECT r.id,t.id FROM source_rows r LEFT JOIN tags t ON t.id<=r.id WHERE r.id<>2;
+} {3 3 3 1 1 1}
+do_execsql_test reverse-filtered-left-7 {
+  SELECT r.id,t.id FROM source_rows r LEFT JOIN tags t ON t.id=r.id WHERE r.id<>2 ORDER BY r.id;
+} {1 1 3 3}
+do_execsql_test reverse-filtered-left-8 {
+  PRAGMA reverse_unordered_selects=OFF;
+  SELECT r.id,t.id FROM source_rows r LEFT JOIN tags t ON t.id=r.id WHERE r.id<>2;
+} {1 1 3 3}
+finish_test
+"#,
+    );
+}

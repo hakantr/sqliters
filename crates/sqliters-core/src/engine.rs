@@ -7487,7 +7487,6 @@ fn exec_single_select_core_inner(
                 }
                 Some(fc) => {
                     let reverse_scans = if !*distinct
-                        && selection.is_none()
                         && group_by.is_empty()
                         && having.is_none()
                         && windows.is_empty()
@@ -7496,7 +7495,7 @@ fn exec_single_select_core_inner(
                         && ctes.scopes.is_empty()
                         && is_plain_reverse_projection(projection)
                     {
-                        reverse_plain_join_scans(ctx.db_set, fc)
+                        reverse_plain_join_scans(ctx.db_set, fc, selection.as_ref())
                     } else {
                         ReverseJoinScans::None
                     };
@@ -8933,7 +8932,11 @@ fn plain_join_table<'a>(
         .then_some((table, alias.as_deref().unwrap_or(&name.name)))
 }
 
-fn reverse_plain_join_scans(db_set: &DatabaseSet, from: &FromClause) -> ReverseJoinScans {
+fn reverse_plain_join_scans(
+    db_set: &DatabaseSet,
+    from: &FromClause,
+    selection: Option<&Expr>,
+) -> ReverseJoinScans {
     if db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder == 0 {
         return ReverseJoinScans::None;
     }
@@ -8949,7 +8952,7 @@ fn reverse_plain_join_scans(db_set: &DatabaseSet, from: &FromClause) -> ReverseJ
     ) else {
         return ReverseJoinScans::None;
     };
-    if join.join_type == JoinType::Cross && join.constraint.is_none() {
+    if join.join_type == JoinType::Cross && join.constraint.is_none() && selection.is_none() {
         return ReverseJoinScans::Both;
     }
     if !matches!(join.join_type, JoinType::Inner | JoinType::Left)
@@ -8960,6 +8963,26 @@ fn reverse_plain_join_scans(db_set: &DatabaseSet, from: &FromClause) -> ReverseJ
     let is_rowid_alias = |table: &TableSchema, name: &str| {
         table.rowid_alias_col.is_some_and(|id| table.columns[id].name.eq_ignore_ascii_case(name))
     };
+    let is_key = |expr: &Expr, table: &TableSchema, alias: &str| {
+        let Expr::Column(column) = expr else {
+            return false;
+        };
+        column.schema.is_none()
+            && column.table.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(alias))
+            && is_rowid_alias(table, &column.column)
+    };
+    if let Some(predicate) = selection {
+        let Expr::Binary { left: a, op: BinaryOp::Ne, right: b } = predicate else {
+            return ReverseJoinScans::None;
+        };
+        let is_left_key = |expr: &Expr| is_key(expr, left, left_alias);
+        if join.join_type != JoinType::Left
+            || !(is_left_key(a) && matches!(b.as_ref(), Expr::Integer(_))
+                || is_left_key(b) && matches!(a.as_ref(), Expr::Integer(_)))
+        {
+            return ReverseJoinScans::None;
+        }
+    }
     if let Some(JoinConstraint::Using(columns)) = &join.constraint
         && let [name] = columns.as_slice()
         && is_rowid_alias(left, name)
@@ -8973,14 +8996,6 @@ fn reverse_plain_join_scans(db_set: &DatabaseSet, from: &FromClause) -> ReverseJ
         return ReverseJoinScans::None;
     };
 
-    let is_key = |expr: &Expr, table: &TableSchema, alias: &str| {
-        let Expr::Column(column) = expr else {
-            return false;
-        };
-        column.schema.is_none()
-            && column.table.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(alias))
-            && is_rowid_alias(table, &column.column)
-    };
     if (is_key(a, left, left_alias) && is_key(b, right, right_alias))
         || (is_key(b, left, left_alias) && is_key(a, right, right_alias))
     {
