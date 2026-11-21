@@ -30458,6 +30458,7 @@ fn prepare_update_exec<'a>(
                 } else {
                     ViewDmlIndexPredicate::UpdateRange
                 },
+                Some(&mod_col_names),
             );
             // C's copy of WHERE has its own scalar SELECT and Once lifetime.
             if let (Some(candidate), Some((_, rhs))) = (&mut narrowed, scalar_max)
@@ -32269,12 +32270,13 @@ fn view_dml_range_is_lower(op: BinaryOp, bound: &Expr, quoted_range: bool) -> Op
     }
 }
 
-fn has_plain_integer_tokens(sql: &str) -> bool {
+fn has_plain_integer_tokens(sql: &str, forbid_parameters: bool) -> bool {
     // The relational parser folds unary minus. Exclude it here so that
     // structurally different expressions such as -(-5) and 5 stay distinct.
     tokenize(sql).is_ok_and(|tokens| {
         tokens.iter().all(|token| match token.kind {
             TokenKind::Minus => false,
+            TokenKind::Variable if forbid_parameters => false,
             TokenKind::Integer => token.text.bytes().all(|byte| byte.is_ascii_digit()),
             _ => true,
         })
@@ -32291,7 +32293,7 @@ pub(crate) fn view_update_range_tokens(stmt: &Stmt, db_set: &DatabaseSet, sql: &
     let integer_bound = |bound: &Expr| {
         matches!(bound, Expr::Integer(value) if (0..=i64::from(i32::MAX)).contains(value))
     };
-    let comparable = if let Expr::Binary {
+    let (comparable, literal_equality) = if let Expr::Binary {
         left,
         op: BinaryOp::And,
         right,
@@ -32302,7 +32304,7 @@ pub(crate) fn view_update_range_tokens(stmt: &Stmt, db_set: &DatabaseSet, sql: &
         else {
             return false;
         };
-        !left_col.double_quoted
+        let comparable = !left_col.double_quoted
             && !right_col.double_quoted
             && integer_bound(left_bound)
             && integer_bound(right_bound)
@@ -32312,18 +32314,22 @@ pub(crate) fn view_update_range_tokens(stmt: &Stmt, db_set: &DatabaseSet, sql: &
                     | (BinaryOp::Lt | BinaryOp::Le, BinaryOp::Ge)
                     | (BinaryOp::Ge | BinaryOp::Gt, BinaryOp::Ge | BinaryOp::Gt)
                     | (BinaryOp::Lt | BinaryOp::Le, BinaryOp::Lt | BinaryOp::Le)
-            )
+                    | (BinaryOp::Eq, BinaryOp::Ge | BinaryOp::Gt | BinaryOp::Lt | BinaryOp::Le)
+                    | (BinaryOp::Ge | BinaryOp::Gt | BinaryOp::Lt | BinaryOp::Le, BinaryOp::Eq)
+            );
+        (comparable, left_op == BinaryOp::Eq || right_op == BinaryOp::Eq)
     } else {
         let Some((column, BinaryOp::Ge, bound)) = view_dml_index_term(selection) else {
             return false;
         };
-        !column.double_quoted
+        let comparable = !column.double_quoted
             && (integer_bound(bound)
-                || matches!(bound, Expr::Float(value) if (0.0..=f64::from(i32::MAX)).contains(value)))
+                || matches!(bound, Expr::Float(value) if (0.0..=f64::from(i32::MAX)).contains(value)));
+        (comparable, false)
     };
     comparable
         && is_main_rowid_view_update(stmt, db_set)
-        && has_plain_integer_tokens(sql)
+        && has_plain_integer_tokens(sql, literal_equality)
 }
 
 // sqlite3MaterializeView copies the UPDATE or DELETE predicate into the
@@ -32338,6 +32344,7 @@ fn view_dml_indexed_select(
     outer_scopes: &[EvalRow],
     col_specs: &[(String, Collation, Option<TypeAffinity>)],
     predicate: ViewDmlIndexPredicate,
+    update_columns: Option<&[&str]>,
 ) -> Option<ViewSchema> {
     if db_id != DatabaseId::MAIN
         || !outer_scopes.is_empty()
@@ -32367,16 +32374,32 @@ fn view_dml_indexed_select(
     let distinct_columns = second_term.is_some_and(|(other, _, _)| {
         !target_col.column.eq_ignore_ascii_case(&other.column)
     });
+    let equality_range = distinct_columns
+        && second_term.is_some_and(|(_, other_op, _)| op == BinaryOp::Eq || other_op == BinaryOp::Eq);
     let mut same_range_direction = false;
-    if !max_eq {
+    if !max_eq && !equality_range {
         let is_lower = view_dml_range_is_lower(op, bound, quoted_bound.is_some())?;
         if let Some((_, other_op, other_bound)) = second_term {
             same_range_direction =
                 is_lower == view_dml_range_is_lower(other_op, other_bound, false)?;
-            if (same_range_direction || distinct_columns) && !ctx.stmt_tx.view_update_range_tokens {
-                return None;
-            }
         }
+    }
+    if (same_range_direction || distinct_columns) && !ctx.stmt_tx.view_update_range_tokens {
+        return None;
+    }
+    if equality_range
+        && !matches!(
+            ctx.db_set.matching_triggers(
+                db_id,
+                &view.name,
+                TriggerTiming::InsteadOf,
+                TriggerEventKind::Update,
+                update_columns,
+            ).as_slice(),
+            [(DatabaseId::MAIN, _, _)]
+        )
+    {
+        return None;
     }
 
     let (projection, name, alias) = single_table_select_projection(&view.select)?;
@@ -32445,13 +32468,17 @@ fn view_dml_indexed_select(
         let (other, other_op, _) = second_term?;
         let index = projected_index(other)?;
         let other_column = &table.columns[index];
+        let compatible_ops = |range, integer| {
+            if equality_range {
+                matches!(range, BinaryOp::Ge | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Lt)
+                    && integer == BinaryOp::Eq
+            } else {
+                matches!(range, BinaryOp::Ge | BinaryOp::Lt) && integer == BinaryOp::Ge
+            }
+        };
         let compatible = match (column.affinity, other_column.affinity) {
-            (TypeAffinity::Numeric, TypeAffinity::Integer) => {
-                matches!(op, BinaryOp::Ge | BinaryOp::Lt) && other_op == BinaryOp::Ge
-            }
-            (TypeAffinity::Integer, TypeAffinity::Numeric) => {
-                op == BinaryOp::Ge && matches!(other_op, BinaryOp::Ge | BinaryOp::Lt)
-            }
+            (TypeAffinity::Numeric, TypeAffinity::Integer) => compatible_ops(op, other_op),
+            (TypeAffinity::Integer, TypeAffinity::Numeric) => compatible_ops(other_op, op),
             _ => false,
         };
         if !compatible
@@ -32604,7 +32631,7 @@ fn view_dml_indexed_select(
                 || partial_column.double_quoted
                 || (second_term.is_none() && partial_op != BinaryOp::Ge)
                 || !(0..=i64::from(i32::MAX)).contains(partial_bound)
-                || !has_plain_integer_tokens(partial.raw_sql.as_deref()?)
+                || !has_plain_integer_tokens(partial.raw_sql.as_deref()?, false)
             {
                 return None;
             }
@@ -32615,9 +32642,19 @@ fn view_dml_indexed_select(
             };
             let eligible = matches_partial(column, op, bound)
                 || second_term.is_some_and(|(_, op, bound)| matches_partial(other_column, op, bound));
-            let root = if eligible {
-                // A term in the normalized range is known to match structurally.
-                // Let the existing range planner price these two non-covering loops.
+            let root = if eligible || equality_range {
+                let equality_column = if op == BinaryOp::Eq { column_index } else { other_index };
+                let expected = if !equality_range {
+                    partial
+                } else if eligible {
+                    indexes.iter().find(|index| index.columns[0].col_idx == Some(equality_column))?
+                } else {
+                    full
+                };
+                let equality_seek =
+                    equality_range && expected.columns[0].col_idx == Some(equality_column);
+                // C excludes a structurally ineligible partial index before pricing.
+                let full_only = (!eligible).then(|| IndexHint::IndexedBy(full.name.clone()));
                 let plan = choose_access_plan_with_context(
                     table,
                     "main",
@@ -32626,13 +32663,16 @@ fn view_dml_indexed_select(
                     schema,
                     QueryPlanContext {
                         projection: Some(projection),
+                        indexed_by: full_only.as_ref(),
                         ..Default::default()
                     },
                 );
-                let AccessPlan::IndexRangeScan { index, .. } = plan else {
-                    return None;
+                let index = match plan {
+                    AccessPlan::IndexSeek { index, .. } if equality_seek => index,
+                    AccessPlan::IndexRangeScan { index, .. } if !equality_seek => index,
+                    _ => return None,
                 };
-                if index.root_pgno != partial.root_pgno {
+                if index.root_pgno != expected.root_pgno {
                     return None;
                 }
                 index.root_pgno
@@ -32744,6 +32784,7 @@ fn prepare_delete_exec(
                 outer_scopes,
                 &col_specs,
                 ViewDmlIndexPredicate::DeleteRange,
+                None,
             );
             let (view_out, _, _) = eval_view_query_output(
                 ctx,

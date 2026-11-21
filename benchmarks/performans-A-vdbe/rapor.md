@@ -1632,3 +1632,8 @@ Olağan görünüm UPDATE taramasında iki doğrudan sütun izdüşümü, kısmi
 ## V6b.265 — Typed Julian tek başlangıç değiştiricisi
 
 Doğrudan INTEGER ve REAL Julian girdilerinde tek exact start of day/month/year takvim okumasından önce C yuvarlaması ve aralık kontrolü kullanır. Ana 225 hedefin ve ek 408 sınır hedefinin tamamı iki kipte C ile eş. İki matriste 129 ve 208 fark kapandı, 45 C ve 90 Rust salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,249 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_265.md).
+
+
+## V6b.266 — Görünüm UPDATE sabit eşitlik ve aralık
+
+Açık MAIN yazma işleminde ayrı INTEGER eşitlik ve NUMERIC aralık sütunlarını C yapısal uygunluğuna göre mevcut planlayıcıya verir. 1.152 DELETE/WAL hedefi, 168 ek sözdizimi hedefi ve 14.256 salt okunur C açılışı eş. 192 unary artı komşusu eski davranışı korudu. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_266.md).
