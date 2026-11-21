@@ -9495,7 +9495,7 @@ impl Statement {
                     && self.compiled_v1_expire_generation == inner.v1_expire_generation
                     && self.compiled_advisory_expire_generation == inner.advisory_expire_generation
                     && self.compiled_c_expire_seq == inner.db_set.c_expire_seq()
-                    && matches!(self.params.len(), 1 | 2)
+                    && (1..=31).contains(&self.params.len())
                 {
                     parsed_stmt.as_ref()
                         .and_then(|stmt| {

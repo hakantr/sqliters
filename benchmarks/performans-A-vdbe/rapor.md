@@ -1707,3 +1707,8 @@ Açık TEXT biçimi ve tek sabit tarih girdisinde strftime yüzde W, ilk Pazarte
 ## V6b.280 — strftime on iki saat alanı
 
 Açık TEXT biçimi ve tek sabit tarih girdisinde yüzde l, C'nin boşluk dolgulu on iki saat alanını üretir. Tcl date-3.29 kapandı. Üç kodlamada 2.034 sonuç, 18 C salt okunur açılışı ve önceki 27 W ile 42 date-19 koruması doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,274 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_280.md).
+
+
+## V6b.281 — Görünüm UPDATE düşük boşluklu yuvalar
+
+İki gerçek V2 bağ yuvası 1–31 içindeyse kısmi equality kökü ve maskesi C ile eş. Önceki 68 dosya farkı kapandı. 16 normal okumadan yazmaya geçiş örneğinde üçüncü STEP kök ve log eş, ilk fark açık. 9.384 C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,285 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_281.md).

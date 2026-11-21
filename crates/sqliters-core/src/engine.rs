@@ -32306,17 +32306,20 @@ pub(crate) fn bound_view_partial_index(
     };
     let equality_slot = bind_slot(bound);
     let range_slot = bind_slot(range_bound);
-    let expected_shape = match (parameter_count, equality_slot, range_slot) {
-        (1, Some(1), None) => plain_integer(range_bound),
-        (1, None, Some(1)) => plain_integer(bound),
-        (2, Some(1), Some(2)) | (2, Some(2), Some(1)) => true,
-        _ => false,
+    let markers = match (parameter_count, equality_slot, range_slot) {
+        (1, Some(1), None) if plain_integer(range_bound) => 1,
+        (1, None, Some(1)) if plain_integer(bound) => 1,
+        (_, Some(eq_slot), Some(ge_slot))
+            if eq_slot != ge_slot
+                && (1..=31).contains(&eq_slot)
+                && (1..=31).contains(&ge_slot)
+                && parameter_count == eq_slot.max(ge_slot) => 2,
+        _ => return None,
     };
-    if !expected_shape
-        || equality.double_quoted
+    if equality.double_quoted
         || range.double_quoted
         || !has_plain_integer_tokens(sql, false)
-        || tokenize(sql).ok()?.iter().filter(|tok| tok.kind == TokenKind::Variable).count() != parameter_count
+        || tokenize(sql).ok()?.iter().filter(|tok| tok.kind == TokenKind::Variable).count() != markers
     {
         return None;
     }
@@ -32370,7 +32373,7 @@ pub(crate) fn bound_view_partial_index(
         BinaryOp::Eq if column.column.eq_ignore_ascii_case(&equality.column) => {
             (equality_slot?, PartialIndexPredicate::Equal)
         }
-        BinaryOp::Ge if column.column.eq_ignore_ascii_case(&range.column) => {
+        BinaryOp::Ge if parameter_count <= 2 && column.column.eq_ignore_ascii_case(&range.column) => {
             (range_slot?, PartialIndexPredicate::GreaterOrEqual)
         }
         _ => return None,
