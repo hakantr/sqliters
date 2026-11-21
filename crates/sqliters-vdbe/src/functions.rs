@@ -1522,23 +1522,44 @@ fn parse_datetime_value(
             Value::Null | Value::Blob(_) => return None,
         };
         // A canonical date is already normalized and has no raw clock fields.
-        let modifiers = match (val, modifiers) {
-            (Value::Text(date), [Value::Text(modifier)])
-                if matches!(date.as_bytes(), [_, _, _, _, b'-', _, _, b'-', _, _])
-                    && (modifier.eq_ignore_ascii_case("ceiling")
-                        || modifier.eq_ignore_ascii_case("floor")) =>
-            {
-                if modifier.eq_ignore_ascii_case("floor") {
-                    let raw_day = date.get(8..)?.parse::<u32>().ok()?;
-                    let normalized_day = utc_ymdhms_from_unix_ms(time.unix_ms).2;
-                    // After a month rollover the new day counts the overflow days.
-                    if normalized_day != raw_day {
-                        time.unix_ms -= i64::from(normalized_day) * 86_400_000;
+        let modifiers = if let Value::Text(date) = val
+            && matches!(date.as_bytes(), [_, _, _, _, b'-', _, _, b'-', _, _])
+        {
+            let raw_day = || date.get(8..)?.parse::<u32>().ok();
+            match modifiers {
+                [Value::Text(modifier)]
+                    if modifier.eq_ignore_ascii_case("ceiling")
+                        || modifier.eq_ignore_ascii_case("floor") =>
+                {
+                    if modifier.eq_ignore_ascii_case("floor") {
+                        let normalized_day = utc_ymdhms_from_unix_ms(time.unix_ms).2;
+                        // After a month rollover the new day counts the overflow days.
+                        if normalized_day != raw_day()? {
+                            time.unix_ms -= i64::from(normalized_day) * 86_400_000;
+                        }
+                    }
+                    &modifiers[..0]
+                }
+                [Value::Text(shift), Value::Text(ceiling)]
+                    if ceiling.eq_ignore_ascii_case("ceiling")
+                        && raw_day()? == utc_ymdhms_from_unix_ms(time.unix_ms).2 =>
+                {
+                    if let Some(fields) = split_numeric_datetime_modifier(shift)
+                        && fields.is_signed_integer_calendar_shift()
+                    {
+                        time.unix_ms =
+                            apply_datetime_modifier_ms(&mut time, shift, None, false, || {
+                                Some(fields)
+                            })?;
+                        &modifiers[..0]
+                    } else {
+                        modifiers
                     }
                 }
-                &modifiers[..0]
+                _ => modifiers,
             }
-            _ => modifiers,
+        } else {
+            modifiers
         };
         (time, modifiers, check_julian_range)
     };
@@ -1884,6 +1905,17 @@ struct NumericDateTimeModifier<'a> {
     amount: &'a str,
     unit: &'a str,
     elapsed: Option<(f64, f32)>,
+}
+
+impl NumericDateTimeModifier<'_> {
+    fn is_signed_integer_calendar_shift(&self) -> bool {
+        self.amount.starts_with(['+', '-'])
+            && self.amount.parse::<i32>().is_ok_and(|amount| {
+                let magnitude = amount.unsigned_abs();
+                (self.unit.eq_ignore_ascii_case("month") && magnitude < 176_546)
+                    || (self.unit.eq_ignore_ascii_case("year") && magnitude < 14_713)
+            })
+    }
 }
 
 fn split_numeric_datetime_modifier(modifier: &str) -> Option<NumericDateTimeModifier<'_>> {

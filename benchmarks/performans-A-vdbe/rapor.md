@@ -1662,3 +1662,8 @@ Dört haneli işaretsiz ISO tarihindeki tek terminal ceiling C normalizasyonunu 
 ## V6b.271 — Tek ISO tarih floor değiştiricisi
 
 Dört haneli işaretsiz ISO tarihin tek terminal floor adımı C'nin başlangıç günü taşmasını düzeltiyor. 14 Tcl vakası ve üç kodlamada 800 hedef C eş, önceki 14 ceiling vakası başarılı. 36 salt okunur C açılışı ve DELETE/WAL dosya baytları eş. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,281 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_271.md).
+
+
+## V6b.272 — Ay ve yıl kaydırması sonrası ceiling
+
+Geçerli ISO başlangıç gününde tam ve işaretli ay veya yıl kaydırmasından sonra tek terminal ceiling, mevcut kaydırmanın C ile eş normalize sonucunu kullanır. Dört Tcl vakası, üç kodlamada 7.852 SQL ölçümü ve 27 C salt okunur açılışı eş. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,269 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_272.md).
