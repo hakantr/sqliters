@@ -362,7 +362,8 @@ fn choose_single_term_plan(
         && ctx.order_by.is_empty()
         && ctx.group_by.is_empty()
         && ctx.having.is_none()
-        && let Some(plan) = choose_unordered_without_rowid_scan(tbl, schema_name, alias, schema, &ctx, None)
+        && let Some(plan) =
+            choose_unordered_without_rowid_scan(tbl, schema_name, alias, schema, &ctx, None, false)
     {
         return plan;
     }
@@ -925,13 +926,18 @@ pub(crate) fn choose_plain_table_plan(
         && ctx.group_by.is_empty()
         && ctx.having.is_none()
         && ctx.projection.is_some_and(crate::engine::is_simple_covering_projection)
-        && let AccessPlan::IndexFullScan { index, is_covering: true } = &plan
     {
-        choose_unordered_without_rowid_scan(tbl, schema_name, alias, schema, &ctx, Some(index))
-            .unwrap_or(plan)
-    } else {
-        plan
+        let covering_index = match &plan {
+            AccessPlan::IndexFullScan { index, is_covering: true } => Some(index),
+            _ => None,
+        };
+        if tbl.stat1.has_stat1 || covering_index.is_some() {
+            return choose_unordered_without_rowid_scan(
+                tbl, schema_name, alias, schema, &ctx, covering_index, true,
+            ).unwrap_or(plan);
+        }
     }
+    plan
 }
 
 /// With no competing secondary loop, price a fully covering explicit index
@@ -980,7 +986,7 @@ pub(crate) fn choose_wr_delete_covering_scan(
         projection: Some(&[ResultColumn::Star]),
         ..Default::default()
     };
-    choose_unordered_without_rowid_scan(tbl, schema_name, None, schema, &ctx, None)
+    choose_unordered_without_rowid_scan(tbl, schema_name, None, schema, &ctx, None, false)
         .filter(|plan| matches!(plan, AccessPlan::IndexFullScan { is_covering: true, .. }))
 }
 
@@ -992,11 +998,12 @@ fn choose_unordered_without_rowid_scan(
     alias: Option<&str>,
     schema: &Schema,
     ctx: &QueryPlanContext<'_>,
-    covering_autoindex: Option<&IndexSchema>,
+    covering_index: Option<&IndexSchema>,
+    is_select: bool,
 ) -> Option<AccessPlan> {
     let indexes = schema.indexes_for_table(&tbl.name);
     let index_is_covering = |idx: &IndexSchema| {
-        if covering_autoindex.is_some() && idx.is_autoindex && idx.origin == "u" {
+        if is_select && idx.is_autoindex && idx.origin == "u" {
             // build.c fills colNotIdxed before convertToWithoutRowidTable
             // appends the PRIMARY KEY trailer to an automatic UNIQUE index.
             let mut mask = idx.clone();
@@ -1006,11 +1013,8 @@ fn choose_unordered_without_rowid_scan(
             index_is_covering_for_query(idx, tbl, schema_name, alias, None, ctx)
         }
     };
-    if let Some(index) = covering_autoindex
+    if is_select
         && (!tbl.without_rowid
-            || !index.is_autoindex
-            || index.origin != "u"
-            || index.trailing_pk_cols.is_empty()
             || tbl.columns.len() > 63
             || tbl.columns.iter().any(|col| {
                 col.generated.is_some() || col.custom_collation.is_some()
@@ -1019,16 +1023,25 @@ fn choose_unordered_without_rowid_scan(
                 idx.columns.iter().any(|key| {
                     key.col_idx.is_none() || key.sort_order.custom_collation.is_some()
                 })
-            })
-            || index_is_covering(index))
+            }))
     {
         return None;
+    }
+    if is_select && !tbl.stat1.has_stat1 {
+        let index = covering_index?;
+        if !index.is_autoindex
+            || index.origin != "u"
+            || index.trailing_pk_cols.is_empty()
+            || index_is_covering(index)
+        {
+            return None;
+        }
     }
     let has_statistics = tbl.stat1.has_stat1
         || tbl.without_rowid_pk_stat1.is_some()
         || indexes.iter().any(|idx| idx.stat1.is_some());
     if has_statistics
-        && (covering_autoindex.is_none()
+        && (!is_select
             || schema.stat1_rows.iter().any(|(table, _, stats)| {
                 table.eq_ignore_ascii_case(&tbl.name)
                     && stats.split_ascii_whitespace().any(|value| {
@@ -1066,9 +1079,13 @@ fn choose_unordered_without_rowid_scan(
         } else {
             idx.default_sz_idx_row(tbl)
         };
-        let row_estimate = idx.stat1.as_ref()
+        let row_estimate = idx
+            .stat1
+            .as_ref()
             .and_then(|stat| stat.row_log_est.first().copied())
-            .unwrap_or(tbl.stat1.n_row_log_est);
+            // sqlite3DefaultRowEst floors the estimate at 1000 rows when
+            // the index lacks its own ANALYZE statistics.
+            .unwrap_or(tbl.stat1.n_row_log_est.max(sqlite_log_est(1000)));
         let cost = full_index_scan_cost(row_estimate, index_size, table_size, is_covering);
         if cost < best_cost {
             best_cost = cost;

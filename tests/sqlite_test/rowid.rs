@@ -887,3 +887,56 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_without_rowid_covering_after_index_analyze() {
+    sqliters_tcltest::run_test_script(
+        "without_rowid_covering_after_index_analyze",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+proc load_records {} {
+  execsql {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INTEGER PRIMARY KEY);
+    INSERT INTO parent VALUES(5),(6),(11),(12);
+    CREATE TABLE records(
+      id INT, a INT UNIQUE, b NUM, PRIMARY KEY(id,a), FOREIGN KEY(a) REFERENCES parent(a)
+    ) WITHOUT ROWID;
+    CREATE INDEX records_bb ON records(b,b);
+    CREATE INDEX records_b ON records(b);
+    CREATE INDEX records_a_partial ON records(a) WHERE a>4;
+    INSERT INTO records VALUES(10,5,6),(7,11,4),(8,6,1);
+    CREATE TABLE ledger(seq INTEGER PRIMARY KEY, v INT, w INT);
+  }
+}
+load_records
+do_execsql_test wr-cover-index-analyze-1 {
+  ANALYZE records_b;
+  SELECT id%3,a+2 FROM records;
+} {2 8 1 13 1 7}
+do_execsql_test wr-cover-index-analyze-2 {
+  SELECT a FROM records;
+} {6 11 5}
+do_execsql_test wr-cover-index-analyze-3 {
+  SELECT id%3,a+2 FROM records LIMIT 1 OFFSET 1;
+  INSERT INTO ledger(v,w) SELECT id%3,a+2 FROM records;
+  SELECT seq,v,w FROM ledger ORDER BY seq;
+} {1 13 1 2 8 2 1 13 3 1 7}
+reset_db
+load_records
+do_execsql_test wr-cover-index-analyze-4 {
+  ANALYZE sqlite_autoindex_records_1;
+  SELECT id%3,a+2 FROM records;
+} {1 7 2 8 1 13}
+do_execsql_test wr-cover-index-analyze-5 {
+  SELECT a FROM records;
+} {5 6 11}
+do_execsql_test wr-cover-index-analyze-6 {
+  PRAGMA integrity_check;
+  PRAGMA foreign_key_check;
+} {ok}
+finish_test
+"#,
+    );
+}
