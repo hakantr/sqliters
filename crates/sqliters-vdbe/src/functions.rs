@@ -1474,6 +1474,7 @@ fn parse_datetime_value(
                 match other_modifiers.next() {
                     None => (ParsedDateTime::from_unix_ms(julian_days_to_ms(days)?), true),
                     Some(modifier) => {
+                        let mut single_start_of = false;
                         if other_modifiers.next().is_some() {
                             // Reuse the numeric fields if the chain needs the legacy dispatcher.
                             let fields: Vec<_> = modifiers
@@ -1489,15 +1490,24 @@ fn parse_datetime_value(
                                         || fields.is_some_and(|fields| fields.elapsed.is_some())
                                 });
                             typed_modifier_fields = Some(fields);
-                        } else if matches!(modifier, Value::Text(_)) {
-                            single_typed_modifier_days = Some(days);
+                        } else if let Value::Text(text) = modifier {
+                            single_start_of = ["start of day", "start of month", "start of year"]
+                                .iter()
+                                .any(|name| text.eq_ignore_ascii_case(name));
+                            single_typed_modifier_days = (!single_start_of).then_some(days);
                         }
-                        let ms = if typed_elapsed_chain {
-                            julian_days_to_ms(days)?
+                        let check_julian_range = typed_elapsed_chain || single_start_of;
+                        let ms = if check_julian_range {
+                            let ms = julian_days_to_ms(days)?;
+                            // Start-of reads the calendar before producing its new Julian day.
+                            if single_start_of && !valid_julian_unix_ms(ms) {
+                                return None;
+                            }
+                            ms
                         } else {
                             ((days - 2_440_587.5) * 86_400_000.0).round() as i64
                         };
-                        (ParsedDateTime::from_unix_ms(ms), typed_elapsed_chain)
+                        (ParsedDateTime::from_unix_ms(ms), check_julian_range)
                     }
                 }
             }

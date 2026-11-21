@@ -1627,3 +1627,8 @@ Yalnız süre ve hassasiyet bayrakları içeren typed INTEGER/REAL zincirleri, b
 ## V6b.264 — Görünüm UPDATE farklı sütun aralığı
 
 Olağan görünüm UPDATE taramasında iki doğrudan sütun izdüşümü, kısmi indeksin aralık sütunu ile korunmuş plan sınırlarına göre eşlenir. Sabit C ve iki Rust kipi 252 hedef, 420 korunmuş fiziksel kapanış ve 9.414 C salt okunur açılışında eşleşti. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_264.md).
+
+
+## V6b.265 — Typed Julian tek başlangıç değiştiricisi
+
+Doğrudan INTEGER ve REAL Julian girdilerinde tek exact start of day/month/year takvim okumasından önce C yuvarlaması ve aralık kontrolü kullanır. Ana 225 hedefin ve ek 408 sınır hedefinin tamamı iki kipte C ile eş. İki matriste 129 ve 208 fark kapandı, 45 C ve 90 Rust salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,249 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_265.md).
