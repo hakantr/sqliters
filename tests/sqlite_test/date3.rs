@@ -1,5 +1,4 @@
 #[test]
-#[ignore = "112/126 subtests passed; pending: date3 edge cases"]
 fn test_date3() {
     sqliters_tcltest::run_test_script(
         "date3",

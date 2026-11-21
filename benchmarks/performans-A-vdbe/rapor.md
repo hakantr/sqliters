@@ -1792,3 +1792,8 @@ Ayrı test host’ları için Tcl bağlı tamsayısı disk VFS saatine yansıtı
 ## V6b.297 — WITHOUT ROWID farklı üst eşik
 
 C’nin farklı işlemciyle elediği aynı anahtarlı kısmi indeks yerine tam indeksin doğru üst sınırı kullanılacak. 80 eski tarama kökü ve 320 taze ilişki sonucu C ile eş. 18.552 salt okunur C bütünlük kontrolü geçti. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,283 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_297.md).
+
+
+## V6b.298 — Date3 ve func2 normal workspace
+
+İki testin eski ignore satırı kaldırıldı. Dört normal odak koşusu geçti. Ayrı Tcl doğrulamasında her kipte date3 126/126 ve func2 131/131. Tam workspace için iki ek geçen ve iki eksik ignore denetlenir. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_298.md).
