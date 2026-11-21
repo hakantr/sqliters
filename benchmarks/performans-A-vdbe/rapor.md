@@ -1717,3 +1717,8 @@ Açık TEXT biçimi ve tek sabit tarih girdisinde yüzde l, C'nin boşluk dolgul
 ## V6b.282 — Görünüm UPDATE yüksek bağ yuvaları
 
 C'nin paylaşılan yüksek bağ biti gerçek equality yuvasından ayrı kullanılır. Önceki matrisin 68 son dosya farkı kapandı. 12.436 C salt okunur açılışı ve sonraki STEP kök/log kararları doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,268 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_282.md).
+
+
+## V6b.283 — timediff scalar işlevi
+
+İki argümanlı timediff, ortak tarih ayrıştırması ve Gregorian zaman hesabıyla C süre metni üretir. Üç kodlamada 62 TEXT, 14 NULL, beş arity tanısı ve iki Tcl vakası eş. 18 C salt okunur açılışı ve DELETE/WAL dosya eşliği doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_283.md).

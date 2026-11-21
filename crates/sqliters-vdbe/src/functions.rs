@@ -195,7 +195,7 @@ fn builtin_scalar_flags_upper(upper: &str, enable_test_functions: bool) -> Optio
             Some(FunctionFlags::INNOCUOUS)
         }
         "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" | "DATE" | "TIME" | "DATETIME"
-        | "UNIXEPOCH" | "JULIANDAY" | "STRFTIME" => Some(FunctionFlags::INNOCUOUS),
+        | "UNIXEPOCH" | "JULIANDAY" | "STRFTIME" | "TIMEDIFF" => Some(FunctionFlags::INNOCUOUS),
         _ => scalar_function_arity_with_flag(upper, enable_test_functions)
             .map(|_| FunctionFlags::DETERMINISTIC | FunctionFlags::INNOCUOUS),
     }
@@ -991,6 +991,10 @@ fn eval_scalar_function_plain(
             eval_datetime_function(upper, args, ctx)
         }
         "STRFTIME" => eval_strftime_function(args, ctx),
+        "TIMEDIFF" => {
+            check_arity(name, args, 2, 2)?;
+            Ok(eval_timediff(&args[0], &args[1], ctx))
+        }
         "PI" => {
             check_arity(name, args, 0, 0)?;
             Ok(Value::real(std::f64::consts::PI))
@@ -1165,7 +1169,7 @@ fn scalar_function_arity_with_flag(
         }
         "COALESCE" | "IIF" | "IF" => Some((2, usize::MAX)),
         "IFNULL" | "NULLIF" | "INSTR" | "GLOB" | "LIKELIHOOD" | "->" | "->>" | "JSON_PATCH"
-        | "JSONB_PATCH" | "POW" | "POWER" | "ATAN2" | "MOD" => Some((2, 2)),
+        | "JSONB_PATCH" | "POW" | "POWER" | "ATAN2" | "MOD" | "TIMEDIFF" => Some((2, 2)),
         "RANDSTR" | "TEST_SET_SUBTYPE" | "TEST_BAD_SUBTYPE" if enable_test_functions => {
             Some((2, 2))
         }
@@ -2221,6 +2225,53 @@ fn eval_datetime_function(
         }
         _ => unreachable!(),
     }
+}
+
+fn eval_timediff(first: &Value, second: &Value, ctx: &VmRuntimeContext) -> Value {
+    const DAY_MS: i64 = 86_400_000;
+
+    let Some((first, _)) = parse_datetime_value(first, &[], ctx) else {
+        return Value::Null;
+    };
+    let Some((second, _)) = parse_datetime_value(second, &[], ctx) else {
+        return Value::Null;
+    };
+
+    let (first_year, first_month, _, _, _, _) = utc_ymdhms_from_unix_ms(first.unix_ms);
+    let (second_year, second_month, second_day, _, _, _) = utc_ymdhms_from_unix_ms(second.unix_ms);
+    let (sign, direction) = if first.unix_ms >= second.unix_ms {
+        ('+', 1)
+    } else {
+        ('-', -1)
+    };
+    let month_number = |year, month| i64::from(year) * 12 + i64::from(month) - 1;
+    let mut anchor_month = month_number(first_year, first_month);
+    let mut months = (anchor_month - month_number(second_year, second_month)) * direction;
+    let second_clock = second.unix_ms.rem_euclid(DAY_MS);
+    let anchor_ms = |month: i64| {
+        let year = month.div_euclid(12);
+        let month = month.rem_euclid(12) as u32 + 1;
+        days_from_civil(year, month, second_day) * DAY_MS + second_clock
+    };
+
+    // Keep the second date's day and clock when testing each calendar month.
+    let mut remainder = (first.unix_ms - anchor_ms(anchor_month)) * direction;
+    while remainder < 0 {
+        months -= 1;
+        anchor_month -= direction;
+        remainder = (first.unix_ms - anchor_ms(anchor_month)) * direction;
+    }
+
+    let years = months / 12;
+    let months = months % 12;
+    // SQLite formats the remainder relative to January 1 of year zero.
+    let remainder_date = days_from_civil(0, 1, 1) * DAY_MS + remainder;
+    let (_, _, day, hour, minute, second) = utc_ymdhms_from_unix_ms(remainder_date);
+    let days = day - 1;
+    let milliseconds = remainder % 1_000;
+    Value::Text(format!(
+        "{sign}{years:04}-{months:02}-{days:02} {hour:02}:{minute:02}:{second:02}.{milliseconds:03}"
+    ))
 }
 
 fn eval_strftime_function(args: &[Value], ctx: &VmRuntimeContext) -> Result<Value> {
