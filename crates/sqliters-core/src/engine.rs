@@ -33292,8 +33292,7 @@ fn view_dml_indexed_select(
         && (column.affinity == TypeAffinity::Numeric || distinct_columns)
         && !column.is_primary_key
         && ctx.collations.get_custom("BINARY").is_none();
-    let wr_index_pair = indexes.len() == 2
-        && table.without_rowid
+    let wr_single_integer_range = table.without_rowid
         && matches!(
             predicate,
             ViewDmlIndexPredicate::UpdateRange | ViewDmlIndexPredicate::UpdateReturningRange
@@ -33307,6 +33306,32 @@ fn view_dml_indexed_select(
         && table.without_rowid_pk_cols.iter().all(|key| {
             key.sort_order.collation == Collation::Binary && key.sort_order.custom_collation.is_none()
         });
+    let wr_range_with_unrelated_indexes = wr_single_integer_range
+        && indexes.len() > 1
+        && !has_partial
+        && indexes.iter().filter(|index| {
+            index.columns.first().is_some_and(|key| matches_key(key.col_idx))
+        }).count() == 1
+        && indexes.iter().all(|index| {
+            let [key] = index.columns.as_slice() else {
+                return false;
+            };
+            !index.is_autoindex
+                && index.stat1.is_none()
+                && key.sort_order.collation == Collation::Binary
+                && key.sort_order.custom_collation.is_none()
+                && match key.col_idx {
+                    Some(column) if matches_key(Some(column)) => !index.unique,
+                    Some(_) => index.unique,
+                    None => !index.unique && key.expr.is_some(),
+                }
+        });
+    if wr_range_with_unrelated_indexes {
+        // The view predicate can constrain the plain key. The other full
+        // indexes have an unrelated expression or a different unique key.
+        indexes.retain(|index| matches_key(index.columns[0].col_idx));
+    }
+    let wr_index_pair = indexes.len() == 2 && wr_single_integer_range;
     if (two_index_range || wr_index_pair)
         && indexes.iter().any(|index| {
             let [key] = index.columns.as_slice() else {
@@ -33558,7 +33583,7 @@ fn view_dml_indexed_select(
             indexes.truncate(1);
         }
     }
-    if wr_index_pair {
+    if wr_index_pair || wr_range_with_unrelated_indexes {
         let expected = if let Some(root) = wr_mixed_root {
             indexes.iter().find(|index| index.root_pgno == root)?
         } else {
@@ -33628,7 +33653,7 @@ fn view_dml_indexed_select(
         ..
     } = &mut narrowed.select.body.head
     {
-        if (tied_range || wr_index_pair)
+        if (tied_range || wr_index_pair || wr_range_with_unrelated_indexes)
             && let TableOrSubquery::Table { indexed_by, .. } = &mut from.head
         {
             *indexed_by = Some(IndexHint::IndexedBy(index.name.clone()));

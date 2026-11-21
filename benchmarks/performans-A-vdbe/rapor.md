@@ -2042,3 +2042,8 @@ Nitelikli INTEGER PRIMARY KEY eşitliğinde olağan INNER ve LEFT JOIN, reverse_
 ## V6b.347 — Sol INTEGER PRIMARY KEY filtresiyle ters LEFT JOIN taraması
 
 72 SELECT biçimi ve altı profilde 70 sıra farkı kapandı. 18 C yeniden açılışı ve sekiz odaklı kontrol geçti. OFF 1223/1/329, ON 1220/4/329. DML OFF 392/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,272 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_347.md).
+
+
+## V6b.348 — WITHOUT ROWID görünüm UPDATE ve bağımsız tam indeksler
+
+96 profilde 100 sıra veya ana dosya farkı kapandı. İki uygun indeksin bulunduğu 24 profil öncekiyle eş. 360 C yeniden açılışı ile altı odaklı kontrol geçti. OFF 1224/1/329, ON 1221/4/329. DML OFF 392/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,262 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_348.md).

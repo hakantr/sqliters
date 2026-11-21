@@ -492,3 +492,52 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_returning_without_rowid_view_unrelated_indexes() {
+    sqliters_tcltest::run_test_script(
+        "returning_without_rowid_view_unrelated_indexes",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach {layout indexes} {
+  expression_first {
+    CREATE INDEX shifted ON base(k+1);
+    CREATE INDEX keyed ON base(k);
+  }
+  unique_last {
+    CREATE INDEX keyed ON base(k);
+    CREATE UNIQUE INDEX unique_label ON base(label);
+  }
+  mixed {
+    CREATE INDEX keyed ON base(k);
+    CREATE UNIQUE INDEX unique_label ON base(label);
+    CREATE INDEX shifted ON base(k+1);
+  }
+} {
+  reset_db
+  execsql {
+    CREATE TABLE base(id INTEGER PRIMARY KEY, k INTEGER, label TEXT) WITHOUT ROWID;
+    CREATE TABLE seen(seq INTEGER PRIMARY KEY, id INTEGER, previous TEXT);
+    INSERT INTO base VALUES (1,5,'one'),(2,2,'two'),(3,1,'three'),(4,3,'four'),(5,4,'five');
+    CREATE VIEW projected AS SELECT id,k,label FROM base;
+    CREATE TRIGGER revise INSTEAD OF UPDATE ON projected BEGIN
+      INSERT INTO seen(id,previous) VALUES(old.id,old.label);
+      UPDATE base SET label=new.label WHERE id=old.id;
+    END;
+  }
+  execsql $indexes
+  do_execsql_test returning-unrelated-$layout.1 {
+    UPDATE projected SET label=label||'!' WHERE k>=2 RETURNING id;
+    SELECT changes();
+  } {2 4 5 1 0}
+  do_execsql_test returning-unrelated-$layout.2 {
+    SELECT id,previous FROM seen ORDER BY seq;
+    SELECT id,label FROM base ORDER BY id;
+    PRAGMA integrity_check;
+  } {2 two 4 four 5 five 1 one 1 one! 2 two! 3 three 4 four! 5 five! ok}
+}
+finish_test
+"#,
+    );
+}
