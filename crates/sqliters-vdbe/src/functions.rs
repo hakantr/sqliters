@@ -1578,10 +1578,18 @@ fn parse_datetime_value(
                     ParsedDateTime::from_unix_ms(julian_days_to_ms(days)?)
                 } else {
                     let clock = stamp.as_bytes().get(11..).unwrap_or_default();
-                    if !is_normal_iso_calendar(&stamp)
-                        || !clock.iter().all(|byte| {
-                            matches!(byte, b'0'..=b'9' | b':' | b'.' | b'Z' | b'+' | b'-')
-                        })
+                    let bare_clock = matches!(
+                        stamp.as_bytes(),
+                        [b'0' | b'1', b'0'..=b'9', b':', ..]
+                            | [b'2', b'0'..=b'4', b':', ..]
+                    ) && stamp.bytes().all(|byte| {
+                        matches!(byte, b'0'..=b'9' | b':' | b'.' | b'Z' | b'z' | b'+' | b'-' | b' ')
+                    });
+                    if !bare_clock
+                        && (!is_normal_iso_calendar(&stamp)
+                            || !clock.iter().all(|byte| {
+                                matches!(byte, b'0'..=b'9' | b':' | b'.' | b'Z' | b'+' | b'-')
+                            }))
                     {
                         return None;
                     }
