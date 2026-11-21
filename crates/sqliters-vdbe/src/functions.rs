@@ -1554,15 +1554,27 @@ fn parse_datetime_value(
                     return None;
                 }
                 let stamp = ctx.text_encoding.decode_bytes(bytes);
-                let clock = stamp.as_bytes().get(11..).unwrap_or_default();
-                if !is_normal_iso_calendar(&stamp)
-                    || !clock.iter().all(|byte| {
-                        matches!(byte, b'0'..=b'9' | b':' | b'.' | b'Z' | b'+' | b'-')
-                    })
-                {
-                    return None;
-                }
-                (parse_iso_datetime(&stamp, false)?, true)
+                let digits =
+                    |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+                let julian_number = match stamp.split_once('.') {
+                    Some((whole, fraction)) => digits(whole) && digits(fraction),
+                    None => digits(&stamp),
+                };
+                let time = if julian_number {
+                    let days = parse_datetime_number_text(&stamp)?;
+                    ParsedDateTime::from_unix_ms(julian_days_to_ms(days)?)
+                } else {
+                    let clock = stamp.as_bytes().get(11..).unwrap_or_default();
+                    if !is_normal_iso_calendar(&stamp)
+                        || !clock.iter().all(|byte| {
+                            matches!(byte, b'0'..=b'9' | b':' | b'.' | b'Z' | b'+' | b'-')
+                        })
+                    {
+                        return None;
+                    }
+                    parse_iso_datetime(&stamp, false)?
+                };
+                (time, true)
             }
             Value::Null | Value::Blob(_) => return None,
         };
@@ -1772,14 +1784,17 @@ fn parse_datetime_text(
     }
 }
 
+fn parse_datetime_number_text(text: &str) -> Option<f64> {
+    let (value, result) = sqliters_types::sqlite_atof(text.as_bytes());
+    (result > 0).then_some(value)
+}
+
 fn parse_raw_datetime_number(val: &Value, encoding: TextEncoding) -> Option<f64> {
     match val {
         Value::Integer(value) => Some(*value as f64),
         Value::Real(value) => Some(*value),
         Value::Text(_) | Value::Blob(_) => {
-            let text = value_to_text_in_encoding(val, encoding);
-            let (value, result) = sqliters_types::sqlite_atof(text.as_bytes());
-            (result > 0).then_some(value)
+            parse_datetime_number_text(&value_to_text_in_encoding(val, encoding))
         }
         Value::Null => None,
     }

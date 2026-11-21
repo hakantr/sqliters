@@ -1832,3 +1832,8 @@ Değiştiricisiz kanonik BLOB tarihleri mevcut ISO ayrıştırıcısıyla işlen
 ## V6b.305 — VDBE saf tarih çağrısı koruması
 
 OP_PureFunc rolü ve P5 korunur. C’nin reddettiği beş yerleşik zaman çağrısının ölçülen biçimleri değerlendirme öncesi durur. İki rol birim kanıtı, 592 normal ham karşılaştırma ve 209 C açılışı geçti. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,264 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_305.md).
+
+
+## V6b.306 — İşaretsiz Julian tarih BLOB girdisi
+
+Değiştiricisiz tam kod birimi BLOB içindeki işaretsiz ASCII tamsayı ve ondalık kesir mevcut Julian dönüşümünden geçer. 1.320 doğrudan ve 1.320 satır akışı C sonucu eş. 3.636 C salt okunur açılışı ve 36 çıktı imajı doğrulandı. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,269 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_306.md).
