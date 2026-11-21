@@ -2092,3 +2092,8 @@ Nitelikli INTEGER PRIMARY KEY eşitliğinde olağan INNER ve LEFT JOIN, reverse_
 ## V6b.357 — WITHOUT ROWID görünüm UPDATE ve UNIQUE kısıtının otomatik indeksi
 
 120 profilde 140 sıra veya ana dosya farkı kapandı. 360 C yeniden açılışı ve dört odaklı kontrol geçti. 6138 OFF korpusunda C ile eşleşti. OFF 1233/1/329, ON 1230/4/329. DML OFF 393/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,268 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_357.md).
+
+
+## V6b.358 — WITHOUT ROWID görünüm UPDATE RETURNING sırasında birincil anahtar filtresi
+
+330 profilde 90 sıra veya dosya farkı kapandı. 990 C yeniden açılışı ve dört odaklı kontrol geçti. OFF 1234/1/329, ON 1231/4/329. DML OFF 393/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_358.md).

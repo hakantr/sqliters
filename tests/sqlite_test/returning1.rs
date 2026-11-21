@@ -879,3 +879,43 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_returning_without_rowid_view_preserves_primary_key_filter() {
+    sqliters_tcltest::run_test_script(
+        "returning_without_rowid_view_preserves_primary_key_filter",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach {layout filter expected final_rows} {
+  outside {id<>3} {2 4 5 1} {1 one! 2 two! 3 three 4 four! 5 five!}
+  excludes_last {id<>1} {2 4 5} {1 one 2 two! 3 three 4 four! 5 five!}
+  excludes_first {id!=2} {4 5 1} {1 one! 2 two 3 three 4 four! 5 five!}
+  range_control {k<5} {2 4 5} {1 one 2 two! 3 three 4 four! 5 five!}
+} {
+  reset_db
+  execsql {
+    CREATE TABLE base(id INTEGER PRIMARY KEY, k INTEGER, label TEXT) WITHOUT ROWID;
+    CREATE TABLE seen(seq INTEGER PRIMARY KEY, id INTEGER);
+    INSERT INTO base VALUES (1,5,'one'),(2,2,'two'),(3,1,'three'),(4,3,'four'),(5,4,'five');
+    CREATE INDEX keyed ON base(k);
+  }
+  execsql "CREATE VIEW projected AS SELECT id,k,label FROM base WHERE $filter;"
+  execsql {
+    CREATE TRIGGER revise INSTEAD OF UPDATE ON projected BEGIN
+      INSERT INTO seen(id) VALUES(old.id);
+      UPDATE base SET label=new.label WHERE id=old.id;
+    END;
+  }
+  do_execsql_test returning-filtered-view-$layout.1 {
+    UPDATE projected SET label=label||'!' WHERE k>=2 RETURNING id;
+    SELECT changes();
+    SELECT id FROM seen ORDER BY seq;
+    SELECT id,label FROM base ORDER BY id;
+    PRAGMA integrity_check;
+  } [concat $expected {0} $expected $final_rows {ok}]
+}
+finish_test
+"#,
+    );
+}

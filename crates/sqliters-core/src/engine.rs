@@ -32661,6 +32661,13 @@ struct PreparedVTabDelete {
 fn single_table_select_projection(
     select: &SelectStmt,
 ) -> Option<(&[ResultColumn], &QualifiedName, Option<&str>)> {
+    let (projection, name, alias, selection) = single_table_select_parts(select)?;
+    selection.is_none().then_some((projection, name, alias))
+}
+
+fn single_table_select_parts(
+    select: &SelectStmt,
+) -> Option<(&[ResultColumn], &QualifiedName, Option<&str>, Option<&Expr>)> {
     if !select.ctes.is_empty()
         || !select.body.compounds.is_empty()
         || !select.order_by.is_empty()
@@ -32672,7 +32679,7 @@ fn single_table_select_projection(
         distinct: false,
         projection,
         from: Some(from),
-        selection: None,
+        selection,
         group_by,
         having: None,
         windows,
@@ -32692,7 +32699,7 @@ fn single_table_select_projection(
     if !from.joins.is_empty() || !group_by.is_empty() || !windows.is_empty() {
         return None;
     }
-    Some((projection, name, alias.as_deref()))
+    Some((projection, name, alias.as_deref(), selection.as_ref()))
 }
 
 pub(crate) fn is_main_rowid_view_update(stmt: &Stmt, db_set: &DatabaseSet) -> bool {
@@ -33174,7 +33181,10 @@ fn view_dml_indexed_select(
         return None;
     }
 
-    let (projection, name, alias) = single_table_select_projection(&view.select)?;
+    let (projection, name, alias, view_filter) = single_table_select_parts(&view.select)?;
+    if view_filter.is_some() && (!returning_range || second_term.is_some()) {
+        return None;
+    }
     if name
         .schema
         .as_deref()
@@ -33252,6 +33262,18 @@ fn view_dml_indexed_select(
     };
     let column_index = projected_index(target_col)?;
     let column = &table.columns[column_index];
+    if let Some(view_filter) = view_filter {
+        let (filter_col, filter_op, filter_bound) = view_dml_index_term(view_filter)?;
+        let (_, filter_key) = table.find_column(&filter_col.column)?;
+        if !filter_key.is_primary_key
+            || filter_key.affinity != TypeAffinity::Integer
+            || filter_op != BinaryOp::Ne
+            || !matches!(filter_bound, Expr::Integer(_))
+            || !view_dml_range_is_lower(op, bound, false)?
+        {
+            return None;
+        }
+    }
     let other_index = if distinct_columns {
         let (other, other_op, _) = second_term?;
         let index = projected_index(other)?;
@@ -33294,7 +33316,13 @@ fn view_dml_indexed_select(
     };
     let make_selection = || {
         let first = make_term(column, op, bound);
-        if let Some((_, other_op, other_bound)) = second_term {
+        if let Some(view_filter) = view_filter {
+            Expr::Binary {
+                left: Box::new(view_filter.clone()),
+                op: BinaryOp::And,
+                right: Box::new(first),
+            }
+        } else if let Some((_, other_op, other_bound)) = second_term {
             Expr::Binary {
                 left: Box::new(first),
                 op: BinaryOp::And,
@@ -33334,6 +33362,9 @@ fn view_dml_indexed_select(
     }
     let mut indexes = schema.indexes_for_table(&table.name);
     let has_partial = indexes.iter().any(|index| index.where_clause.is_some());
+    if view_filter.is_some() && has_partial {
+        return None;
+    }
     let two_index_range = indexes.len() == 2
         && predicate == ViewDmlIndexPredicate::UpdateRange
         && (second_term.is_none() || (has_partial && ctx.stmt_tx.view_update_range_tokens))
