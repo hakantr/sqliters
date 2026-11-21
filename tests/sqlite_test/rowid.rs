@@ -1094,3 +1094,43 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_reverse_unordered_integer_key_range_join() {
+    sqliters_tcltest::run_test_script(
+        "reverse_unordered_integer_key_range_join",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE source_rows(id INTEGER PRIMARY KEY, value TEXT);
+  CREATE TABLE tags(id INTEGER PRIMARY KEY, name TEXT);
+  INSERT INTO source_rows VALUES(1,'r1'),(2,'r2'),(3,'r3');
+  INSERT INTO tags VALUES(1,'a'),(3,'c'),(4,'d');
+  PRAGMA reverse_unordered_selects=ON;
+}
+do_execsql_test reverse-key-range-1 {
+  SELECT r.id,t.id FROM source_rows r LEFT JOIN tags t ON t.id>r.id;
+} {3 4 2 4 2 3 1 4 1 3}
+do_execsql_test reverse-key-range-2 {
+  SELECT r.id,t.id FROM source_rows r LEFT JOIN tags t ON t.id<=r.id;
+} {3 3 3 1 2 1 1 1}
+do_execsql_test reverse-key-range-3 {
+  SELECT r.id,t.id FROM source_rows r LEFT JOIN tags t ON r.id<=t.id;
+} {3 4 3 3 2 4 2 3 1 4 1 3 1 1}
+do_execsql_test reverse-key-range-4 {
+  SELECT r.*,t.* FROM source_rows r LEFT JOIN tags t ON t.id<r.id;
+} {3 r3 1 a 2 r2 1 a 1 r1 {} {}}
+do_execsql_test reverse-key-range-5 {
+  SELECT r.id,t.id FROM source_rows r LEFT JOIN tags t ON t.id>r.id LIMIT 2 OFFSET 1;
+} {2 4 2 3}
+do_execsql_test reverse-key-range-6 {
+  SELECT r.id,t.id FROM source_rows r LEFT JOIN tags t ON t.id>=r.id ORDER BY r.id,t.id;
+} {1 1 1 3 1 4 2 3 2 4 3 3 3 4}
+do_execsql_test reverse-key-range-7 {
+  SELECT r.id,t.id FROM source_rows r LEFT JOIN tags t ON t.id=r.id;
+} {3 3 2 {} 1 1}
+finish_test
+"#,
+    );
+}

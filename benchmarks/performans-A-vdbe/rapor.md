@@ -2027,3 +2027,8 @@ Yıldız ve nitelikli yıldız ifadeleri olağan tek tablo ve CROSS JOIN okumala
 ## V6b.344 — INTEGER PRIMARY KEY eşitliğinde ters JOIN taraması
 
 Nitelikli INTEGER PRIMARY KEY eşitliğinde olağan INNER ve LEFT JOIN, reverse_unordered_selects açıkken C ile aynı satır sırasını veriyor. 60 fark kapandı. 18 C yeniden açılışı ve yedi odaklı kontrol doğrulandı. OFF 1220/1/329, ON 1217/4/329. DML OFF 392/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,270 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_344.md).
+
+
+## V6b.345 — INTEGER PRIMARY KEY aralığında ters LEFT JOIN taraması
+
+34 SELECT biçimi ve altı profilde 60 aralık sırası farkı kapandı. 18 C yeniden açılışı ve yedi odaklı kontrol geçti. OFF 1221/1/329, ON 1218/4/329. DML OFF 392/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,268 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_345.md).

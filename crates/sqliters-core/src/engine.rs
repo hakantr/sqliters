@@ -8957,7 +8957,7 @@ fn reverse_plain_join_scans(db_set: &DatabaseSet, from: &FromClause) -> ReverseJ
     {
         return ReverseJoinScans::None;
     }
-    let Some(JoinConstraint::On(Expr::Binary { left: a, op: BinaryOp::Eq, right: b })) =
+    let Some(JoinConstraint::On(Expr::Binary { left: a, op, right: b })) =
         join.constraint.as_ref()
     else {
         return ReverseJoinScans::None;
@@ -8976,9 +8976,16 @@ fn reverse_plain_join_scans(db_set: &DatabaseSet, from: &FromClause) -> ReverseJ
     if (is_key(a, left, left_alias) && is_key(b, right, right_alias))
         || (is_key(b, left, left_alias) && is_key(a, right, right_alias))
     {
-        // Each left key matches at most one right row. Its scan order does
-        // not affect the order of this result.
-        ReverseJoinScans::Left
+        match op {
+            // Each left key matches at most one right row.
+            BinaryOp::Eq => ReverseJoinScans::Left,
+            BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+                if join.join_type == JoinType::Left =>
+            {
+                ReverseJoinScans::Both
+            }
+            _ => ReverseJoinScans::None,
+        }
     } else {
         ReverseJoinScans::None
     }
