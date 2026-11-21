@@ -1912,3 +1912,8 @@ Materyalize SELECT ve CTE sınırları kayıpsız tam sayı dönüşümünü kul
 ## V6b.321 — Olağan SELECT LIMIT ve OFFSET değerlendirme sırası
 
 Olağan tablolardaki DISTINCT GROUP BY ve JOIN sorguları LIMIT ve OFFSET değerlerini satır hazırlamadan önce değerlendirir. 180 başlangıç farkı kapandı. 54 sorgu, 18 C salt okunur açılış ve beş odaklı Rust karşılaştırması doğrulandı. OFF 1197/1/329, ON 1194/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_321.md).
+
+
+## V6b.322 — Bileşik SELECT LIMIT ve OFFSET değerlendirme sırası
+
+Olağan tablo kollarındaki UNION ALL UNION INTERSECT ve EXCEPT için 800 ifade sırası farkı kapandı. 88 sorgu biçimi, 18 C salt okunur açılış ve 24 Rust okuyucu/yazıcı çifti C ile eş. Yeni odaklı test iki kipte geçti. OFF 1198/1/329, ON 1195/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,055 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_322.md).

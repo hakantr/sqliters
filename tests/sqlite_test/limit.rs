@@ -681,3 +681,36 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_compound_limit_evaluation_order() {
+    sqliters_tcltest::run_test_script(
+        "compound_limit_order",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE item(id INTEGER PRIMARY KEY);
+  INSERT INTO item VALUES(1),(2),(3);
+  CREATE TABLE detail(id INTEGER PRIMARY KEY);
+  INSERT INTO detail VALUES(1),(3),(4);
+}
+do_execsql_test compound-limit-order-1 {
+  SELECT abs(-9223372036854775808) FROM item UNION ALL SELECT id FROM detail LIMIT 0;
+} {}
+do_catchsql_test compound-limit-order-2 {
+  SELECT id FROM item UNION SELECT abs(-9223372036854775808) FROM detail ORDER BY 1 LIMIT 1.5;
+} {1 {datatype mismatch}}
+do_catchsql_test compound-limit-order-3 {
+  SELECT abs(-9223372036854775808) FROM item INTERSECT SELECT id FROM detail LIMIT 2 OFFSET NULL;
+} {1 {datatype mismatch}}
+do_execsql_test compound-limit-order-4 {
+  SELECT id FROM item EXCEPT SELECT abs(-9223372036854775808) FROM detail ORDER BY 1 LIMIT 0 OFFSET 'unused';
+} {}
+do_execsql_test compound-limit-order-5 {
+  SELECT id FROM item UNION SELECT id FROM detail ORDER BY 1 LIMIT '2e0' OFFSET 1.0;
+} {2 3}
+finish_test
+"#,
+    );
+}

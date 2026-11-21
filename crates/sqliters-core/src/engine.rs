@@ -6894,8 +6894,27 @@ fn exec_compound_select(
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
 ) -> Result<QueryOutput> {
+    let ordinary_arm = |core: &SelectCore| {
+        matches!(
+            core,
+            SelectCore::Select { from: Some(from), .. }
+                if has_ordinary_limit_sources(ctx.db_set, from, ctes)
+        )
+    };
+    let evaluated_limit = if let Some(limit) = limit
+        && ordinary_arm(&body.head)
+        && body.compounds.iter().all(|(_, arm)| ordinary_arm(arm))
+    {
+        Some(eval_select_limit_offset(ctx, limit, params, outer_scopes, ctes)?)
+    } else {
+        None
+    };
+    // Each arm still supplies its column names when a zero LIMIT skips its rows.
+    let zero = LimitClause { limit: Expr::Integer(0), offset: None };
+    let arm_limit = matches!(evaluated_limit, Some((0, _))).then_some(&zero);
     let body_meta = infer_select_body_meta(body, outer_scopes, ctx.db_set, ctes);
-    let head_out = exec_single_select_core(ctx, &body.head, &[], None, params, outer_scopes, ctes)?;
+    let head_out =
+        exec_single_select_core(ctx, &body.head, &[], arm_limit, params, outer_scopes, ctes)?;
     let col_names = head_out.column_names;
     let mut all_arm_col_names = vec![col_names.clone()];
     let mut acc_rows = head_out.rows;
@@ -6914,7 +6933,7 @@ fn exec_compound_select(
 
     for (op, rhs_core) in &body.compounds {
         let rhs_out =
-            exec_single_select_core(ctx, rhs_core, &[], None, params, outer_scopes, ctes)?;
+            exec_single_select_core(ctx, rhs_core, &[], arm_limit, params, outer_scopes, ctes)?;
         if rhs_out.column_names.len() != col_names.len() {
             return Err(SqliteError::new(
                 ErrorCode::Error,
@@ -7025,7 +7044,11 @@ fn exec_compound_select(
             enc,
         )?;
     }
-    let acc_rows = apply_limit_offset(ctx, acc_rows, limit, params, outer_scopes, ctes)?;
+    let acc_rows = if let Some((limit, offset)) = evaluated_limit {
+        slice_select_rows(acc_rows, limit, offset)
+    } else {
+        apply_limit_offset(ctx, acc_rows, limit, params, outer_scopes, ctes)?
+    };
     Ok(QueryOutput {
         column_names: col_names,
         rows: acc_rows,
