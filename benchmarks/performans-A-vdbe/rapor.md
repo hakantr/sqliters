@@ -1687,3 +1687,8 @@ Geçerli ISO tarihte tam ve işaretli ay veya yıl kaydırmasından sonra tek te
 ## V6b.276 — Tek işaretli takvim kaydırması
 
 Geçerli ISO başlangıçta dört haneli tek işaretli takvim değiştiricisi yıl ve ayı önce, gün miktarını son uygular. Ortak ISO Julian denetimi son değeri doğrular. 746 hedef, 2.590 ham koruma ve 30 C salt okunur açılışı eş. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,267 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_276.md).
+
+
+## V6b.277 — İşaretli takvim sonrası floor ve ceiling
+
+Geçerli ISO başlangıçta dört haneli işaretli takvim kaydırmasının terminal floor ve ceiling adımları C ile eş. Düzeltme altı Tcl vakasını kapattı ve date-19 adayını 42/42 yaptı. Üç kodlamada 1.490 terminal çıktı ve 30 C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,291 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_277.md).

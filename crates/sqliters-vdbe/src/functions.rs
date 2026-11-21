@@ -1546,7 +1546,8 @@ fn parse_datetime_value(
                     &modifiers[..0]
                 }
                 [Value::Text(modifier)] => {
-                    if let Some(unix_ms) = apply_packed_calendar_shift(time.unix_ms, date, modifier)
+                    if let Some(unix_ms) =
+                        apply_packed_calendar_shift(time.unix_ms, date, modifier, false)
                     {
                         time.unix_ms = unix_ms;
                         &modifiers[..0]
@@ -1558,25 +1559,35 @@ fn parse_datetime_value(
                     if modifier.eq_ignore_ascii_case("ceiling")
                         || modifier.eq_ignore_ascii_case("floor") =>
                 {
-                    let original_day = raw_day()?;
-                    if original_day == utc_ymdhms_from_unix_ms(time.unix_ms).2
-                        && let Some(fields) = split_numeric_datetime_modifier(shift)
-                        && fields.is_signed_integer_calendar_shift()
-                    {
-                        time.unix_ms =
-                            apply_datetime_modifier_ms(&mut time, shift, None, false, || {
-                                Some(fields)
-                            })?;
-                        if modifier.eq_ignore_ascii_case("floor") {
-                            // A whole shift cannot roll the last day of December into year 10000.
-                            if !valid_julian_unix_ms(time.unix_ms) {
-                                return None;
-                            }
-                            time.unix_ms = floor_month_overflow(time.unix_ms, original_day);
-                        }
+                    if let Some(unix_ms) = apply_packed_calendar_shift(
+                        time.unix_ms,
+                        date,
+                        shift,
+                        modifier.eq_ignore_ascii_case("floor"),
+                    ) {
+                        time.unix_ms = unix_ms;
                         &modifiers[..0]
                     } else {
-                        modifiers
+                        let original_day = raw_day()?;
+                        if original_day == utc_ymdhms_from_unix_ms(time.unix_ms).2
+                            && let Some(fields) = split_numeric_datetime_modifier(shift)
+                            && fields.is_signed_integer_calendar_shift()
+                        {
+                            time.unix_ms =
+                                apply_datetime_modifier_ms(&mut time, shift, None, false, || {
+                                    Some(fields)
+                                })?;
+                            if modifier.eq_ignore_ascii_case("floor") {
+                                // A whole shift cannot roll the last day of December into year 10000.
+                                if !valid_julian_unix_ms(time.unix_ms) {
+                                    return None;
+                                }
+                                time.unix_ms = floor_month_overflow(time.unix_ms, original_day);
+                            }
+                            &modifiers[..0]
+                        } else {
+                            modifiers
+                        }
                     }
                 }
                 _ => modifiers,
@@ -1965,7 +1976,12 @@ fn split_numeric_datetime_modifier(modifier: &str) -> Option<NumericDateTimeModi
     })
 }
 
-fn apply_packed_calendar_shift(unix_ms: i64, original_date: &str, modifier: &str) -> Option<i64> {
+fn apply_packed_calendar_shift(
+    unix_ms: i64,
+    original_date: &str,
+    modifier: &str,
+    floor: bool,
+) -> Option<i64> {
     let [sign @ (b'+' | b'-'), _, _, _, _, b'-', _, _, b'-', _, _] = modifier.as_bytes() else {
         return None;
     };
@@ -1991,7 +2007,13 @@ fn apply_packed_calendar_shift(unix_ms: i64, original_date: &str, modifier: &str
     let month = shifted_month.rem_euclid(12) as u32 + 1;
     // Normalize the original day in the target month before applying the day shift.
     let date_days = days_from_civil(year, month, day);
-    Some((date_days + direction * i64::from(days)) * 86_400_000)
+    let overflow_days = if floor {
+        let next_month_start = days_from_civil(year + i64::from(month == 12), month % 12 + 1, 1);
+        (date_days - next_month_start + 1).max(0)
+    } else {
+        0
+    };
+    Some((date_days + direction * i64::from(days) - overflow_days) * 86_400_000)
 }
 
 fn apply_datetime_modifier_ms<'a>(
