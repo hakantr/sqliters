@@ -7306,7 +7306,8 @@ fn exec_single_select_core_inner(
 
             let evaluated_limit = match (limit, from) {
                 (Some(limit), Some(from))
-                    if has_ordinary_limit_sources(ctx.db_set, from, ctes, &mut Vec::new()) =>
+                    if has_ordinary_limit_sources(ctx.db_set, from, ctes, &mut Vec::new())
+                        || (!order_by.is_empty() && has_simple_recursive_limit_source(from, ctes)) =>
                 {
                     Some(eval_select_limit_offset(ctx, limit, params, outer_scopes, ctes)?)
                 }
@@ -16787,6 +16788,32 @@ fn eval_select_offset(
     };
     let offset = select_limit_integer(eval_expr(ctx, offset, params, outer_scopes, ctes, None)?)?;
     Ok(usize::try_from(offset.max(0)).unwrap_or(usize::MAX))
+}
+
+fn has_simple_recursive_limit_source(from: &FromClause, ctes: &CteStore) -> bool {
+    let TableOrSubquery::Table {
+        name,
+        table_args: None,
+        indexed_by: None,
+        ..
+    } = &from.head else {
+        return false;
+    };
+    if name.schema.is_some() || !from.joins.is_empty() {
+        return false;
+    }
+    let Some((scope, index)) = ctes.locate(&name.name) else {
+        return false;
+    };
+    let cte = &ctes.scopes[scope][index];
+    let [(CompoundOp::UnionAll | CompoundOp::Union, arm)] = cte.query.body.compounds.as_slice() else {
+        return false;
+    };
+    cte.columns.is_some()
+        && cte.query.ctes.is_empty()
+        && matches!(cte.query.body.head, SelectCore::Values(_))
+        && matches!(classify_cte_recursion(cte), CteRecursionKind::Recursive { first_rec_idx: 0 })
+        && check_recursive_arm_no_aggregates(arm).is_ok()
 }
 
 fn has_ordinary_limit_sources(

@@ -837,3 +837,37 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_ordered_recursive_cte_limit() {
+    sqliters_tcltest::run_test_script(
+        "ordered_recursive_cte_limit",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+do_execsql_test recursive-limit-order-1 {
+  WITH RECURSIVE seq(x) AS (
+    VALUES(abs(-9223372036854775808)) UNION ALL SELECT x+1 FROM seq WHERE x<4
+  ) SELECT x FROM seq ORDER BY x LIMIT 0 OFFSET 'unused';
+} {}
+do_catchsql_test recursive-limit-order-2 {
+  WITH RECURSIVE seq(x) AS (
+    VALUES(1) UNION ALL SELECT abs(-9223372036854775808) FROM seq WHERE x<4
+  ) SELECT x FROM seq ORDER BY x LIMIT 1.5;
+} {1 {datatype mismatch}}
+do_catchsql_test recursive-limit-order-3 {
+  WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<4)
+  SELECT abs(-9223372036854775808),x FROM seq ORDER BY x LIMIT 1 OFFSET NULL;
+} {1 {datatype mismatch}}
+do_execsql_test recursive-limit-order-4 {
+  WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<4)
+  SELECT x FROM seq ORDER BY x DESC LIMIT '2e0' OFFSET 1;
+} {3 2}
+do_execsql_test recursive-limit-order-5 {
+  WITH RECURSIVE seq(x) AS (VALUES(1) UNION SELECT x+1 FROM seq WHERE x<4)
+  SELECT abs(-9223372036854775808) FROM seq ORDER BY x LIMIT 0;
+} {}
+finish_test
+"#,
+    );
+}
