@@ -1732,3 +1732,8 @@ Tek normal signed tarih ve saat değiştiricisi C'nin yıl, ay, gün ve saat sı
 ## V6b.285 — strftime Pazar başlangıçlı hafta
 
 Açık TEXT biçimi ve tek sabit tarihle yüzde U, C'nin Pazar başlangıçlı haftasını üretir. İki Tcl vakası kapandı ve date-23 adayı 22/22 oldu. Üç kodlamada 2.433 sonuç ve 18 C salt okunur açılışı eş. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,262 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_285.md).
+
+
+## V6b.286 — WITHOUT ROWID görünümü adlandırılmış RETURNING
+
+Tek sıradan BINARY ikincil indeksli WITHOUT ROWID görünümünde nitelemesiz RETURNING ile sayı aralığı C materyalizasyon sırasını kullanır. Önceki 120 fark kapandı ve 480 DELETE veya WAL hedefi C eş. 2.592 C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,269 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_286.md).

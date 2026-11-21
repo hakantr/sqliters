@@ -30438,15 +30438,25 @@ fn prepare_update_exec<'a>(
                 None
             };
 
+            let has_returning = !upd.returning.is_empty();
             let selection = upd.selection.as_ref().filter(|_| {
                 upd.from.is_none()
                     && upd.alias.is_none()
                     && upd.indexed_by.is_none()
                     && upd.ctes.is_empty()
-                    && upd.returning.is_empty()
+                    && upd.returning.iter().all(|item| {
+                        view_dml_named_column(item).is_some_and(|column| {
+                            col_specs
+                                .iter()
+                                .any(|(name, _, _)| name.eq_ignore_ascii_case(&column.column))
+                        })
+                    })
             });
-            let scalar_max =
-                selection.and_then(|w| view_update_max_subquery(ctx, db_id, &view, w));
+            let scalar_max = if has_returning {
+                None
+            } else {
+                selection.and_then(|w| view_update_max_subquery(ctx, db_id, &view, w))
+            };
             let mut narrowed = view_dml_indexed_select(
                 ctx,
                 db_id,
@@ -30454,7 +30464,9 @@ fn prepare_update_exec<'a>(
                 selection,
                 outer_scopes,
                 &col_specs,
-                if scalar_max.is_some() {
+                if has_returning {
+                    ViewDmlIndexPredicate::UpdateReturningRange
+                } else if scalar_max.is_some() {
                     ViewDmlIndexPredicate::UpdateMax
                 } else {
                     ViewDmlIndexPredicate::UpdateRange
@@ -32236,8 +32248,21 @@ fn eval_view_max_literal(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewDmlIndexPredicate {
     UpdateRange,
+    UpdateReturningRange,
     UpdateMax,
     DeleteRange,
+}
+
+fn view_dml_named_column(item: &ResultColumn) -> Option<&ColumnRef> {
+    let ResultColumn::Expr {
+        expr: Expr::Column(column),
+        alias: None,
+        ..
+    } = item
+    else {
+        return None;
+    };
+    (column.schema.is_none() && column.table.is_none() && !column.double_quoted).then_some(column)
 }
 
 fn view_dml_index_term(term: &Expr) -> Option<(&ColumnRef, BinaryOp, &Expr)> {
@@ -32463,6 +32488,7 @@ fn view_dml_indexed_select(
         return None;
     }
     let max_eq = predicate == ViewDmlIndexPredicate::UpdateMax;
+    let returning_range = predicate == ViewDmlIndexPredicate::UpdateReturningRange;
     let (term, second_term) = match selection? {
         Expr::Binary { left, op: BinaryOp::And, right }
             if predicate == ViewDmlIndexPredicate::UpdateRange =>
@@ -32472,6 +32498,9 @@ fn view_dml_indexed_select(
         term => (term, None),
     };
     let (target_col, op, bound) = view_dml_index_term(term)?;
+    if returning_range && !matches!(bound, Expr::Integer(_)) {
+        return None;
+    }
     let quoted_bound = if predicate == ViewDmlIndexPredicate::UpdateRange
         && second_term.is_none()
         && let Expr::String(literal) = bound
@@ -32523,6 +32552,8 @@ fn view_dml_indexed_select(
     let schema = &ctx.db_set.main_slot().schema;
     let table = schema.find_user_table(&name.name)?;
     if (max_eq && !table.without_rowid)
+        || (returning_range
+            && (!table.without_rowid || ctx.collations.get_custom("BINARY").is_some()))
         || (table.without_rowid && predicate == ViewDmlIndexPredicate::DeleteRange)
         || (quoted_bound.is_some()
             && (table.without_rowid || ctx.collations.get_custom("BINARY").is_some()))
@@ -32532,6 +32563,11 @@ fn view_dml_indexed_select(
             .columns
             .iter()
             .any(|c| c.generated.as_ref().is_some_and(|(_, stored)| !stored))
+    {
+        return None;
+    }
+    if returning_range
+        && (alias.is_some() || projection.iter().any(|item| view_dml_named_column(item).is_none()))
     {
         return None;
     }
@@ -32802,9 +32838,10 @@ fn view_dml_indexed_select(
         return None;
     };
     let key = index.columns.first()?;
-    let without_rowid_range = table.without_rowid && predicate == ViewDmlIndexPredicate::UpdateRange;
+    let without_rowid_range = table.without_rowid && !max_eq;
     let expected_keys = if max_eq { 2 } else { 1 };
     if (index.where_clause.is_some() && !partial_range)
+        || (returning_range && index.unique)
         || index.is_unordered()
         || index.columns.len() != expected_keys
         || !matches_key(key.col_idx)
