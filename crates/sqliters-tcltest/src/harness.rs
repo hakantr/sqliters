@@ -4033,6 +4033,11 @@ fn cmd_stmt_busy(host: &SharedHost, args: &[String]) -> TclResult<String> {
 }
 
 fn cmd_bind_scalar(host: &SharedHost, kind: &str, args: &[String]) -> TclResult<String> {
+    let args = if kind == "blob" && args.len() == 5 && args[0] == "-static" {
+        &args[1..]
+    } else {
+        args
+    };
     let min_args = if kind == "null" { 2 } else { 3 };
     if args.len() < min_args {
         return Err(TclControl::Error(format!(

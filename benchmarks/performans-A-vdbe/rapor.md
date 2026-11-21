@@ -1877,3 +1877,8 @@ Mevcut SQLite ASCII boşluk denetimi sayısal BLOB yazımının başına ve sonu
 ## V6b.314 — Sabit saat metni içeren tarih BLOB girdisi
 
 Değiştiricisiz sabit saat metni mevcut C uyumlu saat ayrıştırmasına bağlanır. Üç kodlamada bağlı ve literal yerleşimde 1.800’er tipli sonuç C ile eş. 2.340 salt okunur denetim ve 18 dosya imajı doğrulandı. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,232 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_314.md).
+
+
+## V6b.315 — CAST Tcl paketinin etkinleştirilmesi
+
+Belgelendirilmiş Tcl BLOB bağlama seçenek dizilimi tanındı. CAST iki Rust kipinde 130/132’den 132/132’ye geçti. Var olan CAST paketi normal workspace doğrulamasına alındı. OFF 1189/1/334, ON 1186/4/334. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_315.md).
