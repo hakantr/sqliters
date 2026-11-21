@@ -1439,6 +1439,8 @@ fn parse_datetime_value(
         .unwrap_or_default();
 
     let mut single_typed_modifier_days = None;
+    let mut typed_modifier_fields = None;
+    let mut typed_elapsed_chain = false;
     let (mut time, modifiers, check_julian_range) = if first_name.eq_ignore_ascii_case("unixepoch")
     {
         let seconds = parse_raw_datetime_number(val, ctx.text_encoding)?;
@@ -1472,11 +1474,30 @@ fn parse_datetime_value(
                 match other_modifiers.next() {
                     None => (ParsedDateTime::from_unix_ms(julian_days_to_ms(days)?), true),
                     Some(modifier) => {
-                        if matches!(modifier, Value::Text(_)) && other_modifiers.next().is_none() {
+                        if other_modifiers.next().is_some() {
+                            // Reuse the numeric fields if the chain needs the legacy dispatcher.
+                            let fields: Vec<_> = modifiers
+                                .iter()
+                                .map(|modifier| match modifier {
+                                    Value::Text(text) => split_numeric_datetime_modifier(text),
+                                    _ => None,
+                                })
+                                .collect();
+                            typed_elapsed_chain =
+                                modifiers.iter().zip(&fields).all(|(modifier, fields)| {
+                                    is_output_precision(modifier)
+                                        || fields.is_some_and(|fields| fields.elapsed.is_some())
+                                });
+                            typed_modifier_fields = Some(fields);
+                        } else if matches!(modifier, Value::Text(_)) {
                             single_typed_modifier_days = Some(days);
                         }
-                        let ms = ((days - 2_440_587.5) * 86_400_000.0).round() as i64;
-                        (ParsedDateTime::from_unix_ms(ms), false)
+                        let ms = if typed_elapsed_chain {
+                            julian_days_to_ms(days)?
+                        } else {
+                            ((days - 2_440_587.5) * 86_400_000.0).round() as i64
+                        };
+                        (ParsedDateTime::from_unix_ms(ms), typed_elapsed_chain)
                     }
                 }
             }
@@ -1497,7 +1518,7 @@ fn parse_datetime_value(
     let mut bare_hour24 = time.bare_hour24;
     let use_subsec = 'modifiers: loop {
         let mut use_subsec = false;
-        for m in modifiers {
+        for (index, m) in modifiers.iter().enumerate() {
             let mod_str = m.to_text_lossy();
             if mod_str.eq_ignore_ascii_case("subsec") || mod_str.eq_ignore_ascii_case("subsecond") {
                 use_subsec = true;
@@ -1520,8 +1541,17 @@ fn parse_datetime_value(
                 }
                 continue;
             }
-            time.unix_ms =
-                apply_datetime_modifier_ms(&mut time, &mod_str, single_typed_modifier_days)?;
+            let numeric_modifier = || match (&typed_modifier_fields, m) {
+                (Some(fields), Value::Text(_)) => fields[index],
+                _ => split_numeric_datetime_modifier(&mod_str),
+            };
+            time.unix_ms = apply_datetime_modifier_ms(
+                &mut time,
+                &mod_str,
+                single_typed_modifier_days,
+                typed_elapsed_chain,
+                numeric_modifier,
+            )?;
             time.raw_seconds = None;
         }
         break use_subsec;
@@ -1820,10 +1850,43 @@ fn parse_long_clock_fraction(second: u32, digits: &str) -> Option<(u32, f64)> {
     Some((millis, seconds))
 }
 
-fn apply_datetime_modifier_ms(
+#[derive(Clone, Copy)]
+struct NumericDateTimeModifier<'a> {
+    amount: &'a str,
+    unit: &'a str,
+    elapsed: Option<(f64, f32)>,
+}
+
+fn split_numeric_datetime_modifier(modifier: &str) -> Option<NumericDateTimeModifier<'_>> {
+    let (amount, unit) = modifier.split_at(modifier.find(is_date_time_space)?);
+    if !matches!(
+        amount.as_bytes().first().copied()?,
+        b'+' | b'-' | b'0'..=b'9'
+    ) {
+        return None;
+    }
+    let unit = unit.trim_start_matches(is_date_time_space);
+    let unit = unit.strip_suffix(['s', 'S']).unwrap_or(unit);
+    let elapsed = match unit {
+        unit if unit.eq_ignore_ascii_case("second") => Some((1.0, 4.6427e14)),
+        unit if unit.eq_ignore_ascii_case("minute") => Some((60.0, 7.7379e12)),
+        unit if unit.eq_ignore_ascii_case("hour") => Some((3_600.0, 1.2897e11)),
+        unit if unit.eq_ignore_ascii_case("day") => Some((86_400.0, 5_373_485.0)),
+        _ => None,
+    };
+    Some(NumericDateTimeModifier {
+        amount,
+        unit,
+        elapsed,
+    })
+}
+
+fn apply_datetime_modifier_ms<'a>(
     time: &mut ParsedDateTime,
     modifier: &str,
     single_typed_modifier_days: Option<f64>,
+    typed_elapsed_chain: bool,
+    numeric_modifier: impl FnOnce() -> Option<NumericDateTimeModifier<'a>>,
 ) -> Option<i64> {
     let mut ms = time.unix_ms;
     let bare_hour24 = time.bare_hour24.take();
@@ -1897,24 +1960,13 @@ fn apply_datetime_modifier_ms(
         return calendar_output(ms.saturating_add(add_days * 86_400_000));
     }
 
-    let (amount, unit) = lower.split_at(lower.find(is_date_time_space)?);
-    if !matches!(
-        amount.as_bytes().first().copied()?,
-        b'+' | b'-' | b'0'..=b'9'
-    ) {
-        return None;
-    }
-    let unit = unit.trim_start_matches(is_date_time_space);
-    let unit = unit.strip_suffix('s').unwrap_or(unit);
-    let elapsed: Option<(f64, f32)> = match unit {
-        "second" => Some((1.0, 4.6427e14)),
-        "minute" => Some((60.0, 7.7379e12)),
-        "hour" => Some((3_600.0, 1.2897e11)),
-        "day" => Some((86_400.0, 5_373_485.0)),
-        _ => None,
-    };
+    let NumericDateTimeModifier {
+        amount,
+        unit,
+        elapsed,
+    } = numeric_modifier()?;
     let elapsed_julian_days = single_typed_modifier_days.filter(|_| elapsed.is_some());
-    let use_c_number = signed_hour24 || elapsed_julian_days.is_some();
+    let use_c_number = signed_hour24 || typed_elapsed_chain || elapsed_julian_days.is_some();
     let num: f64 = if use_c_number {
         let (value, status) = sqliters_types::sqlite_atof(amount.as_bytes());
         (status > 0).then_some(value)?
@@ -1947,7 +1999,7 @@ fn apply_datetime_modifier_ms(
         return Some(ms.saturating_add((num * (seconds * 1_000.0)).round() as i64));
     }
     match unit {
-        "month" => {
+        unit if unit.eq_ignore_ascii_case("month") => {
             calendar_input?;
             if !calendar_in_range && (num.fract() != 0.0 || num.abs() >= 176_546.0) {
                 return None;
@@ -1968,7 +2020,7 @@ fn apply_datetime_modifier_ms(
                     .saturating_add(frac_ms),
             )
         }
-        "year" => {
+        unit if unit.eq_ignore_ascii_case("year") => {
             calendar_input?;
             if !calendar_in_range && (num.fract() != 0.0 || num.abs() >= 14_713.0) {
                 return None;
