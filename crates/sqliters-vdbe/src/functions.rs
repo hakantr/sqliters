@@ -1545,6 +1545,15 @@ fn parse_datetime_value(
                     }
                     &modifiers[..0]
                 }
+                [Value::Text(modifier)] => {
+                    if let Some(unix_ms) = apply_packed_calendar_shift(time.unix_ms, date, modifier)
+                    {
+                        time.unix_ms = unix_ms;
+                        &modifiers[..0]
+                    } else {
+                        modifiers
+                    }
+                }
                 [Value::Text(shift), Value::Text(modifier)]
                     if modifier.eq_ignore_ascii_case("ceiling")
                         || modifier.eq_ignore_ascii_case("floor") =>
@@ -1954,6 +1963,35 @@ fn split_numeric_datetime_modifier(modifier: &str) -> Option<NumericDateTimeModi
         unit,
         elapsed,
     })
+}
+
+fn apply_packed_calendar_shift(unix_ms: i64, original_date: &str, modifier: &str) -> Option<i64> {
+    let [sign @ (b'+' | b'-'), _, _, _, _, b'-', _, _, b'-', _, _] = modifier.as_bytes() else {
+        return None;
+    };
+    let years = parse_two_time_digits(modifier.get(1..3)?)? * 100
+        + parse_two_time_digits(modifier.get(3..5)?)?;
+    let months = parse_two_time_digits(modifier.get(6..8)?)?;
+    let days = parse_two_time_digits(modifier.get(9..11)?)?;
+    if months > 11 || days > 30 {
+        return None;
+    }
+
+    let (year, month, day, _, _, _) = utc_ymdhms_from_unix_ms(unix_ms);
+    if day != parse_two_time_digits(original_date.get(8..)?)? {
+        return None;
+    }
+    let direction = if *sign == b'-' { -1 } else { 1 };
+    let shifted_month =
+        i64::from(year) * 12 + i64::from(month) - 1 + direction * i64::from(years * 12 + months);
+    let year = shifted_month.div_euclid(12);
+    if !(-4713..=9999).contains(&year) {
+        return None;
+    }
+    let month = shifted_month.rem_euclid(12) as u32 + 1;
+    // Normalize the original day in the target month before applying the day shift.
+    let date_days = days_from_civil(year, month, day);
+    Some((date_days + direction * i64::from(days)) * 86_400_000)
 }
 
 fn apply_datetime_modifier_ms<'a>(
