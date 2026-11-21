@@ -1467,7 +1467,7 @@ fn parse_datetime_value(
             matches!(modifier, Value::Text(text)
                 if text.eq_ignore_ascii_case("subsec") || text.eq_ignore_ascii_case("subsecond"))
         };
-        let (time, check_julian_range) = match val {
+        let (mut time, check_julian_range) = match val {
             Value::Integer(_) | Value::Real(_) => {
                 let days = parse_raw_datetime_number(val, ctx.text_encoding)?;
                 let mut other_modifiers = modifiers.iter().filter(|m| !is_output_precision(m));
@@ -1521,12 +1521,21 @@ fn parse_datetime_value(
             })?,
             Value::Null | Value::Blob(_) => return None,
         };
-        // A canonical date has no clock fields left to normalize for ceiling.
+        // A canonical date is already normalized and has no raw clock fields.
         let modifiers = match (val, modifiers) {
             (Value::Text(date), [Value::Text(modifier)])
-                if modifier.eq_ignore_ascii_case("ceiling")
-                    && matches!(date.as_bytes(), [_, _, _, _, b'-', _, _, b'-', _, _]) =>
+                if matches!(date.as_bytes(), [_, _, _, _, b'-', _, _, b'-', _, _])
+                    && (modifier.eq_ignore_ascii_case("ceiling")
+                        || modifier.eq_ignore_ascii_case("floor")) =>
             {
+                if modifier.eq_ignore_ascii_case("floor") {
+                    let raw_day = date.get(8..)?.parse::<u32>().ok()?;
+                    let normalized_day = utc_ymdhms_from_unix_ms(time.unix_ms).2;
+                    // After a month rollover the new day counts the overflow days.
+                    if normalized_day != raw_day {
+                        time.unix_ms -= i64::from(normalized_day) * 86_400_000;
+                    }
+                }
                 &modifiers[..0]
             }
             _ => modifiers,
