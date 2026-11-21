@@ -38,33 +38,50 @@ use crate::execution_context::{CollationRegistry, ExecutionContext, FunctionRegi
 /// the machine support completely are executed by the machine.
 pub(crate) fn exec_switch_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SQLITERS_VDBE_EXEC").is_some()) || FORCE.with(std::cell::Cell::get)
+    let on = *ON.get_or_init(|| std::env::var_os("SQLITERS_VDBE_EXEC").is_some());
+    #[cfg(test)]
+    let on = FORCE.with(std::cell::Cell::get).unwrap_or(on);
+    on
 }
 
 thread_local! {
-    /// The switch for the tests of this crate (the environment variable is read once per
-    /// process): on for the statements the calling thread prepares.
-    static FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// An override of the process switch for statements prepared on the test thread.
+    #[cfg(test)]
+    static FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// Number of statements the machine has run on this thread.
     static RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Turns the switch on for the calling thread until dropped (tests).
+/// Overrides the switch on the calling thread until dropped (tests).
 #[cfg(test)]
-pub(crate) struct ForceMachine;
+#[must_use]
+pub(crate) struct ForceMachine {
+    previous: Option<bool>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
 
 #[cfg(test)]
 impl ForceMachine {
-    pub(crate) fn on() -> ForceMachine {
-        FORCE.with(|f| f.set(true));
-        ForceMachine
+    pub(crate) fn on() -> Self {
+        Self::set(true)
+    }
+
+    pub(crate) fn off() -> Self {
+        Self::set(false)
+    }
+
+    fn set(on: bool) -> Self {
+        Self {
+            previous: FORCE.with(|f| f.replace(Some(on))),
+            _thread: std::marker::PhantomData,
+        }
     }
 }
 
 #[cfg(test)]
 impl Drop for ForceMachine {
     fn drop(&mut self) {
-        FORCE.with(|f| f.set(false));
+        FORCE.with(|f| f.set(self.previous));
     }
 }
 

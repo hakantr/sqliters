@@ -14134,6 +14134,7 @@ mod tests {
     /// that stay prepared.
     #[test]
     fn point_update_delete_plans_match_vdbe_programs() {
+        let _off = vdbe_host::ForceMachine::off();
         #[derive(Clone, Copy, PartialEq, Eq, Debug)]
         enum Plan {
             Update,

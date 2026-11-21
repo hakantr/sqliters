@@ -1637,3 +1637,8 @@ Doğrudan INTEGER ve REAL Julian girdilerinde tek exact start of day/month/year 
 ## V6b.266 — Görünüm UPDATE sabit eşitlik ve aralık
 
 Açık MAIN yazma işleminde ayrı INTEGER eşitlik ve NUMERIC aralık sütunlarını C yapısal uygunluğuna göre mevcut planlayıcıya verir. 1.152 DELETE/WAL hedefi, 168 ek sözdizimi hedefi ve 14.256 salt okunur C açılışı eş. 192 unary artı komşusu eski davranışı korudu. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_266.md).
+
+
+## V6b.267 — Point UPDATE ve DELETE plan testi
+
+Mevcut test doğrudan rowid planı ile eski Rust VDBE’yi iki workspace ortamında aynı tam gövdeyle karşılaştırır. Test iş parçacığı geçici kipi güvenli geri yükler. Odaklı ve paralel ON/OFF testleri, 72 normal C/Rust DML tekrarı ve dosya baytları doğrulandı. OFF 1186/1/337, ON 1182/5/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,255 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_267.md).
