@@ -2017,3 +2017,8 @@ Filtresiz ve sıralamasız olağan MAIN rowid taramalarında reverse_unordered_s
 ## V6b.342 — reverse_unordered_selects ile olağan CROSS JOIN
 
 İki indekssiz MAIN rowid kaynağı arasındaki filtresiz CROSS JOIN, reverse_unordered_selects açıkken kaynakları C sırasıyla okuyor. 20 fark kapandı. 18 C yeniden açılışı ve altı odaklı kontrol doğrulandı. OFF 1218/1/329, ON 1215/4/329. DML OFF 392/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,265 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_342.md).
+
+
+## V6b.343 — reverse_unordered_selects ile yıldızlı SELECT
+
+Yıldız ve nitelikli yıldız ifadeleri olağan tek tablo ve CROSS JOIN okumalarında C ters sırasını koruyor. 70 fark kapandı. 18 C yeniden açılışı ve altı odaklı kontrol doğrulandı. OFF 1219/1/329, ON 1216/4/329. DML OFF 392/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,195 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_343.md).

@@ -1016,3 +1016,41 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_reverse_unordered_plain_star_projection() {
+    sqliters_tcltest::run_test_script(
+        "reverse_unordered_plain_star_projection",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE source_rows(id INTEGER PRIMARY KEY, value TEXT);
+  CREATE TABLE tags(id INTEGER PRIMARY KEY, name TEXT);
+  INSERT INTO source_rows VALUES(1,'a'),(2,NULL),(3,'c');
+  INSERT INTO tags VALUES(1,'x'),(2,'y'),(3,'z');
+  PRAGMA reverse_unordered_selects=ON;
+}
+do_execsql_test reverse-star-1 {
+  SELECT * FROM source_rows;
+} {3 c 2 {} 1 a}
+do_execsql_test reverse-star-2 {
+  SELECT r.*,r.rowid FROM source_rows r LIMIT 2 OFFSET 1;
+} {2 {} 2 1 a 1}
+do_execsql_test reverse-star-3 {
+  SELECT * FROM source_rows r CROSS JOIN tags t LIMIT 2;
+} {3 c 3 z 3 c 2 y}
+do_execsql_test reverse-star-4 {
+  SELECT r.*,t.* FROM source_rows r CROSS JOIN tags t LIMIT 1 OFFSET 3;
+} {2 {} 3 z}
+do_execsql_test reverse-star-5 {
+  SELECT * FROM source_rows r CROSS JOIN tags t ORDER BY r.id,t.id LIMIT 2;
+} {1 a 1 x 1 a 2 y}
+do_execsql_test reverse-star-6 {
+  PRAGMA reverse_unordered_selects=OFF;
+  SELECT r.* FROM source_rows r;
+} {1 a 2 {} 3 c}
+finish_test
+"#,
+    );
+}

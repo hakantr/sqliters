@@ -5177,7 +5177,7 @@ fn compile_single_table_select(
         && !tbl.without_rowid
         && selection.is_none()
         && order_by.is_empty()
-        && crate::engine::is_simple_covering_projection(projection)
+        && crate::engine::is_plain_reverse_projection(projection)
         && matches!(plan, AccessPlan::FullScan)
     {
         // The relational executor can traverse this rowid table backwards.

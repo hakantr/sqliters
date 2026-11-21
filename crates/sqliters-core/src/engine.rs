@@ -7494,7 +7494,7 @@ fn exec_single_select_core_inner(
                         && order_by.is_empty()
                         && outer_scopes.is_empty()
                         && ctes.scopes.is_empty()
-                        && is_simple_covering_projection(projection)
+                        && is_plain_reverse_projection(projection)
                         && can_reverse_plain_cross_join(ctx.db_set, fc);
                     eval_from_clause_inner(
                         ctx,
@@ -13824,6 +13824,13 @@ pub(crate) fn is_simple_covering_projection(projection: &[ResultColumn]) -> bool
     })
 }
 
+pub(crate) fn is_plain_reverse_projection(projection: &[ResultColumn]) -> bool {
+    projection.iter().all(|column| match column {
+        ResultColumn::Star | ResultColumn::TableStar { .. } => true,
+        ResultColumn::Expr { expr, .. } => is_simple_covering_expr(expr),
+    })
+}
+
 fn is_simple_covering_expr(expr: &Expr) -> bool {
     use crate::dml_c::{Walk, walk_expr};
     let mut simple = true;
@@ -14695,7 +14702,7 @@ fn reverse_plain_rowid_scan(
             info.reverse_unordered_rowid_source
                 || (info.allow_reverse_index_order
                     && info.plan_ctx.is_some_and(|(projection, order_by)| {
-                        order_by.is_empty() && is_simple_covering_projection(projection)
+                        order_by.is_empty() && is_plain_reverse_projection(projection)
                     }))
         })
 }
