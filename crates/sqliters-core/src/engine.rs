@@ -7403,6 +7403,12 @@ fn exec_single_select_core_inner(
 
             let sample_cols: Vec<ScopedColumn> = match source_rows.first() {
                 Some(r) => r.cols.to_vec(),
+                None if empty_limit => from
+                    .as_ref()
+                    .and_then(|from| {
+                        static_schema_cols_for_from(from, outer_scopes, ctx.db_set, ctes, &mut Vec::new())
+                    })
+                    .unwrap_or_default(),
                 None => match from {
                     Some(fc) => {
                         schema_cols_preview(ctx, fc, params, outer_scopes, ctes).unwrap_or_default()
@@ -16766,22 +16772,33 @@ fn eval_select_offset(
 fn has_ordinary_limit_sources(db_set: &DatabaseSet, from: &FromClause, ctes: &CteStore) -> bool {
     std::iter::once(&from.head)
         .chain(from.joins.iter().map(|join| &join.right))
-        .all(|source| {
-            let TableOrSubquery::Table {
+        .all(|source| match source {
+            TableOrSubquery::Table {
                 name,
                 table_args: None,
                 indexed_by: None,
                 ..
-            } = source else {
-                return false;
-            };
-            if name.schema.is_none() && ctes.locate(&name.name).is_some() {
-                return false;
+            } => {
+                if name.schema.is_none() && ctes.locate(&name.name).is_some() {
+                    return false;
+                }
+                matches!(
+                    db_set.find_relation_ref_in_set(name),
+                    Ok(Some((_, crate::db_set::RelationRef::Table(_))))
+                )
             }
-            matches!(
-                db_set.find_relation_ref_in_set(name),
-                Ok(Some((_, crate::db_set::RelationRef::Table(_))))
-            )
+            TableOrSubquery::Subquery { query, .. } => {
+                query.ctes.is_empty()
+                    && query.body.compounds.is_empty()
+                    && matches!(
+                        &query.body.head,
+                        SelectCore::Select { from, .. }
+                            if from.as_ref().is_none_or(
+                                |from| has_ordinary_limit_sources(db_set, from, ctes)
+                            )
+                    )
+            }
+            _ => false,
         })
 }
 

@@ -714,3 +714,34 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_subquery_limit_evaluation_order() {
+    sqliters_tcltest::run_test_script(
+        "subquery_limit_order",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE item(id INTEGER PRIMARY KEY, label TEXT);
+  INSERT INTO item VALUES(1,'a'),(2,'b'),(3,'c');
+}
+do_execsql_test subquery-limit-order-1 {
+  SELECT value FROM (SELECT value FROM (SELECT abs(-9223372036854775808) AS value FROM item)) LIMIT 0;
+} {}
+do_catchsql_test subquery-limit-order-2 {
+  SELECT value FROM (SELECT abs(-9223372036854775808) AS value FROM item ORDER BY id) LIMIT 1.5;
+} {1 {datatype mismatch}}
+do_catchsql_test subquery-limit-order-3 {
+  SELECT value FROM (SELECT abs(-9223372036854775808) AS value) LIMIT 1 OFFSET NULL;
+} {1 {datatype mismatch}}
+do_execsql_test subquery-limit-order-4 {
+  SELECT q.* FROM (SELECT id AS repeated,label AS repeated FROM item) AS q LIMIT 0 OFFSET 'unused';
+} {}
+do_execsql_test subquery-limit-order-5 {
+  SELECT q.id,q.label FROM (SELECT * FROM item) AS q ORDER BY q.id LIMIT 1 OFFSET 1;
+} {2 b}
+finish_test
+"#,
+    );
+}
