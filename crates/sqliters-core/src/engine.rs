@@ -32285,17 +32285,42 @@ pub(crate) fn view_update_range_tokens(stmt: &Stmt, db_set: &DatabaseSet, sql: &
     let Stmt::Update(update) = stmt else {
         return false;
     };
-    let Some((column, BinaryOp::Ge, bound)) = update.selection.as_ref().and_then(view_dml_index_term)
-    else {
+    let Some(selection) = update.selection.as_ref() else {
         return false;
     };
-    let comparable = match bound {
-        Expr::Integer(value) => i32::try_from(*value).is_ok() && *value >= 0,
-        Expr::Float(value) => (0.0..=f64::from(i32::MAX)).contains(value),
-        _ => false,
+    let integer_bound = |bound: &Expr| {
+        matches!(bound, Expr::Integer(value) if (0..=i64::from(i32::MAX)).contains(value))
+    };
+    let comparable = if let Expr::Binary {
+        left,
+        op: BinaryOp::And,
+        right,
+    } = selection
+    {
+        let (Some((left_col, left_op, left_bound)), Some((right_col, right_op, right_bound))) =
+            (view_dml_index_term(left), view_dml_index_term(right))
+        else {
+            return false;
+        };
+        !left_col.double_quoted
+            && !right_col.double_quoted
+            && left_col.column.eq_ignore_ascii_case(&right_col.column)
+            && integer_bound(left_bound)
+            && integer_bound(right_bound)
+            && matches!(
+                (left_op, right_op),
+                (BinaryOp::Ge, BinaryOp::Lt | BinaryOp::Le)
+                    | (BinaryOp::Lt | BinaryOp::Le, BinaryOp::Ge)
+            )
+    } else {
+        let Some((column, BinaryOp::Ge, bound)) = view_dml_index_term(selection) else {
+            return false;
+        };
+        !column.double_quoted
+            && (integer_bound(bound)
+                || matches!(bound, Expr::Float(value) if (0.0..=f64::from(i32::MAX)).contains(value)))
     };
     comparable
-        && !column.double_quoted
         && is_main_rowid_view_update(stmt, db_set)
         && has_plain_integer_tokens(sql)
 }
@@ -32415,6 +32440,18 @@ fn view_dml_indexed_select(
         op,
         right: Box::new(bound.clone()),
     };
+    let make_selection = || {
+        let first = make_term(op, bound);
+        if let Some((_, other_op, other_bound)) = second_term {
+            Expr::Binary {
+                left: Box::new(first),
+                op: BinaryOp::And,
+                right: Box::new(make_term(other_op, other_bound)),
+            }
+        } else {
+            first
+        }
+    };
     let compatible_affinity = if let Some(literal) = quoted_bound {
         match column.affinity {
             TypeAffinity::Text => true,
@@ -32437,9 +32474,10 @@ fn view_dml_indexed_select(
         return None;
     }
     let mut indexes = schema.indexes_for_table(&table.name);
+    let has_partial = indexes.iter().any(|index| index.where_clause.is_some());
     let two_index_range = indexes.len() == 2
         && predicate == ViewDmlIndexPredicate::UpdateRange
-        && second_term.is_none()
+        && (second_term.is_none() || (has_partial && ctx.stmt_tx.view_update_range_tokens))
         && quoted_bound.is_none()
         && !table.without_rowid
         && column.affinity == TypeAffinity::Numeric
@@ -32455,10 +32493,10 @@ fn view_dml_indexed_select(
     {
         return None;
     }
-    let partial_range = two_index_range && indexes.iter().any(|index| index.where_clause.is_some());
+    let partial_range = two_index_range && has_partial;
     if partial_range
         && (!ctx.stmt_tx.view_update_range_tokens
-            || op != BinaryOp::Ge
+            || (second_term.is_none() && op != BinaryOp::Ge)
             || indexes
                 .iter()
                 .any(|index| index.columns[0].col_idx != Some(column_index)))
@@ -32509,26 +32547,32 @@ fn view_dml_indexed_select(
         if partial_range {
             let full = indexes.iter().find(|index| index.where_clause.is_none())?;
             let partial = indexes.iter().find(|index| index.where_clause.is_some())?;
-            let (partial_column, BinaryOp::Ge, Expr::Integer(partial_bound)) =
+            let (partial_column, partial_op, Expr::Integer(partial_bound)) =
                 view_dml_index_term(partial.where_clause.as_ref()?)?
             else {
                 return None;
             };
             if !partial_column.column.eq_ignore_ascii_case(&column.name)
                 || partial_column.double_quoted
+                || (second_term.is_none() && partial_op != BinaryOp::Ge)
                 || !(0..=i64::from(i32::MAX)).contains(partial_bound)
                 || !has_plain_integer_tokens(partial.raw_sql.as_deref()?)
             {
                 return None;
             }
-            let root = if matches!(bound, Expr::Integer(value) if value == partial_bound) {
-                // The single normalized term is now known to match structurally.
+            let matches_partial = |op, bound: &Expr| {
+                op == partial_op && matches!(bound, Expr::Integer(value) if value == partial_bound)
+            };
+            let eligible = matches_partial(op, bound)
+                || second_term.is_some_and(|(_, op, bound)| matches_partial(op, bound));
+            let root = if eligible {
+                // A term in the normalized range is known to match structurally.
                 // Let the existing range planner price these two non-covering loops.
                 let plan = choose_access_plan_with_context(
                     table,
                     "main",
                     alias,
-                    Some(&make_term(op, bound)),
+                    Some(&make_selection()),
                     schema,
                     QueryPlanContext {
                         projection: Some(projection),
@@ -32542,8 +32586,10 @@ fn view_dml_indexed_select(
                     return None;
                 }
                 index.root_pgno
-            } else {
+            } else if second_term.is_none() {
                 full.root_pgno
+            } else {
+                return None;
             };
             indexes.retain(|index| index.root_pgno == root);
         } else {
@@ -32581,7 +32627,6 @@ fn view_dml_indexed_select(
         return None;
     }
 
-    let first = make_term(op, bound);
     let mut narrowed = view.clone();
     if let SelectCore::Select {
         from: Some(from),
@@ -32592,15 +32637,7 @@ fn view_dml_indexed_select(
         if tied_range && let TableOrSubquery::Table { indexed_by, .. } = &mut from.head {
             *indexed_by = Some(IndexHint::IndexedBy(index.name.clone()));
         }
-        *selection = Some(if let Some((_, other_op, other_bound)) = second_term {
-            Expr::Binary {
-                left: Box::new(first),
-                op: BinaryOp::And,
-                right: Box::new(make_term(other_op, other_bound)),
-            }
-        } else {
-            first
-        });
+        *selection = Some(make_selection());
     }
     Some(narrowed)
 }
