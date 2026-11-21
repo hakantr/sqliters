@@ -33089,18 +33089,29 @@ fn view_dml_indexed_select(
     }
     let max_eq = predicate == ViewDmlIndexPredicate::UpdateMax;
     let returning_range = predicate == ViewDmlIndexPredicate::UpdateReturningRange;
-    let (term, second_term) = match selection? {
+    let ((target_col, op, bound), second_term) = match selection? {
         Expr::Binary { left, op: BinaryOp::And, right }
             if matches!(
                 predicate,
                 ViewDmlIndexPredicate::UpdateRange | ViewDmlIndexPredicate::UpdateReturningRange
             ) =>
         {
-            (left.as_ref(), Some(view_dml_index_term(right)?))
+            (view_dml_index_term(left)?, Some(view_dml_index_term(right)?))
         }
-        term => (term, None),
+        Expr::Between { expr, low, high, negated: false } if returning_range => {
+            let Expr::Column(column) = expr.as_ref() else {
+                return None;
+            };
+            if column.table.is_some() || column.schema.is_some() {
+                return None;
+            }
+            (
+                (column, BinaryOp::Ge, low.as_ref()),
+                Some((column, BinaryOp::Le, high.as_ref())),
+            )
+        }
+        term => (view_dml_index_term(term)?, None),
     };
-    let (target_col, op, bound) = view_dml_index_term(term)?;
     let finite_real_bound = matches!(bound, Expr::Float(value) if value.is_finite());
     if returning_range && !matches!(bound, Expr::Integer(_)) && !finite_real_bound {
         return None;

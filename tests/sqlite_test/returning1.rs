@@ -730,3 +730,41 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_returning_without_rowid_view_between_range() {
+    sqliters_tcltest::run_test_script(
+        "returning_without_rowid_view_between_range",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach {layout indexes limits expected} {
+  ascending {CREATE INDEX keyed ON base(k);} {k BETWEEN 2 AND 5} {2 4 5 1}
+  descending {CREATE INDEX keyed ON base(k DESC);} {k BETWEEN 1.5 AND 5.5} {1 5 4 2}
+  unique {CREATE INDEX shifted ON base(k+1); CREATE UNIQUE INDEX keyed ON base(k);} {k BETWEEN 2 AND 5} {2 4 5 1}
+  negated {CREATE INDEX keyed ON base(k);} {k NOT BETWEEN 1 AND 1} {1 2 4 5}
+} {
+  reset_db
+  execsql {
+    CREATE TABLE base(id INTEGER PRIMARY KEY, k INTEGER, label TEXT) WITHOUT ROWID;
+    CREATE TABLE seen(seq INTEGER PRIMARY KEY, id INTEGER);
+    INSERT INTO base VALUES (1,5,'one'),(2,2,'two'),(3,1,'three'),(4,3,'four'),(5,4,'five');
+    CREATE VIEW projected AS SELECT id,k,label FROM base;
+    CREATE TRIGGER revise INSTEAD OF UPDATE ON projected BEGIN
+      INSERT INTO seen(id) VALUES(old.id);
+      UPDATE base SET label=new.label WHERE id=old.id;
+    END;
+  }
+  execsql $indexes
+  do_execsql_test returning-between-range-$layout.1 "
+    UPDATE projected SET label=label||'!' WHERE $limits RETURNING id;
+    SELECT changes();
+    SELECT id FROM seen ORDER BY seq;
+    SELECT id,label FROM base ORDER BY id;
+    PRAGMA integrity_check;
+  " [concat $expected {0} $expected {1 one! 2 two! 3 three 4 four! 5 five! ok}]
+}
+finish_test
+"#,
+    );
+}
