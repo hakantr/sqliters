@@ -1882,3 +1882,8 @@ Değiştiricisiz sabit saat metni mevcut C uyumlu saat ayrıştırmasına bağla
 ## V6b.315 — CAST Tcl paketinin etkinleştirilmesi
 
 Belgelendirilmiş Tcl BLOB bağlama seçenek dizilimi tanındı. CAST iki Rust kipinde 130/132’den 132/132’ye geçti. Var olan CAST paketi normal workspace doğrulamasına alındı. OFF 1189/1/334, ON 1186/4/334. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_315.md).
+
+
+## V6b.316 — date5, func7 ve func8 test paketleri
+
+Mevcut Tcl paketleri iki kipte 874/874, 73/73 ve 8/8 ile normal koşuya alındı. Takvimde kip başına 2.622 ayrı C sonucu, matematikte 73 ham C bölüm sonucu ve 7 C kullanıcı işlevi sonucu eş. OFF 1192/1/331, ON 1189/4/331. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_316.md).

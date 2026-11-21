@@ -1,5 +1,4 @@
 #[test]
-#[ignore = "0/8 subtests passed; pending: func8 edge cases"]
 fn test_func8() {
     sqliters_tcltest::run_test_script(
         "func8",

@@ -407,6 +407,7 @@ pub const PHASE1_CAPABILITY_TABLE: &[(&str, bool)] = &[
     ("like_match_blobs", true),
     ("like_opt", true),
     ("localtime", true),
+    ("mathlib", true),
     ("memorydb", true),
     ("mergesort", true),
     ("or_opt", true),
