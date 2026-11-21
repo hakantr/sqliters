@@ -56687,6 +56687,63 @@ fn resolve_view_columns_static(
     Ok((final_cols, meta, schema_lbl))
 }
 
+fn view_pragma_cast_types(
+    body: &SelectBody,
+    meta: &[(Option<TypeAffinity>, Collation)],
+    db_set: &DatabaseSet,
+    ctes: &CteStore,
+) -> Vec<Option<&'static str>> {
+    let numeric_cast = |column, expr: &Expr| {
+        matches!(expr, Expr::Cast { .. })
+            && matches!(
+                meta.get(column),
+                Some((Some(TypeAffinity::Numeric | TypeAffinity::Integer | TypeAffinity::Real), _))
+            )
+    };
+    match &body.head {
+        SelectCore::Select { projection, from, .. }
+            if !body.compounds.is_empty()
+                && body.compounds.iter().all(|(op, core)| {
+                    *op == CompoundOp::UnionAll && matches!(core, SelectCore::Select { .. })
+                }) =>
+        {
+            let mut visited = Vec::new();
+            let sample = from
+                .as_ref()
+                .and_then(|from| static_schema_cols_for_from(from, &[], db_set, ctes, &mut visited))
+                .unwrap_or_default();
+            let Ok((_, expanded)) = expand_projection(projection, &sample) else {
+                return Vec::new();
+            };
+            // The compound affinity already accounts for the types of subsequent arms.
+            expanded
+                .iter()
+                .enumerate()
+                .map(|(i, (expr, _, _))| numeric_cast(i, expr).then_some("NUM"))
+                .collect()
+        }
+        SelectCore::Values(rows) if body.compounds.is_empty() && rows.len() > 1 => {
+            let (first, rest) = rows.split_first().expect("multi-row VALUES");
+            let mut visited = Vec::new();
+            // Unlike SELECT compounds, this AST holds every VALUES row in one core.
+            first
+                .iter()
+                .enumerate()
+                .map(|(i, expr)| {
+                    if !numeric_cast(i, expr) {
+                        return None;
+                    }
+                    let may_be_text = rest.iter().filter_map(|row| row.get(i)).any(|expr| {
+                        expr_data_type_mask(expr, &[], db_set, ctes, &mut visited) & 0x02 != 0
+                    });
+                    Some(if may_be_text { "BLOB" } else { "NUM" })
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn infer_view_pragma_columns(
     db_id: DatabaseId,
     view: &ViewSchema,
@@ -56720,6 +56777,7 @@ fn infer_view_pragma_columns(
     };
     let meta = infer_select_stmt_meta(&fixed_sel, &[], db_set, &view_ctes);
     let sub_ctes = view_ctes.with_scope(&fixed_sel.ctes);
+    let cast_types = view_pragma_cast_types(&fixed_sel.body, &meta, db_set, &sub_ctes);
     let mut depth = 0usize;
     let head_decl_types =
         infer_core_origin_declared_types(&fixed_sel.body.head, db_set, &sub_ctes, &mut depth);
@@ -56727,7 +56785,9 @@ fn infer_view_pragma_columns(
     for (i, cname) in names.into_iter().enumerate() {
         let aff = meta.get(i).and_then(|(a, _)| *a);
         let decl_opt = head_decl_types.get(i).and_then(|d| d.as_deref());
-        let type_str = if let Some(dt) = decl_opt
+        let type_str = if let Some(ty) = cast_types.get(i).copied().flatten() {
+            ty.to_owned()
+        } else if let Some(dt) = decl_opt
             && !dt.is_empty()
             && Some(TypeAffinity::from_declared_type(dt)) == aff
         {
