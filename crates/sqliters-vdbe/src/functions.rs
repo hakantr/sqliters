@@ -1549,6 +1549,21 @@ fn parse_datetime_value(
                 let ms = julian_days_to_ms(days)?;
                 Some((ParsedDateTime::from_unix_ms(ms), true))
             })?,
+            Value::Blob(bytes) if modifiers.is_empty() && packed_hms.is_none() => {
+                if ctx.text_encoding != TextEncoding::Utf8 && !bytes.len().is_multiple_of(2) {
+                    return None;
+                }
+                let stamp = ctx.text_encoding.decode_bytes(bytes);
+                let clock = stamp.as_bytes().get(11..).unwrap_or_default();
+                if !is_normal_iso_calendar(&stamp)
+                    || !clock.iter().all(|byte| {
+                        matches!(byte, b'0'..=b'9' | b':' | b'.' | b'Z' | b'+' | b'-')
+                    })
+                {
+                    return None;
+                }
+                (parse_iso_datetime(&stamp, false)?, true)
+            }
             Value::Null | Value::Blob(_) => return None,
         };
         if let Value::Text(stamp) = val {
