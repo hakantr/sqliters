@@ -2080,6 +2080,7 @@ struct CteStreamHint {
     eff_alias: String,
     where_expr: Option<Expr>,
     max_kept: usize,
+    filter_output: bool,
 }
 
 #[derive(Clone)]
@@ -5907,6 +5908,7 @@ fn exec_select(
 ) -> Result<QueryOutput> {
     let mut ctes = parent_ctes.with_scope_at(&stmt.ctes, outer_scopes.len());
     let mut recursive_cte_limit = None;
+    let mut filter_stream_output = false;
 
     // Propagate outer `LIMIT [OFFSET]` cap when `SELECT ... FROM <cte> [WHERE ...] LIMIT k` has no
     // sorting/grouping and `<cte>` is not `AS MATERIALIZED`, allowing unbounded recursive CTEs to
@@ -5949,12 +5951,22 @@ fn exec_select(
     {
         let (limit, offset) = eval_select_limit_offset(ctx, lim, params, outer_scopes, &ctes)?;
         if limit >= 0 {
+            filter_stream_output = selection.as_ref().is_some_and(|predicate| {
+                outer_scopes.is_empty()
+                    && ctes.scopes[s_idx][c_idx].query.limit.is_none()
+                    && !expr_contains_subquery(predicate)
+                    && has_simple_recursive_limit_source(fc, &ctes)
+                    && projection.iter().all(|column| {
+                        !matches!(column, ResultColumn::Expr { alias: Some(_), .. })
+                    })
+            });
             ctes.limit_hint = Some(CteStreamHint {
                 s_idx,
                 c_idx,
                 eff_alias: alias.clone().unwrap_or_else(|| name.name.clone()),
                 where_expr: selection.clone(),
                 max_kept: offset.saturating_add(usize::try_from(limit).unwrap_or(usize::MAX)),
+                filter_output: filter_stream_output,
             });
         }
         // Use the evaluated values when slicing the output of the recursive CTE.
@@ -6029,9 +6041,17 @@ fn exec_select(
 
     let limit = recursive_cte_limit.as_ref().or(stmt.limit.as_ref());
     if stmt.body.compounds.is_empty() {
+        // The recursive stream already applied this predicate to the rows it returned.
+        let filtered_head = filter_stream_output.then(|| {
+            let mut head = stmt.body.head.clone();
+            if let SelectCore::Select { selection, .. } = &mut head {
+                *selection = None;
+            }
+            head
+        });
         exec_single_select_core(
             ctx,
-            &stmt.body.head,
+            filtered_head.as_ref().unwrap_or(&stmt.body.head),
             &stmt.order_by,
             limit,
             params,
@@ -6832,20 +6852,23 @@ fn exec_recursive_cte(
                 break;
             }
             if let Some(ref sh) = outer_stream_hint {
-                if let (Some(we), Some(cols), Some(ow_ctes)) = (
+                let matches = if let (Some(we), Some(cols), Some(ow_ctes)) = (
                     sh.where_expr.as_ref(),
                     stream_hint_cols.as_ref(),
                     outer_where_ctes.as_mut(),
                 ) {
                     let erow = EvalRow::new(Rc::clone(cols), cur_row.clone());
                     let sc = push_scope(caller_outer_scopes, &erow);
-                    if eval_expr(ctx, we, params, &sc, ow_ctes, None)?
+                    eval_expr(ctx, we, params, &sc, ow_ctes, None)?
                         .truthiness_with_encoding(ctx.encoding())
-                        == Some(true) {
-                        outer_kept += 1;
-                    }
+                        == Some(true)
                 } else {
+                    true
+                };
+                if matches {
                     outer_kept += 1;
+                } else if sh.filter_output {
+                    out_rows.pop();
                 }
                 if outer_kept >= sh.max_kept {
                     break;
@@ -7428,9 +7451,22 @@ fn exec_single_select_core_inner(
                 )?,
             };
 
+            // Metadata for an empty filtered CTE comes from its definition without replaying WHERE.
+            let empty_filtered_cte = source_rows.is_empty()
+                && from.as_ref().is_some_and(|from| {
+                    let TableOrSubquery::Table { name, .. } = &from.head else {
+                        return false;
+                    };
+                    ctes.limit_hint.as_ref().is_some_and(|hint| {
+                        hint.filter_output
+                            && from.joins.is_empty()
+                            && name.schema.is_none()
+                            && ctes.locate(&name.name) == Some((hint.s_idx, hint.c_idx))
+                    })
+                });
             let sample_cols: Vec<ScopedColumn> = match source_rows.first() {
                 Some(r) => r.cols.to_vec(),
-                None if empty_limit => from
+                None if empty_limit || empty_filtered_cte => from
                     .as_ref()
                     .and_then(|from| {
                         static_schema_cols_for_from(from, outer_scopes, ctx.db_set, ctes, &mut Vec::new())

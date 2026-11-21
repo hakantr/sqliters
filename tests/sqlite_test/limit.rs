@@ -929,3 +929,68 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_recursive_stream_filter_once() {
+    sqliters_tcltest::run_test_script(
+        "recursive_stream_filter_once",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+proc count_even {value} {
+  incr ::filter_calls
+  return [expr {$value % 2 == 0}]
+}
+db function count_even count_even
+do_test recursive-where-c-1 {
+  set ::filter_calls 0
+  set rows [execsql {
+    WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<8)
+    SELECT x FROM seq WHERE count_even(x) LIMIT 2 OFFSET 1;
+  }]
+  list $rows $::filter_calls
+} {{4 6} 6}
+do_test recursive-where-c-2 {
+  set ::filter_calls 0
+  set rows [execsql {
+    WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<8)
+    SELECT x FROM seq WHERE count_even(x) LIMIT 3 OFFSET 3;
+  }]
+  list $rows $::filter_calls
+} {8 8}
+do_test recursive-where-c-3 {
+  set ::filter_calls 0
+  set rows [execsql {
+    WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<8)
+    SELECT x FROM seq WHERE count_even(x) LIMIT 1 OFFSET -1;
+  }]
+  list $rows $::filter_calls
+} {2 2}
+do_test recursive-where-c-4 {
+  set ::filter_calls 0
+  set rows [execsql {
+    WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<8)
+    SELECT x FROM seq WHERE count_even(x) LIMIT 0 OFFSET NULL;
+  }]
+  list $rows $::filter_calls
+} {{} 0}
+do_test recursive-where-c-5 {
+  set ::filter_calls 0
+  set rows [execsql {
+    WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<8)
+    SELECT x FROM seq WHERE count_even(x) AND x>8 LIMIT 2;
+  }]
+  list $rows $::filter_calls
+} {{} 8}
+do_test recursive-where-c-6 {
+  set ::filter_calls 0
+  set rows [execsql {
+    WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<8)
+    SELECT x FROM seq WHERE count_even(x) LIMIT 1 OFFSET 8;
+  }]
+  list $rows $::filter_calls
+} {{} 8}
+finish_test
+"#,
+    );
+}
