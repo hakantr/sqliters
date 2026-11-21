@@ -32311,8 +32311,8 @@ pub(crate) fn bound_view_partial_index(
         (1, None, Some(1)) if plain_integer(bound) => 1,
         (_, Some(eq_slot), Some(ge_slot))
             if eq_slot != ge_slot
-                && (1..=31).contains(&eq_slot)
-                && (1..=31).contains(&ge_slot)
+                && eq_slot > 0
+                && ge_slot > 0
                 && parameter_count == eq_slot.max(ge_slot) => 2,
         _ => return None,
     };

@@ -7866,10 +7866,14 @@ impl Statement {
             .map_or(0, |p| p.expmask)
     }
 
+    fn c_bind_mask_bit(index_1_based: usize) -> u32 {
+        if index_1_based >= 32 { 0x8000_0000 } else { 1 << (index_1_based - 1) }
+    }
+
     /// A masked bind expires the plan. The integer binder in vdbeapi.c keeps it
     /// valid when the slot already holds the same typed integer.
     fn expire_for_binding(&mut self, index_1_based: usize, value: Option<&Value>) {
-        let bit = if index_1_based >= 32 { 0x8000_0000 } else { 1 << (index_1_based - 1) };
+        let bit = Self::c_bind_mask_bit(index_1_based);
         if self.c_bind_expmask() & bit != 0
             && !matches!(
                 (&self.params[index_1_based - 1], value),
@@ -9495,7 +9499,7 @@ impl Statement {
                     && self.compiled_v1_expire_generation == inner.v1_expire_generation
                     && self.compiled_advisory_expire_generation == inner.advisory_expire_generation
                     && self.compiled_c_expire_seq == inner.db_set.c_expire_seq()
-                    && (1..=31).contains(&self.params.len())
+                    && !self.params.is_empty()
                 {
                     parsed_stmt.as_ref()
                         .and_then(|stmt| {
@@ -9503,7 +9507,7 @@ impl Statement {
                         })
                         .and_then(|(root, slot, predicate)| {
                             let value = self.params.get(slot - 1)?;
-                            (self.c_bind_expmask() == 1 << (slot - 1)
+                            (self.c_bind_expmask() == Self::c_bind_mask_bit(slot)
                                 && matches!(value, Value::Integer(_) | Value::Real(_))
                                 && inner.collations.get_custom("BINARY").is_none()
                                 && !self.has_detached_slot(inner)

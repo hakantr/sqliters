@@ -1712,3 +1712,8 @@ Açık TEXT biçimi ve tek sabit tarih girdisinde yüzde l, C'nin boşluk dolgul
 ## V6b.281 — Görünüm UPDATE düşük boşluklu yuvalar
 
 İki gerçek V2 bağ yuvası 1–31 içindeyse kısmi equality kökü ve maskesi C ile eş. Önceki 68 dosya farkı kapandı. 16 normal okumadan yazmaya geçiş örneğinde üçüncü STEP kök ve log eş, ilk fark açık. 9.384 C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,285 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_281.md).
+
+
+## V6b.282 — Görünüm UPDATE yüksek bağ yuvaları
+
+C'nin paylaşılan yüksek bağ biti gerçek equality yuvasından ayrı kullanılır. Önceki matrisin 68 son dosya farkı kapandı. 12.436 C salt okunur açılışı ve sonraki STEP kök/log kararları doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,268 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_282.md).
