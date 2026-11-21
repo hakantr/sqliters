@@ -1735,12 +1735,18 @@ fn datetime_c_string(text: &str) -> &str {
     text.split_once('\0').map_or(text, |(prefix, _)| prefix)
 }
 
+/// Recognizes the explicit current-time input used by the date functions.
+#[doc(hidden)]
+pub fn is_datetime_now_text(text: &str) -> bool {
+    text.eq_ignore_ascii_case("now")
+}
+
 fn parse_datetime_text(
     text: &str,
     ctx: &VmRuntimeContext,
     allow_signed_year: bool,
 ) -> Option<(ParsedDateTime, bool)> {
-    if text.trim().eq_ignore_ascii_case("now") {
+    if is_datetime_now_text(text) {
         Some((
             ParsedDateTime::from_unix_ms(ctx.effective_timestamp_ms()),
             false,
@@ -2522,7 +2528,7 @@ fn eval_strftime_function(args: &[Value], ctx: &VmRuntimeContext) -> Result<Valu
     let is_fixed_text_format = || {
         matches!(args, [Value::Text(_), _])
             && !fmt.contains('\0')
-            && !matches!(&args[1], Value::Text(text) if text.trim().eq_ignore_ascii_case("now"))
+            && !matches!(&args[1], Value::Text(text) if is_datetime_now_text(text))
     };
     let mut out = String::with_capacity(fmt.len() + 16);
     let mut chars = fmt.chars();

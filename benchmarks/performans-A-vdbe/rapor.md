@@ -1812,3 +1812,8 @@ Farklı ilk sütunlu kısmi indeksin çıplak REAL koşulu C gibi maliyet önces
 ## V6b.301 — Doğal SELECT akışında adım saati
 
 Exact birleşik tabanda ölçülen doğal legacy projeksiyonlar zamanı ilk ihtiyaçta ve aynı adım boyunca tek değer olarak alır. Beş sorgu biçiminde 100 C eş sonuç, 209 C salt okunur açılış ve 840 native matris kaydı yeniden doğrulandı. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,270 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_301.md).
+
+
+## V6b.302 — Tarih girdisinde now yazımı
+
+Ortak now girdi kararı çevre boşluğunu kabul etmez. 2.880 satır sonucu ve 900 C salt okunur dosya doğrulandı. Doğal adım saati, date3 ve func2 korumaları geçti. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,276 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_302.md).

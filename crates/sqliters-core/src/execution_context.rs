@@ -11,6 +11,7 @@ use sqliters_types::{
     FunctionFlags, KeySortOrder, Result, RowMutationOp, RuntimeValue, SqliteError, TextEncoding,
     Value, enforce_result_subtype_contract, extended, strip_unsubscribed_subtypes,
 };
+use sqliters_vdbe::functions::is_datetime_now_text;
 use sqliters_vdbe::{
     AggregateAccumulator, AggregateKind, VmRuntimeContext, eval_scalar_function_rt_with_strict,
     validate_function_call,
@@ -1110,7 +1111,7 @@ impl ExecutionServices for ExecutionContext<'_> {
     ) -> Result<RuntimeValue> {
         if step_clock_date_scalar(name)
             && matches!(args.first().map(|arg| &arg.value), Some(Value::Text(s))
-                if s.trim().eq_ignore_ascii_case("now"))
+                if is_datetime_now_text(s))
             && self.functions.find_scalar(name, args.len()).is_none()
         {
             let runtime = VmRuntimeContext {
