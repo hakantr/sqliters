@@ -16150,7 +16150,14 @@ fn build_groups(
 
     let mut g_specs: Vec<KeySortOrder> = Vec::with_capacity(group_by.len());
     for ge in group_by {
-        let spec = match ge {
+        // SQLite keeps the source collation through CAST and unary plus.
+        let mut collated_expression = ge;
+        while let Expr::Cast { expr, .. } | Expr::Unary { op: UnaryOp::Plus, expr } =
+            collated_expression
+        {
+            collated_expression = expr;
+        }
+        let spec = match collated_expression {
             Expr::Collate { collation, .. } => ctx
                 .collations
                 .resolve_key_sort_order(collation, false, false)?,

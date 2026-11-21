@@ -510,3 +510,42 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_group_transparent_collations() {
+    sqliters_tcltest::run_test_script(
+        "group_transparent_collations",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE cases(id INTEGER PRIMARY KEY, value TEXT COLLATE NOCASE);
+  INSERT INTO cases VALUES(1,'a'),(2,'A'),(3,'b'),(4,'B'),(5,NULL);
+  CREATE TABLE spaces(id INTEGER PRIMARY KEY, value TEXT COLLATE RTRIM);
+  INSERT INTO spaces VALUES(1,'a '),(2,'a'),(3,'b  '),(4,'b'),(5,NULL);
+}
+do_execsql_test group-collation-1 {
+  SELECT quote(+value),count(*) FROM cases GROUP BY +value ORDER BY 1;
+} {'a' 2 'b' 2 NULL 1}
+do_execsql_test group-collation-2 {
+  SELECT hex(value),count(*) FROM spaces GROUP BY CAST(value AS TEXT) ORDER BY 1;
+} {{} 1 6120 2 622020 2}
+do_execsql_test group-collation-3 {
+  SELECT quote(+CAST(value AS TEXT)),count(*) FROM cases GROUP BY +CAST(value AS TEXT) ORDER BY 1;
+} {'a' 2 'b' 2 NULL 1}
+do_execsql_test group-collation-4 {
+  SELECT quote(value),count(*) FROM cases GROUP BY CAST(value COLLATE NOCASE AS TEXT) ORDER BY 1;
+} {'a' 2 'b' 2 NULL 1}
+do_execsql_test group-collation-5 {
+  SELECT quote(value),count(*) FROM cases GROUP BY +value COLLATE BINARY ORDER BY 1;
+} {'A' 1 'B' 1 'a' 1 'b' 1 NULL 1}
+do_execsql_test group-collation-6 {
+  SELECT quote(value),count(*) FROM cases GROUP BY CAST(value||'' AS TEXT) ORDER BY 1;
+} {'A' 1 'B' 1 'a' 1 'b' 1 NULL 1}
+do_execsql_test group-collation-7 {
+  SELECT quote(+value),max(id) FROM cases GROUP BY +value ORDER BY 1;
+} {'A' 2 'B' 4 NULL 5}
+finish_test
+"#,
+    );
+}
