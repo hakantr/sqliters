@@ -940,3 +940,40 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_reverse_unordered_plain_rowid_scan() {
+    sqliters_tcltest::run_test_script(
+        "reverse_unordered_plain_rowid_scan",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE entries(c0,c1);
+  INSERT INTO entries VALUES (0,0),(0,NULL),(1,5),(2,7);
+  CREATE TABLE empty_entries(x);
+  PRAGMA reverse_unordered_selects=ON;
+}
+do_execsql_test rowid-reverse-1 {
+  SELECT rowid,c1 FROM entries;
+} {4 7 3 5 2 {} 1 0}
+do_execsql_test rowid-reverse-2 {
+  SELECT rowid,c1 FROM entries LIMIT 2 OFFSET 1;
+} {3 5 2 {}}
+do_execsql_test rowid-reverse-3 {
+  SELECT rowid,c1 FROM entries NOT INDEXED;
+} {4 7 3 5 2 {} 1 0}
+do_execsql_test rowid-reverse-4 {
+  SELECT rowid,c1 FROM entries ORDER BY rowid ASC;
+} {1 0 2 {} 3 5 4 7}
+do_execsql_test rowid-reverse-5 {
+  SELECT * FROM empty_entries;
+} {}
+do_execsql_test rowid-reverse-6 {
+  PRAGMA reverse_unordered_selects=OFF;
+  SELECT rowid,c1 FROM entries;
+} {1 0 2 {} 3 5 4 7}
+finish_test
+"#,
+    );
+}

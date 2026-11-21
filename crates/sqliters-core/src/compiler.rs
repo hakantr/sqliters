@@ -3025,7 +3025,7 @@ pub fn try_compile_select_with_functions(
     schema: &Schema,
     functions: &FunctionRegistry,
 ) -> Result<Option<VdbeProgram>> {
-    try_compile_select_core(stmt, functions, true, |name| {
+    try_compile_select_core(stmt, functions, false, |name| {
         let Some(tbl) = resolve_main_table_for_compiler(name, schema)? else {
             return Ok(None);
         };
@@ -3041,9 +3041,9 @@ pub fn try_compile_select_in_db_set(
     db_set: &DatabaseSet,
     functions: &FunctionRegistry,
 ) -> Result<Option<VdbeProgram>> {
-    let allow_wr_autoindex_covering =
-        db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder == 0;
-    let res = try_compile_select_core(stmt, functions, allow_wr_autoindex_covering, |name| {
+    let reverse_unordered_selects =
+        db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0;
+    let res = try_compile_select_core(stmt, functions, reverse_unordered_selects, |name| {
         resolve_db_set_table_for_compiler(name, db_set)
     })?;
     if let Some(ref prog) = res
@@ -4584,7 +4584,7 @@ pub fn try_compile_update_in_db_set(
 fn try_compile_select_core<'a, F>(
     stmt: &SelectStmt,
     functions: &FunctionRegistry,
-    allow_wr_autoindex_covering: bool,
+    reverse_unordered_selects: bool,
     resolve_table: F,
 ) -> Result<Option<VdbeProgram>>
 where
@@ -4681,8 +4681,7 @@ where
                     tbl: &tbl,
                     alias: alias.as_deref(),
                     indexed_by: indexed_by.as_ref(),
-                    allow_wr_autoindex_covering: allow_wr_autoindex_covering
-                        && db_id == DatabaseId::MAIN,
+                    reverse_unordered_selects,
                 },
                 projection,
                 selection.as_ref(),
@@ -4782,7 +4781,7 @@ struct SingleTableSource<'a> {
     tbl: &'a TableSchema,
     alias: Option<&'a str>,
     indexed_by: Option<&'a IndexHint>,
-    allow_wr_autoindex_covering: bool,
+    reverse_unordered_selects: bool,
 }
 
 fn step_clock_projection(expr: &Expr, functions: &FunctionRegistry) -> Option<bool> {
@@ -4854,7 +4853,7 @@ fn compile_single_table_select(
         tbl,
         alias,
         indexed_by,
-        allow_wr_autoindex_covering,
+        reverse_unordered_selects,
     } = source;
     let mut prog = VdbeProgram::new();
     let init_addr = prog.emit(Instruction::new(Opcode::Init, 0, 0, 0));
@@ -4964,7 +4963,7 @@ fn compile_single_table_select(
             indexed_by,
             is_count_star_only: false,
         },
-        allow_wr_autoindex_covering,
+        !reverse_unordered_selects && db_id == DatabaseId::MAIN,
     );
     // A plain ascending rowid order can stream through the table, as C does.
     // A covering scan of an unrelated index would otherwise materialize a sorter.
@@ -5172,6 +5171,18 @@ fn compile_single_table_select(
     let mut jumps_next_row = Vec::new();
     let mut seek_advance_cursor = None;
 
+    if reverse_unordered_selects
+        && db_id == DatabaseId::MAIN
+        && tbl.schema_rowid > 0
+        && !tbl.without_rowid
+        && selection.is_none()
+        && order_by.is_empty()
+        && crate::engine::is_simple_covering_projection(projection)
+        && matches!(plan, AccessPlan::FullScan)
+    {
+        // The relational executor can traverse this rowid table backwards.
+        return Ok(None);
+    }
     let loop_top = match &plan {
         AccessPlan::FullScan => {
             let rewind = prog.emit(Instruction::new(Opcode::Rewind, tbl_cursor, 0, 0));

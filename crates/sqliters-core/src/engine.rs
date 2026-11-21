@@ -615,6 +615,15 @@ impl ExecContext<'_> {
         db_id: DatabaseId,
         root_pgno: Pgno,
     ) -> Result<Vec<(i64, Vec<u8>)>> {
+        self.scan_table_in_db_ordered(db_id, root_pgno, false)
+    }
+
+    fn scan_table_in_db_ordered(
+        &mut self,
+        db_id: DatabaseId,
+        root_pgno: Pgno,
+        reverse: bool,
+    ) -> Result<Vec<(i64, Vec<u8>)>> {
         if root_pgno == 0 {
             return Ok(Vec::new());
         }
@@ -634,7 +643,7 @@ impl ExecContext<'_> {
             progress: self.progress,
             strict_subtype: self.strict_subtype,
         };
-        scan_table_incremental_with_services(bt, root_pgno, &mut svc)
+        scan_table_incremental_with_services(bt, root_pgno, reverse, &mut svc)
     }
 
     pub(crate) fn scan_index_in_db(
@@ -14353,6 +14362,7 @@ fn eval_table_or_subquery(
                     };
 
                 if !ctx.progress.is_enabled()
+                    && !reverse_plain_rowid_scan(ctx, db_id, &tbl, plan_where_hint, vtab_query_info)
                     && (indexed_by.is_none() || matches!(indexed_by, Some(IndexHint::NotIndexed)))
                 {
                     let interrupt_flag = ctx.interrupt_flag;
@@ -14619,6 +14629,26 @@ fn read_table_with_plan_scan(
     )
 }
 
+fn reverse_plain_rowid_scan(
+    ctx: &ExecContext<'_>,
+    db_id: DatabaseId,
+    tbl: &TableSchema,
+    where_hint: Option<&Expr>,
+    query_info: Option<&SingleVtabQueryInfo<'_>>,
+) -> bool {
+    db_id == DatabaseId::MAIN
+        && tbl.schema_rowid > 0
+        && !tbl.without_rowid
+        && where_hint.is_none()
+        && ctx.db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0
+        && query_info.is_some_and(|info| {
+            info.allow_reverse_index_order
+                && info.plan_ctx.is_some_and(|(projection, order_by)| {
+                    order_by.is_empty() && is_simple_covering_projection(projection)
+                })
+        })
+}
+
 /// [`read_table_with_plan_scan`] with the result columns / ORDER BY of a plain single-table
 /// SELECT (`query_ctx`), which the planner needs to consider covering-index scans.
 #[allow(clippy::too_many_arguments)]
@@ -14648,12 +14678,16 @@ fn read_table_with_plan_ctx(
     let db_enc = bt_ref.encoding();
     let slot_name = slot_ref.name.clone();
     let query_ctx = query_info.and_then(|info| info.plan_ctx);
+    let reverse_plain = reverse_plain_rowid_scan(ctx, db_id, tbl, where_hint, query_info);
 
     if let Some(hint) = indexed_by {
         match hint {
             IndexHint::NotIndexed => {
                 if db_page_count == 0 {
                     return Ok((Vec::new(), no_scan));
+                }
+                if reverse_plain {
+                    return scan_plain_rowid_table_reverse(ctx, db_id, tbl.root_pgno).map(|r| (r, no_scan));
                 }
                 return scan_table_raw_entries(ctx, db_id, tbl).map(|r| (r, no_scan));
             }
@@ -14796,6 +14830,9 @@ fn read_table_with_plan_ctx(
     if db_page_count == 0 {
         return Ok((Vec::new(), scan));
     }
+    if reverse_plain && matches!(plan, AccessPlan::FullScan) {
+        return scan_plain_rowid_table_reverse(ctx, db_id, tbl.root_pgno).map(|r| (r, scan));
+    }
     let reverse = reverse_rowid_scan
         && match scan.shape {
             crate::dml_c::ScanShape::RowidRange | crate::dml_c::ScanShape::RowidIn => true,
@@ -14820,6 +14857,15 @@ fn read_table_with_plan_ctx(
     };
     execute_access_plan(ctx, db_id, db_enc, tbl, &plan, params, outer_scopes, ctes, order)
         .map(|r| (r, scan))
+}
+
+fn scan_plain_rowid_table_reverse(
+    ctx: &mut ExecContext<'_>,
+    db_id: DatabaseId,
+    root: Pgno,
+) -> Result<Vec<(TableRowKey, Vec<u8>)>> {
+    let rows = ctx.scan_table_in_db_ordered(db_id, root, true)?;
+    Ok(rows.into_iter().map(|(rowid, payload)| (TableRowKey::Rowid(rowid), payload)).collect())
 }
 
 pub(crate) fn eval_rowid_target_int(val: Value) -> Option<i64> {

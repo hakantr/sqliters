@@ -2889,6 +2889,7 @@ pub(crate) fn scan_table_incremental(
 pub(crate) fn scan_table_incremental_with_services(
     btree: &mut Btree,
     root_pgno: Pgno,
+    reverse: bool,
     services: &mut dyn ExecutionServices,
 ) -> Result<Vec<(i64, Vec<u8>)>> {
     services.check_interrupted()?;
@@ -2900,18 +2901,22 @@ pub(crate) fn scan_table_incremental_with_services(
     btree.cursor_mark_c(cid);
     let res = (|| {
         let mut out = Vec::new();
-        if !btree.cursor_first(cid)? {
-            return Ok(out);
-        }
-        loop {
+        let mut valid = if reverse {
+            btree.cursor_last(cid)?
+        } else {
+            btree.cursor_first(cid)?
+        };
+        while valid {
             services.check_interrupted()?;
             services.tick_progress()?;
             let rowid = btree.cursor_rowid(cid)?;
             let payload = btree.cursor_payload(cid)?;
             out.push((rowid, payload));
-            if !btree.cursor_next(cid)? {
-                break;
-            }
+            valid = if reverse {
+                btree.cursor_prev(cid)?
+            } else {
+                btree.cursor_next(cid)?
+            };
         }
         Ok(out)
     })();
