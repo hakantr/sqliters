@@ -1592,3 +1592,8 @@ Ortak tarih ayrıştırıcı C’nin ASCII yıl, ay ve gün alanlarını, büyü
 ## V6b.257 — Ortak tarih değiştiricisi sözdizimi
 
 Tarih değiştiricileri C’nin ASCII ayırıcı ve baştaki sayısal karakter kararlarını kullanır. 212 farklı girdi düzeldi ve önceki 459 eş sonuç korundu. ISO, sayısal TEXT, negatif 24:00, üç kalıcı dosya ve 60 bağımsız C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,248 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_257.md).
+
+
+## V6b.258 — Görünüm UPDATE tek koşullu tam ve kısmi indeks
+
+Sabit MAIN şemasında ve mevcut açık yazma snapshot’ında tek tam ve tek kısmi indeks, tek basit aralık koşulu için C’nin yapısal uygunluk ayrımını kullanır. Kalıcı sıra ve dosya farkları OFF’ta 108, UTF-16 ilişkisel ON’da 72 kapandı. 330 koruma ve 2.628 C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,457 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_258.md).

@@ -122,6 +122,8 @@ pub struct StmtTxTracker {
     pub(crate) prepared_ignore_checks: Option<bool>,
     /// The generated rowid loop direction is fixed when the statement is prepared.
     pub(crate) prepared_reverse_order: bool,
+    /// The top-level view UPDATE has a plain numeric range in an existing write snapshot.
+    pub(crate) view_update_range_tokens: bool,
     /// Named trigger recursion is fixed by the prepared program.
     pub(crate) prepared_recursive_triggers: Option<bool>,
     /// The prepared DML result shape follows CountRows at compilation.
@@ -32267,6 +32269,37 @@ fn view_dml_range_is_lower(op: BinaryOp, bound: &Expr, quoted_range: bool) -> Op
     }
 }
 
+fn has_plain_integer_tokens(sql: &str) -> bool {
+    // The relational parser folds unary minus. Exclude it here so that
+    // structurally different expressions such as -(-5) and 5 stay distinct.
+    tokenize(sql).is_ok_and(|tokens| {
+        tokens.iter().all(|token| match token.kind {
+            TokenKind::Minus => false,
+            TokenKind::Integer => token.text.bytes().all(|byte| byte.is_ascii_digit()),
+            _ => true,
+        })
+    })
+}
+
+pub(crate) fn view_update_range_tokens(stmt: &Stmt, db_set: &DatabaseSet, sql: &str) -> bool {
+    let Stmt::Update(update) = stmt else {
+        return false;
+    };
+    let Some((column, BinaryOp::Ge, bound)) = update.selection.as_ref().and_then(view_dml_index_term)
+    else {
+        return false;
+    };
+    let comparable = match bound {
+        Expr::Integer(value) => i32::try_from(*value).is_ok() && *value >= 0,
+        Expr::Float(value) => (0.0..=f64::from(i32::MAX)).contains(value),
+        _ => false,
+    };
+    comparable
+        && !column.double_quoted
+        && is_main_rowid_view_update(stmt, db_set)
+        && has_plain_integer_tokens(sql)
+}
+
 // sqlite3MaterializeView copies the UPDATE or DELETE predicate into the
 // ephemeral SELECT. Its scan order becomes the INSTEAD OF trigger input order.
 // Push only a proven index term over a directly projected column. For a
@@ -32372,6 +32405,16 @@ fn view_dml_indexed_select(
         .iter()
         .position(|c| c.name.eq_ignore_ascii_case(column_name))?;
     let column = &table.columns[column_index];
+    let make_term = |op, bound: &Expr| Expr::Binary {
+        left: Box::new(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some(alias.unwrap_or(&name.name).to_owned()),
+            column: column.name.clone(),
+            double_quoted: false,
+        })),
+        op,
+        right: Box::new(bound.clone()),
+    };
     let compatible_affinity = if let Some(literal) = quoted_bound {
         match column.affinity {
             TypeAffinity::Text => true,
@@ -32412,10 +32455,20 @@ fn view_dml_indexed_select(
     {
         return None;
     }
+    let partial_range = two_index_range && indexes.iter().any(|index| index.where_clause.is_some());
+    if partial_range
+        && (!ctx.stmt_tx.view_update_range_tokens
+            || op != BinaryOp::Ge
+            || indexes
+                .iter()
+                .any(|index| index.columns[0].col_idx != Some(column_index)))
+    {
+        return None;
+    }
     if indexes.len() > 1 && (max_eq || two_index_range) {
-        // Partial, statistical and expression indexes need separate planning.
+        // Keep the proven partial range separate from statistics and expression indexes.
         if indexes.iter().any(|index| {
-            index.where_clause.is_some()
+            (index.where_clause.is_some() && !partial_range)
                 || index.stat1.is_some()
                 || index.columns.iter().any(|col| {
                     col.col_idx.is_none() || col.sort_order.custom_collation.is_some()
@@ -32453,10 +32506,52 @@ fn view_dml_indexed_select(
         {
             return None;
         }
-        // C considers the newest catalog entry first and keeps it on equal cost.
-        // The two range indexes have the same key and require the same table reads.
-        indexes = ordered_table_indexes(table, &indexes);
-        indexes.truncate(1);
+        if partial_range {
+            let full = indexes.iter().find(|index| index.where_clause.is_none())?;
+            let partial = indexes.iter().find(|index| index.where_clause.is_some())?;
+            let (partial_column, BinaryOp::Ge, Expr::Integer(partial_bound)) =
+                view_dml_index_term(partial.where_clause.as_ref()?)?
+            else {
+                return None;
+            };
+            if !partial_column.column.eq_ignore_ascii_case(&column.name)
+                || partial_column.double_quoted
+                || !(0..=i64::from(i32::MAX)).contains(partial_bound)
+                || !has_plain_integer_tokens(partial.raw_sql.as_deref()?)
+            {
+                return None;
+            }
+            let root = if matches!(bound, Expr::Integer(value) if value == partial_bound) {
+                // The single normalized term is now known to match structurally.
+                // Let the existing range planner price these two non-covering loops.
+                let plan = choose_access_plan_with_context(
+                    table,
+                    "main",
+                    alias,
+                    Some(&make_term(op, bound)),
+                    schema,
+                    QueryPlanContext {
+                        projection: Some(projection),
+                        ..Default::default()
+                    },
+                );
+                let AccessPlan::IndexRangeScan { index, .. } = plan else {
+                    return None;
+                };
+                if index.root_pgno != partial.root_pgno {
+                    return None;
+                }
+                index.root_pgno
+            } else {
+                full.root_pgno
+            };
+            indexes.retain(|index| index.root_pgno == root);
+        } else {
+            // C considers the newest catalog entry first and keeps it on equal cost.
+            // The two range indexes have the same key and require the same table reads.
+            indexes = ordered_table_indexes(table, &indexes);
+            indexes.truncate(1);
+        }
     }
     let [index] = indexes.as_slice() else {
         return None;
@@ -32464,7 +32559,7 @@ fn view_dml_indexed_select(
     let key = index.columns.first()?;
     let without_rowid_range = table.without_rowid && predicate == ViewDmlIndexPredicate::UpdateRange;
     let expected_keys = if max_eq { 2 } else { 1 };
-    if index.where_clause.is_some()
+    if (index.where_clause.is_some() && !partial_range)
         || index.is_unordered()
         || index.columns.len() != expected_keys
         || key.col_idx != Some(column_index)
@@ -32486,16 +32581,6 @@ fn view_dml_indexed_select(
         return None;
     }
 
-    let make_term = |op, bound: &Expr| Expr::Binary {
-        left: Box::new(Expr::Column(ColumnRef {
-            schema: None,
-            table: Some(alias.unwrap_or(&name.name).to_owned()),
-            column: column.name.clone(),
-            double_quoted: false,
-        })),
-        op,
-        right: Box::new(bound.clone()),
-    };
     let first = make_term(op, bound);
     let mut narrowed = view.clone();
     if let SelectCore::Select {
