@@ -801,3 +801,39 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_union_all_unused_arms() {
+    sqliters_tcltest::run_test_script(
+        "union_all_unused_arms",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE head(id INTEGER PRIMARY KEY);
+  INSERT INTO head VALUES(1),(2),(3);
+  CREATE TABLE tail(id INTEGER PRIMARY KEY);
+  INSERT INTO tail VALUES(4),(5),(6);
+  CREATE TABLE last(id INTEGER PRIMARY KEY);
+  INSERT INTO last VALUES(7),(8);
+}
+do_execsql_test union-all-arms-1 {
+  SELECT id FROM head UNION ALL SELECT abs(-9223372036854775808) FROM tail LIMIT 1;
+} {1}
+do_execsql_test union-all-arms-2 {
+  SELECT id FROM head UNION ALL SELECT abs(-9223372036854775808) FROM tail LIMIT 2 OFFSET 1;
+} {2 3}
+do_execsql_test union-all-arms-3 {
+  SELECT id FROM head UNION ALL SELECT id FROM tail
+  UNION ALL SELECT abs(-9223372036854775808) FROM last LIMIT 4;
+} {1 2 3 4}
+do_catchsql_test union-all-arms-4 {
+  SELECT id FROM head UNION ALL SELECT abs(-9223372036854775808) FROM tail LIMIT 1 OFFSET 3;
+} {1 {integer overflow}}
+do_catchsql_test union-all-arms-5 {
+  SELECT id FROM head UNION ALL SELECT abs(-9223372036854775808) FROM tail ORDER BY 1 LIMIT 1;
+} {1 {integer overflow}}
+finish_test
+"#,
+    );
+}

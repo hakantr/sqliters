@@ -1927,3 +1927,8 @@ Olağan FROM alt sorgularında LIMIT ve OFFSET satır üretiminden önce değerl
 ## V6b.324 — Özyinelemesiz CTE LIMIT değerlendirme sırası
 
 Özyinelemesiz CTE için LIMIT ve OFFSET satır üretiminden önce birer kez değerlendirilir. 330 fark kapandı. 62 sorgu biçimi, 18 C salt okunur açılış ve altı Rust kontrolü doğrulandı. OFF 1200/1/329, ON 1197/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,297 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_324.md).
+
+
+## V6b.325 — UNION ALL ve dolan LIMIT
+
+Pozitif LIMIT ve OFFSET için yeterli satır oluştuğunda olağan UNION ALL kolları için gereksiz satır değerlendirmesi yapılmaz. 50 fark kapandı. 18 C salt okunur açılış ve beş odaklı Rust kontrolü doğrulandı. OFF 1201/1/329, ON 1198/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,267 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_325.md).
