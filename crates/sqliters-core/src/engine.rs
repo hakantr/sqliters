@@ -33113,10 +33113,10 @@ fn view_dml_indexed_select(
         term => (view_dml_index_term(term)?, None),
     };
     let finite_real_bound = matches!(bound, Expr::Float(value) if value.is_finite());
-    if returning_range && !matches!(bound, Expr::Integer(_)) && !finite_real_bound {
-        return None;
-    }
-    let quoted_bound = if predicate == ViewDmlIndexPredicate::UpdateRange
+    let quoted_bound = if matches!(
+        predicate,
+        ViewDmlIndexPredicate::UpdateRange | ViewDmlIndexPredicate::UpdateReturningRange
+    )
         && second_term.is_none()
         && let Expr::String(literal) = bound
     {
@@ -33124,6 +33124,13 @@ fn view_dml_indexed_select(
     } else {
         None
     };
+    if returning_range
+        && !matches!(bound, Expr::Integer(_))
+        && !finite_real_bound
+        && quoted_bound.is_none()
+    {
+        return None;
+    }
     let distinct_columns = second_term.is_some_and(|(other, _, _)| {
         !target_col.column.eq_ignore_ascii_case(&other.column)
     });
@@ -33183,7 +33190,8 @@ fn view_dml_indexed_select(
             && (!table.without_rowid || ctx.collations.get_custom("BINARY").is_some()))
         || (table.without_rowid && predicate == ViewDmlIndexPredicate::DeleteRange)
         || (quoted_bound.is_some()
-            && (table.without_rowid || ctx.collations.get_custom("BINARY").is_some()))
+            && ((!returning_range && table.without_rowid)
+                || ctx.collations.get_custom("BINARY").is_some()))
         || table.stat1.has_stat1
         || !table.foreign_keys.is_empty()
         || table
@@ -33298,7 +33306,14 @@ fn view_dml_indexed_select(
     };
     let compatible_affinity = if let Some(literal) = quoted_bound {
         match column.affinity {
-            TypeAffinity::Text => true,
+            TypeAffinity::Text => !returning_range,
+            TypeAffinity::Integer | TypeAffinity::Numeric | TypeAffinity::Real if returning_range => {
+                match column.affinity.apply(Value::Text(literal.clone())) {
+                    Value::Integer(_) => true,
+                    Value::Real(value) => value.is_finite(),
+                    _ => false,
+                }
+            }
             TypeAffinity::Numeric => matches!(
                 column.affinity.apply(Value::Text(literal.clone())),
                 Value::Integer(_) | Value::Real(_)
@@ -33334,7 +33349,9 @@ fn view_dml_indexed_select(
         )
         && (second_term.is_none() || (returning_range && !has_partial))
         && (matches!(bound, Expr::Integer(_))
-            || (returning_range && finite_real_bound && !has_partial))
+            || (returning_range
+                && !has_partial
+                && (finite_real_bound || quoted_bound.is_some())))
         && !column.is_primary_key
         && ((alias.is_none()
             && projection.iter().all(|item| view_dml_named_column(item).is_some()))

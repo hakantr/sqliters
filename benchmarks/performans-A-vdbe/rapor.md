@@ -2082,3 +2082,8 @@ Nitelikli INTEGER PRIMARY KEY eşitliğinde olağan INNER ve LEFT JOIN, reverse_
 ## V6b.355 — WITHOUT ROWID görünüm UPDATE RETURNING için aynı yönlü sınırlar
 
 420 profilde 280 sıra veya dosya farkı kapandı. 1260 C yeniden açılışı ve dört odaklı kontrol geçti. OFF 1231/1/329, ON 1228/4/329. DML OFF 392/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,274 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_355.md).
+
+
+## V6b.356 — WITHOUT ROWID görünüm UPDATE RETURNING için metin biçimli sayısal sınır
+
+450 profilde 480 sıra veya ana dosya farkı kapandı. 1350 C yeniden açılışı ve dört odaklı kontrol geçti. OFF 1232/1/329, ON 1229/4/329. DML OFF 392/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,319 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_356.md).
