@@ -616,3 +616,41 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_returning_without_rowid_view_unique_range_index() {
+    sqliters_tcltest::run_test_script(
+        "returning_without_rowid_view_unique_range_index",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach {layout ordering extra expected} {
+  ascending ASC {} {2 4 5 1}
+  descending DESC {} {1 5 4 2}
+  expression ASC {CREATE INDEX shifted ON base(k+1);} {2 4 5 1}
+  additional_unique DESC {CREATE UNIQUE INDEX extra ON base(label);} {1 5 4 2}
+} {
+  reset_db
+  execsql {
+    CREATE TABLE base(id INTEGER PRIMARY KEY, k INTEGER, label TEXT) WITHOUT ROWID;
+    CREATE TABLE seen(seq INTEGER PRIMARY KEY, id INTEGER);
+    INSERT INTO base VALUES (1,5,'one'),(2,2,'two'),(3,1,'three'),(4,3,'four'),(5,4,'five');
+    CREATE VIEW projected AS SELECT id,k,label FROM base;
+    CREATE TRIGGER revise INSTEAD OF UPDATE ON projected BEGIN
+      INSERT INTO seen(id) VALUES(old.id);
+      UPDATE base SET label=new.label WHERE id=old.id;
+    END;
+  }
+  execsql "CREATE UNIQUE INDEX keyed ON base(k $ordering); $extra"
+  do_execsql_test returning-unique-range-$layout.1 {
+    UPDATE projected SET label=label||'!' WHERE k>=2 RETURNING id;
+    SELECT changes();
+    SELECT id FROM seen ORDER BY seq;
+    SELECT id,label FROM base ORDER BY id;
+    PRAGMA integrity_check;
+  } [concat $expected {0} $expected {1 one! 2 two! 3 three 4 four! 5 five! ok}]
+}
+finish_test
+"#,
+    );
+}

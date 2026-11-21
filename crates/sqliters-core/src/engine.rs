@@ -33332,8 +33332,7 @@ fn view_dml_indexed_select(
                 && key.sort_order.collation == Collation::Binary
                 && key.sort_order.custom_collation.is_none()
                 && match key.col_idx {
-                    Some(column) if matches_key(Some(column)) => !index.unique,
-                    Some(_) => index.unique,
+                    Some(column) => matches_key(Some(column)) || index.unique,
                     None => !index.unique && key.expr.is_some(),
                 }
         });
@@ -33635,7 +33634,6 @@ fn view_dml_indexed_select(
     let without_rowid_range = table.without_rowid && !max_eq;
     let expected_keys = if max_eq { 2 } else { 1 };
     if (index.where_clause.is_some() && !partial_range && wr_mixed_root.is_none())
-        || (returning_range && index.unique)
         || index.is_unordered()
         || index.columns.len() != expected_keys
         || !matches_key(key.col_idx)
