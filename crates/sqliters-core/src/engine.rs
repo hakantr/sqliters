@@ -7486,7 +7486,7 @@ fn exec_single_select_core_inner(
                     }
                 }
                 Some(fc) => {
-                    let reverse_sources = !*distinct
+                    let reverse_scans = if !*distinct
                         && selection.is_none()
                         && group_by.is_empty()
                         && having.is_none()
@@ -7495,7 +7495,11 @@ fn exec_single_select_core_inner(
                         && outer_scopes.is_empty()
                         && ctes.scopes.is_empty()
                         && is_plain_reverse_projection(projection)
-                        && can_reverse_plain_cross_join(ctx.db_set, fc);
+                    {
+                        reverse_plain_join_scans(ctx.db_set, fc)
+                    } else {
+                        ReverseJoinScans::None
+                    };
                     eval_from_clause_inner(
                         ctx,
                         fc,
@@ -7506,7 +7510,7 @@ fn exec_single_select_core_inner(
                         ctes,
                         &mut omitted_vtab_conjuncts,
                         fc.joins.len(),
-                        reverse_sources,
+                        reverse_scans,
                     )?
                 }
             };
@@ -8903,30 +8907,81 @@ pub(crate) fn scalar_self_join_cte_columns(
     Some(disambiguate_view_column_names(&columns))
 }
 
-fn can_reverse_plain_cross_join(db_set: &DatabaseSet, from: &FromClause) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReverseJoinScans {
+    None,
+    Left,
+    Both,
+}
+
+fn plain_join_table<'a>(
+    db_set: &'a DatabaseSet,
+    source: &'a TableOrSubquery,
+) -> Option<(&'a TableSchema, &'a str)> {
+    let TableOrSubquery::Table { name, alias, table_args: None, indexed_by: None } = source else {
+        return None;
+    };
+    let Ok(Some((DatabaseId::MAIN, RelationRef::Table(table)))) =
+        db_set.find_relation_ref_in_set(name)
+    else {
+        return None;
+    };
+    let schema = &db_set.main_slot().schema;
+    (table.schema_rowid > 0
+        && !table.without_rowid
+        && !schema.indexes.iter().any(|index| index.table_name.eq_ignore_ascii_case(&table.name)))
+        .then_some((table, alias.as_deref().unwrap_or(&name.name)))
+}
+
+fn reverse_plain_join_scans(db_set: &DatabaseSet, from: &FromClause) -> ReverseJoinScans {
     if db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder == 0 {
-        return false;
+        return ReverseJoinScans::None;
     }
     let [join] = from.joins.as_slice() else {
-        return false;
+        return ReverseJoinScans::None;
     };
-    if join.join_type != JoinType::Cross || join.natural || join.constraint.is_some() {
-        return false;
+    if join.natural {
+        return ReverseJoinScans::None;
     }
-    let schema = &db_set.main_slot().schema;
-    [&from.head, &join.right].into_iter().all(|source| {
-        let TableOrSubquery::Table { name, table_args: None, indexed_by: None, .. } = source else {
+    let (Some((left, left_alias)), Some((right, right_alias))) = (
+        plain_join_table(db_set, &from.head),
+        plain_join_table(db_set, &join.right),
+    ) else {
+        return ReverseJoinScans::None;
+    };
+    if join.join_type == JoinType::Cross && join.constraint.is_none() {
+        return ReverseJoinScans::Both;
+    }
+    if !matches!(join.join_type, JoinType::Inner | JoinType::Left)
+        || left_alias.eq_ignore_ascii_case(right_alias)
+    {
+        return ReverseJoinScans::None;
+    }
+    let Some(JoinConstraint::On(Expr::Binary { left: a, op: BinaryOp::Eq, right: b })) =
+        join.constraint.as_ref()
+    else {
+        return ReverseJoinScans::None;
+    };
+
+    let is_key = |expr: &Expr, table: &TableSchema, alias: &str| {
+        let Expr::Column(column) = expr else {
             return false;
         };
-        let Ok(Some((DatabaseId::MAIN, RelationRef::Table(table)))) =
-            db_set.find_relation_ref_in_set(name)
-        else {
-            return false;
-        };
-        table.schema_rowid > 0
-            && !table.without_rowid
-            && !schema.indexes.iter().any(|index| index.table_name.eq_ignore_ascii_case(&table.name))
-    })
+        column.schema.is_none()
+            && column.table.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(alias))
+            && table.rowid_alias_col.is_some_and(|id| {
+                table.columns[id].name.eq_ignore_ascii_case(&column.column)
+            })
+    };
+    if (is_key(a, left, left_alias) && is_key(b, right, right_alias))
+        || (is_key(b, left, left_alias) && is_key(a, right, right_alias))
+    {
+        // Each left key matches at most one right row. Its scan order does
+        // not affect the order of this result.
+        ReverseJoinScans::Left
+    } else {
+        ReverseJoinScans::None
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8950,7 +9005,7 @@ fn eval_from_clause(
         ctes,
         omitted_conjuncts,
         fc.joins.len(),
-        false,
+        ReverseJoinScans::None,
     )
 }
 
@@ -8965,7 +9020,7 @@ fn eval_from_clause_inner(
     ctes: &CteStore,
     omitted_conjuncts: &mut Vec<Expr>,
     vtab_rotations_left: usize,
-    reverse_sources: bool,
+    reverse_scans: ReverseJoinScans,
 ) -> Result<Vec<EvalRow>> {
     if 1 + fc.joins.len() > 64 {
         return Err(SqliteError::new(
@@ -9097,7 +9152,7 @@ fn eval_from_clause_inner(
                     ctes,
                     omitted_conjuncts,
                     vtab_rotations_left - 1,
-                    false,
+                    ReverseJoinScans::None,
                 )?;
                 if n_m > 0 && n_before_m > 0 && !rows.is_empty() {
                     let mut rotated_cols_cache: Option<Rc<[ScopedColumn]>> = None;
@@ -9228,7 +9283,7 @@ fn eval_from_clause_inner(
             identity,
             output: None,
         });
-    let reverse_info = reverse_sources.then(|| SingleVtabQueryInfo {
+    let reverse_info = (reverse_scans != ReverseJoinScans::None).then(|| SingleVtabQueryInfo {
         has_star: true,
         reverse_unordered_rowid_source: true,
         ..Default::default()
@@ -9342,7 +9397,7 @@ fn eval_from_clause_inner(
                 ctes,
                 omitted_conjuncts,
                 vtab_rotations_left - 1,
-                false,
+                ReverseJoinScans::None,
             )?;
             // Also rotate `row.subtypes` when rotating columns in the `head_is_vtab` path!
             if n_prefix > 0 && n_head > 0 && !rows.is_empty() {
@@ -9546,7 +9601,7 @@ fn eval_from_clause_inner(
                 outer_scopes,
                 ctes,
                 omitted_conjuncts,
-                reverse_info.as_ref(),
+                reverse_info.as_ref().filter(|_| reverse_scans == ReverseJoinScans::Both),
                 from_materialization.as_mut(),
             )?;
             let right_cols_actual: Vec<ScopedColumn> = right_rows

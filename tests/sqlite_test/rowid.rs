@@ -1054,3 +1054,43 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_reverse_unordered_integer_key_join() {
+    sqliters_tcltest::run_test_script(
+        "reverse_unordered_integer_key_join",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE source_rows(id INTEGER PRIMARY KEY, value TEXT);
+  CREATE TABLE tags(id INTEGER PRIMARY KEY, name TEXT);
+  INSERT INTO source_rows VALUES(1,'r1'),(2,'r2'),(3,'r3');
+  INSERT INTO tags VALUES(1,'a'),(3,'c'),(4,'d');
+  PRAGMA reverse_unordered_selects=ON;
+}
+do_execsql_test reverse-key-join-1 {
+  SELECT r.id,t.id FROM source_rows r JOIN tags t ON r.id=t.id;
+} {3 3 1 1}
+do_execsql_test reverse-key-join-2 {
+  SELECT r.id,t.id FROM source_rows r INNER JOIN tags t ON t.id=r.id;
+} {3 3 1 1}
+do_execsql_test reverse-key-join-3 {
+  SELECT r.id,t.id FROM source_rows r LEFT JOIN tags t ON r.id=t.id;
+} {3 3 2 {} 1 1}
+do_execsql_test reverse-key-join-4 {
+  SELECT r.id,t.id FROM source_rows r LEFT JOIN tags t ON t.id=r.id LIMIT 2 OFFSET 1;
+} {2 {} 1 1}
+do_execsql_test reverse-key-join-5 {
+  SELECT r.*,t.* FROM source_rows r LEFT JOIN tags t ON r.id=t.id LIMIT 2;
+} {3 r3 3 c 2 r2 {} {}}
+do_execsql_test reverse-key-join-6 {
+  SELECT t.id,r.id FROM tags t LEFT JOIN source_rows r ON r.id=t.id;
+} {4 {} 3 3 1 1}
+do_execsql_test reverse-key-join-7 {
+  SELECT r.id,t.id FROM source_rows r LEFT JOIN tags t ON r.id=t.id ORDER BY r.id;
+} {1 1 2 {} 3 3}
+finish_test
+"#,
+    );
+}
