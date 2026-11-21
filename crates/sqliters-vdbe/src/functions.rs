@@ -1460,7 +1460,17 @@ fn parse_datetime_value(
             true,
         )
     } else {
+        let output_precision_only = || {
+            modifiers.iter().all(|m| {
+                matches!(m, Value::Text(text)
+                    if text.eq_ignore_ascii_case("subsec") || text.eq_ignore_ascii_case("subsecond"))
+            })
+        };
         let (time, check_julian_range) = match val {
+            Value::Integer(_) | Value::Real(_) if output_precision_only() => {
+                let days = parse_raw_datetime_number(val, ctx.text_encoding)?;
+                (ParsedDateTime::from_unix_ms(julian_days_to_ms(days)?), true)
+            }
             Value::Integer(jd) => {
                 // Julian day -> Unix ms (`2440587.5` JD = Unix epoch)
                 let ms = ((*jd as f64 - 2_440_587.5) * 86_400_000.0).round() as i64;
@@ -1471,14 +1481,7 @@ fn parse_datetime_value(
                 (ParsedDateTime::from_unix_ms(ms), false)
             }
             Value::Text(s) => parse_datetime_text(s, ctx, allow_signed_year).or_else(|| {
-                // Output precision does not change the meaning of the Julian input.
-                if s.contains('\0')
-                    || !modifiers.iter().all(|m| {
-                        matches!(m, Value::Text(text)
-                            if text.eq_ignore_ascii_case("subsec")
-                                || text.eq_ignore_ascii_case("subsecond"))
-                    })
-                {
+                if s.contains('\0') || !output_precision_only() {
                     return None;
                 }
                 let days = parse_raw_datetime_number(val, ctx.text_encoding)?;
