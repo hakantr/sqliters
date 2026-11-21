@@ -1581,6 +1581,12 @@ fn parse_datetime_value(
                     }
                     return finish(shift_weekday_ms(time.unix_ms, weekday.abs() as i64, true));
                 }
+                if let Some(delta) = parse_clock_shift_ms(modifier)
+                    && valid_julian_unix_ms(time.unix_ms)
+                    && is_normal_iso_calendar(stamp)
+                {
+                    return finish(time.unix_ms.checked_add(delta)?);
+                }
             }
         }
         // A canonical date is already normalized and has no raw clock fields.
@@ -1946,6 +1952,23 @@ fn parse_numeric_time_offset_ms(s: &str) -> Option<i64> {
     }
     let ms = i64::from(hours * 60 + minutes) * 60_000;
     Some(if s.starts_with('-') { -ms } else { ms })
+}
+
+fn parse_clock_shift_ms(modifier: &str) -> Option<i64> {
+    let clock = modifier.strip_prefix(['+', '-']).unwrap_or(modifier);
+    if !matches!(clock.as_bytes(), [b'0'..=b'9', b'0'..=b'9', b':', ..]) {
+        return None;
+    }
+    // SQLite computes this bare clock relative to midnight, takes its day
+    // remainder, and only then applies the modifier's leading sign.
+    let millis = parse_iso_datetime(clock, false)?
+        .unix_ms
+        .rem_euclid(86_400_000);
+    Some(if modifier.starts_with('-') {
+        -millis
+    } else {
+        millis
+    })
 }
 
 fn parse_hms_ms(s: &str, allow_hour24: bool) -> Option<(i64, Option<f64>)> {
