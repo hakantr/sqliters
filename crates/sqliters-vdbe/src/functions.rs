@@ -1555,13 +1555,32 @@ fn parse_datetime_value(
             let mut date_modifiers = modifiers.iter().filter(|m| !is_output_precision(m));
             if let (Some(Value::Text(modifier)), None) =
                 (date_modifiers.next(), date_modifiers.next())
-                && modifier
+            {
+                let finish = |unix_ms| {
+                    valid_julian_unix_ms(unix_ms)
+                        .then_some((ParsedDateTime::from_unix_ms(unix_ms), modifiers.len() > 1))
+                };
+                if modifier
                     .get(..7)
                     .is_some_and(|prefix| prefix.eq_ignore_ascii_case("end of "))
-            {
-                let unix_ms = end_of_iso_period_ms(time.unix_ms, stamp, modifier)?;
-                return valid_julian_unix_ms(unix_ms)
-                    .then_some((ParsedDateTime::from_unix_ms(unix_ms), modifiers.len() > 1));
+                {
+                    return finish(end_of_iso_period_ms(time.unix_ms, stamp, modifier)?);
+                }
+                if let Some(amount) = modifier
+                    .get(8..)
+                    .filter(|_| modifier[..8].eq_ignore_ascii_case("weekday "))
+                    // SQLite looks for a literal minus, including a negative zero or exponent.
+                    && amount.contains('-')
+                    && !amount.contains('\0')
+                    && valid_julian_unix_ms(time.unix_ms)
+                    && is_normal_iso_calendar(stamp)
+                {
+                    let (weekday, status) = sqliters_types::sqlite_atof(amount.as_bytes());
+                    if status <= 0 || !(-6.0..=6.0).contains(&weekday) || weekday.fract() != 0.0 {
+                        return None;
+                    }
+                    return finish(shift_weekday_ms(time.unix_ms, weekday.abs() as i64, true));
+                }
             }
         }
         // A canonical date is already normalized and has no raw clock fields.
@@ -2110,22 +2129,27 @@ fn has_raw_calendar_overflow(text: &str) -> bool {
         .is_some_and(|local| utc_ymdhms_from_unix_ms(local.unix_ms).2 != raw_day)
 }
 
-fn end_of_iso_period_ms(unix_ms: i64, stamp: &str, modifier: &str) -> Option<i64> {
-    let (date, clock) = stamp.split_at_checked(10)?;
+fn is_normal_iso_calendar(stamp: &str) -> bool {
+    let Some((date, clock)) = stamp.split_at_checked(10) else {
+        return false;
+    };
     let canonical_clock = match clock.as_bytes() {
         [] => true,
-        [b' ' | b'T', _, _, b':', ..] => {
-            parse_two_time_digits(clock.get(1..3)?).is_some_and(|hour| hour < 24)
-        }
+        [b' ' | b'T', _, _, b':', ..] => clock
+            .get(1..3)
+            .and_then(parse_two_time_digits)
+            .is_some_and(|hour| hour < 24),
         _ => false,
     };
-    if !matches!(
+    matches!(
         date.as_bytes(),
         [b'0'..=b'9', _, _, _, b'-', _, _, b'-', _, _]
-    ) || !canonical_clock
-        || has_raw_calendar_overflow(stamp)
-        || !valid_julian_unix_ms(unix_ms)
-    {
+    ) && canonical_clock
+        && !has_raw_calendar_overflow(stamp)
+}
+
+fn end_of_iso_period_ms(unix_ms: i64, stamp: &str, modifier: &str) -> Option<i64> {
+    if !is_normal_iso_calendar(stamp) || !valid_julian_unix_ms(unix_ms) {
         return None;
     }
 
@@ -2141,6 +2165,16 @@ fn end_of_iso_period_ms(unix_ms: i64, stamp: &str, modifier: &str) -> Option<i64
         _ => return None,
     };
     Some(next_day * 86_400_000 - 1)
+}
+
+fn shift_weekday_ms(unix_ms: i64, target_day: i64, backward: bool) -> i64 {
+    let day = unix_ms.div_euclid(86_400_000);
+    let current_day = (day + 4).rem_euclid(7);
+    let mut days = (target_day - current_day).rem_euclid(7);
+    if backward && days != 0 {
+        days -= 7;
+    }
+    unix_ms.saturating_add(days * 86_400_000)
 }
 
 fn apply_packed_calendar_shift(
@@ -2257,10 +2291,7 @@ fn apply_datetime_modifier_ms<'a>(
             };
             return Some(ms + days * 86_400_000);
         }
-        let days = ms.div_euclid(86_400_000);
-        let dow = (days + 4).rem_euclid(7);
-        let add_days = (target_dow - dow).rem_euclid(7);
-        return calendar_output(ms.saturating_add(add_days * 86_400_000));
+        return calendar_output(shift_weekday_ms(ms, target_dow, false));
     }
 
     let NumericDateTimeModifier {

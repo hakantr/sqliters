@@ -1752,3 +1752,8 @@ Kapsayıcı olmayan iki sıradan tam BINARY ikincil indeksli WR görünüm aral�
 ## V6b.289 — Gün ay ve yıl sonu tarih değiştiricileri
 
 Normal ISO tarih metninde end of day/month/year, C'nin son milisaniye ve civil yıl aralığı kararını kullanır. Dokuz Tcl vakası, kodlama başına 976 hedef ve 30 C salt okunur açılışı eş. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,293 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_289.md).
+
+
+## V6b.290 — İşaretli hafta günü kaydırması
+
+Geçerli ISO tarih metninde tek weekday sayısındaki gerçek eksi, C'nin geriye kaydırma yönünü kullanır. 13 Tcl vakası ve 932 önceki fark kapandı. 1.680 ileri yön kontrolü ve 30 salt okunur C açılışı doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,272 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_290.md).
