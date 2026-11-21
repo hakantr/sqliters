@@ -34397,7 +34397,10 @@ fn exec_create_table_as(
         slot.name.clone()
     };
 
-    let meta = infer_select_stmt_meta(query, &[], ctx.db_set, &CteStore::default());
+    let ctes = CteStore::default();
+    let meta = infer_select_stmt_meta(query, &[], ctx.db_set, &ctes);
+    let cast_affinities =
+        compound_cast_affinities(&query.body, &meta, ctx.db_set, &ctes.with_scope(&query.ctes));
     // C runs `sqlite3StartTable` before the SELECT: the root page exists and sqlite_schema holds
     // the placeholder row (five NULLs) while the query runs, so a query that reads
     // sqlite_schema sees that row.
@@ -34439,13 +34442,16 @@ fn exec_create_table_as(
     let mut columns = Vec::with_capacity(dedup_names.len());
     let mut rendered_cols = Vec::with_capacity(dedup_names.len());
     for (i, cname) in dedup_names.into_iter().enumerate() {
-        let aff = meta.get(i).and_then(|(a, _)| *a);
-        let type_str = match aff {
-            Some(TypeAffinity::Integer) => "INT",
-            Some(TypeAffinity::Text) => "TEXT",
-            Some(TypeAffinity::Real) => "REAL",
-            Some(TypeAffinity::Numeric) => "NUM",
-            Some(TypeAffinity::Blob) | None => "",
+        let type_str = match cast_affinities.get(i).copied().flatten() {
+            Some(CompoundCastAffinity::FlexNum) => "NUM",
+            Some(CompoundCastAffinity::Blob) => "",
+            None => match meta.get(i).and_then(|(a, _)| *a) {
+                Some(TypeAffinity::Integer) => "INT",
+                Some(TypeAffinity::Text) => "TEXT",
+                Some(TypeAffinity::Real) => "REAL",
+                Some(TypeAffinity::Numeric) => "NUM",
+                Some(TypeAffinity::Blob) | None => "",
+            },
         };
         let cdef = ColumnDef {
             name: cname,
@@ -34494,14 +34500,29 @@ fn exec_create_table_as(
     };
     exec_create_table_started(ctx, &ct, Some(started))?;
 
-    let Some(tbl) = ctx
+    let Some(mut tbl) = ctx
         .db_set
         .slot(db_id)
         .and_then(|s| s.schema.find_user_table(&name.name).cloned())
     else {
         return Ok(());
     };
-    for row in q_out.rows {
+    // C creates NUM columns with FLEXNUM affinity for this initial write only. Convert
+    // text as numeric, then use a no-op affinity in the local writer schema so already
+    // numeric values keep their storage type. The catalog retains NUM for later writes.
+    for (column, affinity) in tbl.columns.iter_mut().zip(&cast_affinities) {
+        if matches!(affinity, Some(CompoundCastAffinity::FlexNum)) {
+            column.affinity = TypeAffinity::Blob;
+        }
+    }
+    for mut row in q_out.rows {
+        for (value, affinity) in row.iter_mut().zip(&cast_affinities) {
+            if matches!(affinity, Some(CompoundCastAffinity::FlexNum))
+                && matches!(value, Value::Text(_))
+            {
+                *value = TypeAffinity::Numeric.apply(std::mem::replace(value, Value::Null));
+            }
+        }
         validate_and_write_row(
             ctx,
             db_id,
@@ -56687,12 +56708,18 @@ fn resolve_view_columns_static(
     Ok((final_cols, meta, schema_lbl))
 }
 
-fn view_pragma_cast_types(
+#[derive(Clone, Copy)]
+enum CompoundCastAffinity {
+    FlexNum,
+    Blob,
+}
+
+fn compound_cast_affinities(
     body: &SelectBody,
     meta: &[(Option<TypeAffinity>, Collation)],
     db_set: &DatabaseSet,
     ctes: &CteStore,
-) -> Vec<Option<&'static str>> {
+) -> Vec<Option<CompoundCastAffinity>> {
     let numeric_cast = |column, expr: &Expr| {
         matches!(expr, Expr::Cast { .. })
             && matches!(
@@ -56719,7 +56746,7 @@ fn view_pragma_cast_types(
             expanded
                 .iter()
                 .enumerate()
-                .map(|(i, (expr, _, _))| numeric_cast(i, expr).then_some("NUM"))
+                .map(|(i, (expr, _, _))| numeric_cast(i, expr).then_some(CompoundCastAffinity::FlexNum))
                 .collect()
         }
         SelectCore::Values(rows) if body.compounds.is_empty() && rows.len() > 1 => {
@@ -56736,7 +56763,11 @@ fn view_pragma_cast_types(
                     let may_be_text = rest.iter().filter_map(|row| row.get(i)).any(|expr| {
                         expr_data_type_mask(expr, &[], db_set, ctes, &mut visited) & 0x02 != 0
                     });
-                    Some(if may_be_text { "BLOB" } else { "NUM" })
+                    Some(if may_be_text {
+                        CompoundCastAffinity::Blob
+                    } else {
+                        CompoundCastAffinity::FlexNum
+                    })
                 })
                 .collect()
         }
@@ -56777,7 +56808,7 @@ fn infer_view_pragma_columns(
     };
     let meta = infer_select_stmt_meta(&fixed_sel, &[], db_set, &view_ctes);
     let sub_ctes = view_ctes.with_scope(&fixed_sel.ctes);
-    let cast_types = view_pragma_cast_types(&fixed_sel.body, &meta, db_set, &sub_ctes);
+    let cast_affinities = compound_cast_affinities(&fixed_sel.body, &meta, db_set, &sub_ctes);
     let mut depth = 0usize;
     let head_decl_types =
         infer_core_origin_declared_types(&fixed_sel.body.head, db_set, &sub_ctes, &mut depth);
@@ -56785,22 +56816,22 @@ fn infer_view_pragma_columns(
     for (i, cname) in names.into_iter().enumerate() {
         let aff = meta.get(i).and_then(|(a, _)| *a);
         let decl_opt = head_decl_types.get(i).and_then(|d| d.as_deref());
-        let type_str = if let Some(ty) = cast_types.get(i).copied().flatten() {
-            ty.to_owned()
-        } else if let Some(dt) = decl_opt
-            && !dt.is_empty()
-            && Some(TypeAffinity::from_declared_type(dt)) == aff
-        {
-            dt.to_owned()
-        } else {
-            match aff {
-                Some(TypeAffinity::Integer) => "INT".to_owned(),
-                Some(TypeAffinity::Real) => "REAL".to_owned(),
-                Some(TypeAffinity::Text) => "TEXT".to_owned(),
-                Some(TypeAffinity::Blob) => "BLOB".to_owned(),
-                Some(TypeAffinity::Numeric) => "NUM".to_owned(),
-                None => String::new(),
-            }
+        let type_str = match cast_affinities.get(i).copied().flatten() {
+            Some(CompoundCastAffinity::FlexNum) => "NUM".to_owned(),
+            Some(CompoundCastAffinity::Blob) => "BLOB".to_owned(),
+            None => match decl_opt {
+                Some(dt) if !dt.is_empty() && Some(TypeAffinity::from_declared_type(dt)) == aff => {
+                    dt.to_owned()
+                }
+                _ => match aff {
+                    Some(TypeAffinity::Integer) => "INT".to_owned(),
+                    Some(TypeAffinity::Real) => "REAL".to_owned(),
+                    Some(TypeAffinity::Text) => "TEXT".to_owned(),
+                    Some(TypeAffinity::Blob) => "BLOB".to_owned(),
+                    Some(TypeAffinity::Numeric) => "NUM".to_owned(),
+                    None => String::new(),
+                },
+            },
         };
         out.push((cname, type_str));
     }

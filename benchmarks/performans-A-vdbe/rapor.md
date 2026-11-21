@@ -1857,3 +1857,8 @@ Normal SELECT için mevcut C tipi hazırlama sonucundaki geçersiz likelihood ol
 ## V6b.310 — Üslü Julian tarih BLOB girdisi
 
 Değiştiricisiz tam kod birimi BLOB içindeki üslü ASCII sayı mevcut iJD dönüşümünü kullanır. Bağlı ve literal yerleşimde 1.440’ar C sonucu eş, 3.376 salt okunur C açılışı ve 36 çıktı imajı doğrulandı. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,278 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_310.md).
+
+
+## V6b.311 — Bileşik CAST ile CREATE TABLE AS
+
+CTAS sayısal baş CAST için katalogda NUM ve ilk yazımda FLEXNUM kararını taşır. Çok satırlı VALUES için BLOB türü ayrı. 108 fiziksel kayıt farkı kapandı, 36 aday dosyası C ile bayt eş ve 18 native callback profili eş. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,276 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_311.md).
