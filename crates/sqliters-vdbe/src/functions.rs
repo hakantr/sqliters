@@ -1431,6 +1431,12 @@ fn parse_datetime_value(
     if val.is_null() || modifiers.iter().any(Value::is_null) {
         return None;
     }
+    let packed_hms = match modifiers {
+        [Value::Text(text)] => parse_packed_hms_modifier(text),
+        _ => None,
+    };
+    // The signed date-and-clock shift applies to the ordinary unmodified value.
+    let modifiers = if packed_hms.is_some() { &[] } else { modifiers };
     // Host-local conversion for a signed ISO year is outside this parser path.
     let allow_signed_year = !matches!(val, Value::Text(text) if text.starts_with('-')
         && modifiers.iter().any(|m| m.to_text_lossy().trim().eq_ignore_ascii_case("utc")));
@@ -1602,6 +1608,17 @@ fn parse_datetime_value(
         (time, modifiers, check_julian_range)
     };
 
+    if let Some((shift, clock_ms)) = packed_hms {
+        if !check_julian_range
+            || time.bare_hour24.is_some()
+            || time.signed_hour24
+            || has_raw_calendar_overflow(val)
+        {
+            return None;
+        }
+        let shifted = apply_packed_shift(time.unix_ms, shift, false)?;
+        time = ParsedDateTime::from_unix_ms(shifted + shift.direction * clock_ms);
+    }
     let initial_time = time;
     let mut bare_hour24 = time.bare_hour24;
     let use_subsec = 'modifiers: loop {
@@ -1980,30 +1997,89 @@ fn split_numeric_datetime_modifier(modifier: &str) -> Option<NumericDateTimeModi
     })
 }
 
+#[derive(Clone, Copy)]
+struct PackedCalendarShift {
+    direction: i64,
+    months: i64,
+    days: i64,
+}
+
+fn parse_packed_calendar_shift(text: &str) -> Option<PackedCalendarShift> {
+    let (sign, text) = text.split_at_checked(1)?;
+    let direction = match sign {
+        "+" => 1,
+        "-" => -1,
+        _ => return None,
+    };
+    let (year_text, tail) = text.split_once('-')?;
+    let (month_text, day_text) = tail.split_once('-')?;
+    if !matches!(year_text.len(), 4 | 5) || !year_text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let years = year_text.parse::<i64>().ok()?;
+    let months = i64::from(parse_two_time_digits(month_text)?);
+    let days = i64::from(parse_two_time_digits(day_text)?);
+    if years > 14_712 || (year_text.len() == 5 && years < 10_000) || months > 11 || days > 30 {
+        return None;
+    }
+    Some(PackedCalendarShift {
+        direction,
+        months: years * 12 + months,
+        days,
+    })
+}
+
+fn parse_packed_hms_modifier(text: &str) -> Option<(PackedCalendarShift, i64)> {
+    let (date, clock) = text.split_once(' ')?;
+    if !matches!(
+        clock.as_bytes(),
+        [_, _, b':', _, _, b':', _, _, b'.', _, _, _]
+    ) {
+        return None;
+    }
+    let shift = parse_packed_calendar_shift(date)?;
+    let (clock_ms, _) = parse_hms_ms(clock, false)?;
+    Some((shift, clock_ms))
+}
+
+fn has_raw_calendar_overflow(value: &Value) -> bool {
+    let Value::Text(text) = value else {
+        return false;
+    };
+    let Some(date) = text.get(..10) else {
+        return false;
+    };
+    // A positive date can retain a day past the end of the month in SQLite.
+    if !matches!(date.as_bytes(), [_, _, _, _, b'-', _, _, b'-', _, _]) {
+        return false;
+    }
+    let Some(raw_day) = date.get(8..).and_then(parse_two_time_digits) else {
+        return false;
+    };
+    parse_iso_datetime(date, false)
+        .is_some_and(|local| utc_ymdhms_from_unix_ms(local.unix_ms).2 != raw_day)
+}
+
 fn apply_packed_calendar_shift(
     unix_ms: i64,
     original_date: &str,
     modifier: &str,
     floor: bool,
 ) -> Option<i64> {
-    let [sign @ (b'+' | b'-'), _, _, _, _, b'-', _, _, b'-', _, _] = modifier.as_bytes() else {
-        return None;
-    };
-    let years = parse_two_time_digits(modifier.get(1..3)?)? * 100
-        + parse_two_time_digits(modifier.get(3..5)?)?;
-    let months = parse_two_time_digits(modifier.get(6..8)?)?;
-    let days = parse_two_time_digits(modifier.get(9..11)?)?;
-    if months > 11 || days > 30 {
+    if modifier.len() != 11 {
         return None;
     }
+    let shift = parse_packed_calendar_shift(modifier)?;
+    if utc_ymdhms_from_unix_ms(unix_ms).2 != parse_two_time_digits(original_date.get(8..)?)? {
+        return None;
+    }
+    apply_packed_shift(unix_ms, shift, floor)
+}
 
+fn apply_packed_shift(unix_ms: i64, shift: PackedCalendarShift, floor: bool) -> Option<i64> {
     let (year, month, day, _, _, _) = utc_ymdhms_from_unix_ms(unix_ms);
-    if day != parse_two_time_digits(original_date.get(8..)?)? {
-        return None;
-    }
-    let direction = if *sign == b'-' { -1 } else { 1 };
     let shifted_month =
-        i64::from(year) * 12 + i64::from(month) - 1 + direction * i64::from(years * 12 + months);
+        i64::from(year) * 12 + i64::from(month) - 1 + shift.direction * shift.months;
     let year = shifted_month.div_euclid(12);
     if !(-4713..=9999).contains(&year) {
         return None;
@@ -2017,7 +2093,8 @@ fn apply_packed_calendar_shift(
     } else {
         0
     };
-    Some((date_days + direction * i64::from(days) - overflow_days) * 86_400_000)
+    let shifted_days = date_days + shift.direction * shift.days - overflow_days;
+    Some(shifted_days * 86_400_000 + unix_ms.rem_euclid(86_400_000))
 }
 
 fn apply_datetime_modifier_ms<'a>(
