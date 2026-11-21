@@ -3199,6 +3199,7 @@ struct OrderedCoveringGroupByPlan {
     where_pred: Option<FastExpr>,
     aggs: Box<[FastAggSpec]>,
     projections: Box<[FastGroupProjExpr]>,
+    reject_integral_real_group_key: bool,
     /// Integer row kernel (`None` when the plan shape has none).
     int_kernel: Option<CovIntKernelShape>,
 }
@@ -3209,7 +3210,7 @@ impl OrderedCoveringGroupByPlan {
         bt: &mut Btree,
         params: &[Value],
         enc: TextEncoding,
-    ) -> Result<Vec<Vec<Value>>> {
+    ) -> Result<Option<Vec<Vec<Value>>>> {
         let col_buf_len = if self.table.needs_record_parse {
             self.table.max_record_col + 1
         } else {
@@ -3243,6 +3244,7 @@ impl OrderedCoveringGroupByPlan {
             Ok(())
         };
 
+        let mut fallback = false;
         let kernel = self.int_kernel.as_ref().and_then(|k| k.bind(params));
 
         bt.scan_index_raw_cells(self.cov.root_pgno, self.reverse, |cell| {
@@ -3304,6 +3306,15 @@ impl OrderedCoveringGroupByPlan {
                 return Ok(ControlFlow::Continue(()));
             }
             let raw_gk = ctx.get_col(self.group_col);
+            // BINARY preserves text and blob identity. An integral REAL can
+            // compare equal to an INTEGER while retaining a different value.
+            if self.reject_integral_real_group_key
+                && matches!(raw_gk, RawField::Float(value)
+                    if value.fract() == 0.0 && value >= i64::MIN as f64 && value < i64::MAX as f64)
+            {
+                fallback = true;
+                return Ok(ControlFlow::Break(()));
+            }
             let same_group = match cur_group_key.as_ref() {
                 None => false,
                 Some(prev) => match (raw_gk, prev) {
@@ -3329,10 +3340,13 @@ impl OrderedCoveringGroupByPlan {
             Ok(ControlFlow::Continue(()))
         })?;
 
+        if fallback {
+            return Ok(None);
+        }
         if let Some(last_key) = cur_group_key.take() {
             flush_group(last_key, &mut states, &mut out_rows)?;
         }
-        Ok(out_rows)
+        Ok(Some(out_rows))
     }
 }
 
@@ -5003,22 +5017,22 @@ impl FastReadPlan {
         bt: &mut Btree,
         params: &[Value],
         enc: TextEncoding,
-    ) -> Result<FastReadExecOut> {
+    ) -> Result<Option<FastReadExecOut>> {
         match &self.kind {
             FastReadKind::UngroupedAgg(p) => {
-                Ok(FastReadExecOut::SingleRow(p.execute(bt, params, enc)?))
+                Ok(Some(FastReadExecOut::SingleRow(p.execute(bt, params, enc)?)))
             }
             FastReadKind::OrderedCoveringGroupBy(p) => {
-                Ok(FastReadExecOut::from_rows(p.execute(bt, params, enc)?))
+                Ok(p.execute(bt, params, enc)?.map(FastReadExecOut::from_rows))
             }
             FastReadKind::HashGroupBy(p) => {
-                Ok(FastReadExecOut::from_rows(p.execute(bt, params, enc)?))
+                Ok(Some(FastReadExecOut::from_rows(p.execute(bt, params, enc)?)))
             }
-            FastReadKind::OrderedIndexSelect(p) => p.execute(bt, params, enc),
+            FastReadKind::OrderedIndexSelect(p) => p.execute(bt, params, enc).map(Some),
             FastReadKind::EquiJoinGroupBy(p) => {
-                Ok(FastReadExecOut::from_rows(p.execute(bt, params, enc)?))
+                Ok(Some(FastReadExecOut::from_rows(p.execute(bt, params, enc)?)))
             }
-            FastReadKind::EquiJoinProject(p) => p.execute(bt, params, enc),
+            FastReadKind::EquiJoinProject(p) => p.execute(bt, params, enc).map(Some),
         }
     }
 }
@@ -5362,6 +5376,19 @@ fn compile_fast_agg_access(
     compile_fast_single_access(ap, tbl, td, exact_cols, needs_rowid)
 }
 
+fn group_needs_representative_row(
+    projections: &[FastGroupProjExpr],
+    order_by: &[GroupSortSpec],
+    aggs: &[FastAggSpec],
+) -> bool {
+    // Group keys alone do not retain the input row selected by MIN/MAX.
+    aggs.iter().any(|agg| matches!(agg, FastAggSpec::Min(..) | FastAggSpec::Max(..)))
+        && projections
+            .iter()
+            .chain(order_by.iter().map(|term| &term.proj_or_key))
+            .any(|expr| matches!(expr, FastGroupProjExpr::GroupKey(_)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_group_sort_specs(
     order_by: &[OrderByTerm],
@@ -5585,6 +5612,7 @@ fn try_compile_single_table_core(
             &scope,
             &mut aggs,
         )?;
+        let needs_representative = group_needs_representative_row(&projs, &sort_specs, &aggs);
 
         let mut td = build_fast_table_desc(tbl)?;
         let mut tds = [td];
@@ -5678,6 +5706,9 @@ fn try_compile_single_table_core(
                         &aggs,
                     )
                 };
+                if needs_representative && (gb_coll != Collation::Binary || int_kernel.is_none()) {
+                    continue;
+                }
                 return Some(FastReadPlan {
                     db_id,
                     column_names: col_names,
@@ -5691,10 +5722,15 @@ fn try_compile_single_table_core(
                         where_pred: compiled_where,
                         aggs: aggs.into_boxed_slice(),
                         projections: projs.into_boxed_slice(),
+                        reject_integral_real_group_key: needs_representative,
                         int_kernel,
                     }),
                 });
             }
+        }
+
+        if needs_representative {
+            return None;
         }
 
         // Subcase 2b: Selective Table-Leaf / Covering Range `HashGroupBy` (`W10` Q1, `W14` Q3)
@@ -6351,6 +6387,9 @@ fn try_compile_two_table_join_core(
             &scope,
             &mut aggs,
         )?;
+        if group_needs_representative_row(&projs, &sort_specs, &aggs) {
+            return None;
+        }
 
         let b_where = match b_where_ast.as_ref() {
             None => None,

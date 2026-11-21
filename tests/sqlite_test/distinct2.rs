@@ -549,3 +549,69 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_group_minmax_representative() {
+    sqliters_tcltest::run_test_script(
+        "group_minmax_representative",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE cases(id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE, score);
+  INSERT INTO cases VALUES(1,'a',90),(2,'A',20),(3,'a',50),(4,'b',10),(5,'B',60),(6,'b',20);
+  CREATE INDEX cases_name_score ON cases(name,score,id);
+  CREATE TABLE spaces(id INTEGER PRIMARY KEY, name TEXT COLLATE RTRIM, score);
+  INSERT INTO spaces VALUES(1,'a  ',90),(2,'a',20),(3,'a ',50),(4,'b',10),(5,'b  ',60),(6,'b ',20);
+  CREATE TABLE numbers(id INTEGER PRIMARY KEY, name, score);
+  INSERT INTO numbers VALUES(1,1,90),(2,1.0,20),(3,1,50),(4,2,10),(5,2.0,60),(6,2,20);
+  CREATE TABLE detail(id INTEGER PRIMARY KEY, factor INTEGER);
+  INSERT INTO detail VALUES(1,90),(2,20),(3,50),(4,10),(5,60),(6,20);
+  CREATE TABLE ints(id INTEGER PRIMARY KEY, g INT, score INT);
+  INSERT INTO ints VALUES(1,-9223372036854775808,1),(2,-9223372036854775808.0,2),
+    (3,-9223372036854775808.0,3),(4,1,10),(5,1.0,20);
+  CREATE INDEX ints_group_score ON ints(g,score);
+}
+do_execsql_test group-minmax-rep-1 {
+  SELECT name,max(score) FROM cases NOT INDEXED GROUP BY name ORDER BY name;
+} {a 90 B 60}
+do_execsql_test group-minmax-rep-2 {
+  SELECT name,min(score) FROM cases NOT INDEXED GROUP BY name ORDER BY name;
+} {A 20 b 10}
+do_execsql_test group-minmax-rep-3 {
+  SELECT name,min(score),max(score) FROM cases INDEXED BY cases_name_score GROUP BY name ORDER BY name;
+} {a 20 90 B 10 60}
+do_execsql_test group-minmax-rep-4 {
+  SELECT name,max(score),min(score) FROM cases NOT INDEXED GROUP BY name ORDER BY name;
+} {A 90 20 b 60 10}
+do_execsql_test group-minmax-rep-5 {
+  SELECT name,max(score) FROM spaces GROUP BY name ORDER BY name;
+} {{a  } 90 {b  } 60}
+do_execsql_test group-minmax-rep-6 {
+  SELECT name,max(score) FROM numbers GROUP BY name ORDER BY name;
+} {1 90 2.0 60}
+do_execsql_test group-minmax-rep-7 {
+  SELECT c.name,min(d.factor),max(d.factor) FROM cases c JOIN detail d USING(id) GROUP BY c.name ORDER BY c.name;
+} {a 20 90 B 10 60}
+do_execsql_test group-minmax-rep-8 {
+  SELECT min(score),max(score) FROM cases GROUP BY name ORDER BY name COLLATE BINARY;
+} {10 60 20 90}
+do_execsql_test group-minmax-rep-9 {
+  SELECT name,count(*) FROM cases NOT INDEXED GROUP BY name ORDER BY name;
+} {a 3 b 3}
+do_test group-minmax-rep-10 {
+  set result [db eval {
+    SELECT g,min(score),max(score) FROM ints INDEXED BY ints_group_score GROUP BY g ORDER BY g;
+  }]
+  list [string match {*e+18} [lindex $result 0]] [lrange $result 1 end]
+} {1 {1 3 1 10 20}}
+do_test group-minmax-rep-11 {
+  db eval BEGIN
+  set result [db eval {SELECT g,max(score) FROM ints INDEXED BY ints_group_score GROUP BY g;}]
+  db eval COMMIT
+  list [string match {*e+18} [lindex $result 0]] [lrange $result 1 end]
+} {1 {3 1 20}}
+finish_test
+"#,
+    );
+}

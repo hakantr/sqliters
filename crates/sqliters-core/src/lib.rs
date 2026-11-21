@@ -13323,7 +13323,26 @@ fn try_fast_read_plan_fields(
     };
 
     match exec_res {
-        Ok(fast_read::FastReadExecOut::Empty) => {
+        Ok(None) => {
+            if started_here && !inner.in_user_btree_tx && inner.is_autocommit() {
+                let sum = inner.activity.summary_excluding(hid, &inner.db_set);
+                if (sum.other_read_db_mask & 1) == 0
+                    && (sum.other_write_db_mask & 1) == 0
+                    && sum.other_writers == 0
+                    && let Some(ref mut bt) = inner.db_set.slots_mut()[0].btree
+                    && bt.transaction_state() == TransactionState::Read
+                    && let Err(e) = bt.end_read_if_unused()
+                {
+                    let error = inner.poison_with(e);
+                    *lifecycle = StatementLifecycle::Halted {
+                        last_error: Some(error.clone()),
+                    };
+                    return Some(Err(error));
+                }
+            }
+            None
+        }
+        Ok(Some(fast_read::FastReadExecOut::Empty)) => {
             if !inner.is_autocommit() {
                 inner.in_user_btree_tx = true;
             } else if !inner.in_user_btree_tx {
@@ -13345,7 +13364,7 @@ fn try_fast_read_plan_fields(
             *lifecycle = StatementLifecycle::Halted { last_error: None };
             Some(Ok(StepResult::Done))
         }
-        Ok(fast_read::FastReadExecOut::SingleRow(vals)) => {
+        Ok(Some(fast_read::FastReadExecOut::SingleRow(vals))) => {
             if !inner.is_autocommit() {
                 inner.in_user_btree_tx = true;
             }
@@ -13361,7 +13380,7 @@ fn try_fast_read_plan_fields(
                 StatementLifecycle::Running(RunningExec::PointSelectRowYielded { read_instances });
             Some(Ok(StepResult::Row(Row::new(vals))))
         }
-        Ok(out_multi) => {
+        Ok(Some(out_multi)) => {
             if !inner.is_autocommit() {
                 inner.in_user_btree_tx = true;
             }

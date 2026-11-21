@@ -1972,3 +1972,8 @@ MIN/MAX ile hesaplanmış GROUP BY anahtarının sonuçta kullanımı C ile eş.
 ## V6b.333 — GROUP BY anahtarında collation aktarımı
 
 Tekli artı ve CAST ile sarılmış sütunlar ve açık COLLATE ifadeleri, gruplamada C ile aynı karşılaştırma kuralını taşır. Üç kodlama, DELETE ve WAL içinde 120 fark kapandı. C ve iki Rust kipi yedi odaklı kontrolde eş. OFF 1209/1/329, ON 1206/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,275 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_333.md).
+
+
+## V6b.334 — GROUP BY sonucunda MIN/MAX girdisinin temsili
+
+MIN/MAX ile döndürülen grup sütunu C’nin seçtiği girdi değerini taşıyor. Önceki 130 düzeltme korundu, 30 INTEGER/REAL sınır farkı kapandı. İlk adayda bozulan integer kernel testi düzeltilen adayda geçti. On bir odaklı C ve Rust kontrolü doğrulandı. OFF 1210/1/329, ON 1207/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,277 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_334.md).
