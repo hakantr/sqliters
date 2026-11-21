@@ -33091,7 +33091,10 @@ fn view_dml_indexed_select(
     let returning_range = predicate == ViewDmlIndexPredicate::UpdateReturningRange;
     let (term, second_term) = match selection? {
         Expr::Binary { left, op: BinaryOp::And, right }
-            if predicate == ViewDmlIndexPredicate::UpdateRange =>
+            if matches!(
+                predicate,
+                ViewDmlIndexPredicate::UpdateRange | ViewDmlIndexPredicate::UpdateReturningRange
+            ) =>
         {
             (left.as_ref(), Some(view_dml_index_term(right)?))
         }
@@ -33113,6 +33116,14 @@ fn view_dml_indexed_select(
     let distinct_columns = second_term.is_some_and(|(other, _, _)| {
         !target_col.column.eq_ignore_ascii_case(&other.column)
     });
+    if returning_range
+        && (distinct_columns || second_term.is_some_and(|(_, _, bound)| {
+            !matches!(bound, Expr::Integer(_))
+                && !matches!(bound, Expr::Float(value) if value.is_finite())
+        }))
+    {
+        return None;
+    }
     let equality_range = distinct_columns
         && second_term.is_some_and(|(_, other_op, _)| op == BinaryOp::Eq || other_op == BinaryOp::Eq);
     let mut same_range_direction = false;
@@ -33301,12 +33312,12 @@ fn view_dml_indexed_select(
         && (column.affinity == TypeAffinity::Numeric || distinct_columns)
         && !column.is_primary_key
         && ctx.collations.get_custom("BINARY").is_none();
-    let wr_single_numeric_range = table.without_rowid
+    let wr_numeric_range = table.without_rowid
         && matches!(
             predicate,
             ViewDmlIndexPredicate::UpdateRange | ViewDmlIndexPredicate::UpdateReturningRange
         )
-        && second_term.is_none()
+        && (second_term.is_none() || (returning_range && !has_partial))
         && (matches!(bound, Expr::Integer(_))
             || (returning_range && finite_real_bound && !has_partial))
         && !column.is_primary_key
@@ -33317,7 +33328,7 @@ fn view_dml_indexed_select(
         && table.without_rowid_pk_cols.iter().all(|key| {
             key.sort_order.collation == Collation::Binary && key.sort_order.custom_collation.is_none()
         });
-    let wr_range_with_unrelated_indexes = wr_single_numeric_range
+    let wr_range_with_unrelated_indexes = wr_numeric_range
         && indexes.len() > 1
         && !has_partial
         && indexes.iter().filter(|index| {
@@ -33341,7 +33352,7 @@ fn view_dml_indexed_select(
         // indexes have an unrelated expression or a different unique key.
         indexes.retain(|index| matches_key(index.columns[0].col_idx));
     }
-    let wr_index_pair = indexes.len() == 2 && wr_single_numeric_range;
+    let wr_index_pair = indexes.len() == 2 && wr_numeric_range;
     if (two_index_range || wr_index_pair)
         && indexes.iter().any(|index| {
             let [key] = index.columns.as_slice() else {
