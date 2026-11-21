@@ -32311,6 +32311,8 @@ pub(crate) fn view_update_range_tokens(stmt: &Stmt, db_set: &DatabaseSet, sql: &
                 (left_op, right_op),
                 (BinaryOp::Ge, BinaryOp::Lt | BinaryOp::Le)
                     | (BinaryOp::Lt | BinaryOp::Le, BinaryOp::Ge)
+                    | (BinaryOp::Ge | BinaryOp::Gt, BinaryOp::Ge | BinaryOp::Gt)
+                    | (BinaryOp::Lt | BinaryOp::Le, BinaryOp::Lt | BinaryOp::Le)
             )
     } else {
         let Some((column, BinaryOp::Ge, bound)) = view_dml_index_term(selection) else {
@@ -32363,13 +32365,18 @@ fn view_dml_indexed_select(
     } else {
         None
     };
+    let mut same_range_direction = false;
     if !max_eq {
         let is_lower = view_dml_range_is_lower(op, bound, quoted_bound.is_some())?;
-        if let Some((other_col, other_op, other_bound)) = second_term
-            && (!target_col.column.eq_ignore_ascii_case(&other_col.column)
-                || is_lower == view_dml_range_is_lower(other_op, other_bound, false)?)
-        {
-            return None;
+        if let Some((other_col, other_op, other_bound)) = second_term {
+            if !target_col.column.eq_ignore_ascii_case(&other_col.column) {
+                return None;
+            }
+            same_range_direction =
+                is_lower == view_dml_range_is_lower(other_op, other_bound, false)?;
+            if same_range_direction && !ctx.stmt_tx.view_update_range_tokens {
+                return None;
+            }
         }
     }
 
@@ -32494,6 +32501,11 @@ fn view_dml_indexed_select(
         return None;
     }
     let partial_range = two_index_range && has_partial;
+    // Only the matching partial-index path has established the same-direction
+    // scan order. Keep both terms in order so the planner uses the first bound.
+    if same_range_direction && !partial_range {
+        return None;
+    }
     if partial_range
         && (!ctx.stmt_tx.view_update_range_tokens
             || (second_term.is_none() && op != BinaryOp::Ge)

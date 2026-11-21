@@ -1612,3 +1612,8 @@ Açık MAIN yazma işleminde aynı NUMERIC BINARY sütununda bir alt ve bir üst
 ## V6b.261 — Typed Julian tek süre değiştiricisi
 
 Tek olağan süre değiştiricili INTEGER ve REAL için C uyumlu ham dönüşüm, birim sınırı, yarım ms yuvarlaması ve son aralık denetimi kullanılır. Üç ölçüm kümesinde sırasıyla 87, 78 ve 441 C farkı kapandı. Üç kalıcı dosya profili ve 105 C salt okunur açılışı eş. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,257 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_261.md).
+
+
+## V6b.262 — Görünüm UPDATE aynı yönlü iki sınır
+
+Açık MAIN yazma işleminde aynı NUMERIC sütunun aynı yönlü iki koşulundan biri kısmi indeksle yapısal eşse mevcut C uyumlu ilk sınır kullanılır. 216 hedef C ile bayt eş ve 280 önceki sıra/dosya farkı kapandı. 12 ilk yaprak kontrolü ve 4.950 bağımsız C salt okunur açılışı eş. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,522 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_262.md).
