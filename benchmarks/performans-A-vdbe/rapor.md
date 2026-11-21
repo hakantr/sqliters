@@ -1767,3 +1767,8 @@ Aynı BINARY anahtardaki yapısal olarak eş tamsayı kısmi koşulu, C ile eş 
 ## V6b.292 — Tek saat kaydırması
 
 Geçerli ISO tarih-saat girdisi ve tek saat kaydırmasında yerel SQL sonucu C ile eş. Dokuz Tcl vakası ve üç metin kodlamasında DELETE/WAL dosya kontrolleri doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,291 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_292.md).
+
+
+## V6b.293 — WITHOUT ROWID görünümünde tam indeks seçimi
+
+Ölçülen yapısal elemede C’nin tam indeks kökü, tetikleyici sırası ve kapanmış dosya baytları eşleşti. 480 önceki fark ve 80 ek üst eşik sonucu kapandı. 8.760 C salt okunur bütünlük denetlendi. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,268 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_293.md).

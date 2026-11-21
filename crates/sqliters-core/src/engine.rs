@@ -32741,28 +32741,38 @@ fn view_dml_indexed_select(
     {
         return None;
     }
-    let wr_partial_root = if wr_index_pair && has_partial {
+    let wr_mixed_root = if wr_index_pair && has_partial {
         let [first, second] = indexes.as_slice() else {
             return None;
         };
-        let (partial, where_clause) = match (&first.where_clause, &second.where_clause) {
-            (Some(clause), None) => (first, clause),
-            (None, Some(clause)) => (second, clause),
+        let (full, partial, where_clause) = match (&first.where_clause, &second.where_clause) {
+            (Some(clause), None) => (second, first, clause),
+            (None, Some(clause)) => (first, second, clause),
             _ => return None,
         };
         let (partial_col, partial_op, partial_bound) = view_dml_index_term(where_clause)?;
+        let (Expr::Integer(query_value), Expr::Integer(partial_value)) = (bound, partial_bound) else {
+            return None;
+        };
         if !ctx.stmt_tx.view_update_range_tokens
-            || !matches!(op, BinaryOp::Ge | BinaryOp::Lt)
             || indexes.iter().any(|index| !matches_key(index.columns[0].col_idx))
             || partial_col.double_quoted
             || !partial_col.column.eq_ignore_ascii_case(&column.name)
-            || op != partial_op
-            || !matches!((bound, partial_bound), (Expr::Integer(query), Expr::Integer(index)) if query == index)
+            || !(0..=i64::from(i32::MAX)).contains(partial_value)
             || !has_plain_integer_tokens(partial.raw_sql.as_deref()?, true)
         {
             return None;
         }
-        Some(partial.root_pgno)
+        // C admits equal literal predicates and gives the partial range a lower estimate.
+        // The other supported pairs are structurally different before cost estimation.
+        let index = match (op, partial_op) {
+            (BinaryOp::Ge, BinaryOp::Ge) | (BinaryOp::Lt, BinaryOp::Lt) => {
+                if query_value == partial_value { partial } else { full }
+            }
+            (BinaryOp::Lt, BinaryOp::Le) if query_value == partial_value => full,
+            _ => return None,
+        };
+        Some(index.root_pgno)
     } else {
         None
     };
@@ -32784,7 +32794,7 @@ fn view_dml_indexed_select(
     if indexes.len() > 1 && (max_eq || two_index_range || wr_index_pair) {
         // Keep the proven partial range separate from statistics and expression indexes.
         if indexes.iter().any(|index| {
-            (index.where_clause.is_some() && !partial_range && wr_partial_root.is_none())
+            (index.where_clause.is_some() && !partial_range && wr_mixed_root.is_none())
                 || index.stat1.is_some()
                 || index.columns.iter().any(|col| {
                     col.col_idx.is_none() || col.sort_order.custom_collation.is_some()
@@ -32899,8 +32909,7 @@ fn view_dml_indexed_select(
         }
     }
     if wr_index_pair {
-        let expected = if let Some(root) = wr_partial_root {
-            // C's default estimate favors the structurally eligible partial range.
+        let expected = if let Some(root) = wr_mixed_root {
             indexes.iter().find(|index| index.root_pgno == root)?
         } else {
             // Equal single-key ranges keep the first entry in C's pTab->pIndex order.
@@ -32928,7 +32937,7 @@ fn view_dml_indexed_select(
         ) else {
             return None;
         };
-        if index.root_pgno != expected.root_pgno || (is_covering && wr_partial_root.is_none()) {
+        if index.root_pgno != expected.root_pgno || (is_covering && index.where_clause.is_none()) {
             return None;
         }
         indexes.retain(|candidate| candidate.root_pgno == index.root_pgno);
@@ -32939,7 +32948,7 @@ fn view_dml_indexed_select(
     let key = index.columns.first()?;
     let without_rowid_range = table.without_rowid && !max_eq;
     let expected_keys = if max_eq { 2 } else { 1 };
-    if (index.where_clause.is_some() && !partial_range && wr_partial_root.is_none())
+    if (index.where_clause.is_some() && !partial_range && wr_mixed_root.is_none())
         || (returning_range && index.unique)
         || index.is_unordered()
         || index.columns.len() != expected_keys
