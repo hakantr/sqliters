@@ -1521,6 +1521,16 @@ fn parse_datetime_value(
             })?,
             Value::Null | Value::Blob(_) => return None,
         };
+        // A canonical date has no clock fields left to normalize for ceiling.
+        let modifiers = match (val, modifiers) {
+            (Value::Text(date), [Value::Text(modifier)])
+                if modifier.eq_ignore_ascii_case("ceiling")
+                    && matches!(date.as_bytes(), [_, _, _, _, b'-', _, _, b'-', _, _]) =>
+            {
+                &modifiers[..0]
+            }
+            _ => modifiers,
+        };
         (time, modifiers, check_julian_range)
     };
 

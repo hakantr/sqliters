@@ -1652,3 +1652,8 @@ Mevcut testin sekiz profili, profil başına 700 işlemi ve tüm kıyasları iki
 ## V6b.269 — Görünüm UPDATE tek bağlı eşitlik
 
 Açık MAIN yazmasında dar V2 görünüm UPDATE yeniden hazırlaması, ilgili INTEGER veya REAL bağlı değeri kısmi indeks uygunluğuna taşır. İlk bağda 8 ve yeniden bağlamada 12 profil C kökü ve dosya baytı eş. 1.440 C salt okunur açılışı ve 376 OFF koruması doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,318 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_269.md).
+
+
+## V6b.270 — Tek ISO tarih ceiling değiştiricisi
+
+Dört haneli işaretsiz ISO tarihindeki tek terminal ceiling C normalizasyonunu kullanır. 14 Tcl vakası, üç kodlamada 706 hedef ve 36 salt okunur C açılışı doğrulandı. Diğer 28 Tcl vakasının ham davranışı korundu. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,303 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_270.md).
