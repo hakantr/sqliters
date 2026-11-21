@@ -1742,3 +1742,8 @@ Tek sıradan BINARY ikincil indeksli WITHOUT ROWID görünümünde nitelemesiz R
 ## V6b.287 — Typed Julian tam ay ve yıl
 
 Tek typed Julian ve tam ay veya yıl değiştiricisi, C miktar ve Julian aralık denetimlerini kullanır. 388 hedefte 208 önceki fark ve dört Tcl vakası kapandı. Üç kodlamada 30 C salt okunur açılışı ve dosya baytları eş. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,260 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_287.md).
+
+
+## V6b.288 — WITHOUT ROWID görünümü iki tam indeks
+
+Kapsayıcı olmayan iki sıradan tam BINARY ikincil indeksli WR görünüm aralığı, C ile eş kökü seçer. 360 eski log veya dosya farkı kapandı. 1.632 iki indeks profili ve 7.728 C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,260 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_288.md).

@@ -32692,7 +32692,23 @@ fn view_dml_indexed_select(
         && (column.affinity == TypeAffinity::Numeric || distinct_columns)
         && !column.is_primary_key
         && ctx.collations.get_custom("BINARY").is_none();
-    if two_index_range
+    let wr_index_pair = indexes.len() == 2
+        && table.without_rowid
+        && matches!(
+            predicate,
+            ViewDmlIndexPredicate::UpdateRange | ViewDmlIndexPredicate::UpdateReturningRange
+        )
+        && !has_partial
+        && second_term.is_none()
+        && matches!(bound, Expr::Integer(_))
+        && !column.is_primary_key
+        && alias.is_none()
+        && projection.iter().all(|item| view_dml_named_column(item).is_some())
+        && ctx.collations.get_custom("BINARY").is_none()
+        && table.without_rowid_pk_cols.iter().all(|key| {
+            key.sort_order.collation == Collation::Binary && key.sort_order.custom_collation.is_none()
+        });
+    if (two_index_range || wr_index_pair)
         && indexes.iter().any(|index| {
             let [key] = index.columns.as_slice() else {
                 return true;
@@ -32717,7 +32733,7 @@ fn view_dml_indexed_select(
     {
         return None;
     }
-    if indexes.len() > 1 && (max_eq || two_index_range) {
+    if indexes.len() > 1 && (max_eq || two_index_range || wr_index_pair) {
         // Keep the proven partial range separate from statistics and expression indexes.
         if indexes.iter().any(|index| {
             (index.where_clause.is_some() && !partial_range)
@@ -32834,6 +32850,36 @@ fn view_dml_indexed_select(
             indexes.truncate(1);
         }
     }
+    if wr_index_pair {
+        // Equal single-key ranges keep the first entry in C's pTab->pIndex order.
+        indexes = ordered_table_indexes(table, &indexes);
+        let expected = indexes.iter().find(|index| !index.is_autoindex)?;
+        let indexed_by = IndexHint::IndexedBy(expected.name.clone());
+        let AccessPlan::IndexRangeScan {
+            index,
+            range_col_idx: Some(0),
+            is_covering: false,
+            skip_scan_cols: 0,
+            ..
+        } = choose_access_plan_with_context(
+            table,
+            "main",
+            alias,
+            Some(&make_selection()),
+            schema,
+            QueryPlanContext {
+                projection: Some(projection),
+                indexed_by: Some(&indexed_by),
+                ..Default::default()
+            },
+        ) else {
+            return None;
+        };
+        if index.root_pgno != expected.root_pgno {
+            return None;
+        }
+        indexes.retain(|candidate| candidate.root_pgno == index.root_pgno);
+    }
     let [index] = indexes.as_slice() else {
         return None;
     };
@@ -32870,7 +32916,9 @@ fn view_dml_indexed_select(
         ..
     } = &mut narrowed.select.body.head
     {
-        if tied_range && let TableOrSubquery::Table { indexed_by, .. } = &mut from.head {
+        if (tied_range || wr_index_pair)
+            && let TableOrSubquery::Table { indexed_by, .. } = &mut from.head
+        {
             *indexed_by = Some(IndexHint::IndexedBy(index.name.clone()));
         }
         *selection = Some(make_selection());
