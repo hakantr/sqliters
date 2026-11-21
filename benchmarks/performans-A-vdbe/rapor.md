@@ -1982,3 +1982,8 @@ MIN/MAX ile döndürülen grup sütunu C’nin seçtiği girdi değerini taşıy
 ## V6b.335 — Skaler işlev içindeki MIN/MAX ve grup satırı
 
 Skaler işlev içinde aynı SELECT kapsamında çağrılan MIN/MAX, grup satırını C ile aynı şekilde seçiyor. Üç kodlama ve iki journal kipinde 140 fark kapandı. Bağlantıya özel MAX ve ayrı alt sorgu dahil dokuz odaklı kontrol geçti. OFF 1211/1/329, ON 1208/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,277 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_335.md).
+
+
+## V6b.336 — Tekrarlanan sütun MIN/MAX işleminde grup satırı
+
+Filtresiz tek sütun MIN/MAX tekrarları C gibi ilk akümülatör konumunu koruyor. Üç kodlama ve iki journal kipinde 90 fark kapandı. Ayrı DISTINCT, FILTER ve farklı literal yazımları dahil sekiz odaklı kontrol geçti. OFF 1212/1/329, ON 1209/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_336.md).

@@ -661,3 +661,46 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_group_repeated_minmax() {
+    sqliters_tcltest::run_test_script(
+        "group_repeated_minmax",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE cases(id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE, score);
+  INSERT INTO cases VALUES(1,'a',90),(2,'A',20),(3,'a',50),(4,'b',10),(5,'B',60),(6,'b',20);
+  CREATE INDEX cases_name_score ON cases(name,score,id);
+}
+do_execsql_test group-repeated-minmax-1 {
+  SELECT name,max(score),min(score),max(score) FROM cases NOT INDEXED GROUP BY name ORDER BY name;
+} {A 90 20 90 b 60 10 60}
+do_execsql_test group-repeated-minmax-2 {
+  SELECT name,min(score),max(score),min(score) FROM cases INDEXED BY cases_name_score GROUP BY name ORDER BY name;
+} {a 20 90 20 B 10 60 10}
+do_execsql_test group-repeated-minmax-3 {
+  SELECT name,Max(score),min(score),MAX(c.score) FROM cases c NOT INDEXED GROUP BY name ORDER BY name;
+} {A 90 20 90 b 60 10 60}
+do_execsql_test group-repeated-minmax-4 {
+  SELECT name,coalesce(max(score),0),abs(min(score)),max(score) FROM cases NOT INDEXED GROUP BY name ORDER BY name;
+} {A 90 20 90 b 60 10 60}
+do_execsql_test group-repeated-minmax-5 {
+  SELECT name,max(score),min(score),max(DISTINCT score) FROM cases NOT INDEXED GROUP BY name ORDER BY name;
+} {a 90 20 90 B 60 10 60}
+do_execsql_test group-repeated-minmax-6 {
+  SELECT name,max(score+1.0),min(score),max(score+1.00) FROM cases NOT INDEXED GROUP BY name ORDER BY name;
+} {a 91.0 20 91.0 B 61.0 10 61.0}
+do_execsql_test group-repeated-minmax-7 {
+  SELECT name,max(score) FILTER (WHERE score>1.0),min(score),
+         max(score) FILTER (WHERE score>1.00) FROM cases NOT INDEXED GROUP BY name ORDER BY name;
+} {a 90 20 90 B 60 10 60}
+do_execsql_test group-repeated-minmax-8 {
+  SELECT name,max(score),min(score),max(score),row_number() OVER (ORDER BY name)
+  FROM cases NOT INDEXED GROUP BY name ORDER BY name;
+} {A 90 20 90 1 b 60 10 60 2}
+finish_test
+"#,
+    );
+}

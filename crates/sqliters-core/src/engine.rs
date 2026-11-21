@@ -7732,7 +7732,7 @@ fn exec_single_select_core_inner(
 
                 let mut win_items: Vec<WindowExecItem> = Vec::new();
                 if is_agg {
-                    let mut minmax_specs: Vec<(AggregateKind, Expr, Option<Expr>, Collation)> =
+                    let mut minmax_specs: Vec<RepresentativeMinMax> =
                         Vec::new();
                     for (pe, _, _) in &expanded_proj {
                         collect_minmax_aggregates(
@@ -7930,7 +7930,7 @@ fn exec_single_select_core_inner(
                     result_rows_with_sort.push((out_vals, sort_vals));
                 }
             } else if is_agg {
-                let mut minmax_specs: Vec<(AggregateKind, Expr, Option<Expr>, Collation)> =
+                let mut minmax_specs: Vec<RepresentativeMinMax> =
                     Vec::new();
                 for (pe, _, _) in &expanded_proj {
                     collect_minmax_aggregates(pe, &sample_cols, ctx.functions, &mut minmax_specs);
@@ -8253,16 +8253,25 @@ fn exec_single_select_core_inner(
     }
 }
 
+struct RepresentativeMinMax {
+    kind: AggregateKind,
+    arg: Expr,
+    filter: Option<Expr>,
+    collation: Collation,
+    distinct: bool,
+    unfiltered_column: Option<usize>,
+}
+
 fn collect_minmax_aggregates(
     expr: &Expr,
     sample_cols: &[ScopedColumn],
     functions: &FunctionRegistry,
-    out: &mut Vec<(AggregateKind, Expr, Option<Expr>, Collation)>,
+    out: &mut Vec<RepresentativeMinMax>,
 ) {
     match expr {
         Expr::FunctionCall {
             name,
-            distinct: _,
+            distinct,
             args: FunctionArgs::Exprs(es),
             filter,
             over: None,
@@ -8275,8 +8284,33 @@ fn collect_minmax_aggregates(
             } else {
                 AggregateKind::Max
             };
-            let coll = infer_expr_collation_from_cols(&es[0], sample_cols);
-            out.push((kind, es[0].clone(), filter.as_deref().cloned(), coll));
+            let arg = &es[0];
+            let filter = filter.as_deref();
+            let unfiltered_column = match arg {
+                Expr::Column(cref) if filter.is_none() => {
+                    resolve_unique_col_idx_cref(sample_cols, cref).ok().flatten()
+                }
+                _ => None,
+            };
+
+            // C reuses the accumulator for repeated aggregate expressions.
+            // The same resolved column is comparable without the original SQL spelling.
+            if !unfiltered_column.is_some_and(|column| {
+                out.iter().any(|spec| {
+                    spec.kind == kind
+                        && spec.distinct == *distinct
+                        && spec.unfiltered_column == Some(column)
+                })
+            }) {
+                out.push(RepresentativeMinMax {
+                    kind,
+                    arg: arg.clone(),
+                    filter: filter.cloned(),
+                    collation: infer_expr_collation_from_cols(arg, sample_cols),
+                    distinct: *distinct,
+                    unfiltered_column,
+                });
+            }
         }
         Expr::FunctionCall {
             name, args, filter, over, ..
@@ -8366,7 +8400,7 @@ fn choose_aggregate_representative_row(
     ctx: &mut ExecContext<'_>,
     group_rows: &[EvalRow],
     sample_cols: &[ScopedColumn],
-    minmax_specs: &[(AggregateKind, Expr, Option<Expr>, Collation)],
+    minmax_specs: &[RepresentativeMinMax],
     params: &[Value],
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
@@ -8377,7 +8411,14 @@ fn choose_aggregate_representative_row(
             vec![Value::Null; sample_cols.len()],
         ));
     };
-    let Some((kind, arg_expr, filt_expr, coll)) = minmax_specs.last() else {
+    let Some(RepresentativeMinMax {
+        kind,
+        arg: arg_expr,
+        filter: filt_expr,
+        collation: coll,
+        ..
+    }) = minmax_specs.last()
+    else {
         return Ok(first_row.clone());
     };
 
