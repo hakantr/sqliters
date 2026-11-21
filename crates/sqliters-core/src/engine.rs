@@ -32785,7 +32785,7 @@ fn view_dml_indexed_select(
             Expr::Float(value)
                 if op == BinaryOp::Ge
                     && partial_op == BinaryOp::Ge
-                    && partial_matches_key
+                    && partial.columns[0].col_idx.is_some()
                     && column.affinity == TypeAffinity::Integer
                     && value.is_finite() =>
             {
