@@ -1667,3 +1667,8 @@ Dört haneli işaretsiz ISO tarihin tek terminal floor adımı C'nin başlangı�
 ## V6b.272 — Ay ve yıl kaydırması sonrası ceiling
 
 Geçerli ISO başlangıç gününde tam ve işaretli ay veya yıl kaydırmasından sonra tek terminal ceiling, mevcut kaydırmanın C ile eş normalize sonucunu kullanır. Dört Tcl vakası, üç kodlamada 7.852 SQL ölçümü ve 27 C salt okunur açılışı eş. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,269 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_272.md).
+
+
+## V6b.273 — Aynı tamsayı yeniden bağlama
+
+Maskeli yuvada önceki ve yeni typed INTEGER aynıysa C gibi gereksiz yeniden hazırlama oluşmaz. 116 generated ON profilinin sayacı C eş, önceki Rust satırları, kökleri ve dosya baytları korundu. 6.340 C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_273.md).

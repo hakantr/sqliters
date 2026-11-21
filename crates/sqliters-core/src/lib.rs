@@ -7865,11 +7865,16 @@ impl Statement {
             .map_or(0, |p| p.expmask)
     }
 
-    /// vdbeapi.c:1753–1765: unbinding a masked parameter expires the plan,
-    /// including binding NULL again. An active VM applies this on its next run.
-    fn expire_for_binding(&mut self, index_1_based: usize) {
+    /// A masked bind expires the plan. The integer binder in vdbeapi.c keeps it
+    /// valid when the slot already holds the same typed integer.
+    fn expire_for_binding(&mut self, index_1_based: usize, value: Option<&Value>) {
         let bit = if index_1_based >= 32 { 0x8000_0000 } else { 1 << (index_1_based - 1) };
-        if self.c_bind_expmask() & bit != 0 {
+        if self.c_bind_expmask() & bit != 0
+            && !matches!(
+                (&self.params[index_1_based - 1], value),
+                (Value::Integer(old), Some(Value::Integer(new))) if old == new
+            )
+        {
             self.c_write_expired_by_binding |= !self.expired && self.c_machine_write.is_some();
             self.expired = true;
         }
@@ -8979,15 +8984,14 @@ impl Statement {
         Ok(())
     }
 
-    fn bind_slot(&mut self, index_1_based: usize) -> Result<&mut Value> {
+    fn check_bind_index(&self, index_1_based: usize) -> Result<()> {
         if index_1_based == 0 || index_1_based > self.params.len() {
             return Err(SqliteError::new(
                 ErrorCode::Range,
                 format!("column/bind index {index_1_based} out of range"),
             ));
         }
-        self.expire_for_binding(index_1_based);
-        Ok(&mut self.params[index_1_based - 1])
+        Ok(())
     }
 
     fn check_bind_size(slot: &mut Value, len: usize) -> Result<()> {
@@ -9000,15 +9004,19 @@ impl Statement {
     }
 
     fn set_bound_value(&mut self, index_1_based: usize, value: impl Into<Value>) -> Result<()> {
-        let slot = self.bind_slot(index_1_based)?;
+        self.check_bind_index(index_1_based)?;
         let value = value.into();
+        self.expire_for_binding(index_1_based, Some(&value));
+        let slot = &mut self.params[index_1_based - 1];
         Self::check_bind_size(slot, value.as_bytes().map_or(0, <[u8]>::len))?;
         *slot = value;
         Ok(())
     }
 
     fn set_bound_text(&mut self, index_1_based: usize, text: &str) -> Result<()> {
-        let slot = self.bind_slot(index_1_based)?;
+        self.check_bind_index(index_1_based)?;
+        self.expire_for_binding(index_1_based, None);
+        let slot = &mut self.params[index_1_based - 1];
         Self::check_bind_size(slot, text.len())?;
         if let Value::Text(buffer) = slot {
             buffer.clear();
@@ -9032,7 +9040,7 @@ impl Statement {
             ));
         }
         for (i, v) in values.iter().enumerate() {
-            self.expire_for_binding(i + 1);
+            self.expire_for_binding(i + 1, Some(v));
             let slot = &mut self.params[i];
             Self::check_bind_size(slot, v.as_bytes().map_or(0, <[u8]>::len))?;
             *slot = v.clone();
