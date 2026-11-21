@@ -32759,13 +32759,57 @@ fn view_dml_indexed_select(
             || !matches_key(full.columns[0].col_idx)
             || partial_col.double_quoted
             || !partial_col.column.eq_ignore_ascii_case(&column.name)
-            || !has_plain_integer_tokens(partial_sql, true)
         {
             return None;
         }
         let partial_matches_key = matches_key(partial.columns[0].col_idx);
+        let plain_tokens = has_plain_integer_tokens(partial_sql, true);
         let index = match partial_bound {
-            Expr::Integer(partial_value) if (0..=i64::from(i32::MAX)).contains(partial_value) => {
+            Expr::Integer(value)
+                if !plain_tokens
+                    && op == BinaryOp::Ge
+                    && partial_op == BinaryOp::Ge
+                    && partial_matches_key
+                    && column.affinity == TypeAffinity::Integer
+                    && (0..=i64::from(i32::MAX)).contains(value) =>
+            {
+                // C preserves both unary nodes although the relational AST folds the integer.
+                let tokens = tokenize(partial_sql).ok()?;
+                let end = tokens.iter().rposition(|token| {
+                    !matches!(token.kind, TokenKind::Semi | TokenKind::Eof)
+                })?;
+                let [.., comparison, outer_sign, open, inner_sign, literal, close] =
+                    &tokens[..=end]
+                else {
+                    return None;
+                };
+                let shape = (
+                    comparison.kind,
+                    outer_sign.kind,
+                    open.kind,
+                    inner_sign.kind,
+                    literal.kind,
+                    close.kind,
+                );
+                if shape
+                    != (
+                        TokenKind::Ge,
+                        TokenKind::Minus,
+                        TokenKind::Lp,
+                        TokenKind::Minus,
+                        TokenKind::Integer,
+                        TokenKind::Rp,
+                    )
+                    || !literal.text.bytes().all(|byte| byte.is_ascii_digit())
+                    || literal.text.parse::<i64>().ok() != Some(*value)
+                {
+                    return None;
+                }
+                full
+            }
+            Expr::Integer(partial_value)
+                if plain_tokens && (0..=i64::from(i32::MAX)).contains(partial_value) =>
+            {
                 // C admits equal literal predicates and gives the partial range a lower estimate.
                 match (op, partial_op) {
                     (BinaryOp::Ge, BinaryOp::Ge) | (BinaryOp::Lt, BinaryOp::Lt)
@@ -32783,7 +32827,8 @@ fn view_dml_indexed_select(
                 }
             }
             Expr::Float(value)
-                if op == BinaryOp::Ge
+                if plain_tokens
+                    && op == BinaryOp::Ge
                     && partial_op == BinaryOp::Ge
                     && partial.columns[0].col_idx.is_some()
                     && column.affinity == TypeAffinity::Integer

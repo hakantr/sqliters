@@ -1817,3 +1817,8 @@ Exact birleşik tabanda ölçülen doğal legacy projeksiyonlar zamanı ilk ihti
 ## V6b.302 — Tarih girdisinde now yazımı
 
 Ortak now girdi kararı çevre boşluğunu kabul etmez. 2.880 satır sonucu ve 900 C salt okunur dosya doğrulandı. Doğal adım saati, date3 ve func2 korumaları geçti. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,276 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_302.md).
+
+
+## V6b.303 — WITHOUT ROWID görünümünde çift eksi koşulu
+
+Aynı anahtardaki iki unary eksi koşulunda C’nin tam aralık kökü kullanılır. 160 eski ve 520 ek sonuç C ile eş. 29.352 C salt okunur bütünlük kontrolü tamamlandı. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,265 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_303.md).
