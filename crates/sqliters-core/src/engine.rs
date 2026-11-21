@@ -33098,7 +33098,8 @@ fn view_dml_indexed_select(
         term => (term, None),
     };
     let (target_col, op, bound) = view_dml_index_term(term)?;
-    if returning_range && !matches!(bound, Expr::Integer(_)) {
+    let finite_real_bound = matches!(bound, Expr::Float(value) if value.is_finite());
+    if returning_range && !matches!(bound, Expr::Integer(_)) && !finite_real_bound {
         return None;
     }
     let quoted_bound = if predicate == ViewDmlIndexPredicate::UpdateRange
@@ -33292,13 +33293,14 @@ fn view_dml_indexed_select(
         && (column.affinity == TypeAffinity::Numeric || distinct_columns)
         && !column.is_primary_key
         && ctx.collations.get_custom("BINARY").is_none();
-    let wr_single_integer_range = table.without_rowid
+    let wr_single_numeric_range = table.without_rowid
         && matches!(
             predicate,
             ViewDmlIndexPredicate::UpdateRange | ViewDmlIndexPredicate::UpdateReturningRange
         )
         && second_term.is_none()
-        && matches!(bound, Expr::Integer(_))
+        && (matches!(bound, Expr::Integer(_))
+            || (returning_range && finite_real_bound && !has_partial))
         && !column.is_primary_key
         && alias.is_none()
         && projection.iter().all(|item| view_dml_named_column(item).is_some())
@@ -33306,7 +33308,7 @@ fn view_dml_indexed_select(
         && table.without_rowid_pk_cols.iter().all(|key| {
             key.sort_order.collation == Collation::Binary && key.sort_order.custom_collation.is_none()
         });
-    let wr_range_with_unrelated_indexes = wr_single_integer_range
+    let wr_range_with_unrelated_indexes = wr_single_numeric_range
         && indexes.len() > 1
         && !has_partial
         && indexes.iter().filter(|index| {
@@ -33331,7 +33333,7 @@ fn view_dml_indexed_select(
         // indexes have an unrelated expression or a different unique key.
         indexes.retain(|index| matches_key(index.columns[0].col_idx));
     }
-    let wr_index_pair = indexes.len() == 2 && wr_single_integer_range;
+    let wr_index_pair = indexes.len() == 2 && wr_single_numeric_range;
     if (two_index_range || wr_index_pair)
         && indexes.iter().any(|index| {
             let [key] = index.columns.as_slice() else {

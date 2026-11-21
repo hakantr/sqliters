@@ -541,3 +541,37 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_returning_without_rowid_view_real_bounds() {
+    sqliters_tcltest::run_test_script(
+        "returning_without_rowid_view_real_bounds",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach {affinity bound} {INTEGER 1.5 NUMERIC 1.5 REAL 1.5 INTEGER 1.9999999999999998} {
+  incr case
+  reset_db
+  execsql "CREATE TABLE base(id INTEGER PRIMARY KEY, k $affinity, label TEXT) WITHOUT ROWID;"
+  execsql {
+    CREATE TABLE seen(seq INTEGER PRIMARY KEY, id INTEGER);
+    INSERT INTO base VALUES (1,5,'one'),(2,2,'two'),(3,1,'three'),(4,3,'four'),(5,4,'five');
+    CREATE VIEW projected AS SELECT id,k,label FROM base;
+    CREATE TRIGGER revise INSTEAD OF UPDATE ON projected BEGIN
+      INSERT INTO seen(id) VALUES(old.id);
+      UPDATE base SET label=new.label WHERE id=old.id;
+    END;
+    CREATE INDEX shifted ON base(k+1);
+    CREATE INDEX keyed ON base(k);
+  }
+  do_execsql_test returning-real-range-$case.1 "
+    UPDATE projected SET label=label||'!' WHERE k>$bound RETURNING id;
+    SELECT id FROM seen ORDER BY seq;
+    SELECT id,label FROM base ORDER BY id;
+    PRAGMA integrity_check;
+  " {2 4 5 1 2 4 5 1 1 one! 2 two! 3 three 4 four! 5 five! ok}
+}
+finish_test
+"#,
+    );
+}
