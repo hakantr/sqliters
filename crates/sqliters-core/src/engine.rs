@@ -7485,16 +7485,30 @@ fn exec_single_select_core_inner(
                         },
                     }
                 }
-                Some(fc) => eval_from_clause(
-                    ctx,
-                    fc,
-                    pre_where_selection.as_deref(),
-                    &[],
-                    params,
-                    outer_scopes,
-                    ctes,
-                    &mut omitted_vtab_conjuncts,
-                )?,
+                Some(fc) => {
+                    let reverse_sources = !*distinct
+                        && selection.is_none()
+                        && group_by.is_empty()
+                        && having.is_none()
+                        && windows.is_empty()
+                        && order_by.is_empty()
+                        && outer_scopes.is_empty()
+                        && ctes.scopes.is_empty()
+                        && is_simple_covering_projection(projection)
+                        && can_reverse_plain_cross_join(ctx.db_set, fc);
+                    eval_from_clause_inner(
+                        ctx,
+                        fc,
+                        pre_where_selection.as_deref(),
+                        &[],
+                        params,
+                        outer_scopes,
+                        ctes,
+                        &mut omitted_vtab_conjuncts,
+                        fc.joins.len(),
+                        reverse_sources,
+                    )?
+                }
             };
 
             // Metadata for an empty filtered CTE comes from its definition without replaying WHERE.
@@ -8889,6 +8903,32 @@ pub(crate) fn scalar_self_join_cte_columns(
     Some(disambiguate_view_column_names(&columns))
 }
 
+fn can_reverse_plain_cross_join(db_set: &DatabaseSet, from: &FromClause) -> bool {
+    if db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder == 0 {
+        return false;
+    }
+    let [join] = from.joins.as_slice() else {
+        return false;
+    };
+    if join.join_type != JoinType::Cross || join.natural || join.constraint.is_some() {
+        return false;
+    }
+    let schema = &db_set.main_slot().schema;
+    [&from.head, &join.right].into_iter().all(|source| {
+        let TableOrSubquery::Table { name, table_args: None, indexed_by: None, .. } = source else {
+            return false;
+        };
+        let Ok(Some((DatabaseId::MAIN, RelationRef::Table(table)))) =
+            db_set.find_relation_ref_in_set(name)
+        else {
+            return false;
+        };
+        table.schema_rowid > 0
+            && !table.without_rowid
+            && !schema.indexes.iter().any(|index| index.table_name.eq_ignore_ascii_case(&table.name))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn eval_from_clause(
     ctx: &mut ExecContext<'_>,
@@ -8910,6 +8950,7 @@ fn eval_from_clause(
         ctes,
         omitted_conjuncts,
         fc.joins.len(),
+        false,
     )
 }
 
@@ -8924,6 +8965,7 @@ fn eval_from_clause_inner(
     ctes: &CteStore,
     omitted_conjuncts: &mut Vec<Expr>,
     vtab_rotations_left: usize,
+    reverse_sources: bool,
 ) -> Result<Vec<EvalRow>> {
     if 1 + fc.joins.len() > 64 {
         return Err(SqliteError::new(
@@ -9055,6 +9097,7 @@ fn eval_from_clause_inner(
                     ctes,
                     omitted_conjuncts,
                     vtab_rotations_left - 1,
+                    false,
                 )?;
                 if n_m > 0 && n_before_m > 0 && !rows.is_empty() {
                     let mut rotated_cols_cache: Option<Rc<[ScopedColumn]>> = None;
@@ -9185,6 +9228,11 @@ fn eval_from_clause_inner(
             identity,
             output: None,
         });
+    let reverse_info = reverse_sources.then(|| SingleVtabQueryInfo {
+        has_star: true,
+        reverse_unordered_rowid_source: true,
+        ..Default::default()
+    });
     // If `fc.head` is a virtual table or table-valued function whose required arguments depend
     // on a subsequent INNER/CROSS table, rotate `fc.head` past the INNER/CROSS prefix if needed.
     let mut left_rows = match eval_table_or_subquery(
@@ -9201,7 +9249,7 @@ fn eval_from_clause_inner(
         outer_scopes,
         ctes,
         omitted_conjuncts,
-        None,
+        reverse_info.as_ref(),
         from_materialization.as_mut(),
     ) {
         Ok(rows) => rows,
@@ -9294,6 +9342,7 @@ fn eval_from_clause_inner(
                 ctes,
                 omitted_conjuncts,
                 vtab_rotations_left - 1,
+                false,
             )?;
             // Also rotate `row.subtypes` when rotating columns in the `head_is_vtab` path!
             if n_prefix > 0 && n_head > 0 && !rows.is_empty() {
@@ -9497,7 +9546,7 @@ fn eval_from_clause_inner(
                 outer_scopes,
                 ctes,
                 omitted_conjuncts,
-                None,
+                reverse_info.as_ref(),
                 from_materialization.as_mut(),
             )?;
             let right_cols_actual: Vec<ScopedColumn> = right_rows
@@ -9841,6 +9890,7 @@ struct SingleVtabQueryInfo<'a> {
     allow_local_exists_covering: bool,
     allow_wr_autoindex_covering: bool,
     allow_reverse_index_order: bool,
+    reverse_unordered_rowid_source: bool,
 }
 
 impl<'a> SingleVtabQueryInfo<'a> {
@@ -14642,10 +14692,11 @@ fn reverse_plain_rowid_scan(
         && where_hint.is_none()
         && ctx.db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0
         && query_info.is_some_and(|info| {
-            info.allow_reverse_index_order
-                && info.plan_ctx.is_some_and(|(projection, order_by)| {
-                    order_by.is_empty() && is_simple_covering_projection(projection)
-                })
+            info.reverse_unordered_rowid_source
+                || (info.allow_reverse_index_order
+                    && info.plan_ctx.is_some_and(|(projection, order_by)| {
+                        order_by.is_empty() && is_simple_covering_projection(projection)
+                    }))
         })
 }
 

@@ -977,3 +977,42 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_reverse_unordered_plain_cross_join() {
+    sqliters_tcltest::run_test_script(
+        "reverse_unordered_plain_cross_join",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE source_rows(id INTEGER PRIMARY KEY, value TEXT);
+  CREATE TABLE tags(id INTEGER PRIMARY KEY, name TEXT);
+  CREATE TABLE empty_tags(id INTEGER PRIMARY KEY, name TEXT);
+  INSERT INTO source_rows VALUES(1,'a'),(2,'b'),(3,'c');
+  INSERT INTO tags VALUES(1,'x'),(2,'y'),(3,'z');
+  PRAGMA reverse_unordered_selects=ON;
+}
+do_execsql_test reverse-cross-1 {
+  SELECT r.id,t.id FROM source_rows r CROSS JOIN tags t;
+} {3 3 3 2 3 1 2 3 2 2 2 1 1 3 1 2 1 1}
+do_execsql_test reverse-cross-2 {
+  SELECT r.id,t.id FROM source_rows r CROSS JOIN tags t LIMIT 3;
+} {3 3 3 2 3 1}
+do_execsql_test reverse-cross-3 {
+  SELECT r.id,t.id FROM source_rows r CROSS JOIN tags t LIMIT 3 OFFSET 2;
+} {3 1 2 3 2 2}
+do_execsql_test reverse-cross-4 {
+  SELECT r.id,t.id FROM source_rows r CROSS JOIN tags t ORDER BY r.id,t.id LIMIT 3;
+} {1 1 1 2 1 3}
+do_execsql_test reverse-cross-5 {
+  SELECT r.id,t.id FROM source_rows r CROSS JOIN empty_tags t;
+} {}
+do_execsql_test reverse-cross-6 {
+  PRAGMA reverse_unordered_selects=OFF;
+  SELECT r.id,t.id FROM source_rows r CROSS JOIN tags t LIMIT 3;
+} {1 1 1 2 1 3}
+finish_test
+"#,
+    );
+}
