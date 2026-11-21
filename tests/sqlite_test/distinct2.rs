@@ -454,3 +454,59 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_group_minmax_key_projection() {
+    sqliters_tcltest::run_test_script(
+        "group_minmax_key_projection",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE item(id INTEGER PRIMARY KEY, value TEXT COLLATE NOCASE);
+  INSERT INTO item VALUES(1,'a'),(2,'A'),(3,'b'),(4,'B'),(5,'c'),(6,'C');
+}
+proc next_group {id} {
+  incr ::calls
+  if {$::calls>6} { return 9 }
+  return [lindex {0 1 1 2 2 2} [expr {$::calls-1}]]
+}
+proc mark {value} {
+  incr ::calls
+  return $value
+}
+db function next_group next_group
+db function mark mark
+foreach {name sql expected} {
+  bare {SELECT value,max(id) FROM item GROUP BY 1 ORDER BY 1}
+    {{A 2 B 4 C 6} 0}
+  bare_collated {SELECT value COLLATE NOCASE,max(id) FROM item GROUP BY 1 ORDER BY 1}
+    {{A 2 B 4 C 6} 0}
+  explicit_plus {SELECT +value COLLATE NOCASE,max(id) FROM item GROUP BY 1 ORDER BY 1}
+    {{a 2 b 4 c 6} 0}
+  function_key {SELECT next_group(id),max(id) FROM item GROUP BY 1 ORDER BY 1}
+    {{0 1 1 3 2 6} 6}
+  composed_key {SELECT next_group(id)+1,min(id) FROM item GROUP BY 1 ORDER BY 1}
+    {{1 1 2 2 3 4} 6}
+  collated_function {SELECT mark(value) COLLATE NOCASE,max(id) FROM item GROUP BY 1 ORDER BY 1}
+    {{a 2 b 4 c 6} 6}
+  duplicate {SELECT next_group(id),next_group(id),max(id) FROM item GROUP BY 2 ORDER BY 2}
+    {{9 0 1 9 1 3 9 2 6} 9}
+  function_alias {SELECT next_group(id) AS g,max(id) FROM item GROUP BY g ORDER BY g}
+    {{0 1 1 3 2 6} 6}
+  collated_function_alias {SELECT next_group(id) COLLATE BINARY AS g,max(id) FROM item GROUP BY g ORDER BY g}
+    {{9 1 9 3 9 6} 9}
+  collated_computed_alias {SELECT +value COLLATE NOCASE AS g,max(id) FROM item GROUP BY g ORDER BY g}
+    {{A 2 B 4 C 6} 0}
+
+} {
+  do_test group-minmax-$name {
+    set ::calls 0
+    set rows [execsql $sql]
+    list $rows $::calls
+  } $expected
+}
+finish_test
+"#,
+    );
+}

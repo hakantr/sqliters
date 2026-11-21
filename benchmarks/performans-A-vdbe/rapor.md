@@ -1962,3 +1962,8 @@ Materyalize UNION aynı kolda ilk temsilciyi korur ve eşitlikte sağ kolu seçe
 ## V6b.331 — GROUP BY anahtarının sonuç sütununda kullanımı
 
 GROUP BY anahtarını sonuç sütununda kullanma, takma ada bağlı doğrudan COLLATE ifadesinin ayrı değerlendirilmesini koruyacak biçimde doğrulandı. 18 C ve Rust kontrolü, 17 olağan SQL biçimi ve 18 C salt okunur açılışı doğrulandı. OFF 1207/1/329, ON 1204/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,276 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_331.md).
+
+
+## V6b.332 — MIN/MAX ile gruplama anahtarının kullanımı
+
+MIN/MAX ile hesaplanmış GROUP BY anahtarının sonuçta kullanımı C ile eş. 20 yerel fark kapandı. On C ve Rust kontrolü, 24 olağan SQL biçimi ve 18 C salt okunur açılışı doğrulandı. OFF 1208/1/329, ON 1205/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_332.md).

@@ -7925,7 +7925,7 @@ fn exec_single_select_core_inner(
 
                 // A GROUP BY reference supplies the value for its selected result column.
                 let mut projected_key = vec![None; expanded_proj.len()];
-                if minmax_specs.is_empty() && resolved_having.is_none() {
+                if resolved_having.is_none() {
                     for (key, (group_term, resolved)) in
                         group_by.iter().zip(&resolved_group_by).enumerate()
                     {
@@ -7951,6 +7951,17 @@ fn exec_single_select_core_inner(
                         if let Some(index) = result_column
                             && &expanded_proj[index].0 == resolved
                         {
+                            // MIN/MAX can choose the input row for a bare column, even when
+                            // that column's collation considers several representations equal.
+                            if !minmax_specs.is_empty() {
+                                let mut expression = resolved;
+                                while let Expr::Collate { expr, .. } = expression {
+                                    expression = expr;
+                                }
+                                if matches!(expression, Expr::Column(_)) {
+                                    continue;
+                                }
+                            }
                             projected_key[index].get_or_insert(key);
                         }
                     }
