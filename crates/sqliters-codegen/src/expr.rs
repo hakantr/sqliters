@@ -1934,19 +1934,21 @@ pub fn sqlite3_expr_compare(p: &Parse, use_parse: bool, a: ExprId, b: ExprId, i_
     expr_compare(p, use_parse, a, b, i_tab, None)
 }
 
-pub(crate) fn sqlite3_partial_bound_eq(p: &Parse, term: ExprId, partial: ExprId, i_tab: i32, value: &Value) -> bool {
+pub(crate) fn sqlite3_partial_bound_eq(
+    p: &Parse, term: ExprId, partial: ExprId, i_tab: i32, binding: (usize, &Value),
+) -> bool {
     let (term_expr, partial_expr) = (p.e(term), p.e(partial));
     term_expr.op == TK_EQ
         && partial_expr.op == TK_EQ
         && [term_expr.p_left, partial_expr.p_left].iter().all(|&id| id.nn() && p.e(id).op == TK_COLUMN)
         && term_expr.p_right.nn() && p.e(term_expr.p_right).op == TK_VARIABLE
-        && p.e(term_expr.p_right).i_column == 1
+        && p.e(term_expr.p_right).i_column as usize == binding.0
         && partial_expr.p_right.nn() && p.e(partial_expr.p_right).op == TK_INTEGER
         && p.e(partial_expr.p_right).has(EP_IntValue)
-        && expr_compare(p, true, term, partial, i_tab, Some(value)) == 0
+        && expr_compare(p, true, term, partial, i_tab, Some(binding)) == 0
 }
 
-fn expr_compare(p: &Parse, use_parse: bool, a: ExprId, b: ExprId, i_tab: i32, bound: Option<&Value>) -> i32 {
+fn expr_compare(p: &Parse, use_parse: bool, a: ExprId, b: ExprId, i_tab: i32, bound: Option<(usize, &Value)>) -> i32 {
     if a.is_null() || b.is_null() {
         return if a == b { 0 } else { 2 };
     }
@@ -1966,7 +1968,7 @@ fn expr_compare(p: &Parse, use_parse: bool, a: ExprId, b: ExprId, i_tab: i32, bo
             let i_var = pa.i_column as i32;
             let m: u32 = if i_var >= 32 { 0x8000_0000 } else { 1u32 << (i_var - 1) };
             p.pending_expmask.set(p.pending_expmask.get() | m);
-            if i_var == 1 && let Some(value) = bound {
+            if let Some((slot, value)) = bound && i_var as usize == slot {
                 return if sqlite3_mem_compare(&Mem::from_value(value), &Mem::from_value(&literal), None) == 0 {
                     0
                 } else {

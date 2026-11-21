@@ -30,7 +30,7 @@ const SQLITE_FUNC_UNSAFE: u32 = 0x0020_0000;
 enum PrepareBindings<'a> {
     Unbound,
     Read(&'a [Value]),
-    PartialIndex { root: u32, value: &'a Value },
+    PartialIndex { root: u32, slot: usize, value: &'a Value },
 }
 
 struct EngineHost<'a> {
@@ -117,9 +117,9 @@ impl Host for EngineHost<'_> {
             .filter(|v| !matches!(v, Value::Null)).cloned()
     }
 
-    fn partial_index_bound_value(&self, root_pgno: u32) -> Option<&Value> {
+    fn partial_index_binding(&self, root_pgno: u32) -> Option<(usize, &Value)> {
         match self.bindings {
-            PrepareBindings::PartialIndex { root, value } if root == root_pgno => Some(value),
+            PrepareBindings::PartialIndex { root, slot, value } if root == root_pgno => Some((slot, value)),
             _ => None,
         }
     }
@@ -516,9 +516,10 @@ pub(crate) fn c_prepare_bound_partial_index(
     inner: &ConnectionInner,
     sql: &str,
     root: u32,
+    slot: usize,
     value: &Value,
 ) -> (PrepareResult, usize, bool) {
-    c_prepare_impl(inner, sql, false, PrepareBindings::PartialIndex { root, value }, None, false, None)
+    c_prepare_impl(inner, sql, false, PrepareBindings::PartialIndex { root, slot, value }, None, false, None)
 }
 
 pub(crate) fn c_prepare_table_scan(

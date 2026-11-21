@@ -32281,7 +32281,8 @@ pub(crate) fn bound_view_partial_index(
     stmt: &Stmt,
     db_set: &DatabaseSet,
     sql: &str,
-) -> Option<u32> {
+    parameter_count: usize,
+) -> Option<(u32, usize)> {
     if db_set.slots().iter().skip(1).any(|slot| slot.btree.is_some()) {
         return None;
     }
@@ -32292,18 +32293,24 @@ pub(crate) fn bound_view_partial_index(
     let first = view_dml_index_term(left)?;
     let second = view_dml_index_term(right)?;
     let terms = if first.1 == BinaryOp::Eq { (first, second) } else { (second, first) };
-    let ((equality, BinaryOp::Eq, bound), (range, BinaryOp::Ge, Expr::Integer(lower))) = terms else {
+    let ((equality, BinaryOp::Eq, bound), (range, BinaryOp::Ge, range_bound)) = terms else {
         return None;
     };
-    if equality.double_quoted
+    let bind_slot = |expr: &Expr| match expr {
+        Expr::Bind(sqliters_syntax::BindParam::Anonymous(slot) | sqliters_syntax::BindParam::Numbered(slot)) => Some(*slot),
+        _ => None,
+    };
+    let equality_slot = bind_slot(bound)?;
+    let expected_shape = match (parameter_count, range_bound) {
+        (1, Expr::Integer(lower)) => equality_slot == 1 && (0..=i64::from(i32::MAX)).contains(lower),
+        (2, range) => matches!((equality_slot, bind_slot(range)), (1, Some(2)) | (2, Some(1))),
+        _ => false,
+    };
+    if !expected_shape
+        || equality.double_quoted
         || range.double_quoted
-        || !matches!(
-            bound,
-            Expr::Bind(sqliters_syntax::BindParam::Anonymous(1) | sqliters_syntax::BindParam::Numbered(1))
-        )
-        || !(0..=i64::from(i32::MAX)).contains(lower)
         || !has_plain_integer_tokens(sql, false)
-        || tokenize(sql).ok()?.iter().filter(|tok| tok.kind == TokenKind::Variable).count() != 1
+        || tokenize(sql).ok()?.iter().filter(|tok| tok.kind == TokenKind::Variable).count() != parameter_count
     {
         return None;
     }
@@ -32369,7 +32376,7 @@ pub(crate) fn bound_view_partial_index(
     {
         return None;
     }
-    Some(partial.root_pgno)
+    Some((partial.root_pgno, equality_slot))
 }
 
 pub(crate) fn view_update_range_tokens(stmt: &Stmt, db_set: &DatabaseSet, sql: &str) -> bool {

@@ -610,7 +610,7 @@ pub(crate) fn machine_write_program(
     inner: &ConnectionInner,
     stmt: Option<&Stmt>,
     raw_sql: &str,
-    bound_partial: Option<(u32, &Value)>,
+    bound_partial: Option<(u32, usize, &Value)>,
 ) -> (WriteRoute, bool) {
     if !exec_switch_on() {
         return (WriteRoute::Engine, false);
@@ -664,7 +664,7 @@ pub(crate) fn machine_write_program(
         return (WriteRoute::Engine, false);
     }
     let (r, _, loaded) = match bound_partial {
-        Some((root, value)) => crate::cgen::c_prepare_bound_partial_index(inner, raw_sql, root, value),
+        Some((root, slot, value)) => crate::cgen::c_prepare_bound_partial_index(inner, raw_sql, root, slot, value),
         None => crate::cgen::c_prepare(inner, raw_sql),
     };
     let route = match r {

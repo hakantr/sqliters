@@ -8176,7 +8176,7 @@ impl Statement {
         inner: &mut ConnectionInner,
         stmt: Option<&Stmt>,
         raw_sql: &str,
-        bound_partial: Option<(u32, &Value)>,
+        bound_partial: Option<(u32, usize, &Value)>,
     ) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
         if !vdbe_host::exec_switch_on()
             || !matches!(
@@ -9494,16 +9494,21 @@ impl Statement {
                     && self.compiled_v1_expire_generation == inner.v1_expire_generation
                     && self.compiled_advisory_expire_generation == inner.advisory_expire_generation
                     && self.compiled_c_expire_seq == inner.db_set.c_expire_seq()
-                    && let [value @ (Value::Integer(_) | Value::Real(_))] = self.params.as_slice()
+                    && matches!(self.params.len(), 1 | 2)
                 {
                     parsed_stmt.as_ref()
-                        .and_then(|stmt| engine::bound_view_partial_index(stmt, &inner.db_set, &self.raw_sql))
-                        .filter(|_| {
-                            inner.collations.get_custom("BINARY").is_none()
-                                && !self.has_detached_slot(inner)
-                                && !self.slot_cookies_changed(inner)
+                        .and_then(|stmt| {
+                            engine::bound_view_partial_index(stmt, &inner.db_set, &self.raw_sql, self.params.len())
                         })
-                        .map(|root| (root, value))
+                        .and_then(|(root, slot)| {
+                            let value = self.params.get(slot - 1)?;
+                            (self.c_bind_expmask() == 1 << (slot - 1)
+                                && matches!(value, Value::Integer(_) | Value::Real(_))
+                                && inner.collations.get_custom("BINARY").is_none()
+                                && !self.has_detached_slot(inner)
+                                && !self.slot_cookies_changed(inner))
+                            .then_some((root, slot, value))
+                        })
                 } else {
                     None
                 };

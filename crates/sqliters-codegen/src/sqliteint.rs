@@ -1149,6 +1149,11 @@ pub trait Host {
         None
     }
 
+    /// The actual bind slot and its value in a scoped partial-index reprepare.
+    fn partial_index_binding(&self, root_pgno: u32) -> Option<(usize, &sqliters_types::Value)> {
+        self.partial_index_bound_value(root_pgno).map(|value| (1, value))
+    }
+
     /// A connection/pager value read at prepare time by pragma.c. `None` means that
     /// the host does not represent this state; the generator must not approximate it.
     fn pragma_int(&self, _i_db: usize, _name: &str) -> Option<i64> {

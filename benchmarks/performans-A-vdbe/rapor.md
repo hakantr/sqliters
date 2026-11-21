@@ -1677,3 +1677,8 @@ Maskeli yuvada önceki ve yeni typed INTEGER aynıysa C gibi gereksiz yeniden ha
 ## V6b.274 — Ay ve yıl kaydırması sonrası floor
 
 Geçerli ISO tarihte tam ve işaretli ay veya yıl kaydırmasından sonra tek terminal floor, C günü taşma miktarını düşer. Dört Tcl vakası, üç kodlamada 15.704 SQL ölçümü ve 27 C salt okunur açılışı eş. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,270 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_274.md).
+
+
+## V6b.275 — Görünüm UPDATE iki bağlı koşul
+
+İki kompakt yuvada, açık MAIN V2 görünüm UPDATE yeniden hazırlaması gerçek equality yuvasını C ile aynı kısmi indeks uygunluğuna taşır. 412 STEP kökü ve 208 son dosya C eş. 4.384 C salt okunur açılışı ve eski tek bağ/tamsayı korumaları doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,270 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_275.md).
