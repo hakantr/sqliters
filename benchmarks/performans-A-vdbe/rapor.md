@@ -1852,3 +1852,8 @@ Görünüm PRAGMA sütun meta verisinde sayısal baş CAST için C’nin UNION A
 ## V6b.309 — Yerleşik likelihood hazırlama tanısı
 
 Normal SELECT için mevcut C tipi hazırlama sonucundaki geçersiz likelihood olasılığı tanısının kodu, özgün metni ve bayt ofseti taşınır. Yerleşik 126 ve yerel scalar 24 native vaka iki kipte eş. 720 C salt okunur açılışı geçti. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,267 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_309.md).
+
+
+## V6b.310 — Üslü Julian tarih BLOB girdisi
+
+Değiştiricisiz tam kod birimi BLOB içindeki üslü ASCII sayı mevcut iJD dönüşümünü kullanır. Bağlı ve literal yerleşimde 1.440’ar C sonucu eş, 3.376 salt okunur C açılışı ve 36 çıktı imajı doğrulandı. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,278 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_310.md).

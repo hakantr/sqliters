@@ -1557,10 +1557,18 @@ fn parse_datetime_value(
                 let digits =
                     |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
                 let number = stamp.strip_prefix(['+', '-']).unwrap_or(&stamp);
-                let julian_number = match number.split_once('.') {
-                    Some((whole, fraction)) => digits(whole) && digits(fraction),
-                    None => digits(number),
+                let (mantissa, exponent_valid) = match number.split_once(['e', 'E']) {
+                    Some((mantissa, exponent)) => {
+                        let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+                        (mantissa, digits(exponent))
+                    }
+                    None => (number, true),
                 };
+                let julian_number = exponent_valid
+                    && match mantissa.split_once('.') {
+                        Some((whole, fraction)) => digits(whole) && digits(fraction),
+                        None => digits(mantissa),
+                    };
                 let time = if julian_number {
                     let days = parse_datetime_number_text(&stamp)?;
                     ParsedDateTime::from_unix_ms(julian_days_to_ms(days)?)
