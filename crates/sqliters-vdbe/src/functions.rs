@@ -1556,7 +1556,8 @@ fn parse_datetime_value(
                 let stamp = ctx.text_encoding.decode_bytes(bytes);
                 let digits =
                     |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
-                let number = stamp.strip_prefix(['+', '-']).unwrap_or(&stamp);
+                let numeric_stamp = sqliters_types::sqlite_trim_ascii(&stamp);
+                let number = numeric_stamp.strip_prefix(['+', '-']).unwrap_or(numeric_stamp);
                 let (mantissa, exponent_valid) = match number.split_once(['e', 'E']) {
                     Some((mantissa, exponent)) => {
                         let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);

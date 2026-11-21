@@ -1867,3 +1867,8 @@ CTAS sayısal baş CAST için katalogda NUM ve ilk yazımda FLEXNUM kararını t
 ## V6b.312 — Julian BLOB ondalık nokta yazımı
 
 Değiştiricisiz BLOB sayı yazımında ondalık noktanın en az bir yanında rakam olması yeterli. Bağlı ve literal yerleşimde 1.368’er C sonucu, 2.400 C açılışı ve 18 kalıcı imaj eş. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,306 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_312.md).
+
+
+## V6b.313 — Julian BLOB sayısında çevre boşluğu
+
+Mevcut SQLite ASCII boşluk denetimi sayısal BLOB yazımının başına ve sonuna uygulanır. Bağlı ve literal yerleşimde 1.296’şar C sonucu, 1.800 C açılışı ve 18 kalıcı dosya eş. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,281 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_313.md).
