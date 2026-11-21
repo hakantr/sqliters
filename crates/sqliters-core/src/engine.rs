@@ -33353,12 +33353,19 @@ fn view_dml_indexed_select(
         indexes.retain(|index| matches_key(index.columns[0].col_idx));
     }
     let wr_index_pair = indexes.len() == 2 && wr_numeric_range;
+    let wr_competing_full_range = wr_index_pair
+        && !has_partial
+        && indexes.iter().all(|index| {
+            index.columns.first().is_some_and(|key| matches_key(key.col_idx))
+        });
     if (two_index_range || wr_index_pair)
         && indexes.iter().any(|index| {
             let [key] = index.columns.as_slice() else {
                 return true;
             };
-            index.is_autoindex || index.unique || key.sort_order.collation != Collation::Binary
+            index.is_autoindex
+                || (index.unique && !wr_competing_full_range)
+                || key.sort_order.collation != Collation::Binary
         })
     {
         return None;

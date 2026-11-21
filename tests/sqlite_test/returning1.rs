@@ -692,3 +692,41 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_returning_without_rowid_view_competing_unique_range_indexes() {
+    sqliters_tcltest::run_test_script(
+        "returning_without_rowid_view_competing_unique_range_indexes",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach {layout indexes expected} {
+  ordinary_first {CREATE INDEX first_key ON base(k); CREATE UNIQUE INDEX second_key ON base(k DESC);} {1 5 4 2}
+  unique_first {CREATE UNIQUE INDEX first_key ON base(k DESC); CREATE INDEX second_key ON base(k);} {2 4 5 1}
+  two_unique_desc {CREATE UNIQUE INDEX first_key ON base(k); CREATE UNIQUE INDEX second_key ON base(k DESC);} {1 5 4 2}
+  two_unique_asc {CREATE UNIQUE INDEX first_key ON base(k DESC); CREATE UNIQUE INDEX second_key ON base(k);} {2 4 5 1}
+} {
+  reset_db
+  execsql {
+    CREATE TABLE base(id INTEGER PRIMARY KEY, k INTEGER, label TEXT) WITHOUT ROWID;
+    CREATE TABLE seen(seq INTEGER PRIMARY KEY, id INTEGER);
+    INSERT INTO base VALUES (1,5,'one'),(2,2,'two'),(3,1,'three'),(4,3,'four'),(5,4,'five');
+    CREATE VIEW projected AS SELECT id,k,label FROM base;
+    CREATE TRIGGER revise INSTEAD OF UPDATE ON projected BEGIN
+      INSERT INTO seen(id) VALUES(old.id);
+      UPDATE base SET label=new.label WHERE id=old.id;
+    END;
+  }
+  execsql $indexes
+  do_execsql_test returning-competing-unique-range-$layout.1 {
+    UPDATE projected SET label=label||'!' WHERE k>=2 RETURNING id;
+    SELECT changes();
+    SELECT id FROM seen ORDER BY seq;
+    SELECT id,label FROM base ORDER BY id;
+    PRAGMA integrity_check;
+  } [concat $expected {0} $expected {1 one! 2 two! 3 three 4 four! 5 five! ok}]
+}
+finish_test
+"#,
+    );
+}
