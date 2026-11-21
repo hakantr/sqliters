@@ -441,6 +441,21 @@ impl TclInterp {
                 if matches!(self.frames[fidx].vars.get(&bname), Some(VarSlot::Array(_))) {
                     return Err(format!("can't set \"{raw_name}\": variable is array"));
                 }
+                if fidx == 0
+                    && bname == "sqlite_current_time"
+                    && let Some(host) = &self.host
+                {
+                    let host = host.borrow();
+                    if host.set_clock_seconds(&val).is_none() {
+                        let seconds = host.clock_seconds().to_string();
+                        self.frames[fidx]
+                            .vars
+                            .insert(bname, VarSlot::Scalar(seconds));
+                        return Err(format!(
+                            "can't set \"{raw_name}\": variable must have integer value"
+                        ));
+                    }
+                }
                 self.frames[fidx]
                     .vars
                     .insert(bname, VarSlot::Scalar(val.clone()));
@@ -474,6 +489,17 @@ impl TclInterp {
                 Some(_) if nocomplain => Ok(()),
                 Some(_) => Err(format!("can't unset \"{raw_name}\": variable isn't array")),
             };
+        }
+        if fidx == 0
+            && bname == "sqlite_current_time"
+            && idx.is_none()
+            && let Some(host) = &self.host
+        {
+            let seconds = host.borrow().clock_seconds().to_string();
+            self.frames[fidx]
+                .vars
+                .insert(bname, VarSlot::Scalar(seconds));
+            return Ok(());
         }
         match idx {
             None => {

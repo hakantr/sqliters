@@ -9,7 +9,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 
 use sqliters_core::{
     AuthorizerResult, Backup, BackupStepResult, Blob, CloseError, Connection,
@@ -17,7 +17,9 @@ use sqliters_core::{
     StepResult, WalCheckpointMode, WindowAggregateInstance,
 };
 use sqliters_types::{ErrorCode, LockGeometry, SqliteError, Value, extended, format_sqlite_real};
-use sqliters_vfs::{LockLevel, OpenFlags, OsVfs, ShmOpenOptions, SyncFlags, Vfs, VfsFile, WalShm};
+use sqliters_vfs::{
+    LockLevel, OpenFlags, OsVfs, ShmOpenOptions, SyncFlags, UNIX_EPOCH_JD_MS, Vfs, VfsFile, WalShm,
+};
 
 use crate::expr::{eval_expr, parse_tcl_bool, parse_tcl_float, parse_tcl_int};
 use crate::interp::{TclControl, TclInterp, TclResult};
@@ -487,6 +489,7 @@ struct HarnessVfsCounters {
 struct HarnessVfs {
     inner: OsVfs,
     counters: Arc<HarnessVfsCounters>,
+    clock_seconds: Arc<AtomicI32>,
 }
 
 struct HarnessVfsFile {
@@ -657,7 +660,12 @@ impl Vfs for HarnessVfs {
     }
 
     fn current_time_int64(&self) -> i64 {
-        self.inner.current_time_int64()
+        let seconds = self.clock_seconds.load(Ordering::Relaxed);
+        if seconds == 0 {
+            self.inner.current_time_int64()
+        } else {
+            UNIX_EPOCH_JD_MS + i64::from(seconds) * 1_000
+        }
     }
 }
 
@@ -676,6 +684,7 @@ pub struct SqliteTestHost {
     default_page_size: u32,
     lock_geometry: LockGeometry,
     vfs_counters: Arc<HarnessVfsCounters>,
+    clock_seconds: Arc<AtomicI32>,
     disk_vfs: Arc<dyn Vfs>,
     pub report: TestFileReport,
     pub sqlite_test_dir: PathBuf,
@@ -745,9 +754,11 @@ impl SqliteTestHost {
 
         let lock_geometry = LockGeometry::test_64k();
         let vfs_counters = Arc::new(HarnessVfsCounters::default());
+        let clock_seconds = Arc::new(AtomicI32::new(0));
         let disk_vfs: Arc<dyn Vfs> = Arc::new(HarnessVfs {
             inner: OsVfs::with_lock_geometry(lock_geometry),
             counters: Arc::clone(&vfs_counters),
+            clock_seconds: Arc::clone(&clock_seconds),
         });
 
         Rc::new(RefCell::new(Self {
@@ -765,6 +776,7 @@ impl SqliteTestHost {
             default_page_size: TESTFIXTURE_DEFAULT_PAGE_SIZE,
             lock_geometry,
             vfs_counters,
+            clock_seconds,
             disk_vfs,
             report: TestFileReport {
                 file_name: file_name.to_string(),
@@ -815,6 +827,35 @@ impl SqliteTestHost {
 
     fn disk_vfs(&self) -> Arc<dyn Vfs> {
         Arc::clone(&self.disk_vfs)
+    }
+
+    pub(crate) fn clock_seconds(&self) -> i32 {
+        self.clock_seconds.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_clock_seconds(&self, value: &str) -> Option<()> {
+        let value = value.trim_matches(|ch| matches!(ch, ' ' | '\t'..='\r'));
+        let negative = value.starts_with('-');
+        let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
+        let (digits, radix) = match digits.as_bytes() {
+            [b'0', b'x' | b'X', ..] => (&digits[2..], 16),
+            [b'0', b'o' | b'O', ..] => (&digits[2..], 8),
+            [b'0', b'b' | b'B', ..] => (&digits[2..], 2),
+            [b'0', _, ..] => (digits, 8),
+            _ => (digits, 10),
+        };
+        if !digits.as_bytes().first()?.is_ascii_hexdigit() {
+            return None;
+        }
+        // TCL_LINK_INT accepts a 32-bit magnitude and stores it as a signed int.
+        let magnitude = u32::from_str_radix(digits, radix).ok()?;
+        let seconds = if negative {
+            magnitude.wrapping_neg()
+        } else {
+            magnitude
+        };
+        self.clock_seconds.store(seconds as i32, Ordering::Relaxed);
+        Some(())
     }
 
     fn resolve_db_id(&self, raw_token: &str) -> Option<DbId> {
@@ -1237,6 +1278,7 @@ pub(crate) fn set_pending_byte_str(host: &SharedHost, raw: &str) -> Result<u64, 
     h.disk_vfs = Arc::new(HarnessVfs {
         inner: OsVfs::with_lock_geometry(new_geom),
         counters: Arc::clone(&h.vfs_counters),
+        clock_seconds: Arc::clone(&h.clock_seconds),
     });
     Ok(old)
 }

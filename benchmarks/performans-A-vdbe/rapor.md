@@ -1782,3 +1782,8 @@ C’nin reddettiği boşluk çevreli utc değerleri artık SQL NULL. Dört saat 
 ## V6b.295 — WITHOUT ROWID farklı anahtarlı kısmi indeks
 
 C’nin farklı eşikte elediği kısmi indeks yerine tam indeksin aynı aralığı kullanılıyor. Önceki 800 dosya farkının 160’ı kapandı. Taze kontrolle 40 ek sonuç ve 15.672 C salt okunur açılış eş. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,263 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_295.md).
+
+
+## V6b.296 — Tcl test kabuğunda sabit saat
+
+Ayrı test host’ları için Tcl bağlı tamsayısı disk VFS saatine yansıtıldı. 77 Tcl linked-int ve 43 harness kontrolü geçti. İki kipte 21 tarih testi daha aynı beklentiyi verdi. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,289 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_296.md).
