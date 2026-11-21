@@ -385,3 +385,72 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_group_key_projection() {
+    sqliters_tcltest::run_test_script(
+        "group_key_projection",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE item(id INTEGER PRIMARY KEY);
+  INSERT INTO item VALUES(1),(2),(3),(4),(5),(6);
+  CREATE TABLE names(value TEXT COLLATE NOCASE, id INTEGER PRIMARY KEY);
+  INSERT INTO names VALUES('a',1),('A',2),('b',3),('B',4);
+}
+proc next_group {id} {
+  incr ::call_count
+  if {$::call_count>6} { return 9 }
+  return [lindex {0 1 1 2 2 2} [expr {$::call_count-1}]]
+}
+db function next_group next_group
+foreach {name sql expected} {
+  ordinal {SELECT next_group(id) AS g,count(*) FROM item GROUP BY 1 ORDER BY 1}
+    {{0 1 1 2 2 3} 6}
+  alias {SELECT next_group(id) AS g,count(*) FROM item GROUP BY g ORDER BY g}
+    {{0 1 1 2 2 3} 6}
+  expression {SELECT next_group(id) AS g,count(*) FROM item GROUP BY next_group(id) ORDER BY 1}
+    {{0 1 1 2 2 3} 6}
+  descending {SELECT next_group(id) AS g,count(*) FROM item GROUP BY 1 ORDER BY 1 DESC}
+    {{2 3 1 2 0 1} 6}
+  nongroup_projection {SELECT next_group(id),count(*) FROM item GROUP BY id ORDER BY id}
+    {{0 1 1 1 1 1 2 1 2 1 2 1} 6}
+  limited {SELECT next_group(id) AS g,count(*) FROM item GROUP BY 1 ORDER BY 1 LIMIT 1 OFFSET 1}
+    {{1 2} 6}
+  repeated_first {SELECT next_group(id),next_group(id),count(*) FROM item GROUP BY 1 ORDER BY 1}
+    {{0 9 1 1 9 2 2 9 3} 9}
+  repeated_second {SELECT next_group(id),next_group(id),count(*) FROM item GROUP BY 2 ORDER BY 2}
+    {{9 0 1 9 1 2 9 2 3} 9}
+  repeated_alias {SELECT next_group(id) AS a,next_group(id) AS b,count(*) FROM item GROUP BY b ORDER BY b}
+    {{9 0 1 9 1 2 9 2 3} 9}
+  repeated_expression {SELECT next_group(id),next_group(id),count(*) FROM item GROUP BY next_group(id) ORDER BY 1}
+    {{9 0 1 9 1 2 9 2 3} 9}
+  group_collated {SELECT next_group(id),count(*) FROM item GROUP BY 1 COLLATE BINARY ORDER BY 1}
+    {{9 1 9 2 9 3} 9}
+  projection_collated {SELECT next_group(id) COLLATE BINARY,count(*) FROM item GROUP BY 1 ORDER BY 1}
+    {{0 1 1 2 2 3} 6}
+  collated_alias {SELECT next_group(id) COLLATE BINARY AS g,count(*) FROM item GROUP BY g ORDER BY g}
+    {{9 1 9 2 9 3} 9}
+  double_collated_alias {SELECT next_group(id) COLLATE BINARY COLLATE BINARY AS g,count(*) FROM item GROUP BY g ORDER BY g}
+    {{9 1 9 2 9 3} 9}
+  nested_collated_alias {SELECT CAST(next_group(id) COLLATE BINARY AS INTEGER) AS g,count(*) FROM item GROUP BY g ORDER BY g}
+    {{0 1 1 2 2 3} 6}
+  binary {SELECT next_group(id)+1,count(*) FROM item GROUP BY 1 ORDER BY 1}
+    {{1 1 2 2 3 3} 6}
+  two_keys {SELECT next_group(id),id%2,count(*) FROM item GROUP BY 1,2 ORDER BY 1,2}
+    {{0 1 1 1 0 1 1 1 1 2 0 2 2 1 1} 6}
+} {
+  do_test group-key-$name {
+    set ::call_count 0
+    set rows [execsql $sql]
+    list $rows $::call_count
+  } $expected
+}
+do_execsql_test group-key-bare-max {
+  SELECT value,max(id) FROM names GROUP BY 1 ORDER BY 1;
+} {A 2 B 4}
+finish_test
+"#,
+    );
+}

@@ -7766,7 +7766,7 @@ fn exec_single_select_core_inner(
                         outer_scopes,
                         ctes,
                     )?;
-                    for group_rows in groups {
+                    for (_, group_rows) in groups {
                         let mut rep_row = choose_aggregate_representative_row(
                             ctx,
                             &group_rows,
@@ -7923,6 +7923,39 @@ fn exec_single_select_core_inner(
                     }
                 }
 
+                // A GROUP BY reference supplies the value for its selected result column.
+                let mut projected_key = vec![None; expanded_proj.len()];
+                if minmax_specs.is_empty() && resolved_having.is_none() {
+                    for (key, (group_term, resolved)) in
+                        group_by.iter().zip(&resolved_group_by).enumerate()
+                    {
+                        let result_column = if let Some(ordinal) =
+                            strip_collate_and_unary_plus(group_term)
+                        {
+                            Some(ordinal as usize - 1)
+                        } else if let Expr::Column(cref) = group_term
+                            && cref.schema.is_none()
+                            && cref.table.is_none()
+                            && !col_in_scoped_cols(&cref.column, &sample_cols)
+                            && let Some(index) = expanded_proj.iter().position(|(_, _, alias)| {
+                                alias.as_deref().is_some_and(|alias| {
+                                    alias.eq_ignore_ascii_case(&cref.column)
+                                })
+                            })
+                        {
+                            // A COLLATE wrapper on a GROUP BY alias is evaluated separately.
+                            (!matches!(resolved, Expr::Collate { .. })).then_some(index)
+                        } else {
+                            expanded_proj.iter().rposition(|(expr, _, _)| expr == resolved)
+                        };
+                        if let Some(index) = result_column
+                            && &expanded_proj[index].0 == resolved
+                        {
+                            projected_key[index].get_or_insert(key);
+                        }
+                    }
+                }
+
                 let groups = build_groups(
                     ctx,
                     filtered,
@@ -7931,7 +7964,7 @@ fn exec_single_select_core_inner(
                     outer_scopes,
                     ctes,
                 )?;
-                for group_rows in groups {
+                for (group_key, group_rows) in groups {
                     let mut rep_row = choose_aggregate_representative_row(
                         ctx,
                         &group_rows,
@@ -7964,15 +7997,13 @@ fn exec_single_select_core_inner(
                     }
 
                     let mut out_vals = Vec::with_capacity(expanded_proj.len());
-                    for (pe, _, _) in &expanded_proj {
-                        out_vals.push(eval_expr(
-                            ctx,
-                            pe,
-                            params,
-                            scopes,
-                            ctes,
-                            Some((&group_rows, outer_scopes)),
-                        )?);
+                    for ((pe, _, _), key) in expanded_proj.iter().zip(&projected_key) {
+                        let value = if let Some(key) = key {
+                            group_key[*key].clone()
+                        } else {
+                            eval_expr(ctx, pe, params, scopes, ctes, Some((&group_rows, outer_scopes)))?
+                        };
+                        out_vals.push(value);
                     }
 
                     let mut sort_vals = Vec::with_capacity(order_by.len());
@@ -16097,10 +16128,10 @@ fn build_groups(
     params: &[Value],
     outer_scopes: &[EvalRow],
     ctes: &CteStore,
-) -> Result<Vec<Vec<EvalRow>>> {
+) -> Result<Vec<(Vec<Value>, Vec<EvalRow>)>> {
     if group_by.is_empty() {
         // Ungrouped aggregate (`SELECT COUNT(*) FROM t`): always yields 1 group even if `rows` is empty!
-        return Ok(vec![rows]);
+        return Ok(vec![(Vec::new(), rows)]);
     }
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -16168,7 +16199,7 @@ fn build_groups(
         compare_value_slices(ka, kb, &g_specs, enc)
     })?;
 
-    Ok(groups.into_iter().map(|(_, b)| b).collect())
+    Ok(groups)
 }
 
 fn first_explicit_collate_in_expr(expr: &Expr) -> Option<&str> {

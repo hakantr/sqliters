@@ -1957,3 +1957,8 @@ Materyalize UNION aynı kolda ilk temsilciyi korur ve eşitlikte sağ kolu seçe
 ## V6b.330 — Sıralamasız UNION ve sabit LIMIT 1
 
 İki olağan koldaki sıralamasız UNION sabit tamsayı LIMIT 1 ile kolları kaynak sırasıyla değerlendirir. 120 fark kapandı. 25 sorgu biçimi ve 18 C salt okunur açılış doğrulandı. OFF 1206/1/329, ON 1203/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_330.md).
+
+
+## V6b.331 — GROUP BY anahtarının sonuç sütununda kullanımı
+
+GROUP BY anahtarını sonuç sütununda kullanma, takma ada bağlı doğrudan COLLATE ifadesinin ayrı değerlendirilmesini koruyacak biçimde doğrulandı. 18 C ve Rust kontrolü, 17 olağan SQL biçimi ve 18 C salt okunur açılışı doğrulandı. OFF 1207/1/329, ON 1204/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,276 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_331.md).
