@@ -33145,7 +33145,11 @@ fn view_dml_indexed_select(
                 is_lower == view_dml_range_is_lower(other_op, other_bound, false)?;
         }
     }
-    if (same_range_direction || distinct_columns) && !ctx.stmt_tx.view_update_range_tokens {
+    let same_returning_range = returning_range && same_range_direction;
+    if (same_range_direction || distinct_columns)
+        && !same_returning_range
+        && !ctx.stmt_tx.view_update_range_tokens
+    {
         return None;
     }
     if equality_range
@@ -33491,8 +33495,10 @@ fn view_dml_indexed_select(
         None
     };
     let partial_range = two_index_range && has_partial;
-    // These two-term shapes use only the proven partial-index path.
-    if (same_range_direction || distinct_columns) && !partial_range {
+    if (same_range_direction || distinct_columns)
+        && !partial_range
+        && !(same_returning_range && !has_partial)
+    {
         return None;
     }
     if partial_range

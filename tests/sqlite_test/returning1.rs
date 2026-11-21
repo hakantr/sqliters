@@ -768,3 +768,41 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_returning_without_rowid_view_same_direction_bounds() {
+    sqliters_tcltest::run_test_script(
+        "returning_without_rowid_view_same_direction_bounds",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach {layout indexes limits expected final_rows} {
+  lower {CREATE INDEX keyed ON base(k);} {k>=2 AND k>1} {2 4 5 1} {1 one! 2 two! 3 three 4 four! 5 five!}
+  lower_real {CREATE INDEX keyed ON base(k DESC);} {k>1.5 AND k>=2.0} {1 5 4 2} {1 one! 2 two! 3 three 4 four! 5 five!}
+  upper {CREATE INDEX keyed ON base(k);} {k<=4 AND k<4.5} {3 2 4 5} {1 one 2 two! 3 three! 4 four! 5 five!}
+  upper_unique {CREATE UNIQUE INDEX keyed ON base(k DESC);} {k<=4 AND k<=4} {5 4 2 3} {1 one 2 two! 3 three! 4 four! 5 five!}
+} {
+  reset_db
+  execsql {
+    CREATE TABLE base(id INTEGER PRIMARY KEY, k INTEGER, label TEXT) WITHOUT ROWID;
+    CREATE TABLE seen(seq INTEGER PRIMARY KEY, id INTEGER);
+    INSERT INTO base VALUES (1,5,'one'),(2,2,'two'),(3,1,'three'),(4,3,'four'),(5,4,'five');
+    CREATE VIEW projected AS SELECT id,k,label FROM base;
+    CREATE TRIGGER revise INSTEAD OF UPDATE ON projected BEGIN
+      INSERT INTO seen(id) VALUES(old.id);
+      UPDATE base SET label=new.label WHERE id=old.id;
+    END;
+  }
+  execsql $indexes
+  do_execsql_test returning-same-direction-range-$layout.1 "
+    UPDATE projected SET label=label||'!' WHERE $limits RETURNING id;
+    SELECT changes();
+    SELECT id FROM seen ORDER BY seq;
+    SELECT id,label FROM base ORDER BY id;
+    PRAGMA integrity_check;
+  " [concat $expected {0} $expected $final_rows {ok}]
+}
+finish_test
+"#,
+    );
+}
