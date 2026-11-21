@@ -1607,3 +1607,8 @@ Değiştiricisiz veya yalnız alt saniye hassasiyeti bayraklı INTEGER ve REAL J
 ## V6b.260 — Görünüm UPDATE karşıt iki sınır ve kısmi indeks
 
 Açık MAIN yazma işleminde aynı NUMERIC BINARY sütununda bir alt ve bir üst sınırdan biri kısmi indeks koşuluyla yapısal eş olduğunda C’nin planı ve kalıcı kayıt sırası izlenir. 90 OFF ve 60 UTF-16 ilişkisel ON farkı kapandı. 888 önceki koruma ve 4.554 bağımsız C salt okunur açılışı geçti. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,265 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_260.md).
+
+
+## V6b.261 — Typed Julian tek süre değiştiricisi
+
+Tek olağan süre değiştiricili INTEGER ve REAL için C uyumlu ham dönüşüm, birim sınırı, yarım ms yuvarlaması ve son aralık denetimi kullanılır. Üç ölçüm kümesinde sırasıyla 87, 78 ve 441 C farkı kapandı. Üç kalıcı dosya profili ve 105 C salt okunur açılışı eş. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,257 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_261.md).

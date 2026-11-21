@@ -1438,6 +1438,7 @@ fn parse_datetime_value(
         .map(datetime_c_string)
         .unwrap_or_default();
 
+    let mut single_typed_modifier_days = None;
     let (mut time, modifiers, check_julian_range) = if first_name.eq_ignore_ascii_case("unixepoch")
     {
         let seconds = parse_raw_datetime_number(val, ctx.text_encoding)?;
@@ -1460,28 +1461,27 @@ fn parse_datetime_value(
             true,
         )
     } else {
-        let output_precision_only = || {
-            modifiers.iter().all(|m| {
-                matches!(m, Value::Text(text)
-                    if text.eq_ignore_ascii_case("subsec") || text.eq_ignore_ascii_case("subsecond"))
-            })
+        let is_output_precision = |modifier: &Value| {
+            matches!(modifier, Value::Text(text)
+                if text.eq_ignore_ascii_case("subsec") || text.eq_ignore_ascii_case("subsecond"))
         };
         let (time, check_julian_range) = match val {
-            Value::Integer(_) | Value::Real(_) if output_precision_only() => {
+            Value::Integer(_) | Value::Real(_) => {
                 let days = parse_raw_datetime_number(val, ctx.text_encoding)?;
-                (ParsedDateTime::from_unix_ms(julian_days_to_ms(days)?), true)
-            }
-            Value::Integer(jd) => {
-                // Julian day -> Unix ms (`2440587.5` JD = Unix epoch)
-                let ms = ((*jd as f64 - 2_440_587.5) * 86_400_000.0).round() as i64;
-                (ParsedDateTime::from_unix_ms(ms), false)
-            }
-            Value::Real(jd) => {
-                let ms = ((*jd - 2_440_587.5) * 86_400_000.0).round() as i64;
-                (ParsedDateTime::from_unix_ms(ms), false)
+                let mut other_modifiers = modifiers.iter().filter(|m| !is_output_precision(m));
+                match other_modifiers.next() {
+                    None => (ParsedDateTime::from_unix_ms(julian_days_to_ms(days)?), true),
+                    Some(modifier) => {
+                        if matches!(modifier, Value::Text(_)) && other_modifiers.next().is_none() {
+                            single_typed_modifier_days = Some(days);
+                        }
+                        let ms = ((days - 2_440_587.5) * 86_400_000.0).round() as i64;
+                        (ParsedDateTime::from_unix_ms(ms), false)
+                    }
+                }
             }
             Value::Text(s) => parse_datetime_text(s, ctx, allow_signed_year).or_else(|| {
-                if s.contains('\0') || !output_precision_only() {
+                if s.contains('\0') || !modifiers.iter().all(is_output_precision) {
                     return None;
                 }
                 let days = parse_raw_datetime_number(val, ctx.text_encoding)?;
@@ -1520,7 +1520,8 @@ fn parse_datetime_value(
                 }
                 continue;
             }
-            time.unix_ms = apply_datetime_modifier_ms(&mut time, &mod_str)?;
+            time.unix_ms =
+                apply_datetime_modifier_ms(&mut time, &mod_str, single_typed_modifier_days)?;
             time.raw_seconds = None;
         }
         break use_subsec;
@@ -1819,7 +1820,11 @@ fn parse_long_clock_fraction(second: u32, digits: &str) -> Option<(u32, f64)> {
     Some((millis, seconds))
 }
 
-fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, modifier: &str) -> Option<i64> {
+fn apply_datetime_modifier_ms(
+    time: &mut ParsedDateTime,
+    modifier: &str,
+    single_typed_modifier_days: Option<f64>,
+) -> Option<i64> {
     let mut ms = time.unix_ms;
     let bare_hour24 = time.bare_hour24.take();
     let signed_hour24 = time.signed_hour24;
@@ -1900,7 +1905,17 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, modifier: &str) -> Opti
         return None;
     }
     let unit = unit.trim_start_matches(is_date_time_space);
-    let num: f64 = if signed_hour24 {
+    let unit = unit.strip_suffix('s').unwrap_or(unit);
+    let elapsed: Option<(f64, f32)> = match unit {
+        "second" => Some((1.0, 4.6427e14)),
+        "minute" => Some((60.0, 7.7379e12)),
+        "hour" => Some((3_600.0, 1.2897e11)),
+        "day" => Some((86_400.0, 5_373_485.0)),
+        _ => None,
+    };
+    let elapsed_julian_days = single_typed_modifier_days.filter(|_| elapsed.is_some());
+    let use_c_number = signed_hour24 || elapsed_julian_days.is_some();
+    let num: f64 = if use_c_number {
         let (value, status) = sqliters_types::sqlite_atof(amount.as_bytes());
         (status > 0).then_some(value)?
     } else {
@@ -1913,24 +1928,25 @@ fn apply_datetime_modifier_ms(time: &mut ParsedDateTime, modifier: &str) -> Opti
         time.is_utc = true;
     }
     time.calendar_retained = false;
-    let elapsed = |seconds: f64, limit: f32| {
-        if signed_hour24 {
+    if let Some((seconds, limit)) = elapsed {
+        if use_c_number {
             // SQLite's duration table uses an exclusive binary32 limit and casts
             // after adding the sign-dependent half millisecond.
             if num.abs() >= f64::from(limit) {
                 return None;
             }
             let rounder = if num < 0.0 { -0.5 } else { 0.5 };
-            return ms.checked_add((num * 1_000.0 * seconds + rounder) as i64);
+            let delta = (num * 1_000.0 * seconds + rounder) as i64;
+            if let Some(days) = elapsed_julian_days {
+                // Only output precision modifiers can follow this duration.
+                let result = julian_days_to_ms(days)?.checked_add(delta)?;
+                return valid_julian_unix_ms(result).then_some(result);
+            }
+            return ms.checked_add(delta);
         }
-        Some(ms.saturating_add((num * (seconds * 1_000.0)).round() as i64))
-    };
-    let unit = unit.strip_suffix('s').unwrap_or(unit);
+        return Some(ms.saturating_add((num * (seconds * 1_000.0)).round() as i64));
+    }
     match unit {
-        "second" => elapsed(1.0, 4.6427e14),
-        "minute" => elapsed(60.0, 7.7379e12),
-        "hour" => elapsed(3_600.0, 1.2897e11),
-        "day" => elapsed(86_400.0, 5_373_485.0),
         "month" => {
             calendar_input?;
             if !calendar_in_range && (num.fract() != 0.0 || num.abs() >= 176_546.0) {
