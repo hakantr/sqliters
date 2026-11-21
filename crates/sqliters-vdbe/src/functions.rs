@@ -1449,6 +1449,7 @@ fn parse_datetime_value(
         .unwrap_or_default();
 
     let mut single_typed_modifier_days = None;
+    let mut single_typed_modifier_fields = None;
     let mut typed_modifier_fields = None;
     let mut typed_elapsed_chain = false;
     let (mut time, modifiers, check_julian_range) = if first_name.eq_ignore_ascii_case("unixepoch")
@@ -1504,6 +1505,25 @@ fn parse_datetime_value(
                             single_start_of = ["start of day", "start of month", "start of year"]
                                 .iter()
                                 .any(|name| text.eq_ignore_ascii_case(name));
+                            let fields = split_numeric_datetime_modifier(text);
+                            if let Some(fields) = fields
+                                && let Some((month_scale, limit)) = fields.whole_calendar_unit()
+                            {
+                                let amount = fields.amount.parse::<i64>().ok()?;
+                                if amount <= -limit || amount >= limit {
+                                    return None;
+                                }
+                                let ms = julian_days_to_ms(days)
+                                    .filter(|&ms| valid_julian_unix_ms(ms))?;
+                                let shifted =
+                                    apply_calendar_shift(ms, amount * month_scale, 0, false)?;
+                                // All other modifiers are exact output precision flags.
+                                return valid_julian_unix_ms(shifted).then_some((
+                                    ParsedDateTime::from_unix_ms(shifted),
+                                    modifiers.len() > 1,
+                                ));
+                            }
+                            single_typed_modifier_fields = Some(fields);
                             single_typed_modifier_days = (!single_start_of).then_some(days);
                         }
                         let check_julian_range = typed_elapsed_chain || single_start_of;
@@ -1616,7 +1636,12 @@ fn parse_datetime_value(
         {
             return None;
         }
-        let shifted = apply_packed_shift(time.unix_ms, shift, false)?;
+        let shifted = apply_calendar_shift(
+            time.unix_ms,
+            shift.direction * shift.months,
+            shift.direction * shift.days,
+            false,
+        )?;
         time = ParsedDateTime::from_unix_ms(shifted + shift.direction * clock_ms);
     }
     let initial_time = time;
@@ -1648,7 +1673,8 @@ fn parse_datetime_value(
             }
             let numeric_modifier = || match (&typed_modifier_fields, m) {
                 (Some(fields), Value::Text(_)) => fields[index],
-                _ => split_numeric_datetime_modifier(&mod_str),
+                _ => single_typed_modifier_fields
+                    .unwrap_or_else(|| split_numeric_datetime_modifier(&mod_str)),
             };
             time.unix_ms = apply_datetime_modifier_ms(
                 &mut time,
@@ -1963,6 +1989,20 @@ struct NumericDateTimeModifier<'a> {
 }
 
 impl NumericDateTimeModifier<'_> {
+    fn whole_calendar_unit(&self) -> Option<(i64, i64)> {
+        let digits = self.amount.strip_prefix(['+', '-']).unwrap_or(self.amount);
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        if self.unit.eq_ignore_ascii_case("month") {
+            Some((1, 176_546))
+        } else if self.unit.eq_ignore_ascii_case("year") {
+            Some((12, 14_713))
+        } else {
+            None
+        }
+    }
+
     fn is_signed_integer_calendar_shift(&self) -> bool {
         self.amount.starts_with(['+', '-'])
             && self.amount.parse::<i32>().is_ok_and(|amount| {
@@ -2073,13 +2113,17 @@ fn apply_packed_calendar_shift(
     if utc_ymdhms_from_unix_ms(unix_ms).2 != parse_two_time_digits(original_date.get(8..)?)? {
         return None;
     }
-    apply_packed_shift(unix_ms, shift, floor)
+    apply_calendar_shift(
+        unix_ms,
+        shift.direction * shift.months,
+        shift.direction * shift.days,
+        floor,
+    )
 }
 
-fn apply_packed_shift(unix_ms: i64, shift: PackedCalendarShift, floor: bool) -> Option<i64> {
+fn apply_calendar_shift(unix_ms: i64, months: i64, days: i64, floor: bool) -> Option<i64> {
     let (year, month, day, _, _, _) = utc_ymdhms_from_unix_ms(unix_ms);
-    let shifted_month =
-        i64::from(year) * 12 + i64::from(month) - 1 + shift.direction * shift.months;
+    let shifted_month = i64::from(year) * 12 + i64::from(month) - 1 + months;
     let year = shifted_month.div_euclid(12);
     if !(-4713..=9999).contains(&year) {
         return None;
@@ -2093,7 +2137,7 @@ fn apply_packed_shift(unix_ms: i64, shift: PackedCalendarShift, floor: bool) -> 
     } else {
         0
     };
-    let shifted_days = date_days + shift.direction * shift.days - overflow_days;
+    let shifted_days = date_days + days - overflow_days;
     Some(shifted_days * 86_400_000 + unix_ms.rem_euclid(86_400_000))
 }
 
