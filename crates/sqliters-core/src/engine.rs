@@ -5940,6 +5940,10 @@ fn exec_select(
         && name.schema.is_none()
         && let Some((s_idx, c_idx)) = ctes.locate(&name.name)
         && ctes.scopes[s_idx][c_idx].materialized != Some(true)
+        && matches!(
+            classify_cte_recursion(&ctes.scopes[s_idx][c_idx]),
+            CteRecursionKind::Recursive { .. }
+        )
         && count_table_refs_in_core(&stmt.body.head, &name.name) == 1
     {
         let lim_val = select_limit_integer(eval_expr(
@@ -6898,7 +6902,7 @@ fn exec_compound_select(
         matches!(
             core,
             SelectCore::Select { from: Some(from), .. }
-                if has_ordinary_limit_sources(ctx.db_set, from, ctes)
+                if has_ordinary_limit_sources(ctx.db_set, from, ctes, &mut Vec::new())
         )
     };
     let evaluated_limit = if let Some(limit) = limit
@@ -7287,7 +7291,9 @@ fn exec_single_select_core_inner(
                 };
 
             let evaluated_limit = match (limit, from) {
-                (Some(limit), Some(from)) if has_ordinary_limit_sources(ctx.db_set, from, ctes) => {
+                (Some(limit), Some(from))
+                    if has_ordinary_limit_sources(ctx.db_set, from, ctes, &mut Vec::new()) =>
+                {
                     Some(eval_select_limit_offset(ctx, limit, params, outer_scopes, ctes)?)
                 }
                 _ => None,
@@ -16769,7 +16775,12 @@ fn eval_select_offset(
     Ok(usize::try_from(offset.max(0)).unwrap_or(usize::MAX))
 }
 
-fn has_ordinary_limit_sources(db_set: &DatabaseSet, from: &FromClause, ctes: &CteStore) -> bool {
+fn has_ordinary_limit_sources(
+    db_set: &DatabaseSet,
+    from: &FromClause,
+    ctes: &CteStore,
+    active_ctes: &mut Vec<(usize, usize)>,
+) -> bool {
     std::iter::once(&from.head)
         .chain(from.joins.iter().map(|join| &join.right))
         .all(|source| match source {
@@ -16779,8 +16790,20 @@ fn has_ordinary_limit_sources(db_set: &DatabaseSet, from: &FromClause, ctes: &Ct
                 indexed_by: None,
                 ..
             } => {
-                if name.schema.is_none() && ctes.locate(&name.name).is_some() {
-                    return false;
+                if name.schema.is_none()
+                    && let Some(key @ (scope, index)) = ctes.locate(&name.name)
+                {
+                    let cte = &ctes.scopes[scope][index];
+                    if active_ctes.contains(&key)
+                        || !matches!(classify_cte_recursion(cte), CteRecursionKind::NonRecursive)
+                    {
+                        return false;
+                    }
+                    active_ctes.push(key);
+                    let lexical_ctes = ctes.slice_to_scope(scope);
+                    let ordinary = has_ordinary_limit_query(db_set, &cte.query, &lexical_ctes, active_ctes);
+                    active_ctes.pop();
+                    return ordinary;
                 }
                 matches!(
                     db_set.find_relation_ref_in_set(name),
@@ -16788,18 +16811,27 @@ fn has_ordinary_limit_sources(db_set: &DatabaseSet, from: &FromClause, ctes: &Ct
                 )
             }
             TableOrSubquery::Subquery { query, .. } => {
-                query.ctes.is_empty()
-                    && query.body.compounds.is_empty()
-                    && matches!(
-                        &query.body.head,
-                        SelectCore::Select { from, .. }
-                            if from.as_ref().is_none_or(
-                                |from| has_ordinary_limit_sources(db_set, from, ctes)
-                            )
-                    )
+                has_ordinary_limit_query(db_set, query, ctes, active_ctes)
             }
             _ => false,
         })
+}
+
+fn has_ordinary_limit_query(
+    db_set: &DatabaseSet,
+    query: &SelectStmt,
+    ctes: &CteStore,
+    active_ctes: &mut Vec<(usize, usize)>,
+) -> bool {
+    query.ctes.is_empty()
+        && query.body.compounds.is_empty()
+        && matches!(
+            &query.body.head,
+            SelectCore::Select { from, .. }
+                if from.as_ref().is_none_or(
+                    |from| has_ordinary_limit_sources(db_set, from, ctes, active_ctes)
+                )
+        )
 }
 
 fn eval_select_limit_offset(

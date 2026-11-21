@@ -745,3 +745,59 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_cte_limit_evaluation_order() {
+    sqliters_tcltest::run_test_script(
+        "cte_limit_order",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE item(id INTEGER PRIMARY KEY);
+  INSERT INTO item VALUES(1),(2),(3);
+  CREATE TABLE detail(id INTEGER PRIMARY KEY);
+  INSERT INTO detail VALUES(1),(2);
+}
+do_execsql_test cte-limit-order-1 {
+  WITH named AS MATERIALIZED (SELECT abs(-9223372036854775808) AS value FROM item)
+  SELECT value FROM named LIMIT 0 OFFSET 'unused';
+} {}
+do_catchsql_test cte-limit-order-2 {
+  WITH first AS (SELECT abs(-9223372036854775808) AS value FROM item),
+       second AS (SELECT value FROM first)
+  SELECT value FROM second ORDER BY value LIMIT 1.5;
+} {1 {datatype mismatch}}
+do_catchsql_test cte-limit-order-3 {
+  WITH named AS (SELECT id,abs(-9223372036854775808) AS value FROM item)
+  SELECT value FROM named JOIN detail USING(id) LIMIT 1 OFFSET NULL;
+} {1 {datatype mismatch}}
+do_execsql_test cte-limit-order-4 {
+  WITH named(value) AS (SELECT 'ordinary')
+  SELECT value FROM named LIMIT 1;
+} {ordinary}
+proc count_limit {value} {
+  incr ::limit_calls
+  return $value
+}
+db function count_limit count_limit
+do_test cte-limit-order-5 {
+  set ::limit_calls 0
+  set rows [execsql {
+    WITH named AS (SELECT id FROM item ORDER BY id)
+    SELECT id FROM named LIMIT count_limit(1) OFFSET count_limit(1);
+  }]
+  list $rows $::limit_calls
+} {2 2}
+do_test cte-limit-order-6 {
+  set ::limit_calls 0
+  set rows [execsql {
+    WITH named AS (SELECT abs(-9223372036854775808) AS value FROM item)
+    SELECT value FROM named LIMIT count_limit(0) OFFSET count_limit(1);
+  }]
+  list $rows $::limit_calls
+} {{} 1}
+finish_test
+"#,
+    );
+}

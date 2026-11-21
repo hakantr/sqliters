@@ -1922,3 +1922,8 @@ Olağan tablo kollarındaki UNION ALL UNION INTERSECT ve EXCEPT için 800 ifade 
 ## V6b.323 — FROM alt sorgularında LIMIT değerlendirme sırası
 
 Olağan FROM alt sorgularında LIMIT ve OFFSET satır üretiminden önce değerlendirilir. 360 fark kapandı. 93 sorgu, 18 C salt okunur açılış ve beş odaklı Rust karşılaştırması doğrulandı. OFF 1199/1/329, ON 1196/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,306 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_323.md).
+
+
+## V6b.324 — Özyinelemesiz CTE LIMIT değerlendirme sırası
+
+Özyinelemesiz CTE için LIMIT ve OFFSET satır üretiminden önce birer kez değerlendirilir. 330 fark kapandı. 62 sorgu biçimi, 18 C salt okunur açılış ve altı Rust kontrolü doğrulandı. OFF 1200/1/329, ON 1197/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,297 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_324.md).
