@@ -5906,6 +5906,7 @@ fn exec_select(
     parent_ctes: &CteStore,
 ) -> Result<QueryOutput> {
     let mut ctes = parent_ctes.with_scope_at(&stmt.ctes, outer_scopes.len());
+    let mut recursive_cte_limit = None;
 
     // Propagate outer `LIMIT [OFFSET]` cap when `SELECT ... FROM <cte> [WHERE ...] LIMIT k` has no
     // sorting/grouping and `<cte>` is not `AS MATERIALIZED`, allowing unbounded recursive CTEs to
@@ -5946,19 +5947,23 @@ fn exec_select(
         )
         && count_table_refs_in_core(&stmt.body.head, &name.name) == 1
     {
-        let lim_val = select_limit_integer(eval_expr(
-            ctx, &lim.limit, params, outer_scopes, &ctes, None,
-        )?)?;
-        if lim_val >= 0 {
-            let off_val = eval_select_offset(ctx, lim, lim_val, params, outer_scopes, &ctes)?;
+        let (limit, offset) = eval_select_limit_offset(ctx, lim, params, outer_scopes, &ctes)?;
+        if limit >= 0 {
             ctes.limit_hint = Some(CteStreamHint {
                 s_idx,
                 c_idx,
                 eff_alias: alias.clone().unwrap_or_else(|| name.name.clone()),
                 where_expr: selection.clone(),
-                max_kept: off_val.saturating_add(usize::try_from(lim_val).unwrap_or(usize::MAX)),
+                max_kept: offset.saturating_add(usize::try_from(limit).unwrap_or(usize::MAX)),
             });
         }
+        // Use the evaluated values when slicing the output of the recursive CTE.
+        recursive_cte_limit = Some(LimitClause {
+            limit: Expr::Integer(limit),
+            offset: lim.offset.as_ref().map(|_| {
+                Expr::Integer(i64::try_from(offset).unwrap_or(i64::MAX))
+            }),
+        });
     }
 
     // Fast `OP_Count` path for `SELECT COUNT(*) FROM <table>` with no `WHERE`, `GROUP BY`, `HAVING`,
@@ -6022,12 +6027,13 @@ fn exec_select(
         });
     }
 
+    let limit = recursive_cte_limit.as_ref().or(stmt.limit.as_ref());
     if stmt.body.compounds.is_empty() {
         exec_single_select_core(
             ctx,
             &stmt.body.head,
             &stmt.order_by,
-            stmt.limit.as_ref(),
+            limit,
             params,
             outer_scopes,
             &ctes,
@@ -6037,7 +6043,7 @@ fn exec_select(
             ctx,
             &stmt.body,
             &stmt.order_by,
-            stmt.limit.as_ref(),
+            limit,
             params,
             outer_scopes,
             &ctes,
@@ -7307,7 +7313,7 @@ fn exec_single_select_core_inner(
             let evaluated_limit = match (limit, from) {
                 (Some(limit), Some(from))
                     if has_ordinary_limit_sources(ctx.db_set, from, ctes, &mut Vec::new())
-                        || (!order_by.is_empty() && has_simple_recursive_limit_source(from, ctes)) =>
+                        || has_simple_recursive_limit_source(from, ctes) =>
                 {
                     Some(eval_select_limit_offset(ctx, limit, params, outer_scopes, ctes)?)
                 }

@@ -871,3 +871,61 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_recursive_stream_cte_limit() {
+    sqliters_tcltest::run_test_script(
+        "recursive_stream_cte_limit",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+proc count_limit {value} {
+  incr ::limit_calls
+  return $value
+}
+db function count_limit count_limit
+do_test recursive-stream-limit-1 {
+  set ::limit_calls 0
+  set rows [execsql {
+    WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<4)
+    SELECT abs(-9223372036854775808) FROM seq
+    LIMIT count_limit(0) OFFSET count_limit(1);
+  }]
+  list $rows $::limit_calls
+} {{} 1}
+do_test recursive-stream-limit-2 {
+  set ::limit_calls 0
+  set rows [execsql {
+    WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<4)
+    SELECT x FROM seq LIMIT count_limit(2) OFFSET count_limit(1);
+  }]
+  list $rows $::limit_calls
+} {{2 3} 2}
+do_test recursive-stream-limit-3 {
+  set ::limit_calls 0
+  set rows [execsql {
+    WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<4)
+    SELECT x FROM seq LIMIT count_limit(-1) OFFSET count_limit(1);
+  }]
+  list $rows $::limit_calls
+} {{2 3 4} 2}
+do_test recursive-stream-limit-4 {
+  set ::limit_calls 0
+  set code [catch {execsql {
+    WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<4)
+    SELECT x FROM seq LIMIT count_limit('wrong') OFFSET count_limit(1);
+  }} message]
+  list $code $message $::limit_calls
+} {1 {datatype mismatch} 1}
+do_test recursive-stream-limit-5 {
+  set ::limit_calls 0
+  set rows [execsql {
+    WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<4)
+    SELECT x FROM seq LIMIT count_limit(1) OFFSET count_limit(-1);
+  }]
+  list $rows $::limit_calls
+} {1 2}
+finish_test
+"#,
+    );
+}
