@@ -1566,7 +1566,10 @@ fn parse_datetime_value(
                 };
                 let julian_number = exponent_valid
                     && match mantissa.split_once('.') {
-                        Some((whole, fraction)) => digits(whole) && digits(fraction),
+                        Some((whole, fraction)) => {
+                            !(whole.is_empty() && fraction.is_empty())
+                                && whole.bytes().chain(fraction.bytes()).all(|byte| byte.is_ascii_digit())
+                        }
                         None => digits(mantissa),
                     };
                 let time = if julian_number {
