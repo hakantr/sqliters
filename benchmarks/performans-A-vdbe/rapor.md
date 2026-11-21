@@ -1777,3 +1777,8 @@ Geçerli ISO tarih-saat girdisi ve tek saat kaydırmasında yerel SQL sonucu C i
 ## V6b.294 — UTC değiştiricisinin tam yazımı
 
 C’nin reddettiği boşluk çevreli utc değerleri artık SQL NULL. Dört saat dilimi ve üç kodlamada 432 önceki fark kapandı. 24 DELETE/WAL imajı ve 120 C salt okunur bütünlük kontrolü eş. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_294.md).
+
+
+## V6b.295 — WITHOUT ROWID farklı anahtarlı kısmi indeks
+
+C’nin farklı eşikte elediği kısmi indeks yerine tam indeksin aynı aralığı kullanılıyor. Önceki 800 dosya farkının 160’ı kapandı. Taze kontrolle 40 ek sonuç ve 15.672 C salt okunur açılış eş. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,263 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_295.md).

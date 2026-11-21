@@ -32755,7 +32755,7 @@ fn view_dml_indexed_select(
             return None;
         };
         if !ctx.stmt_tx.view_update_range_tokens
-            || indexes.iter().any(|index| !matches_key(index.columns[0].col_idx))
+            || !matches_key(full.columns[0].col_idx)
             || partial_col.double_quoted
             || !partial_col.column.eq_ignore_ascii_case(&column.name)
             || !(0..=i64::from(i32::MAX)).contains(partial_value)
@@ -32765,11 +32765,19 @@ fn view_dml_indexed_select(
         }
         // C admits equal literal predicates and gives the partial range a lower estimate.
         // The other supported pairs are structurally different before cost estimation.
+        let partial_matches_key = matches_key(partial.columns[0].col_idx);
         let index = match (op, partial_op) {
-            (BinaryOp::Ge, BinaryOp::Ge) | (BinaryOp::Lt, BinaryOp::Lt) => {
+            (BinaryOp::Ge, BinaryOp::Ge) | (BinaryOp::Lt, BinaryOp::Lt) if partial_matches_key => {
                 if query_value == partial_value { partial } else { full }
             }
-            (BinaryOp::Lt, BinaryOp::Le) if query_value == partial_value => full,
+            (BinaryOp::Ge, BinaryOp::Ge)
+                if query_value != partial_value && column.affinity == TypeAffinity::Integer =>
+            {
+                full
+            }
+            (BinaryOp::Lt, BinaryOp::Le) if partial_matches_key && query_value == partial_value => {
+                full
+            }
             _ => return None,
         };
         Some(index.root_pgno)
