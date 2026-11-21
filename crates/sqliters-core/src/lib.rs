@@ -33,6 +33,7 @@ use std::sync::atomic::{
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use sqliters_btree::{Btree, BtreeCursorState, CursorId};
+use sqliters_codegen::sqliteint::PartialIndexBinding;
 pub use sqliters_ext::{
     Fts5AuxRegistry, Fts5Module, Fts5VocabModule, GenerateSeriesModule, JsonEachModule,
     JsonTreeModule, JsonbEachModule, JsonbTreeModule, RTreeCoordMode, RTreeModule,
@@ -8176,7 +8177,7 @@ impl Statement {
         inner: &mut ConnectionInner,
         stmt: Option<&Stmt>,
         raw_sql: &str,
-        bound_partial: Option<(u32, usize, &Value)>,
+        bound_partial: Option<(u32, PartialIndexBinding<'_>)>,
     ) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
         if !vdbe_host::exec_switch_on()
             || !matches!(
@@ -9500,14 +9501,14 @@ impl Statement {
                         .and_then(|stmt| {
                             engine::bound_view_partial_index(stmt, &inner.db_set, &self.raw_sql, self.params.len())
                         })
-                        .and_then(|(root, slot)| {
+                        .and_then(|(root, slot, predicate)| {
                             let value = self.params.get(slot - 1)?;
                             (self.c_bind_expmask() == 1 << (slot - 1)
                                 && matches!(value, Value::Integer(_) | Value::Real(_))
                                 && inner.collations.get_custom("BINARY").is_none()
                                 && !self.has_detached_slot(inner)
                                 && !self.slot_cookies_changed(inner))
-                            .then_some((root, slot, value))
+                            .then_some((root, PartialIndexBinding { predicate, slot, value }))
                         })
                 } else {
                     None

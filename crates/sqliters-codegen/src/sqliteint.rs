@@ -1132,6 +1132,20 @@ pub struct DbInfo {
     pub file_format: u8,
 }
 
+/// Structural comparison eligible for the scoped partial-index binding.
+#[derive(Clone, Copy)]
+pub enum PartialIndexPredicate {
+    Equal,
+    GreaterOrEqual,
+}
+
+#[derive(Clone, Copy)]
+pub struct PartialIndexBinding<'a> {
+    pub predicate: PartialIndexPredicate,
+    pub slot: usize,
+    pub value: &'a sqliters_types::Value,
+}
+
 /// What the code generator asks of the engine: the schema adapter and the registries of
 /// application-defined functions and collations.
 pub trait Host {
@@ -1152,6 +1166,15 @@ pub trait Host {
     /// The actual bind slot and its value in a scoped partial-index reprepare.
     fn partial_index_binding(&self, root_pgno: u32) -> Option<(usize, &sqliters_types::Value)> {
         self.partial_index_bound_value(root_pgno).map(|value| (1, value))
+    }
+
+    /// The exact predicate allowed to consume this typed binding.
+    fn partial_index_predicate_binding(&self, root_pgno: u32) -> Option<PartialIndexBinding<'_>> {
+        self.partial_index_binding(root_pgno).map(|(slot, value)| PartialIndexBinding {
+            predicate: PartialIndexPredicate::Equal,
+            slot,
+            value,
+        })
     }
 
     /// A connection/pager value read at prepare time by pragma.c. `None` means that

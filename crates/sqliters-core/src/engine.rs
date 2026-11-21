@@ -13,6 +13,7 @@ use sqliters_pager::{
     AutoVacuumMode, JournalMode, LockingMode, PagerOpenOptions, TransactionState,
     WalCheckpointMode, WalCheckpointResult,
 };
+use sqliters_codegen::sqliteint::PartialIndexPredicate;
 use sqliters_syntax::{
     AlterTableAction, BinaryOp, BindParam, ColumnDef, ColumnRef, CommonTableExpr, CompoundOp,
     ConflictAction, CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, CreateViewStmt,
@@ -32282,7 +32283,7 @@ pub(crate) fn bound_view_partial_index(
     db_set: &DatabaseSet,
     sql: &str,
     parameter_count: usize,
-) -> Option<(u32, usize)> {
+) -> Option<(u32, usize, PartialIndexPredicate)> {
     if db_set.slots().iter().skip(1).any(|slot| slot.btree.is_some()) {
         return None;
     }
@@ -32300,10 +32301,15 @@ pub(crate) fn bound_view_partial_index(
         Expr::Bind(sqliters_syntax::BindParam::Anonymous(slot) | sqliters_syntax::BindParam::Numbered(slot)) => Some(*slot),
         _ => None,
     };
-    let equality_slot = bind_slot(bound)?;
-    let expected_shape = match (parameter_count, range_bound) {
-        (1, Expr::Integer(lower)) => equality_slot == 1 && (0..=i64::from(i32::MAX)).contains(lower),
-        (2, range) => matches!((equality_slot, bind_slot(range)), (1, Some(2)) | (2, Some(1))),
+    let plain_integer = |expr: &Expr| {
+        matches!(expr, Expr::Integer(value) if (0..=i64::from(i32::MAX)).contains(value))
+    };
+    let equality_slot = bind_slot(bound);
+    let range_slot = bind_slot(range_bound);
+    let expected_shape = match (parameter_count, equality_slot, range_slot) {
+        (1, Some(1), None) => plain_integer(range_bound),
+        (1, None, Some(1)) => plain_integer(bound),
+        (2, Some(1), Some(2)) | (2, Some(2), Some(1)) => true,
         _ => false,
     };
     if !expected_shape
@@ -32359,15 +32365,19 @@ pub(crate) fn bound_view_partial_index(
     };
     let full = find_key(range_col)?;
     let partial = find_key(equality_col)?;
-    let (column, BinaryOp::Eq, Expr::Integer(literal)) =
-        view_dml_index_term(partial.where_clause.as_ref()?)?
-    else {
-        return None;
+    let (column, operator, literal) = view_dml_index_term(partial.where_clause.as_ref()?)?;
+    let (slot, predicate) = match operator {
+        BinaryOp::Eq if column.column.eq_ignore_ascii_case(&equality.column) => {
+            (equality_slot?, PartialIndexPredicate::Equal)
+        }
+        BinaryOp::Ge if column.column.eq_ignore_ascii_case(&range.column) => {
+            (range_slot?, PartialIndexPredicate::GreaterOrEqual)
+        }
+        _ => return None,
     };
     if full.where_clause.is_some()
         || column.double_quoted
-        || !column.column.eq_ignore_ascii_case(&equality.column)
-        || !(0..=i64::from(i32::MAX)).contains(literal)
+        || !plain_integer(literal)
         || !has_plain_integer_tokens(partial.raw_sql.as_deref()?, true)
         || !matches!(db_set.matching_triggers(
             DatabaseId::MAIN, &view.name, TriggerTiming::InsteadOf, TriggerEventKind::Update,
@@ -32376,7 +32386,7 @@ pub(crate) fn bound_view_partial_index(
     {
         return None;
     }
-    Some((partial.root_pgno, equality_slot))
+    Some((partial.root_pgno, slot, predicate))
 }
 
 pub(crate) fn view_update_range_tokens(stmt: &Stmt, db_set: &DatabaseSet, sql: &str) -> bool {

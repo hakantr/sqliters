@@ -1692,3 +1692,8 @@ Geçerli ISO başlangıçta dört haneli tek işaretli takvim değiştiricisi y�
 ## V6b.277 — İşaretli takvim sonrası floor ve ceiling
 
 Geçerli ISO başlangıçta dört haneli işaretli takvim kaydırmasının terminal floor ve ceiling adımları C ile eş. Düzeltme altı Tcl vakasını kapattı ve date-19 adayını 42/42 yaptı. Üç kodlamada 1.490 terminal çıktı ve 30 C salt okunur açılışı doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,291 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_277.md).
+
+
+## V6b.278 — Görünüm UPDATE bağlı aralık
+
+Açık MAIN V2 görünüm UPDATE yeniden hazırlamasında dar bağlı NUMERIC aralık ve plain INTEGER kısmi predikat C yapısal karşılaştırmasını kullanır. 456 STEP kökü, 256 son dosya ve 5.476 C açılışı eş. Önceki eşitlik ve aynı tamsayı vakaları korundu. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_278.md).

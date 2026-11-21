@@ -11,7 +11,7 @@ use std::sync::Arc;
 use sqliters_codegen::builtin_funcs::CONNECTION_FUNCS;
 use sqliters_codegen::build_tab::SchemaRow;
 use sqliters_codegen::consts::{SQLITE_DqsDML, SQLITE_TrustedSchema};
-use sqliters_codegen::sqliteint::{VTable, VtabConnect, VtabModule};
+use sqliters_codegen::sqliteint::{PartialIndexBinding, VTable, VtabConnect, VtabModule};
 use sqliters_codegen::vtab::{IndexInfo, IndexInfoHidden};
 use sqliters_codegen::{Db, DbInfo, Host, PrepareResult};
 use sqliters_types::{
@@ -30,7 +30,7 @@ const SQLITE_FUNC_UNSAFE: u32 = 0x0020_0000;
 enum PrepareBindings<'a> {
     Unbound,
     Read(&'a [Value]),
-    PartialIndex { root: u32, slot: usize, value: &'a Value },
+    PartialIndex { root: u32, binding: PartialIndexBinding<'a> },
 }
 
 struct EngineHost<'a> {
@@ -117,9 +117,9 @@ impl Host for EngineHost<'_> {
             .filter(|v| !matches!(v, Value::Null)).cloned()
     }
 
-    fn partial_index_binding(&self, root_pgno: u32) -> Option<(usize, &Value)> {
+    fn partial_index_predicate_binding(&self, root_pgno: u32) -> Option<PartialIndexBinding<'_>> {
         match self.bindings {
-            PrepareBindings::PartialIndex { root, slot, value } if root == root_pgno => Some((slot, value)),
+            PrepareBindings::PartialIndex { root, binding } if root == root_pgno => Some(binding),
             _ => None,
         }
     }
@@ -516,10 +516,9 @@ pub(crate) fn c_prepare_bound_partial_index(
     inner: &ConnectionInner,
     sql: &str,
     root: u32,
-    slot: usize,
-    value: &Value,
+    binding: PartialIndexBinding<'_>,
 ) -> (PrepareResult, usize, bool) {
-    c_prepare_impl(inner, sql, false, PrepareBindings::PartialIndex { root, slot, value }, None, false, None)
+    c_prepare_impl(inner, sql, false, PrepareBindings::PartialIndex { root, binding }, None, false, None)
 }
 
 pub(crate) fn c_prepare_table_scan(

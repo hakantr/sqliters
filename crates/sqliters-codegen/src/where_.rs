@@ -1897,7 +1897,7 @@ fn index_might_help_with_order_by(p: &mut Parse, w: &WhereInfo, index: IndexId, 
 /// with pPartIndexWhere can be used in the current query. Return true if it can be and false
 /// if not.
 fn where_usable_partial_index(
-    p: &mut Parse, w: &WhereInfo, i_tab: i32, jointype: u8, wc: WcId, mut p_where: ExprId, bound: Option<(usize, &Value)>,
+    p: &mut Parse, w: &WhereInfo, i_tab: i32, jointype: u8, wc: WcId, mut p_where: ExprId, bound: Option<PartialIndexBinding<'_>>,
 ) -> bool {
     if jointype as i32 & JT_LTORJ != 0 {
         return false;
@@ -1916,7 +1916,7 @@ fn where_usable_partial_index(
         };
         let implies = |p: &mut Parse, tab| {
             sqlite3_expr_implies_expr(p, e, p_where, tab)
-                || bound.is_some_and(|binding| sqlite3_partial_bound_eq(p, e, p_where, tab, binding))
+                || bound.is_some_and(|binding| sqlite3_partial_bound_matches(p, e, p_where, tab, binding))
         };
         if (!p.e(e).has(EP_OuterON) || p.e(e).w == i_tab)
             && ((jointype as i32 & JT_OUTER) == 0 || p.e(e).has(EP_OuterON))
@@ -2249,7 +2249,7 @@ fn where_loop_add_btree(p: &mut Parse, w: &mut WhereInfo, b: &mut WhereLoopBuild
         let part = p.idx(probe).p_part_idx_where;
         if part.nn() {
             let bound = if p.is_toplevel() && p.tab(tab).i_db == 0 {
-                p.db.host.partial_index_binding(p.idx(probe).tnum)
+                p.db.host.partial_index_predicate_binding(p.idx(probe).tnum)
             } else {
                 None
             };

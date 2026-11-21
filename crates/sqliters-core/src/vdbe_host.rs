@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use sqliters_btree::Btree;
 use sqliters_codegen::PrepareResult;
+use sqliters_codegen::sqliteint::PartialIndexBinding;
 use sqliters_pager::{JournalMode, LockingMode, PagerOpenOptions, TransactionState};
 use sqliters_types::DatabaseKind;
 use sqliters_syntax::Stmt;
@@ -610,7 +611,7 @@ pub(crate) fn machine_write_program(
     inner: &ConnectionInner,
     stmt: Option<&Stmt>,
     raw_sql: &str,
-    bound_partial: Option<(u32, usize, &Value)>,
+    bound_partial: Option<(u32, PartialIndexBinding<'_>)>,
 ) -> (WriteRoute, bool) {
     if !exec_switch_on() {
         return (WriteRoute::Engine, false);
@@ -664,7 +665,7 @@ pub(crate) fn machine_write_program(
         return (WriteRoute::Engine, false);
     }
     let (r, _, loaded) = match bound_partial {
-        Some((root, slot, value)) => crate::cgen::c_prepare_bound_partial_index(inner, raw_sql, root, slot, value),
+        Some((root, binding)) => crate::cgen::c_prepare_bound_partial_index(inner, raw_sql, root, binding),
         None => crate::cgen::c_prepare(inner, raw_sql),
     };
     let route = match r {
