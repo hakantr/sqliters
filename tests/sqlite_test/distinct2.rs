@@ -615,3 +615,49 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_group_nested_minmax() {
+    sqliters_tcltest::run_test_script(
+        "group_nested_minmax",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE cases(id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE, score);
+  INSERT INTO cases VALUES(1,'a',90),(2,'A',20),(3,'a',50),(4,'b',10),(5,'B',60),(6,'b',20);
+  CREATE INDEX cases_name_score ON cases(name,score,id);
+}
+do_execsql_test group-nested-minmax-1 {
+  SELECT name,coalesce(max(score),0),count(*) FROM cases GROUP BY name ORDER BY name;
+} {a 90 3 B 60 3}
+do_execsql_test group-nested-minmax-2 {
+  SELECT name,ifnull(min(score),0) FROM cases NOT INDEXED GROUP BY name ORDER BY name;
+} {A 20 b 10}
+do_execsql_test group-nested-minmax-3 {
+  SELECT name,max(0,min(score)) FROM cases NOT INDEXED GROUP BY name ORDER BY name;
+} {A 20 b 10}
+do_execsql_test group-nested-minmax-4 {
+  SELECT name,abs(min(score)),coalesce(max(score),0) FROM cases NOT INDEXED GROUP BY name ORDER BY name;
+} {a 20 90 B 10 60}
+do_execsql_test group-nested-minmax-5 {
+  SELECT name,count(*) FROM cases NOT INDEXED GROUP BY name HAVING abs(min(score))>0 ORDER BY name;
+} {A 3 b 3}
+do_execsql_test group-nested-minmax-6 {
+  SELECT name,abs(max(score)),row_number() OVER (ORDER BY name) FROM cases NOT INDEXED GROUP BY name ORDER BY name;
+} {a 90 1 B 60 2}
+do_execsql_test group-nested-minmax-7 {
+  SELECT name,max(0,count(*)) FROM cases NOT INDEXED GROUP BY name ORDER BY name;
+} {a 3 b 3}
+do_execsql_test group-nested-minmax-8 {
+  SELECT name,coalesce((SELECT max(score) FROM cases),0),count(*) FROM cases NOT INDEXED GROUP BY name ORDER BY name;
+} {a 90 3 b 90 3}
+proc local_max {x} { return $x }
+db function max -argcount 1 local_max
+do_execsql_test group-nested-minmax-9 {
+  SELECT name,max(score),count(*) FROM cases NOT INDEXED GROUP BY name ORDER BY name;
+} {a 90 3 b 10 3}
+finish_test
+"#,
+    );
+}

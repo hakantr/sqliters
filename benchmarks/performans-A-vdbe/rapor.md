@@ -1977,3 +1977,8 @@ Tekli artı ve CAST ile sarılmış sütunlar ve açık COLLATE ifadeleri, grupl
 ## V6b.334 — GROUP BY sonucunda MIN/MAX girdisinin temsili
 
 MIN/MAX ile döndürülen grup sütunu C’nin seçtiği girdi değerini taşıyor. Önceki 130 düzeltme korundu, 30 INTEGER/REAL sınır farkı kapandı. İlk adayda bozulan integer kernel testi düzeltilen adayda geçti. On bir odaklı C ve Rust kontrolü doğrulandı. OFF 1210/1/329, ON 1207/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,277 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_334.md).
+
+
+## V6b.335 — Skaler işlev içindeki MIN/MAX ve grup satırı
+
+Skaler işlev içinde aynı SELECT kapsamında çağrılan MIN/MAX, grup satırını C ile aynı şekilde seçiyor. Üç kodlama ve iki journal kipinde 140 fark kapandı. Bağlantıya özel MAX ve ayrı alt sorgu dahil dokuz odaklı kontrol geçti. OFF 1211/1/329, ON 1208/4/329. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,277 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_335.md).

@@ -45,7 +45,7 @@ use crate::compiler::{
     AccessPlan, QueryPlanContext, choose_access_plan_with_context,
     compile_for_explain_in_db_set,
     explain_query_plan_in_db_set, expr_column_label, expr_contains_aggregate,
-    expr_contains_subquery, expr_implies_partial_where,
+    expr_contains_subquery, expr_implies_partial_where, is_aggregate_function_call,
 };
 use crate::SmallInstVec;
 use crate::db_set::{DatabaseSet, RelationRef, ResolvedRelation, SchemaInstanceId, TempStoreMode};
@@ -7735,23 +7735,44 @@ fn exec_single_select_core_inner(
                     let mut minmax_specs: Vec<(AggregateKind, Expr, Option<Expr>, Collation)> =
                         Vec::new();
                     for (pe, _, _) in &expanded_proj {
-                        collect_minmax_aggregates(pe, &sample_cols, &mut minmax_specs);
+                        collect_minmax_aggregates(
+                            pe,
+                            &sample_cols,
+                            ctx.functions,
+                            &mut minmax_specs,
+                        );
                     }
                     if minmax_specs.is_empty() {
                         if let Some(ref hav) = resolved_having {
-                            collect_minmax_aggregates(hav, &sample_cols, &mut minmax_specs);
+                            collect_minmax_aggregates(
+                                hav,
+                                &sample_cols,
+                                ctx.functions,
+                                &mut minmax_specs,
+                            );
                         }
                         for ob in order_by {
-                            collect_minmax_aggregates(&ob.expr, &sample_cols, &mut minmax_specs);
+                            collect_minmax_aggregates(
+                                &ob.expr,
+                                &sample_cols,
+                                ctx.functions,
+                                &mut minmax_specs,
+                            );
                         }
                         for wc in &win_calls {
                             for pe in &wc.spec.partition_by {
-                                collect_minmax_aggregates(pe, &sample_cols, &mut minmax_specs);
+                                collect_minmax_aggregates(
+                                    pe,
+                                    &sample_cols,
+                                    ctx.functions,
+                                    &mut minmax_specs,
+                                );
                             }
                             for ob in &wc.spec.order_by {
                                 collect_minmax_aggregates(
                                     &ob.expr,
                                     &sample_cols,
+                                    ctx.functions,
                                     &mut minmax_specs,
                                 );
                             }
@@ -7912,14 +7933,24 @@ fn exec_single_select_core_inner(
                 let mut minmax_specs: Vec<(AggregateKind, Expr, Option<Expr>, Collation)> =
                     Vec::new();
                 for (pe, _, _) in &expanded_proj {
-                    collect_minmax_aggregates(pe, &sample_cols, &mut minmax_specs);
+                    collect_minmax_aggregates(pe, &sample_cols, ctx.functions, &mut minmax_specs);
                 }
                 if minmax_specs.is_empty() {
                     if let Some(ref hav) = resolved_having {
-                        collect_minmax_aggregates(hav, &sample_cols, &mut minmax_specs);
+                        collect_minmax_aggregates(
+                            hav,
+                            &sample_cols,
+                            ctx.functions,
+                            &mut minmax_specs,
+                        );
                     }
                     for ob in order_by {
-                        collect_minmax_aggregates(&ob.expr, &sample_cols, &mut minmax_specs);
+                        collect_minmax_aggregates(
+                            &ob.expr,
+                            &sample_cols,
+                            ctx.functions,
+                            &mut minmax_specs,
+                        );
                     }
                 }
 
@@ -8225,6 +8256,7 @@ fn exec_single_select_core_inner(
 fn collect_minmax_aggregates(
     expr: &Expr,
     sample_cols: &[ScopedColumn],
+    functions: &FunctionRegistry,
     out: &mut Vec<(AggregateKind, Expr, Option<Expr>, Collation)>,
 ) {
     match expr {
@@ -8235,6 +8267,7 @@ fn collect_minmax_aggregates(
             filter,
             over: None,
         } if es.len() == 1
+            && functions.find_scalar(name, 1).is_none()
             && (name.eq_ignore_ascii_case("MIN") || name.eq_ignore_ascii_case("MAX")) =>
         {
             let kind = if name.eq_ignore_ascii_case("MIN") {
@@ -8246,23 +8279,23 @@ fn collect_minmax_aggregates(
             out.push((kind, es[0].clone(), filter.as_deref().cloned(), coll));
         }
         Expr::FunctionCall {
-            args, filter, over, ..
+            name, args, filter, over, ..
         } => {
-            if over.is_some() || !expr_contains_aggregate(expr) {
+            if over.is_some() || !is_aggregate_function_call(name, args, functions) {
                 if let FunctionArgs::Exprs(es) = args {
                     for a in es {
-                        collect_minmax_aggregates(a, sample_cols, out);
+                        collect_minmax_aggregates(a, sample_cols, functions, out);
                     }
                 }
                 if let Some(f) = filter {
-                    collect_minmax_aggregates(f, sample_cols, out);
+                    collect_minmax_aggregates(f, sample_cols, functions, out);
                 }
                 if let Some(WindowRef::Spec(ws)) = over {
                     for pe in &ws.partition_by {
-                        collect_minmax_aggregates(pe, sample_cols, out);
+                        collect_minmax_aggregates(pe, sample_cols, functions, out);
                     }
                     for ob in &ws.order_by {
-                        collect_minmax_aggregates(&ob.expr, sample_cols, out);
+                        collect_minmax_aggregates(&ob.expr, sample_cols, functions, out);
                     }
                 }
             }
@@ -8270,22 +8303,24 @@ fn collect_minmax_aggregates(
         Expr::Unary { expr: inner, .. }
         | Expr::Collate { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
-        | Expr::Cast { expr: inner, .. } => collect_minmax_aggregates(inner, sample_cols, out),
+        | Expr::Cast { expr: inner, .. } => {
+            collect_minmax_aggregates(inner, sample_cols, functions, out)
+        }
         Expr::Binary { left, right, .. } => {
-            collect_minmax_aggregates(left, sample_cols, out);
-            collect_minmax_aggregates(right, sample_cols, out);
+            collect_minmax_aggregates(left, sample_cols, functions, out);
+            collect_minmax_aggregates(right, sample_cols, functions, out);
         }
         Expr::Between {
             expr: e, low, high, ..
         } => {
-            collect_minmax_aggregates(e, sample_cols, out);
-            collect_minmax_aggregates(low, sample_cols, out);
-            collect_minmax_aggregates(high, sample_cols, out);
+            collect_minmax_aggregates(e, sample_cols, functions, out);
+            collect_minmax_aggregates(low, sample_cols, functions, out);
+            collect_minmax_aggregates(high, sample_cols, functions, out);
         }
         Expr::InList { expr: e, list, .. } => {
-            collect_minmax_aggregates(e, sample_cols, out);
+            collect_minmax_aggregates(e, sample_cols, functions, out);
             for item in list {
-                collect_minmax_aggregates(item, sample_cols, out);
+                collect_minmax_aggregates(item, sample_cols, functions, out);
             }
         }
         Expr::Like {
@@ -8294,10 +8329,10 @@ fn collect_minmax_aggregates(
             escape,
             ..
         } => {
-            collect_minmax_aggregates(e, sample_cols, out);
-            collect_minmax_aggregates(pattern, sample_cols, out);
+            collect_minmax_aggregates(e, sample_cols, functions, out);
+            collect_minmax_aggregates(pattern, sample_cols, functions, out);
             if let Some(esc) = escape {
-                collect_minmax_aggregates(esc, sample_cols, out);
+                collect_minmax_aggregates(esc, sample_cols, functions, out);
             }
         }
         Expr::Case {
@@ -8306,19 +8341,19 @@ fn collect_minmax_aggregates(
             else_expr,
         } => {
             if let Some(op) = operand {
-                collect_minmax_aggregates(op, sample_cols, out);
+                collect_minmax_aggregates(op, sample_cols, functions, out);
             }
             for (w, t) in branches {
-                collect_minmax_aggregates(w, sample_cols, out);
-                collect_minmax_aggregates(t, sample_cols, out);
+                collect_minmax_aggregates(w, sample_cols, functions, out);
+                collect_minmax_aggregates(t, sample_cols, functions, out);
             }
             if let Some(el) = else_expr {
-                collect_minmax_aggregates(el, sample_cols, out);
+                collect_minmax_aggregates(el, sample_cols, functions, out);
             }
         }
         Expr::RowValue(elems) => {
             for el in elems {
-                collect_minmax_aggregates(el, sample_cols, out);
+                collect_minmax_aggregates(el, sample_cols, functions, out);
             }
         }
         _ => {}

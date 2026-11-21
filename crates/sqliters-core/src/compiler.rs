@@ -2618,6 +2618,38 @@ pub fn expr_contains_aggregate(expr: &Expr) -> bool {
     expr_contains_aggregate_with_functions(expr, &FunctionRegistry::default())
 }
 
+pub(crate) fn is_aggregate_function_call(
+    name: &str,
+    args: &FunctionArgs,
+    functions: &FunctionRegistry,
+) -> bool {
+    match args {
+        FunctionArgs::Star => {
+            functions.find_aggregate(name, 0).is_some()
+                || functions.has_aggregate_name(name)
+                || AggregateKind::from_name(name, true).is_some()
+        }
+        FunctionArgs::Exprs(es) => {
+            if functions.find_scalar(name, es.len()).is_some() {
+                false
+            } else if functions.find_aggregate(name, es.len()).is_some()
+                || functions.has_aggregate_name(name)
+            {
+                true
+            } else {
+                let upper = name.to_ascii_uppercase();
+                if (upper == "MIN" || upper == "MAX") && es.len() != 1 {
+                    false
+                } else if upper == "COUNT" && es.is_empty() {
+                    true
+                } else {
+                    AggregateKind::from_name(name, false).is_some()
+                }
+            }
+        }
+    }
+}
+
 pub fn expr_contains_aggregate_with_functions(expr: &Expr, functions: &FunctionRegistry) -> bool {
     match expr {
         Expr::FunctionCall {
@@ -2651,32 +2683,7 @@ pub fn expr_contains_aggregate_with_functions(expr: &Expr, functions: &FunctionR
                         .is_some_and(|e| expr_contains_aggregate_with_functions(e, functions))
                     || in_over;
             }
-            let is_agg = match args {
-                FunctionArgs::Star => {
-                    functions.find_aggregate(name, 0).is_some()
-                        || functions.has_aggregate_name(name)
-                        || AggregateKind::from_name(name, true).is_some()
-                }
-                FunctionArgs::Exprs(es) => {
-                    if functions.find_scalar(name, es.len()).is_some() {
-                        false
-                    } else if functions.find_aggregate(name, es.len()).is_some()
-                        || functions.has_aggregate_name(name)
-                    {
-                        true
-                    } else {
-                        let upper = name.to_ascii_uppercase();
-                        if (upper == "MIN" || upper == "MAX") && es.len() != 1 {
-                            false
-                        } else if upper == "COUNT" && es.is_empty() {
-                            true
-                        } else {
-                            AggregateKind::from_name(name, false).is_some()
-                        }
-                    }
-                }
-            };
-            if is_agg {
+            if is_aggregate_function_call(name, args, functions) {
                 return true;
             }
             filter
