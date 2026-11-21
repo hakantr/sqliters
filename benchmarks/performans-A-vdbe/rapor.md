@@ -2032,3 +2032,8 @@ Nitelikli INTEGER PRIMARY KEY eşitliğinde olağan INNER ve LEFT JOIN, reverse_
 ## V6b.345 — INTEGER PRIMARY KEY aralığında ters LEFT JOIN taraması
 
 34 SELECT biçimi ve altı profilde 60 aralık sırası farkı kapandı. 18 C yeniden açılışı ve yedi odaklı kontrol geçti. OFF 1221/1/329, ON 1218/4/329. DML OFF 392/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,268 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_345.md).
+
+
+## V6b.346 — INTEGER PRIMARY KEY için ters USING JOIN taraması
+
+50 SELECT biçimi ve altı profilde 70 sıra farkı kapandı. 18 C yeniden açılışı ve yedi odaklı kontrol geçti. OFF 1222/1/329, ON 1219/4/329. DML OFF 392/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_346.md).

@@ -8957,6 +8957,16 @@ fn reverse_plain_join_scans(db_set: &DatabaseSet, from: &FromClause) -> ReverseJ
     {
         return ReverseJoinScans::None;
     }
+    let is_rowid_alias = |table: &TableSchema, name: &str| {
+        table.rowid_alias_col.is_some_and(|id| table.columns[id].name.eq_ignore_ascii_case(name))
+    };
+    if let Some(JoinConstraint::Using(columns)) = &join.constraint
+        && let [name] = columns.as_slice()
+        && is_rowid_alias(left, name)
+        && is_rowid_alias(right, name)
+    {
+        return ReverseJoinScans::Left;
+    }
     let Some(JoinConstraint::On(Expr::Binary { left: a, op, right: b })) =
         join.constraint.as_ref()
     else {
@@ -8969,9 +8979,7 @@ fn reverse_plain_join_scans(db_set: &DatabaseSet, from: &FromClause) -> ReverseJ
         };
         column.schema.is_none()
             && column.table.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(alias))
-            && table.rowid_alias_col.is_some_and(|id| {
-                table.columns[id].name.eq_ignore_ascii_case(&column.column)
-            })
+            && is_rowid_alias(table, &column.column)
     };
     if (is_key(a, left, left_alias) && is_key(b, right, right_alias))
         || (is_key(b, left, left_alias) && is_key(a, right, right_alias))

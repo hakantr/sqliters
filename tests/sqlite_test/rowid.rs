@@ -1134,3 +1134,44 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_reverse_unordered_integer_key_using_join() {
+    sqliters_tcltest::run_test_script(
+        "reverse_unordered_integer_key_using_join",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  CREATE TABLE source_rows(id INTEGER PRIMARY KEY, value TEXT);
+  CREATE TABLE tags(id INTEGER PRIMARY KEY, name TEXT);
+  INSERT INTO source_rows VALUES(1,'r1'),(2,'r2'),(3,'r3');
+  INSERT INTO tags VALUES(1,'a'),(3,'c'),(4,'d');
+  PRAGMA reverse_unordered_selects=ON;
+}
+do_execsql_test reverse-key-using-1 {
+  SELECT id,r.value,t.name FROM source_rows r INNER JOIN tags t USING(ID);
+} {3 r3 c 1 r1 a}
+do_execsql_test reverse-key-using-2 {
+  SELECT * FROM source_rows r LEFT JOIN tags t USING(id);
+} {3 r3 c 2 r2 {} 1 r1 a}
+do_execsql_test reverse-key-using-3 {
+  SELECT r.*,t.* FROM source_rows r LEFT JOIN tags t USING(id);
+} {3 r3 3 c 2 r2 {} {} 1 r1 1 a}
+do_execsql_test reverse-key-using-4 {
+  SELECT * FROM tags t LEFT JOIN source_rows r USING(id);
+} {4 d {} 3 c r3 1 a r1}
+do_execsql_test reverse-key-using-5 {
+  SELECT id,r.value,t.name FROM source_rows r LEFT JOIN tags t USING(id) LIMIT 2 OFFSET 1;
+} {2 r2 {} 1 r1 a}
+do_execsql_test reverse-key-using-6 {
+  SELECT id,r.value,t.name FROM source_rows r LEFT JOIN tags t USING(id) ORDER BY id;
+} {1 r1 a 2 r2 {} 3 r3 c}
+do_execsql_test reverse-key-using-7 {
+  PRAGMA reverse_unordered_selects=OFF;
+  SELECT id,r.value,t.name FROM source_rows r LEFT JOIN tags t USING(id);
+} {1 r1 a 2 r2 {} 3 r3 c}
+finish_test
+"#,
+    );
+}
