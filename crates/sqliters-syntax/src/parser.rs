@@ -3314,7 +3314,8 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(Expr::Float(parse_float_literal(tok.text)?))
             }
-            TokenKind::StringLiteral => {
+            // The C grammar allows STRING as a name in table.column and schema.table.column.
+            TokenKind::StringLiteral if self.peek_n(1).kind != TokenKind::Dot => {
                 self.advance();
                 Ok(Expr::String(dequote(tok.text)))
             }
@@ -3455,7 +3456,7 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::Rp)?;
                 Ok(first)
             }
-            k if Self::can_be_ident(k) || Self::is_join_kw(k) => {
+            k if Self::can_be_ident(k) || Self::is_join_kw(k) || k == TokenKind::StringLiteral => {
                 let first_dbl_quoted = tok.text.starts_with('"');
                 let first = self.parse_nm()?;
                 // Function call: `name(...)`

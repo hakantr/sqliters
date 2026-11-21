@@ -162,6 +162,34 @@ mod tests {
     }
 
     #[test]
+    fn test_single_quoted_qualified_columns_and_string_literal() {
+        let Some(Stmt::Select(stmt)) =
+            parse_one("SELECT 't'.'col', 'main'.'t'.'col', 't' FROM t;")
+                .unwrap()
+                .0
+        else {
+            panic!("expected SELECT");
+        };
+        let SelectCore::Select { projection, .. } = stmt.body.head else {
+            panic!("expected SELECT core");
+        };
+        assert!(matches!(
+            &projection[0],
+            ResultColumn::Expr { expr: Expr::Column(column), .. }
+                if *column == ColumnRef::table_qualified("t", "col")
+        ));
+        assert!(matches!(
+            &projection[1],
+            ResultColumn::Expr { expr: Expr::Column(column), .. }
+                if *column == ColumnRef::schema_table_qualified("main", "t", "col")
+        ));
+        assert!(matches!(
+            &projection[2],
+            ResultColumn::Expr { expr: Expr::String(value), .. } if value == "t"
+        ));
+    }
+
+    #[test]
     fn test_parse_vacuum_all_forms() {
         // 1. Bare `VACUUM`
         assert_eq!(

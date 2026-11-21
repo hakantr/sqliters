@@ -1887,3 +1887,8 @@ Belgelendirilmiş Tcl BLOB bağlama seçenek dizilimi tanındı. CAST iki Rust k
 ## V6b.316 — date5, func7 ve func8 test paketleri
 
 Mevcut Tcl paketleri iki kipte 874/874, 73/73 ve 8/8 ile normal koşuya alındı. Takvimde kip başına 2.622 ayrı C sonucu, matematikte 73 ham C bölüm sonucu ve 7 C kullanıcı işlevi sonucu eş. OFF 1192/1/331, ON 1189/4/331. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_316.md).
+
+
+## V6b.317 — Tek tırnaklı nitelikli sütun adları
+
+C’nin iki ve üç parçalı sütun adı söz dizimi mevcut nitelikli ayrıştırma yoluna bağlandı. 168 ham olay, 18 C salt okunur açılış ve dosya özetleri eş. Bir ayrıştırma regresyon testi eklendi. OFF 1193/1/331, ON 1190/4/331. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,263 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_317.md).
