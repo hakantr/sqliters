@@ -1526,31 +1526,45 @@ fn parse_datetime_value(
             && matches!(date.as_bytes(), [_, _, _, _, b'-', _, _, b'-', _, _])
         {
             let raw_day = || date.get(8..)?.parse::<u32>().ok();
+            let floor_month_overflow = |unix_ms, original_day| {
+                let normalized_day = utc_ymdhms_from_unix_ms(unix_ms).2;
+                // After a month rollover the new day counts the overflow days.
+                if normalized_day == original_day {
+                    unix_ms
+                } else {
+                    unix_ms - i64::from(normalized_day) * 86_400_000
+                }
+            };
             match modifiers {
                 [Value::Text(modifier)]
                     if modifier.eq_ignore_ascii_case("ceiling")
                         || modifier.eq_ignore_ascii_case("floor") =>
                 {
                     if modifier.eq_ignore_ascii_case("floor") {
-                        let normalized_day = utc_ymdhms_from_unix_ms(time.unix_ms).2;
-                        // After a month rollover the new day counts the overflow days.
-                        if normalized_day != raw_day()? {
-                            time.unix_ms -= i64::from(normalized_day) * 86_400_000;
-                        }
+                        time.unix_ms = floor_month_overflow(time.unix_ms, raw_day()?);
                     }
                     &modifiers[..0]
                 }
-                [Value::Text(shift), Value::Text(ceiling)]
-                    if ceiling.eq_ignore_ascii_case("ceiling")
-                        && raw_day()? == utc_ymdhms_from_unix_ms(time.unix_ms).2 =>
+                [Value::Text(shift), Value::Text(modifier)]
+                    if modifier.eq_ignore_ascii_case("ceiling")
+                        || modifier.eq_ignore_ascii_case("floor") =>
                 {
-                    if let Some(fields) = split_numeric_datetime_modifier(shift)
+                    let original_day = raw_day()?;
+                    if original_day == utc_ymdhms_from_unix_ms(time.unix_ms).2
+                        && let Some(fields) = split_numeric_datetime_modifier(shift)
                         && fields.is_signed_integer_calendar_shift()
                     {
                         time.unix_ms =
                             apply_datetime_modifier_ms(&mut time, shift, None, false, || {
                                 Some(fields)
                             })?;
+                        if modifier.eq_ignore_ascii_case("floor") {
+                            // A whole shift cannot roll the last day of December into year 10000.
+                            if !valid_julian_unix_ms(time.unix_ms) {
+                                return None;
+                            }
+                            time.unix_ms = floor_month_overflow(time.unix_ms, original_day);
+                        }
                         &modifiers[..0]
                     } else {
                         modifiers
