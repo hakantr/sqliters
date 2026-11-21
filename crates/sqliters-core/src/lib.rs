@@ -5643,7 +5643,12 @@ fn check_c_prepare_error(
                 || message.eq_ignore_ascii_case("wrong number of arguments to function sqlite_compileoption_get()")
                 || message.eq_ignore_ascii_case("wrong number of arguments to function sqlite_compileoption_used()")
                 || message.eq_ignore_ascii_case("no such function: regexp")
-                || message.eq_ignore_ascii_case("wrong number of arguments to function regexp()") =>
+                || message.eq_ignore_ascii_case("wrong number of arguments to function regexp()")
+                || (code == ErrorCode::Error as i32
+                    && matches!(stmt, Some(Stmt::Select(_)))
+                    && message.eq_ignore_ascii_case(
+                        "second argument to likelihood() must be a constant between 0.0 and 1.0",
+                    )) =>
         {
             Err(SqliteError::with_extended(code, message)
                 .with_offset(if offset >= 0 { offset as usize } else { SqliteError::NO_OFFSET }))
