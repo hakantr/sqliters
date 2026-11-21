@@ -33360,6 +33360,59 @@ fn view_dml_indexed_select(
         && table.without_rowid_pk_cols.iter().all(|key| {
             key.sort_order.collation == Collation::Binary && key.sort_order.custom_collation.is_none()
         });
+    let wr_declared_range_root = (|| {
+        if !wr_numeric_range
+            || !matches!(bound, Expr::Integer(_))
+            || second_term.is_some()
+            || !indexes.iter().any(|index| index.is_autoindex || index.where_clause.is_some())
+        {
+            return None;
+        }
+        let range_index = |index: &IndexSchema| {
+            index.where_clause.is_none()
+                && matches!(index.columns.as_slice(), [key] if matches_key(key.col_idx))
+        };
+        let unrelated_partial_expression = |index: &IndexSchema| {
+            let Some(Expr::IsNull { expr, negated: true }) = &index.where_clause else {
+                return false;
+            };
+            let Expr::Column(reference) = expr.as_ref() else {
+                return false;
+            };
+            matches!(index.columns.as_slice(), [key] if key.col_idx.is_none())
+                && reference.schema.is_none()
+                && reference.table.is_none()
+                && !reference.column.eq_ignore_ascii_case(&column.name)
+        };
+        if !indexes.iter().all(|index| {
+            let Some(first) = index.columns.first() else {
+                return false;
+            };
+            index.stat1.is_none()
+                && index.columns.iter().all(|key| {
+                    key.sort_order.collation == Collation::Binary
+                        && key.sort_order.custom_collation.is_none()
+                })
+                && (range_index(index)
+                    || (index.is_autoindex && index.where_clause.is_none()
+                        && !matches_key(first.col_idx))
+                    || unrelated_partial_expression(index))
+        }) {
+            return None;
+        }
+        let ordered = ordered_table_indexes(table, &indexes);
+        let mut eligible = ordered.iter().filter(|index| range_index(index));
+        let first = eligible.next()?;
+        if let Some(second) = eligible.next()
+            && (first.is_autoindex || !second.is_autoindex || eligible.next().is_some())
+        {
+            return None;
+        }
+        Some(first.root_pgno)
+    })();
+    if let Some(root) = wr_declared_range_root {
+        indexes.retain(|index| index.root_pgno == root);
+    }
     let wr_range_with_unrelated_indexes = wr_numeric_range
         && indexes.len() > 1
         && !has_partial
@@ -33645,13 +33698,17 @@ fn view_dml_indexed_select(
             indexes.truncate(1);
         }
     }
-    if wr_index_pair || wr_range_with_unrelated_indexes {
+    let wr_forced_range_plan =
+        wr_index_pair || wr_range_with_unrelated_indexes || wr_declared_range_root.is_some();
+    if wr_forced_range_plan {
         let expected = if let Some(root) = wr_mixed_root {
             indexes.iter().find(|index| index.root_pgno == root)?
         } else {
             // Equal single-key ranges keep the first entry in C's pTab->pIndex order.
             indexes = ordered_table_indexes(table, &indexes);
-            indexes.iter().find(|index| !index.is_autoindex)?
+            indexes.iter().find(|index| {
+                !index.is_autoindex || wr_declared_range_root == Some(index.root_pgno)
+            })?
         };
         let indexed_by = IndexHint::IndexedBy(expected.name.clone());
         let AccessPlan::IndexRangeScan {
@@ -33692,7 +33749,7 @@ fn view_dml_indexed_select(
         || key.sort_order.collation != Collation::Binary
         || key.sort_order.custom_collation.is_some()
         || (without_rowid_range
-            && (index.is_autoindex
+            && ((index.is_autoindex && wr_declared_range_root != Some(index.root_pgno))
                 || index.stat1.is_some()
                 || column.is_primary_key
                 || table
@@ -33714,7 +33771,7 @@ fn view_dml_indexed_select(
         ..
     } = &mut narrowed.select.body.head
     {
-        if (tied_range || wr_index_pair || wr_range_with_unrelated_indexes)
+        if (tied_range || wr_forced_range_plan)
             && let TableOrSubquery::Table { indexed_by, .. } = &mut from.head
         {
             *indexed_by = Some(IndexHint::IndexedBy(index.name.clone()));

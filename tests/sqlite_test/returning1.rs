@@ -841,3 +841,41 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_returning_without_rowid_view_declared_range_indexes() {
+    sqliters_tcltest::run_test_script(
+        "returning_without_rowid_view_declared_range_indexes",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach {layout single compound indexes} {
+  explicit_partial {} {} {CREATE INDEX keyed ON base(k); CREATE INDEX shifted ON base(k+1) WHERE flag IS NOT NULL;}
+  inline_unique { UNIQUE} {} {}
+  inline_partial { UNIQUE} {} {CREATE INDEX shifted ON base(k+1) WHERE flag IS NOT NULL;}
+  inline_compound { UNIQUE} {, UNIQUE(code,k)} {CREATE INDEX keyed ON base(k); CREATE INDEX shifted ON base(k+1) WHERE flag IS NOT NULL;}
+} {
+  reset_db
+  execsql "CREATE TABLE base(id INT PRIMARY KEY, code NUM, k INT$single, label TEXT, flag INT$compound) WITHOUT ROWID;"
+  execsql {
+    CREATE TABLE seen(seq INTEGER PRIMARY KEY, id INTEGER);
+    INSERT INTO base VALUES (1,1,5,'one',NULL),(2,2,2,'two',7),(3,2,1,'three',NULL),(4,3,3,'four',8),(5,4,4,'five',9);
+    CREATE VIEW projected AS SELECT id,code,k,label,flag FROM base;
+    CREATE TRIGGER revise INSTEAD OF UPDATE ON projected BEGIN
+      INSERT INTO seen(id) VALUES(old.id);
+      UPDATE base SET label=new.label WHERE id=old.id;
+    END;
+  }
+  execsql $indexes
+  do_execsql_test returning-declared-range-$layout.1 {
+    UPDATE projected SET label=label||'!' WHERE k>1 RETURNING id;
+    SELECT changes();
+    SELECT id FROM seen ORDER BY seq;
+    SELECT id,label FROM base ORDER BY id;
+    PRAGMA integrity_check;
+  } {2 4 5 1 0 2 4 5 1 1 one! 2 two! 3 three 4 four! 5 five! ok}
+}
+finish_test
+"#,
+    );
+}
