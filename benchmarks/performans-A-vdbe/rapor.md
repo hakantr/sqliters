@@ -1892,3 +1892,8 @@ Mevcut Tcl paketleri iki kipte 874/874, 73/73 ve 8/8 ile normal koşuya alındı
 ## V6b.317 — Tek tırnaklı nitelikli sütun adları
 
 C’nin iki ve üç parçalı sütun adı söz dizimi mevcut nitelikli ayrıştırma yoluna bağlandı. 168 ham olay, 18 C salt okunur açılış ve dosya özetleri eş. Bir ayrıştırma regresyon testi eklendi. OFF 1193/1/331, ON 1190/4/331. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,263 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_317.md).
+
+
+## V6b.318 — NOT NULL test paketini etkinleştir
+
+Mevcut NOT NULL paketi iki çalışma kipinde etkin. 106/106 ham Tcl kontrolü, 12 olağan kısıt profili ve 18 C salt okunur dosya kontrolü eş. OFF 1194/1/330, ON 1191/4/330. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,277 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_318.md).

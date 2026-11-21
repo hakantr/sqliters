@@ -1,5 +1,4 @@
 #[test]
-#[ignore = "98/106 subtests passed; pending: notnull edge cases"]
 fn test_notnull() {
     sqliters_tcltest::run_test_script(
         "notnull",
