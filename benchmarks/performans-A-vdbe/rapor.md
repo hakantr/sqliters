@@ -1622,3 +1622,8 @@ Açık MAIN yazma işleminde aynı NUMERIC sütunun aynı yönlü iki koşulunda
 ## V6b.263 — Typed Julian çoklu süre değiştiricileri
 
 Yalnız süre ve hassasiyet bayrakları içeren typed INTEGER/REAL zincirleri, bir ham Julian dönüşümü, C birim sınırı, her adımın signed yuvarlaması ve tek final aralık kontrolünü kullanır. 1.573/1.573 C eş ve 1.122 fark kapandı. Üç kalıcı kodlama profili ile 120 C salt okunur açılışı geçti. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_263.md).
+
+
+## V6b.264 — Görünüm UPDATE farklı sütun aralığı
+
+Olağan görünüm UPDATE taramasında iki doğrudan sütun izdüşümü, kısmi indeksin aralık sütunu ile korunmuş plan sınırlarına göre eşlenir. Sabit C ve iki Rust kipi 252 hedef, 420 korunmuş fiziksel kapanış ve 9.414 C salt okunur açılışında eşleşti. OFF 1186/1/337, ON 1181/6/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_264.md).

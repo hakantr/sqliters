@@ -32304,7 +32304,6 @@ pub(crate) fn view_update_range_tokens(stmt: &Stmt, db_set: &DatabaseSet, sql: &
         };
         !left_col.double_quoted
             && !right_col.double_quoted
-            && left_col.column.eq_ignore_ascii_case(&right_col.column)
             && integer_bound(left_bound)
             && integer_bound(right_bound)
             && matches!(
@@ -32365,16 +32364,16 @@ fn view_dml_indexed_select(
     } else {
         None
     };
+    let distinct_columns = second_term.is_some_and(|(other, _, _)| {
+        !target_col.column.eq_ignore_ascii_case(&other.column)
+    });
     let mut same_range_direction = false;
     if !max_eq {
         let is_lower = view_dml_range_is_lower(op, bound, quoted_bound.is_some())?;
-        if let Some((other_col, other_op, other_bound)) = second_term {
-            if !target_col.column.eq_ignore_ascii_case(&other_col.column) {
-                return None;
-            }
+        if let Some((_, other_op, other_bound)) = second_term {
             same_range_direction =
                 is_lower == view_dml_range_is_lower(other_op, other_bound, false)?;
-            if same_range_direction && !ctx.stmt_tx.view_update_range_tokens {
+            if (same_range_direction || distinct_columns) && !ctx.stmt_tx.view_update_range_tokens {
                 return None;
             }
         }
@@ -32404,13 +32403,9 @@ fn view_dml_indexed_select(
     {
         return None;
     }
-    let output_column = col_specs
-        .iter()
-        .position(|(name, _, _)| name.eq_ignore_ascii_case(&target_col.column))?;
-    let column_name = if matches!(projection, [ResultColumn::Star]) {
-        &table.columns.get(output_column)?.name
-    } else {
-        if projection.len() != col_specs.len()
+    let star = matches!(projection, [ResultColumn::Star]);
+    if !star
+        && (projection.len() != col_specs.len()
             || !projection.iter().all(|item| {
                 matches!(
                     item,
@@ -32419,25 +32414,60 @@ fn view_dml_indexed_select(
                         ..
                     }
                 )
-            })
+            }))
+    {
+        return None;
+    }
+    let projected_index = |reference: &ColumnRef| {
+        let output_column = col_specs
+            .iter()
+            .position(|(name, _, _)| name.eq_ignore_ascii_case(&reference.column))?;
+        let column_name = if star {
+            &table.columns.get(output_column)?.name
+        } else {
+            let ResultColumn::Expr {
+                expr: Expr::Column(mapped),
+                ..
+            } = projection.get(output_column)?
+            else {
+                return None;
+            };
+            &mapped.column
+        };
+        table
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(column_name))
+    };
+    let column_index = projected_index(target_col)?;
+    let column = &table.columns[column_index];
+    let other_index = if distinct_columns {
+        let (other, other_op, _) = second_term?;
+        let index = projected_index(other)?;
+        let other_column = &table.columns[index];
+        let compatible = match (column.affinity, other_column.affinity) {
+            (TypeAffinity::Numeric, TypeAffinity::Integer) => {
+                matches!(op, BinaryOp::Ge | BinaryOp::Lt) && other_op == BinaryOp::Ge
+            }
+            (TypeAffinity::Integer, TypeAffinity::Numeric) => {
+                op == BinaryOp::Ge && matches!(other_op, BinaryOp::Ge | BinaryOp::Lt)
+            }
+            _ => false,
+        };
+        if !compatible
+            || other_column.is_primary_key
+            || other_column.collation != Collation::Binary
+            || other_column.custom_collation.is_some()
         {
             return None;
         }
-        let ResultColumn::Expr {
-            expr: Expr::Column(mapped),
-            ..
-        } = projection.get(output_column)?
-        else {
-            return None;
-        };
-        &mapped.column
+        index
+    } else {
+        column_index
     };
-    let column_index = table
-        .columns
-        .iter()
-        .position(|c| c.name.eq_ignore_ascii_case(column_name))?;
-    let column = &table.columns[column_index];
-    let make_term = |op, bound: &Expr| Expr::Binary {
+    let other_column = &table.columns[other_index];
+    let matches_key = |key| key == Some(column_index) || key == Some(other_index);
+    let make_term = |column: &ColumnSchema, op, bound: &Expr| Expr::Binary {
         left: Box::new(Expr::Column(ColumnRef {
             schema: None,
             table: Some(alias.unwrap_or(&name.name).to_owned()),
@@ -32448,12 +32478,12 @@ fn view_dml_indexed_select(
         right: Box::new(bound.clone()),
     };
     let make_selection = || {
-        let first = make_term(op, bound);
+        let first = make_term(column, op, bound);
         if let Some((_, other_op, other_bound)) = second_term {
             Expr::Binary {
                 left: Box::new(first),
                 op: BinaryOp::And,
-                right: Box::new(make_term(other_op, other_bound)),
+                right: Box::new(make_term(other_column, other_op, other_bound)),
             }
         } else {
             first
@@ -32487,7 +32517,7 @@ fn view_dml_indexed_select(
         && (second_term.is_none() || (has_partial && ctx.stmt_tx.view_update_range_tokens))
         && quoted_bound.is_none()
         && !table.without_rowid
-        && column.affinity == TypeAffinity::Numeric
+        && (column.affinity == TypeAffinity::Numeric || distinct_columns)
         && !column.is_primary_key
         && ctx.collations.get_custom("BINARY").is_none();
     if two_index_range
@@ -32501,9 +32531,8 @@ fn view_dml_indexed_select(
         return None;
     }
     let partial_range = two_index_range && has_partial;
-    // Only the matching partial-index path has established the same-direction
-    // scan order. Keep both terms in order so the planner uses the first bound.
-    if same_range_direction && !partial_range {
+    // These two-term shapes use only the proven partial-index path.
+    if (same_range_direction || distinct_columns) && !partial_range {
         return None;
     }
     if partial_range
@@ -32511,7 +32540,8 @@ fn view_dml_indexed_select(
             || (second_term.is_none() && op != BinaryOp::Ge)
             || indexes
                 .iter()
-                .any(|index| index.columns[0].col_idx != Some(column_index)))
+                .any(|index| !matches_key(index.columns[0].col_idx))
+            || (distinct_columns && indexes[0].columns[0].col_idx == indexes[1].columns[0].col_idx))
     {
         return None;
     }
@@ -32526,13 +32556,12 @@ fn view_dml_indexed_select(
         }) {
             return None;
         }
-        // In the two-index range case both keys are single columns and the
-        // range column is not the rowid. A different key cannot cover the range.
+        // Keep the single-column keys constrained by these range terms.
         indexes.retain(|index| {
             index
                 .columns
                 .first()
-                .is_some_and(|key| key.col_idx == Some(column_index))
+                .is_some_and(|key| matches_key(key.col_idx))
         });
     }
     let tied_range = two_index_range && indexes.len() == 2;
@@ -32543,16 +32572,20 @@ fn view_dml_indexed_select(
                 TransactionState::Read | TransactionState::Write
             )
         });
-        let needs_table = table.columns.iter().enumerate().any(|(i, col)| {
-            i != column_index
-                && Some(i) != table.rowid_alias_col
-                && (matches!(projection, [ResultColumn::Star])
-                    || projection.iter().any(|item| {
+        let needs_table = |key| {
+            table.columns.iter().enumerate().any(|(i, col)| {
+                i != key
+                    && Some(i) != table.rowid_alias_col
+                    && (star || projection.iter().any(|item| {
                         matches!(item, ResultColumn::Expr { expr: Expr::Column(reference), .. }
                             if reference.column.eq_ignore_ascii_case(&col.name))
                     }))
-        });
-        if !has_snapshot || !needs_table || table.columns.iter().any(|col| col.generated.is_some())
+            })
+        };
+        if !has_snapshot
+            || !needs_table(column_index)
+            || (distinct_columns && !needs_table(other_index))
+            || table.columns.iter().any(|col| col.generated.is_some())
         {
             return None;
         }
@@ -32564,7 +32597,10 @@ fn view_dml_indexed_select(
             else {
                 return None;
             };
-            if !partial_column.column.eq_ignore_ascii_case(&column.name)
+            let matches_column = |column: &ColumnSchema| {
+                partial_column.column.eq_ignore_ascii_case(&column.name)
+            };
+            if !(matches_column(column) || matches_column(other_column))
                 || partial_column.double_quoted
                 || (second_term.is_none() && partial_op != BinaryOp::Ge)
                 || !(0..=i64::from(i32::MAX)).contains(partial_bound)
@@ -32572,11 +32608,13 @@ fn view_dml_indexed_select(
             {
                 return None;
             }
-            let matches_partial = |op, bound: &Expr| {
-                op == partial_op && matches!(bound, Expr::Integer(value) if value == partial_bound)
+            let matches_partial = |column, op, bound: &Expr| {
+                matches_column(column)
+                    && op == partial_op
+                    && matches!(bound, Expr::Integer(value) if value == partial_bound)
             };
-            let eligible = matches_partial(op, bound)
-                || second_term.is_some_and(|(_, op, bound)| matches_partial(op, bound));
+            let eligible = matches_partial(column, op, bound)
+                || second_term.is_some_and(|(_, op, bound)| matches_partial(other_column, op, bound));
             let root = if eligible {
                 // A term in the normalized range is known to match structurally.
                 // Let the existing range planner price these two non-covering loops.
@@ -32620,7 +32658,7 @@ fn view_dml_indexed_select(
     if (index.where_clause.is_some() && !partial_range)
         || index.is_unordered()
         || index.columns.len() != expected_keys
-        || key.col_idx != Some(column_index)
+        || !matches_key(key.col_idx)
         || key.sort_order.collation != Collation::Binary
         || key.sort_order.custom_collation.is_some()
         || (without_rowid_range
