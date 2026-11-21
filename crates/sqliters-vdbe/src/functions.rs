@@ -2251,6 +2251,11 @@ fn eval_strftime_function(args: &[Value], ctx: &VmRuntimeContext) -> Result<Valu
     let jan1_days = days_from_civil(i64::from(y), 1, 1);
     let doy_1_based = (days - jan1_days) + 1;
 
+    let is_fixed_text_format = || {
+        matches!(args, [Value::Text(_), _])
+            && !fmt.contains('\0')
+            && !matches!(&args[1], Value::Text(text) if text.trim().eq_ignore_ascii_case("now"))
+    };
     let mut out = String::with_capacity(fmt.len() + 16);
     let mut chars = fmt.chars();
     while let Some(c) = chars.next() {
@@ -2269,12 +2274,16 @@ fn eval_strftime_function(args: &[Value], ctx: &VmRuntimeContext) -> Result<Valu
             'e' => out.push_str(&format!("{d:2}")),
             'H' => out.push_str(&format!("{hh:02}")),
             'k' => out.push_str(&format!("{hh:2}")),
-            'I' => {
+            'I' | 'l' if spec == 'I' || is_fixed_text_format() => {
                 let h12 = match hh % 12 {
                     0 => 12,
                     v => v,
                 };
-                out.push_str(&format!("{h12:02}"));
+                if spec == 'I' {
+                    out.push_str(&format!("{h12:02}"));
+                } else {
+                    out.push_str(&format!("{h12:2}"));
+                }
             }
             'M' => out.push_str(&format!("{mm:02}")),
             'S' => out.push_str(&format!("{ss:02}")),
@@ -2315,10 +2324,7 @@ fn eval_strftime_function(args: &[Value], ctx: &VmRuntimeContext) -> Result<Valu
             's' => out.push_str(&format!("{total_secs}")),
             'w' => out.push_str(&format!("{dow}")),
             'u' => out.push_str(&format!("{}", if dow == 0 { 7 } else { dow })),
-            'W' if matches!(args, [Value::Text(_), _])
-                && !fmt.contains('\0')
-                && !matches!(&args[1], Value::Text(text) if text.trim().eq_ignore_ascii_case("now")) =>
-            {
+            'W' if is_fixed_text_format() => {
                 let monday_index = (dow + 6) % 7;
                 let week = (doy_1_based + 6 - monday_index) / 7;
                 out.push_str(&format!("{week:02}"));

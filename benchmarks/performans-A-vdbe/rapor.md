@@ -1702,3 +1702,8 @@ Açık MAIN V2 görünüm UPDATE yeniden hazırlamasında dar bağlı NUMERIC ar
 ## V6b.279 — strftime Pazartesi başlangıçlı hafta
 
 Açık TEXT biçimi ve tek sabit tarih girdisinde strftime yüzde W, ilk Pazartesiye göre C hafta numarasını üretir. 27 Tcl vakası, üç kodlamada 1.786 hedef ve 18 C salt okunur açılışı eş. Önceki date-19 sonuçları korundu. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,270 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_279.md).
+
+
+## V6b.280 — strftime on iki saat alanı
+
+Açık TEXT biçimi ve tek sabit tarih girdisinde yüzde l, C'nin boşluk dolgulu on iki saat alanını üretir. Tcl date-3.29 kapandı. Üç kodlamada 2.034 sonuç, 18 C salt okunur açılışı ve önceki 27 W ile 42 date-19 koruması doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,274 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_280.md).
