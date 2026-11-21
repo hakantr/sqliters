@@ -14523,6 +14523,7 @@ mod tests {
     /// everything or end on duplicate keys, and 512-byte to 64 KiB pages (multi-level indexes).
     #[test]
     fn int_kernel_covering_aggregates_match_general_row_code() {
+        let _off = vdbe_host::ForceMachine::off();
         fn next(state: &mut u64) -> u64 {
             *state ^= *state << 13;
             *state ^= *state >> 7;

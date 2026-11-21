@@ -1642,3 +1642,8 @@ Açık MAIN yazma işleminde ayrı INTEGER eşitlik ve NUMERIC aralık sütunlar
 ## V6b.267 — Point UPDATE ve DELETE plan testi
 
 Mevcut test doğrudan rowid planı ile eski Rust VDBE’yi iki workspace ortamında aynı tam gövdeyle karşılaştırır. Test iş parçacığı geçici kipi güvenli geri yükler. Odaklı ve paralel ON/OFF testleri, 72 normal C/Rust DML tekrarı ve dosya baytları doğrulandı. OFF 1186/1/337, ON 1182/5/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,255 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_267.md).
+
+
+## V6b.268 — Tamsayı aggregate plan testi
+
+Mevcut testin sekiz profili, profil başına 700 işlemi ve tüm kıyasları iki workspace ortamında aynı gövdeyle çalışır. Üretim yolu için 48 normal COUNT ve SUM okuması, 48 C salt okunur açılışı ve ham tekrar eşliği doğrulandı. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,251 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_268.md).
