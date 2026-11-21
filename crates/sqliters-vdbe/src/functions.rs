@@ -2315,6 +2315,14 @@ fn eval_strftime_function(args: &[Value], ctx: &VmRuntimeContext) -> Result<Valu
             's' => out.push_str(&format!("{total_secs}")),
             'w' => out.push_str(&format!("{dow}")),
             'u' => out.push_str(&format!("{}", if dow == 0 { 7 } else { dow })),
+            'W' if matches!(args, [Value::Text(_), _])
+                && !fmt.contains('\0')
+                && !matches!(&args[1], Value::Text(text) if text.trim().eq_ignore_ascii_case("now")) =>
+            {
+                let monday_index = (dow + 6) % 7;
+                let week = (doy_1_based + 6 - monday_index) / 7;
+                out.push_str(&format!("{week:02}"));
+            }
             'P' => out.push_str(if hh < 12 { "am" } else { "pm" }),
             'p' => out.push_str(if hh < 12 { "AM" } else { "PM" }),
             _ => {

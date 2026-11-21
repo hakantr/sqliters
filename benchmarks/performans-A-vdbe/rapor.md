@@ -1697,3 +1697,8 @@ Geçerli ISO başlangıçta dört haneli işaretli takvim kaydırmasının termi
 ## V6b.278 — Görünüm UPDATE bağlı aralık
 
 Açık MAIN V2 görünüm UPDATE yeniden hazırlamasında dar bağlı NUMERIC aralık ve plain INTEGER kısmi predikat C yapısal karşılaştırmasını kullanır. 456 STEP kökü, 256 son dosya ve 5.476 C açılışı eş. Önceki eşitlik ve aynı tamsayı vakaları korundu. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_278.md).
+
+
+## V6b.279 — strftime Pazartesi başlangıçlı hafta
+
+Açık TEXT biçimi ve tek sabit tarih girdisinde strftime yüzde W, ilk Pazartesiye göre C hafta numarasını üretir. 27 Tcl vakası, üç kodlamada 1.786 hedef ve 18 C salt okunur açılışı eş. Önceki date-19 sonuçları korundu. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,270 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_279.md).
