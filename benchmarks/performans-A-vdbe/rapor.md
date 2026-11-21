@@ -1787,3 +1787,8 @@ C’nin farklı eşikte elediği kısmi indeks yerine tam indeksin aynı aralı�
 ## V6b.296 — Tcl test kabuğunda sabit saat
 
 Ayrı test host’ları için Tcl bağlı tamsayısı disk VFS saatine yansıtıldı. 77 Tcl linked-int ve 43 harness kontrolü geçti. İki kipte 21 tarih testi daha aynı beklentiyi verdi. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,289 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_296.md).
+
+
+## V6b.297 — WITHOUT ROWID farklı üst eşik
+
+C’nin farklı işlemciyle elediği aynı anahtarlı kısmi indeks yerine tam indeksin doğru üst sınırı kullanılacak. 80 eski tarama kökü ve 320 taze ilişki sonucu C ile eş. 18.552 salt okunur C bütünlük kontrolü geçti. OFF 1186/1/337, ON 1183/4/337. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,283 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_297.md).

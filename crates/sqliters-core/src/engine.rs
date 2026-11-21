@@ -32775,9 +32775,7 @@ fn view_dml_indexed_select(
             {
                 full
             }
-            (BinaryOp::Lt, BinaryOp::Le) if partial_matches_key && query_value == partial_value => {
-                full
-            }
+            (BinaryOp::Lt, BinaryOp::Le) if partial_matches_key => full,
             _ => return None,
         };
         Some(index.root_pgno)
