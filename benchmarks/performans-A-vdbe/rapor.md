@@ -1827,3 +1827,8 @@ Aynı anahtardaki iki unary eksi koşulunda C’nin tam aralık kökü kullanıl
 ## V6b.304 — Sabit ISO tarih BLOB girdisi
 
 Değiştiricisiz kanonik BLOB tarihleri mevcut ISO ayrıştırıcısıyla işlenir. 2.448 C typed sonuç, 3.036 C açılışı ve 36 çıktı imajı eş. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,263 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_304.md).
+
+
+## V6b.305 — VDBE saf tarih çağrısı koruması
+
+OP_PureFunc rolü ve P5 korunur. C’nin reddettiği beş yerleşik zaman çağrısının ölçülen biçimleri değerlendirme öncesi durur. İki rol birim kanıtı, 592 normal ham karşılaştırma ve 209 C açılışı geçti. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,264 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_305.md).

@@ -102,6 +102,16 @@ pub trait VdbeHost {
     fn find_collation(&mut self, name: &str) -> Option<CollRt>;
     /// `pFunc->xSFunc(pCtx, argc, argv)` of a scalar function.
     fn call_function(&mut self, func: &FuncDef, args: &[RuntimeValue]) -> Result<RuntimeValue>;
+    /// Preserves the call context of OP_PureFunc when the host supports it.
+    #[doc(hidden)]
+    fn call_pure_function(
+        &mut self,
+        func: &FuncDef,
+        args: &[RuntimeValue],
+        _context: u16,
+    ) -> Result<RuntimeValue> {
+        self.call_function(func, args)
+    }
     /// A fresh accumulator (`sqlite3_aggregate_context`) of aggregate function `func` called
     /// with `n_arg` arguments: its handle for the four calls below.
     fn agg_open(&mut self, func: &FuncDef, n_arg: usize) -> Result<usize>;
@@ -5079,7 +5089,11 @@ impl Vdbe {
                         out = m;
                     } else {
                         let args: Vec<RuntimeValue> = self.a_mem[p2..p2 + argc].iter().map(Mem::to_runtime_value).collect();
-                        let rv = host.call_function(func, &args)?;
+                        let rv = if op.opcode == OP_PureFunc {
+                            host.call_pure_function(func, &args, op.p5)?
+                        } else {
+                            host.call_function(func, &args)?
+                        };
                         out = mem_from_runtime(&rv);
                     }
                     // vdbeapi.c:sqlite3_result_text/value stores text in pCtx->enc.

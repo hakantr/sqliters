@@ -789,6 +789,43 @@ impl<'a> MachineHost<'a> {
     }
 }
 
+fn pure_datetime_error(
+    func: &FuncDef,
+    args: &[RuntimeValue],
+    context: u16,
+    functions: &FunctionRegistry,
+) -> Option<SqliteError> {
+    use sqliters_codegen::consts::{NC_GenCol, NC_IsCheck, SQLITE_FUNC_BUILTIN};
+
+    if func.func_flags & SQLITE_FUNC_BUILTIN == 0 {
+        return None;
+    }
+    let name = ["date", "time", "datetime", "julianday", "unixepoch"]
+        .into_iter()
+        .find(|name| func.name.eq_ignore_ascii_case(name))?;
+    // Only the ambient-time forms already recognized in this lane.
+    match args {
+        [] => {}
+        [arg] if matches!(&arg.value, Value::Text(text) if text.eq_ignore_ascii_case("now")) => {}
+        _ => return None,
+    }
+    if functions.find_scalar(name, args.len()).is_some() {
+        return None;
+    }
+    let context = i32::from(context);
+    let location = if context & NC_IsCheck != 0 {
+        "a CHECK constraint"
+    } else if context & NC_GenCol != 0 {
+        "a generated column"
+    } else {
+        "an index"
+    };
+    Some(SqliteError::new(
+        ErrorCode::Error,
+        format!("non-deterministic use of {name}() in {location}"),
+    ))
+}
+
 /// The methods of [`VdbeHost`] that are the same for a statement that reads
 /// ([`MachineHost`]) and one that writes ([`WriteHost`]).
 macro_rules! host_common {
@@ -830,6 +867,18 @@ macro_rules! host_common {
                 );
             }
             self.svc().call_scalar(&func.name, args)
+        }
+
+        fn call_pure_function(
+            &mut self,
+            func: &FuncDef,
+            args: &[RuntimeValue],
+            context: u16,
+        ) -> Result<RuntimeValue> {
+            if let Some(error) = pure_datetime_error(func, args, context, self.svc().functions) {
+                return Err(error);
+            }
+            self.call_function(func, args)
         }
 
         fn agg_open(&mut self, func: &FuncDef, n_arg: usize) -> Result<usize> {
