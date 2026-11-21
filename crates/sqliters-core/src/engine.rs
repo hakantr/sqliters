@@ -32751,31 +32751,54 @@ fn view_dml_indexed_select(
             _ => return None,
         };
         let (partial_col, partial_op, partial_bound) = view_dml_index_term(where_clause)?;
-        let (Expr::Integer(query_value), Expr::Integer(partial_value)) = (bound, partial_bound) else {
+        let Expr::Integer(query_value) = bound else {
             return None;
         };
+        let partial_sql = partial.raw_sql.as_deref()?;
         if !ctx.stmt_tx.view_update_range_tokens
             || !matches_key(full.columns[0].col_idx)
             || partial_col.double_quoted
             || !partial_col.column.eq_ignore_ascii_case(&column.name)
-            || !(0..=i64::from(i32::MAX)).contains(partial_value)
-            || !has_plain_integer_tokens(partial.raw_sql.as_deref()?, true)
+            || !has_plain_integer_tokens(partial_sql, true)
         {
             return None;
         }
-        // C admits equal literal predicates and gives the partial range a lower estimate.
-        // The other supported pairs are structurally different before cost estimation.
         let partial_matches_key = matches_key(partial.columns[0].col_idx);
-        let index = match (op, partial_op) {
-            (BinaryOp::Ge, BinaryOp::Ge) | (BinaryOp::Lt, BinaryOp::Lt) if partial_matches_key => {
-                if query_value == partial_value { partial } else { full }
+        let index = match partial_bound {
+            Expr::Integer(partial_value) if (0..=i64::from(i32::MAX)).contains(partial_value) => {
+                // C admits equal literal predicates and gives the partial range a lower estimate.
+                match (op, partial_op) {
+                    (BinaryOp::Ge, BinaryOp::Ge) | (BinaryOp::Lt, BinaryOp::Lt)
+                        if partial_matches_key =>
+                    {
+                        if query_value == partial_value { partial } else { full }
+                    }
+                    (BinaryOp::Ge, BinaryOp::Ge)
+                        if query_value != partial_value && column.affinity == TypeAffinity::Integer =>
+                    {
+                        full
+                    }
+                    (BinaryOp::Lt, BinaryOp::Le) if partial_matches_key => full,
+                    _ => return None,
+                }
             }
-            (BinaryOp::Ge, BinaryOp::Ge)
-                if query_value != partial_value && column.affinity == TypeAffinity::Integer =>
+            Expr::Float(value)
+                if op == BinaryOp::Ge
+                    && partial_op == BinaryOp::Ge
+                    && partial_matches_key
+                    && column.affinity == TypeAffinity::Integer
+                    && value.is_finite() =>
             {
+                // The AST can also turn a large INTEGER or folded expression into Float.
+                // Require the original partial predicate to end in a bare REAL RHS.
+                let tokens = tokenize(partial_sql).ok()?;
+                let mut end = tokens.iter().rev().map(|token| token.kind)
+                    .skip_while(|kind| matches!(kind, TokenKind::Semi | TokenKind::Eof));
+                if end.next() != Some(TokenKind::Float) || end.next() != Some(TokenKind::Ge) {
+                    return None;
+                }
                 full
             }
-            (BinaryOp::Lt, BinaryOp::Le) if partial_matches_key => full,
             _ => return None,
         };
         Some(index.root_pgno)

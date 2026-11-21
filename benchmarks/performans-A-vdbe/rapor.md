@@ -1797,3 +1797,8 @@ C’nin farklı işlemciyle elediği aynı anahtarlı kısmi indeks yerine tam i
 ## V6b.298 — Date3 ve func2 normal workspace
 
 İki testin eski ignore satırı kaldırıldı. Dört normal odak koşusu geçti. Ayrı Tcl doğrulamasında her kipte date3 126/126 ve func2 131/131. Tam workspace için iki ek geçen ve iki eksik ignore denetlenir. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_298.md).
+
+
+## V6b.299 — WITHOUT ROWID INTEGER ve REAL indeks koşulu
+
+INTEGER sorgu ve çıplak REAL kısmi koşulunda C’nin tam indeks seçimi uygulanır. 160 eski, 320 taze ve 80 ek token sonucu eş. 21.768 C salt okunur bütünlük kontrolü geçti. OFF 1188/1/335, ON 1185/4/335. DML OFF 391/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,227 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_299.md).
