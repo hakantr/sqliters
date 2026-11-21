@@ -985,7 +985,7 @@ pub(crate) fn choose_wr_delete_covering_scan(
 }
 
 /// Compare full scans of the primary and secondary B-trees when there is
-/// no predicate, ordering requirement, or ANALYZE estimate to price.
+/// no predicate or ordering requirement to price.
 fn choose_unordered_without_rowid_scan(
     tbl: &TableSchema,
     schema_name: &str,
@@ -1024,9 +1024,17 @@ fn choose_unordered_without_rowid_scan(
     {
         return None;
     }
-    if tbl.stat1.has_stat1
+    let has_statistics = tbl.stat1.has_stat1
         || tbl.without_rowid_pk_stat1.is_some()
-        || indexes.iter().any(|idx| idx.stat1.is_some())
+        || indexes.iter().any(|idx| idx.stat1.is_some());
+    if has_statistics
+        && (covering_autoindex.is_none()
+            || schema.stat1_rows.iter().any(|(table, _, stats)| {
+                table.eq_ignore_ascii_case(&tbl.name)
+                    && stats.split_ascii_whitespace().any(|value| {
+                        !value.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            }))
     {
         return None;
     }
@@ -1058,7 +1066,10 @@ fn choose_unordered_without_rowid_scan(
         } else {
             idx.default_sz_idx_row(tbl)
         };
-        let cost = full_index_scan_cost(tbl.stat1.n_row_log_est, index_size, table_size, is_covering);
+        let row_estimate = idx.stat1.as_ref()
+            .and_then(|stat| stat.row_log_est.first().copied())
+            .unwrap_or(tbl.stat1.n_row_log_est);
+        let cost = full_index_scan_cost(row_estimate, index_size, table_size, is_covering);
         if cost < best_cost {
             best_cost = cost;
             best_plan = if is_primary {
