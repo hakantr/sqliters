@@ -168,9 +168,10 @@ pub fn sqlite3_expr_coll_seq(p: &mut Parse, e: ExprId) -> Option<Arc<CollSeq>> {
             let j = ex.i_column;
             if j >= 0 {
                 let z_coll = p.tab(ex.y_tab).a_col[j as usize].z_coll.clone();
-                // sqlite3ColumnColl() / sqlite3FindCollSeq(db, ENC(db), zColl, 0)
+                // A declared collation has a schema entry even without a comparator.
+                // sqlite3CheckCollSeq reports the missing comparator on first use.
                 p_coll = match z_coll {
-                    Some(z) => sqlite3_find_coll_seq(p, &z),
+                    Some(z) => sqlite3_get_coll_seq(p, &z),
                     // sqlite3FindCollSeq(db, enc, 0, 0) is db->pDfltColl
                     None => Some(dflt_coll(p)),
                 };
@@ -210,8 +211,6 @@ pub fn sqlite3_expr_coll_seq(p: &mut Parse, e: ExprId) -> Option<Arc<CollSeq>> {
             break;
         }
     }
-    // sqlite3CheckCollSeq(): a collation found through sqlite3FindCollSeq always has a
-    // comparison function here.
     p_coll
 }
 

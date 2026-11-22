@@ -2132,3 +2132,8 @@ Tam INTEGER ve uygun kısmi TEXT indeksinin ayrı kullanıldığı 240 profilde 
 ## V6b.365 — Rowid görünüm UPDATE kısmi indeks koşulu
 
 Literal koşul eşliği ve IS NOT NULL çıkarımı C ile eşleşti. 360 profil ve 250 kapanış doğrulandı. OFF 1241/1/329, ON 1238/4/329. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_365.md).
+
+
+## V6b.366 — Kaldırılan sütun karşılaştırma kuralının hazırlama tanısı
+
+72 hazırlama karşılaştırması C ile eşleşti. 36 C yeniden açılışı ve DB dosyası doğrulandı. OFF 1242/1/329, ON 1239/4/329. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,275 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_366.md).
