@@ -718,3 +718,44 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_rowid_view_update_mixed_range_single_index() {
+    sqliters_tcltest::run_test_script(
+        "rowid_view_update_mixed_range_single_index",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach {layout index limits transaction returning order} {
+  integer_desc {CREATE INDEX range_a ON base(a DESC);} {b>4 AND a<6} {} {RETURNING a} {5 3 2 1}
+  integer_asc {CREATE INDEX range_a ON base(a);} {a<6 AND b>4} {BEGIN IMMEDIATE;} {} {1 2 3 5}
+  text_asc {CREATE INDEX range_b ON base(b) WHERE b>4;} {a<6 AND b>4} {} {RETURNING a} {1 3 5 2}
+  text_desc {CREATE INDEX range_b ON base(b DESC) WHERE b>4;} {b>4 AND a<6} {BEGIN IMMEDIATE;} {} {2 5 3 1}
+} {
+  reset_db
+  execsql {
+    CREATE TABLE base(a INT NOT NULL, b TEXT, c NUM);
+    CREATE TABLE seen(seq INTEGER PRIMARY KEY, a INT);
+    INSERT INTO base VALUES (6,'6',60),(3,'8',30),(1,'7',10),(4,'2',40),(5,'9',50),(2,'text',20);
+    CREATE VIEW projected AS SELECT a,b,c FROM base;
+    CREATE TRIGGER revise INSTEAD OF UPDATE ON projected BEGIN
+      INSERT INTO seen(a) VALUES(old.a);
+      UPDATE base SET c=new.c WHERE a=old.a;
+    END;
+  }
+  execsql "$index $transaction"
+  set returned {}
+  if {$returning ne {}} { set returned $order }
+  do_execsql_test single-mixed-rowid-update-range-$layout.1 "
+    UPDATE projected SET c=c+1 WHERE $limits $returning;
+    SELECT changes();
+    SELECT a FROM seen ORDER BY seq;
+    SELECT a,c FROM base ORDER BY a;
+    PRAGMA integrity_check;
+  " [concat $returned {0} $order {1 11 2 21 3 31 4 40 5 51 6 60 ok}]
+  if {$transaction ne {}} { execsql COMMIT }
+}
+finish_test
+"#,
+    );
+}

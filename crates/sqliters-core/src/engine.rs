@@ -33412,23 +33412,10 @@ fn view_dml_indexed_select(
         return None;
     }
     let rowid_text_root = if rowid_text_range {
-        let [first, second] = indexes.as_slice() else {
-            return None;
-        };
-        let (full, partial) = match (&first.where_clause, &second.where_clause) {
-            (None, Some(_)) => (first, second),
-            (Some(_), None) => (second, first),
-            _ => return None,
-        };
         let (text_col, text_bound, int_col) = if column.affinity == TypeAffinity::Text {
             (column_index, bound, other_index)
         } else {
             (other_index, second_term?.2, column_index)
-        };
-        let (part_col, BinaryOp::Gt, Expr::Integer(part_bound)) =
-            view_dml_index_term(partial.where_clause.as_ref()?)?
-        else {
-            return None;
         };
         let simple_index = |index: &IndexSchema, column| {
             !index.is_autoindex
@@ -33438,16 +33425,29 @@ fn view_dml_indexed_select(
                     && key.sort_order.collation == Collation::Binary
                     && key.sort_order.custom_collation.is_none())
         };
-        if !simple_index(full, int_col)
-            || !simple_index(partial, text_col)
-            || part_col.double_quoted
-            || !part_col.column.eq_ignore_ascii_case(&table.columns[text_col].name)
-            || !matches!(text_bound, Expr::Integer(value) if value == part_bound)
-            || !has_plain_integer_tokens(partial.raw_sql.as_deref()?, true)
-        {
-            return None;
-        }
-        let indexed_by = IndexHint::IndexedBy(partial.name.clone());
+        let full_index = |index: &IndexSchema| {
+            index.where_clause.is_none() && simple_index(index, int_col)
+        };
+        let matching_text_index = |index: &IndexSchema| {
+            let Some((part_col, BinaryOp::Gt, Expr::Integer(part_bound))) =
+                index.where_clause.as_ref().and_then(view_dml_index_term)
+            else {
+                return false;
+            };
+            simple_index(index, text_col)
+                && !part_col.double_quoted
+                && part_col.column.eq_ignore_ascii_case(&table.columns[text_col].name)
+                && matches!(text_bound, Expr::Integer(value) if value == part_bound)
+                && index.raw_sql.as_deref().is_some_and(|sql| has_plain_integer_tokens(sql, true))
+        };
+        // For the proven pair, C gives the matching partial range priority.
+        let expected = match indexes.as_slice() {
+            [only] if full_index(only) || matching_text_index(only) => only,
+            [first, second] if full_index(first) && matching_text_index(second) => second,
+            [first, second] if full_index(second) && matching_text_index(first) => first,
+            _ => return None,
+        };
+        let indexed_by = IndexHint::IndexedBy(expected.name.clone());
         let AccessPlan::IndexRangeScan { index, range_col_idx: Some(0), skip_scan_cols: 0, .. } =
             choose_access_plan_with_context(
                 table,
@@ -33464,7 +33464,7 @@ fn view_dml_indexed_select(
         else {
             return None;
         };
-        if index.root_pgno != partial.root_pgno {
+        if index.root_pgno != expected.root_pgno {
             return None;
         }
         Some(index.root_pgno)
