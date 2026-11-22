@@ -3508,6 +3508,20 @@ impl Vfs for OsVfs {
             ));
         }
 
+        #[cfg(unix)]
+        let anonymous_temp = path.is_none() && !flags.is_readonly()
+            && flags.contains(OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::EXCLUSIVE | OpenFlags::DELETEONCLOSE)
+            && (flags.contains(OpenFlags::TEMP_JOURNAL) || flags.contains(OpenFlags::TRANSIENT_DB));
+        #[cfg(unix)]
+        let (temp_directory, unnamed) = if anonymous_temp {
+            let (directory, file) = sys::unix::open_anonymous_temp()?;
+            (Some(directory), file)
+        } else {
+            (None, None)
+        };
+        #[cfg(not(unix))]
+        let (temp_directory, unnamed): (Option<PathBuf>, Option<File>) = (None, None);
+
         let target_path = match path {
             Some(p) => {
                 #[cfg(unix)]
@@ -3535,13 +3549,16 @@ impl Vfs for OsVfs {
                     sys::windows::win_full_pathname(p)?
                 }
             }
-            None => make_temp_file_path(),
+            None => match temp_directory {
+                Some(directory) => make_temp_file_path_in(&directory),
+                None => make_temp_file_path(),
+            },
         };
 
         // Pre-open geometry conflict check on existing Unix inodes so we don't even open a
         // descriptor when an active inode uses a different `LockGeometry`!
         #[cfg(unix)]
-        if let Ok(existing_meta) = fs::metadata(&target_path) {
+        if unnamed.is_none() && let Ok(existing_meta) = fs::metadata(&target_path) {
             use std::os::unix::fs::MetadataExt;
             let pre_key = (existing_meta.dev(), existing_meta.ino());
             let pre_info = lookup_inode_info(pre_key);
@@ -3586,18 +3603,6 @@ impl Vfs for OsVfs {
             );
         }
 
-        #[cfg(unix)]
-        let anonymous_temp = path.is_none() && !readonly
-            && flags.contains(OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::EXCLUSIVE | OpenFlags::DELETEONCLOSE)
-            && (flags.contains(OpenFlags::TEMP_JOURNAL) || flags.contains(OpenFlags::TRANSIENT_DB));
-        #[cfg(target_os = "linux")]
-        let unnamed = if anonymous_temp {
-            target_path.parent().and_then(sys::unix::open_unnamed_temp)
-        } else {
-            None
-        };
-        #[cfg(not(target_os = "linux"))]
-        let unnamed = None;
         #[cfg(unix)]
         let has_unnamed_inode = unnamed.is_some();
         let file = if let Some(file) = unnamed {
@@ -3886,6 +3891,10 @@ fn fill_random_bytes(buf: &mut [u8]) {
 }
 
 fn make_temp_file_path() -> PathBuf {
+    make_temp_file_path_in(&std::env::temp_dir())
+}
+
+fn make_temp_file_path_in(directory: &Path) -> PathBuf {
     // Prefix "etilqs_" matches SQLITE_TEMP_FILE_PREFIX in sqlite/src/os.h!
     let mut rnd = [0u8; 10];
     fill_random_bytes(&mut rnd);
@@ -3893,7 +3902,7 @@ fn make_temp_file_path() -> PathBuf {
     for b in rnd {
         suffix.push_str(&format!("{b:02x}"));
     }
-    std::env::temp_dir().join(format!("etilqs_{suffix}"))
+    directory.join(format!("etilqs_{suffix}"))
 }
 
 #[cfg(test)]

@@ -2447,3 +2447,8 @@ Literal ve bağlı parametreli 576 C profilinde 1.440 adım ve 461.760 VFS okuma
 ## V6b.428 — Anonim sıralama ve geçici indeks dosyalarının ömrü
 
 İki dosya türü ve iki umask altında C ile aynı 0600, sıfır dizin bağı ve temiz süreç sonlandırması doğrulandı. 576 LIMIT/OFFSET profili yeniden eşleşti; MMAP_SIZE bildirimi hatası sıralamayı kesmedi. OFF 1307/1/325, ON 1305/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,277 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_428.md).
+
+
+## V6b.429 — Unix PMA ve geçici indeks dizini seçimi
+
+64 doğrudan VFS ve 72 gerçek diske taşan SQL profili her Rust kipinde C ile eşleşti. 40 VFS ve 48 SQL farkı kapandı. OFF 1307/1/325, ON 1305/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_429.md).

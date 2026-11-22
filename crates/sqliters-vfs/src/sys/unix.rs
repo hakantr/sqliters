@@ -17,7 +17,7 @@ compile_error!(
     "sqliters-vfs Unix sys backend is currently verified only on 64-bit Linux and macOS"
 );
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString, c_char};
 use std::fs::{self, File};
 use std::io::ErrorKind;
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
@@ -75,9 +75,42 @@ pub(crate) const O_NOFOLLOW: i32 = 0x0100;
 )))]
 pub(crate) const O_NOFOLLOW: i32 = 0;
 
+/// Selects the first usable directory in the Unix temporary-file search.
+fn temp_file_dir() -> Option<PathBuf> {
+    std::env::var_os("SQLITE_TMPDIR")
+        .into_iter()
+        .chain(std::env::var_os("TMPDIR"))
+        .map(PathBuf::from)
+        .chain(["/var/tmp", "/usr/tmp", "/tmp", "."].map(PathBuf::from))
+        .find(|dir| {
+            if !dir.is_dir() {
+                return false;
+            }
+            const W_OK: i32 = 2;
+            const X_OK: i32 = 1;
+            CString::new(dir.as_os_str().as_bytes()).is_ok_and(|path| {
+                // SAFETY: path is a valid NUL-terminated string for this access(2) call.
+                unsafe { access(path.as_ptr(), W_OK | X_OK) == 0 }
+            })
+        })
+}
+
+/// `unixOpen` first tries an unnamed inode, then selects a directory for the named fallback.
+pub(crate) fn open_anonymous_temp() -> Result<(PathBuf, Option<File>)> {
+    #[cfg(target_os = "linux")]
+    if let Some(dir) = temp_file_dir()
+        && let Some(file) = open_unnamed_temp(&dir)
+    {
+        return Ok((dir, Some(file)));
+    }
+    temp_file_dir().map(|dir| (dir, None)).ok_or_else(|| {
+        SqliteError::with_extended(extended::SQLITE_IOERR_GETTEMPPATH, "disk I/O error")
+    })
+}
+
 /// `unixOpen` first tries an unnamed inode for disposable temporary files.
 #[cfg(target_os = "linux")]
-pub(crate) fn open_unnamed_temp(directory: &Path) -> Option<File> {
+fn open_unnamed_temp(directory: &Path) -> Option<File> {
     use std::os::unix::fs::OpenOptionsExt;
 
     if O_NOFOLLOW == 0 {
@@ -217,6 +250,7 @@ const MAP_FAILED_ADDR: usize = usize::MAX;
 struct LinuxStatfsBuf([usize; 32]);
 
 unsafe extern "C" {
+    fn access(path: *const c_char, mode: i32) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn ftruncate(fd: i32, length: i64) -> i32;
     fn close(fd: i32) -> i32;
