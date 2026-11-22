@@ -468,6 +468,61 @@ pub(crate) fn row_case_read_program(
     read_machine_program(inner, Some(stmt), sql, n_param, ReadMachineScope::RowCase, bound_values, None)
 }
 
+/// Replace only the confirmed prepare-time diagnostic for a row subquery
+/// compared with scalar WHEN values. The probe never supplies an executable program.
+pub(crate) fn scalar_when_row_subquery_error(
+    inner: &ConnectionInner,
+    select: &sqliters_syntax::SelectStmt,
+    sql: &str,
+    legacy_message: &str,
+) -> Option<SqliteError> {
+    use crate::dml_c::{Walk, walk_select};
+    use sqliters_syntax::{Expr, ResultColumn, SelectCore};
+
+    let width = legacy_message.strip_prefix("sub-select returns ")?
+        .strip_suffix(" columns - expected 1")?.parse::<usize>().ok()?;
+    if width < 2 {
+        return None;
+    }
+    let mut scalar_when = false;
+    let mut custom_collation = false;
+    walk_select(select, &mut |expr| {
+        if let Expr::Case { operand: Some(operand), branches, .. } = expr
+            && let Expr::Subquery(query) = operand.as_ref()
+        {
+            // Star projection widths are decided by C after name resolution.
+            let could_return_row = match &query.body.head {
+                SelectCore::Select { projection, .. } => projection.len() > 1
+                    || projection.iter().any(|column| {
+                        matches!(column, ResultColumn::Star | ResultColumn::TableStar { .. })
+                    }),
+                SelectCore::Values(rows) => rows.first().is_some_and(|row| row.len() > 1),
+            };
+            scalar_when |= could_return_row && branches.iter().all(|(when, _)| {
+                !matches!(when, Expr::RowValue(_) | Expr::Subquery(_))
+            });
+        }
+        if let Expr::Collate { collation, .. } = expr {
+            custom_collation |= inner.collations.get_custom(collation).is_some();
+        }
+        Walk::Deep
+    });
+    if !scalar_when || custom_collation || read_codegen_blocker(inner).is_some()
+        || inner.collations.get_custom("BINARY").is_some()
+    {
+        return None;
+    }
+    match crate::cgen::c_prepare_diagnostic(inner, sql) {
+        PrepareResult::Error { code, message, offset }
+            if code == ErrorCode::Error as i32 && message == "row value misused" =>
+        {
+            Some(SqliteError::with_extended(code, message)
+                .with_offset(usize::try_from(offset).unwrap_or(SqliteError::NO_OFFSET)))
+        }
+        _ => None,
+    }
+}
+
 fn select_has_row_case(select: &sqliters_syntax::SelectStmt) -> bool {
     use crate::dml_c::{Walk, walk_select};
     use sqliters_syntax::Expr;
@@ -563,18 +618,11 @@ pub(crate) fn live_table_join_read_program(
     }).then_some(program)
 }
 
-fn read_machine_program(
-    inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, scope: ReadMachineScope, bound_values: Option<&[Value]>,
-    precompiled: Option<Box<Program>>,
-) -> Result<Option<Arc<Program>>> {
-    if !matches!(stmt, Some(Stmt::Select(_))) {
-        return Ok(None);
-    }
+fn read_codegen_blocker(inner: &ConnectionInner) -> Option<&'static str> {
     if inner.authorizer.is_some() {
         // C's generator asks the authorizer while it resolves names (sqlite3AuthRead); the port
         // of the generator has no authorizer hook yet.
-        trace("fallback: authorizer", raw_sql);
-        return Ok(None);
+        return Some("fallback: authorizer");
     }
     // A schema that declares an application-defined collation: C refuses a statement that
     // needs a collation that is not registered ("no such collation sequence"), and a
@@ -585,7 +633,20 @@ fn read_machine_program(
             || slot.schema.indexes.iter().any(|ix| ix.columns.iter().any(|ic| ic.sort_order.custom_collation.is_some()))
     });
     if custom_coll {
-        trace("fallback: schema with an application-defined collation", raw_sql);
+        return Some("fallback: schema with an application-defined collation");
+    }
+    None
+}
+
+fn read_machine_program(
+    inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, scope: ReadMachineScope, bound_values: Option<&[Value]>,
+    precompiled: Option<Box<Program>>,
+) -> Result<Option<Arc<Program>>> {
+    if !matches!(stmt, Some(Stmt::Select(_))) {
+        return Ok(None);
+    }
+    if let Some(blocker) = read_codegen_blocker(inner) {
+        trace(blocker, raw_sql);
         return Ok(None);
     }
     let prepared = if scope == ReadMachineScope::SchemaFree {

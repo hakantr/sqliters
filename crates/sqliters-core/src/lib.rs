@@ -6501,7 +6501,10 @@ fn refine_prepare_error(
     if error.code != ErrorCode::Error {
         return error;
     }
-    if matches!(stmt, Some(Stmt::Select(_))) {
+    if let Some(Stmt::Select(select)) = stmt {
+        if let Some(diagnostic) = vdbe_host::scalar_when_row_subquery_error(inner, select, sql, &error.message) {
+            return diagnostic;
+        }
         return select_name_error_offset(inner, sql, error);
     }
     if inner.authorizer.is_some() {

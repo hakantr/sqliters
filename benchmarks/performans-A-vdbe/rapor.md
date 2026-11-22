@@ -2222,3 +2222,8 @@ Ana veritabanında BINARY anahtarlı CASE okumalarında karma kodlamalı arama a
 ## V6b.383 — Toplama ve pencere sonucu metin kodlaması
 
 VDBE toplama ve pencere metin sonuçlarını veritabanının kodlamasına getiriyor. 504 gözlemde 112 C bayt farkı kapandı ve 392 önceki eşleşme korundu. Fiziksel indeks ve DISTINCT kontrolleri eş. OFF 1261/1/325, ON 1258/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_383.md).
+
+
+## V6b.384 — Skaler WHEN ile satır CASE hazırlama tanısı
+
+Çok sütunlu alt sorgu ile skaler WHEN karşılaştırmasında C hazırlama tanısı korunuyor. Ana 558 gözlemde 10 ve ek 144 gözlemde 30 fark kapandı. Skaler sonuçlar, tanımsız WHEN adı ve 24 API koruma gözlemi aynı. OFF 1262/1/325, ON 1259/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,270 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_384.md).

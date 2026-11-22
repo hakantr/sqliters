@@ -771,3 +771,64 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_scalar_when_row_subquery_width_diagnostic() {
+    sqliters_tcltest::run_test_script(
+        "scalar_when_row_subquery_width_diagnostic",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+proc width_scalar_call {x} {
+    lappend ::calls $x
+    return [expr {int($x)}]
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    db function width_scalar_call -argcount 1 width_scalar_call
+    execsql {
+        CREATE TABLE detail(id INTEGER PRIMARY KEY,a INT,b INT);
+        INSERT INTO detail VALUES(1,1,10),(2,2,20);
+    }
+    do_catchsql_test scalar-when-width-$encoding.explicit {
+        SELECT CASE (SELECT a,b FROM detail WHERE id=1) WHEN 1 THEN 'yes' END;
+    } {1 {row value misused}}
+    do_catchsql_test scalar-when-width-$encoding.star {
+        SELECT CASE (SELECT * FROM (SELECT a,b FROM detail WHERE id=1)) WHEN 1 THEN 'yes' END;
+    } {1 {row value misused}}
+    do_catchsql_test scalar-when-width-$encoding.qualified-star {
+        SELECT CASE (SELECT d.* FROM detail d WHERE id=1) WHEN 1 THEN 'yes' END;
+    } {1 {row value misused}}
+    do_catchsql_test scalar-when-width-$encoding.values {
+        SELECT CASE (VALUES(1,10)) WHEN 1 THEN 'yes' WHEN 2 THEN 'other' END;
+    } {1 {row value misused}}
+    do_catchsql_test scalar-when-width-$encoding.projection {
+        SELECT (SELECT a,b FROM detail WHERE id=1);
+    } {1 {sub-select returns 2 columns - expected 1}}
+    do_execsql_test scalar-when-width-$encoding.controls {
+        SELECT CASE (SELECT a FROM detail WHERE id=1) WHEN 1 THEN 'single' END;
+        SELECT CASE (SELECT * FROM (SELECT a FROM detail WHERE id=1)) WHEN 1 THEN 'star' END;
+        SELECT CASE (SELECT d.* FROM (SELECT a FROM detail WHERE id=1) d) WHEN 1 THEN 'qualified' END;
+        SELECT CASE (SELECT a,b FROM detail WHERE id=1) WHEN (1,10) THEN 'row' END;
+    } {single star qualified row}
+    do_test scalar-when-width-$encoding.callback {
+        set ::calls {}
+        set q [execsql {SELECT CASE (SELECT width_scalar_call(a) FROM detail WHERE id=1) WHEN 1 THEN 'yes' END;}]
+        list $q $::calls
+    } {yes 1}
+    do_test scalar-when-width-$encoding.reprepare {
+        execsql {CREATE TABLE evolving(a INT); INSERT INTO evolving VALUES(1);}
+        set s [sqlite3_prepare_v2 db {SELECT CASE (SELECT * FROM evolving) WHEN 1 THEN 8 END;} -1]
+        set first [list [sqlite3_step $s] [sqlite3_column_int $s 0]]
+        sqlite3_reset $s
+        execsql {ALTER TABLE evolving ADD COLUMN b INT;}
+        set rc [sqlite3_step $s]
+        set message [sqlite3_errmsg db]
+        list $first $rc $message [sqlite3_finalize $s]
+    } {{SQLITE_ROW 8} SQLITE_ERROR {row value misused} SQLITE_ERROR}
+}
+finish_test
+"#,
+    );
+}
