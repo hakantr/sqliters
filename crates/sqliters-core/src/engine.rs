@@ -52599,14 +52599,17 @@ fn validate_update_static_inner(
                     Some((&modified, chng_rowid)),
                     false,
                 )?;
+                let check_parent_mask = if tbl.without_rowid {
+                    effective_or_conflict == Some(ConflictAction::Abort)
+                } else {
+                    effective_or_conflict.is_none() && !db_set.has_any_triggers()
+                };
                 if db_id == DatabaseId::MAIN
-                    && !tbl.without_rowid
                     && trig_depth == 0
                     && upd.ctes.is_empty()
                     && upd.from.is_none()
                     && upd.returning.is_empty()
-                    && effective_or_conflict.is_none()
-                    && !db_set.has_any_triggers()
+                    && check_parent_mask
                 {
                     validate_fk_oldmask_static(db_set, db_id, &tbl, &modified, chng_rowid)?;
                 }
