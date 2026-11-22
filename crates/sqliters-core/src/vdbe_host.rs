@@ -1270,6 +1270,10 @@ macro_rules! host_common {
             mask
         }
 
+        fn sorter_vfs(&mut self) -> Option<Arc<dyn sqliters_vfs::Vfs>> {
+            Some(Arc::clone(self.dbs().disk_vfs()))
+        }
+
         fn sorter_config(&mut self) -> (i64, i64, bool) {
             let bt = self.dbs().main_btree();
             (i64::from(bt.pager().page_size()), i64::from(bt.cache_size()), self.dbs().temp_store().is_memory())

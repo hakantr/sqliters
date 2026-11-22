@@ -12,3 +12,4 @@ workspace = true
 [dependencies]
 sqliters-types = { path = "../sqliters-types" }
 sqliters-btree = { path = "../sqliters-btree" }
+sqliters-vfs = { path = "../sqliters-vfs" }

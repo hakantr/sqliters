@@ -2417,3 +2417,8 @@ PMA okuyucu ağacı ve 16 üstündeki ara gruplar C ile aynı adım düzeninde i
 ## V6b.422 — WITHOUT ROWID OR için filtreli IN üreticileri
 
 Tek karşılaştırmalı filtre, indeks aralığı ve tek yerleşik ABS üreticisi 112 farkı kapattı. 168 tam C planı ve 84 Rust odak testi doğrulandı. OFF 1302/1/325, ON 1300/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,279 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_422.md).
+
+
+## V6b.423 — Tamponlu seviye 0 PMA dosyası
+
+Bağlantı VFS dosyasındaki seviye 0 PMA biçimi, 8.530 C yazma ve okuma ile eş ofset ve boyut gösterdi. İki Rust kipinde açma hatası karşılaştırmadan önce döndü. OFF 1303/1/325, ON 1301/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,267 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_423.md).

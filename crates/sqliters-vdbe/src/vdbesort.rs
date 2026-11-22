@@ -9,17 +9,17 @@
 //! the same order as the general one for the records they are chosen for, so the general
 //! comparator is used), `sqlite3VdbeSorterCompare`, `sqlite3VdbeSorterRowkey`.
 //!
-//! PMA runs are held in memory. Their merge uses C's reader tree and
-//! bounded intermediate batches. This preserves comparison order across
-//! `SorterSort` and `SorterNext` while keeping the current storage backend.
+//! Level-0 runs use the connection's anonymous temporary file when the host
+//! supplies its VFS. Intermediate merge batches remain in memory.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use sqliters_types::{TextEncoding, Value};
+use sqliters_types::{ErrorCode, Result as SqlResult, SqliteError, TextEncoding, Value, extended};
+use sqliters_vfs::{OpenFlags, Vfs, VfsFile};
 
 use crate::vdbeaux_rt::{
-    KeyInfoRt, UnpackedRecord, get_varint32, sqlite3_varint_len, sqlite3_vdbe_record_compare_with_skip,
+    KeyInfoRt, UnpackedRecord, get_varint32, put_varint, sqlite3_varint_len, sqlite3_vdbe_record_compare_with_skip,
     sqlite3_vdbe_record_unpack,
 };
 use crate::vdbemem::{MEM_NULL, Mem};
@@ -116,33 +116,195 @@ pub fn file_sort_fits_default_pma<'a>(
     true
 }
 
+/// The level-0 PMA file contains a length prefix for the run and then the
+/// length-prefixed records. Each writer starts at the preceding run's end.
+struct PmaFile {
+    handle: Arc<dyn VfsFile>,
+    runs: Vec<u64>,
+    end: u64,
+    page_size: usize,
+}
+
+impl PmaFile {
+    fn open(vfs: &dyn Vfs, page_size: usize) -> SqlResult<Self> {
+        let handle = vfs.open(None, OpenFlags::TEMP_JOURNAL | OpenFlags::READWRITE
+            | OpenFlags::CREATE | OpenFlags::EXCLUSIVE | OpenFlags::DELETEONCLOSE)?;
+        Ok(Self { handle: Arc::from(handle), runs: Vec::new(), end: 0, page_size })
+    }
+
+    fn write_run(&mut self, bytes: u64, run: Vec<Vec<u8>>) -> SqlResult<()> {
+        let start = self.end;
+        let mut writer = PmaWriter {
+            handle: self.handle.as_ref(), offset: start,
+            buffer: Vec::with_capacity(self.page_size), page_size: self.page_size,
+        };
+        let mut length = Vec::with_capacity(9);
+        put_varint(&mut length, bytes);
+        writer.write(&length)?;
+        for record in run {
+            length.clear();
+            put_varint(&mut length, record.len() as u64);
+            writer.write(&length)?;
+            writer.write(&record)?;
+        }
+        writer.flush()?;
+        self.end = writer.offset;
+        self.runs.push(start);
+        Ok(())
+    }
+
+    fn readers(&self) -> SqlResult<Vec<PmaReader>> {
+        self.runs.iter().map(|&start| {
+            let mut disk = PmaDiskReader {
+                file: Arc::clone(&self.handle), offset: start, end: self.end, buffer_start: start,
+                buffer: Vec::new(), page_size: self.page_size,
+            };
+            let bytes = disk.varint()?;
+            disk.end = disk.offset.checked_add(bytes).filter(|end| *end <= self.end).ok_or_else(pma_short_read)?;
+            let mut reader = PmaReader { disk: Some(disk), ..PmaReader::default() };
+            reader.refill_disk()?;
+            Ok(reader)
+        }).collect()
+    }
+}
+
+struct PmaWriter<'a> {
+    handle: &'a dyn VfsFile,
+    offset: u64,
+    buffer: Vec<u8>,
+    page_size: usize,
+}
+
+impl PmaWriter<'_> {
+    fn write(&mut self, mut input: &[u8]) -> SqlResult<()> {
+        while !input.is_empty() {
+            let available = self.page_size - (self.offset % self.page_size as u64) as usize - self.buffer.len();
+            let len = input.len().min(available);
+            self.buffer.extend_from_slice(&input[..len]);
+            input = &input[len..];
+            if len == available {
+                self.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> SqlResult<()> {
+        if !self.buffer.is_empty() {
+            self.handle.write_at(&self.buffer, self.offset)?;
+            self.offset += self.buffer.len() as u64;
+            self.buffer.clear();
+        }
+        Ok(())
+    }
+}
+
+fn pma_short_read() -> SqliteError {
+    SqliteError::with_extended(extended::SQLITE_IOERR_SHORT_READ, ErrorCode::IoErr.as_str())
+}
+
+/// Buffered reads stop at the PMA boundary. The initial prefix is read
+/// from the same partial page that the C reader loads on seeking.
+struct PmaDiskReader {
+    file: Arc<dyn VfsFile>,
+    offset: u64,
+    end: u64,
+    buffer_start: u64,
+    buffer: Vec<u8>,
+    page_size: usize,
+}
+
+impl PmaDiskReader {
+    fn read_exact(&mut self, mut output: &mut [u8]) -> SqlResult<()> {
+        if output.len() as u64 > self.end - self.offset {
+            return Err(pma_short_read());
+        }
+        while !output.is_empty() {
+            let offset = (self.offset - self.buffer_start) as usize;
+            if offset >= self.buffer.len() {
+                let page = self.page_size as u64;
+                let count = ((self.end - self.offset).min(page - self.offset % page)) as usize;
+                self.buffer.resize(count, 0);
+                self.buffer_start = self.offset;
+                if self.file.read_at(&mut self.buffer, self.offset)? != count {
+                    return Err(pma_short_read());
+                }
+            }
+            let start = (self.offset - self.buffer_start) as usize;
+            let count = output.len().min(self.buffer.len() - start);
+            output[..count].copy_from_slice(&self.buffer[start..start + count]);
+            self.offset += count as u64;
+            output = &mut output[count..];
+        }
+        Ok(())
+    }
+
+    fn varint(&mut self) -> SqlResult<u64> {
+        let mut value = 0u64;
+        let mut buf = [0u8];
+        for _ in 0..8 {
+            self.read_exact(&mut buf)?;
+            value = (value << 7) | u64::from(buf[0] & 0x7f);
+            if buf[0] & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        self.read_exact(&mut buf)?;
+        Ok((value << 8) | u64::from(buf[0]))
+    }
+
+    fn next(&mut self) -> SqlResult<Option<Vec<u8>>> {
+        if self.offset == self.end {
+            return Ok(None);
+        }
+        let bytes = self.varint()?;
+        if bytes > self.end - self.offset {
+            return Err(pma_short_read());
+        }
+        let bytes = usize::try_from(bytes).map_err(|_| pma_short_read())?;
+        let mut record = Vec::new();
+        record.try_reserve_exact(bytes).map_err(|_| SqliteError::new(ErrorCode::NoMem, ErrorCode::NoMem.as_str()))?;
+        record.resize(bytes, 0);
+        self.read_exact(&mut record)?;
+        Ok(Some(record))
+    }
+}
+
 /// `SORTER_MAX_MERGE_COUNT`
 const PMA_FANOUT: usize = 16;
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct PmaReader {
     records: VecDeque<Vec<u8>>,
     child: Option<Box<PmaMerge>>,
+    disk: Option<PmaDiskReader>,
 }
 
 impl PmaReader {
-    fn refill(&mut self, key: &KeyInfoRt, refill_bytes: usize) {
-        let Some(child) = &mut self.child else { return };
+    fn refill_disk(&mut self) -> SqlResult<()> {
+        if let Some(disk) = &mut self.disk {
+            self.records.extend(disk.next()?);
+        }
+        Ok(())
+    }
+
+    fn refill(&mut self, key: &KeyInfoRt, refill_bytes: usize) -> SqlResult<()> {
+        let Some(child) = &mut self.child else { return self.refill_disk() };
         let mut remaining = refill_bytes;
         // vdbeIncrPopulate writes each record then advances the input, even
         // when the record just written is the last one that fits.
         while let Some(record) = child.current() {
             let bytes = record.len() + sqlite3_varint_len(record.len() as u64) as usize;
             let Some(rest) = remaining.checked_sub(bytes) else { break };
-            let Some(record) = child.pop(key, refill_bytes) else { break };
+            let Some(record) = child.pop(key, refill_bytes)? else { break };
             self.records.push_back(record);
             remaining = rest;
         }
+        Ok(())
     }
 }
 
 /// A C `MergeEngine` reader tree. The leaves keep the original PMA order.
-#[derive(Debug)]
 struct PmaMerge {
     readers: Vec<PmaReader>,
     winners: Vec<usize>,
@@ -154,11 +316,7 @@ impl PmaMerge {
         Self { readers, winners: vec![0; width] }
     }
 
-    fn from_runs(runs: Vec<Vec<Vec<u8>>>) -> Self {
-        let mut readers: Vec<_> = runs.into_iter().map(|run| PmaReader {
-            records: run.into(),
-            child: None,
-        }).collect();
+    fn from_readers(mut readers: Vec<PmaReader>) -> Self {
         if readers.len() <= PMA_FANOUT {
             let width = readers.len().next_power_of_two().max(2);
             return Self::new(readers, width);
@@ -174,8 +332,8 @@ impl PmaMerge {
                 }
                 let width = if leaf_level { group.len().next_power_of_two().max(2) } else { PMA_FANOUT };
                 parents.push(PmaReader {
-                    records: VecDeque::new(),
                     child: Some(Box::new(Self::new(group, width))),
+                    ..PmaReader::default()
                 });
             }
             readers = parents;
@@ -184,11 +342,11 @@ impl PmaMerge {
         Self::new(readers, PMA_FANOUT)
     }
 
-    fn initialize(&mut self, key: &KeyInfoRt, refill_bytes: usize) {
+    fn initialize(&mut self, key: &KeyInfoRt, refill_bytes: usize) -> SqlResult<()> {
         for reader in &mut self.readers {
             if let Some(child) = &mut reader.child {
-                child.initialize(key, refill_bytes);
-                reader.refill(key, refill_bytes);
+                child.initialize(key, refill_bytes)?;
+                reader.refill(key, refill_bytes)?;
             }
         }
         // vdbeMergeEngineInit visits the nodes from the end of the tree.
@@ -202,6 +360,7 @@ impl PmaMerge {
             };
             self.winners[node] = self.choose(key, left, right);
         }
+        Ok(())
     }
 
     fn choose(&self, key: &KeyInfoRt, left: usize, right: usize) -> usize {
@@ -220,12 +379,12 @@ impl PmaMerge {
         self.readers[self.winners[1]].records.front().map(Vec::as_slice)
     }
 
-    fn pop(&mut self, key: &KeyInfoRt, refill_bytes: usize) -> Option<Vec<u8>> {
+    fn pop(&mut self, key: &KeyInfoRt, refill_bytes: usize) -> SqlResult<Option<Vec<u8>>> {
         let previous = self.winners[1];
         let reader = &mut self.readers[previous];
-        let result = reader.records.pop_front()?;
+        let Some(result) = reader.records.pop_front() else { return Ok(None) };
         if reader.records.is_empty() {
-            reader.refill(key, refill_bytes);
+            reader.refill(key, refill_bytes)?;
         }
 
         // vdbeMergeEngineStep keeps the winner in the same argument slot
@@ -247,12 +406,11 @@ impl PmaMerge {
             }
             node /= 2;
         }
-        Some(result)
+        Ok(Some(result))
     }
 }
 
 /// `struct VdbeSorter`.
-#[derive(Debug)]
 pub struct VdbeSorter {
     /// `pKeyInfo`: a copy whose `nKeyField` is the number of sort columns
     key_info: Arc<KeyInfoRt>,
@@ -269,6 +427,9 @@ pub struct VdbeSorter {
     list: Vec<Vec<u8>>,
     /// The sorted runs written so far (`bUsePMA` when not empty)
     pmas: Vec<Vec<Vec<u8>>>,
+    pma_file: Option<PmaFile>,
+    vfs: Option<Arc<dyn Vfs>>,
+    page_size: usize,
     /// `bUsePMA`
     b_use_pma: bool,
     /// `mxKeysize`, including the length varint.
@@ -282,7 +443,18 @@ pub struct VdbeSorter {
     pub n_pma: u32,
 }
 
+impl std::fmt::Debug for VdbeSorter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VdbeSorter").field("n_pma", &self.n_pma)
+            .field("b_use_pma", &self.b_use_pma).finish_non_exhaustive()
+    }
+}
+
 impl VdbeSorter {
+    pub(crate) fn set_vfs(&mut self, vfs: Option<Arc<dyn Vfs>>) {
+        self.vfs = vfs;
+    }
+
     /// `sqlite3VdbeSorterInit(db, nField, pCsr)`. `pgsz` is the page size of the main
     /// database, `cache_size` is `db->aDb[0].pSchema->cache_size`, `temp_in_memory` is
     /// `sqlite3TempInMemory(db)`.
@@ -300,6 +472,9 @@ impl VdbeSorter {
             sz_pma: 0,
             list: Vec::new(),
             pmas: Vec::new(),
+            pma_file: None,
+            vfs: None,
+            page_size: pgsz.max(1) as usize,
             b_use_pma: false,
             largest_pma_record: 0,
             pma_merge: None,
@@ -370,17 +545,30 @@ impl VdbeSorter {
     }
 
     /// `vdbeSorterFlushPMA`
-    fn flush_pma(&mut self) {
+    fn flush_pma(&mut self) -> SqlResult<()> {
         self.b_use_pma = true;
-        if !self.list.is_empty() {
-            let run = self.sort_list();
-            self.pmas.push(run);
-            self.n_pma += 1;
+        if self.list.is_empty() {
+            return Ok(());
         }
+        if self.pma_file.is_none() && let Some(vfs) = &self.vfs {
+            self.pma_file = Some(PmaFile::open(vfs.as_ref(), self.page_size)?);
+        }
+        let run = self.sort_list();
+        if let Some(file) = &mut self.pma_file {
+            file.write_run(self.sz_pma as u64, run)?;
+        } else {
+            self.pmas.push(run);
+        }
+        self.n_pma += 1;
+        Ok(())
     }
 
     /// `sqlite3VdbeSorterWrite(pCsr, pVal)`
     pub fn write(&mut self, val: &[u8]) {
+        self.write_checked(val).expect("standalone sorter keeps PMAs in memory")
+    }
+
+    pub(crate) fn write_checked(&mut self, val: &[u8]) -> SqlResult<()> {
         // (the typeMask bookkeeping selects among comparators that give the same order)
         let n_req = val.len() as i64 + SZ_SORTER_RECORD;
         let n_pma = val.len() as i64 + sqlite3_varint_len(val.len() as u64) as i64;
@@ -391,7 +579,7 @@ impl VdbeSorter {
                 self.sz_pma > self.mx_pma_size
             };
             if b_flush {
-                self.flush_pma();
+                self.flush_pma()?;
                 self.sz_pma = 0;
                 self.i_memory = 0;
             }
@@ -403,43 +591,60 @@ impl VdbeSorter {
             self.i_memory += (n_req + 7) & !7;
         }
         self.list.push(val.to_vec());
+        Ok(())
     }
 
     /// `sqlite3VdbeSorterRewind(pCsr, &bEof)`: returns `bEof`.
     pub fn rewind(&mut self) -> bool {
+        self.rewind_checked().expect("standalone sorter keeps PMAs in memory")
+    }
+
+    pub(crate) fn rewind_checked(&mut self) -> SqlResult<bool> {
         self.pos = 0;
         self.pma_merge = None;
         if !self.b_use_pma {
             if self.list.is_empty() {
                 self.out = Vec::new();
-                return true;
+                return Ok(true);
             }
             self.out = self.sort_list();
-            return false;
+            return Ok(false);
         }
-        self.flush_pma();
+        self.flush_pma()?;
         self.refill_bytes = (self.mx_pma_size as usize / 2).max(self.largest_pma_record + 9);
-        let mut merge = PmaMerge::from_runs(std::mem::take(&mut self.pmas));
-        merge.initialize(&self.key_info, self.refill_bytes);
+        let readers = if let Some(file) = &self.pma_file {
+            file.readers()?
+        } else {
+            std::mem::take(&mut self.pmas).into_iter().map(|run| PmaReader {
+                records: run.into(),
+                ..PmaReader::default()
+            }).collect()
+        };
+        let mut merge = PmaMerge::from_readers(readers);
+        merge.initialize(&self.key_info, self.refill_bytes)?;
         let empty = merge.current().is_none();
         self.pma_merge = Some(merge);
         self.out.clear();
-        empty
+        Ok(empty)
     }
 
     /// `sqlite3VdbeSorterNext(db, pCsr)`: `true` is `SQLITE_OK`, `false` is `SQLITE_DONE`.
     #[inline]
     pub fn next(&mut self) -> bool {
+        self.next_checked().expect("standalone sorter keeps PMAs in memory")
+    }
+
+    pub(crate) fn next_checked(&mut self) -> SqlResult<bool> {
         if let Some(merge) = &mut self.pma_merge {
-            merge.pop(&self.key_info, self.refill_bytes);
-            return merge.current().is_some();
+            merge.pop(&self.key_info, self.refill_bytes)?;
+            return Ok(merge.current().is_some());
         }
         // (the record is released as C frees it)
         if let Some(r) = self.out.get_mut(self.pos) {
             *r = Vec::new();
         }
         self.pos += 1;
-        self.pos < self.out.len()
+        Ok(self.pos < self.out.len())
     }
 
     /// `vdbeSorterRowkey`
@@ -470,6 +675,7 @@ impl VdbeSorter {
         self.list.clear();
         self.pmas.clear();
         self.pma_merge = None;
+        self.pma_file = None;
         self.largest_pma_record = 0;
         self.refill_bytes = 0;
         self.out.clear();
@@ -602,4 +808,61 @@ fn pma_merge_calls_comparator_on_each_step() {
     assert!(sorter.rewind());
     assert!(sorter.rowkey().is_empty());
     assert!(take_calls().is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn pma_file_open_error_stops_before_sort_comparisons() {
+    use crate::vdbemem::CollRt;
+    use sqliters_types::{CustomCollation, encode_record};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RejectTempOpen(AtomicUsize);
+    impl Vfs for RejectTempOpen {
+        fn name(&self) -> &str { "reject-sorter-temp" }
+
+        fn open(&self, path: Option<&Path>, flags: OpenFlags) -> SqlResult<Box<dyn VfsFile>> {
+            assert!(path.is_none());
+            for flag in [OpenFlags::TEMP_JOURNAL, OpenFlags::READWRITE, OpenFlags::CREATE,
+                         OpenFlags::EXCLUSIVE, OpenFlags::DELETEONCLOSE] {
+                assert!(flags.contains(flag));
+            }
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(SqliteError::new(ErrorCode::CantOpen, ErrorCode::CantOpen.as_str()))
+        }
+
+        fn delete(&self, _: &Path, _: bool) -> SqlResult<()> { unreachable!() }
+        fn exists(&self, _: &Path) -> SqlResult<bool> { unreachable!() }
+        fn full_pathname(&self, _: &Path) -> SqlResult<PathBuf> { unreachable!() }
+    }
+
+    let callbacks = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&callbacks);
+    let collation = CollRt::from_custom(CustomCollation::new("app_order", move |left, right| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Ok(left.cmp(right))
+    }));
+    let key = Arc::new(KeyInfoRt {
+        enc: 1,
+        n_key_field: 1,
+        n_all_field: 1,
+        a_sort_flags: vec![0],
+        a_coll: vec![Some(Arc::new(collation))],
+    });
+    let opens = Arc::new(RejectTempOpen(AtomicUsize::new(0)));
+    let mut sorter = VdbeSorter::init(&key, 0, 512, 1, false);
+    sorter.set_vfs(Some(opens.clone()));
+    let padding = "x".repeat(60_000);
+    for label in ["b", "a"] {
+        sorter.write_checked(&encode_record(&[Value::Text(format!("{label}{padding}").into())])).unwrap();
+    }
+    assert_eq!(opens.0.load(Ordering::Relaxed), 0);
+    let error = sorter.write_checked(&encode_record(&[Value::Text(format!("c{padding}").into())])).unwrap_err();
+    assert_eq!(error.code, ErrorCode::CantOpen);
+    assert_eq!(opens.0.load(Ordering::Relaxed), 1);
+    assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+    assert_eq!(sorter.n_pma, 0);
+    sorter.reset();
+    assert!(sorter.rewind_checked().unwrap());
 }

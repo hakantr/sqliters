@@ -100,6 +100,7 @@ version = "0.1.0"
 dependencies = [
  "sqliters-btree",
  "sqliters-types",
+ "sqliters-vfs",
 ]
 
 [[package]]

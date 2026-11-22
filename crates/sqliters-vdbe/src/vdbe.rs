@@ -137,6 +137,10 @@ pub trait VdbeHost {
     fn progress_invoke(&mut self) -> Result<bool>;
     /// `(page size of the main database, db->aDb[0].pSchema->cache_size, sqlite3TempInMemory(db))`
     fn sorter_config(&mut self) -> (i64, i64, bool);
+    /// Connection VFS for the sorter's anonymous PMA file.
+    fn sorter_vfs(&mut self) -> Option<Arc<dyn sqliters_vfs::Vfs>> {
+        None
+    }
     /// `OP_Transaction` with `P2!=0`: `sqlite3BtreeBeginTrans(pBt, p2, &iMeta)` and, when the
     /// program uses a statement journal and the connection is in a transaction or has other
     /// active statements, `sqlite3BtreeBeginStmt`. Returns `(iMeta, pSchema->iGeneration)`.
@@ -5444,7 +5448,8 @@ impl Vdbe {
                         return Err(internal("OP_SorterOpen without KeyInfo"));
                     };
                     let (pgsz, cache_size, temp_in_memory) = host.sorter_config();
-                    let sorter = VdbeSorter::init(k, op.p3, pgsz, cache_size, temp_in_memory);
+                    let mut sorter = VdbeSorter::init(k, op.p3, pgsz, cache_size, temp_in_memory);
+                    sorter.set_vfs(host.sorter_vfs());
                     let c = csr!(ci);
                     c.key_info = Some(Arc::clone(k));
                     c.sorter = Some(Box::new(sorter));
@@ -6250,7 +6255,7 @@ impl Vdbe {
                         let Some(s) = pc_.sorter.as_mut() else {
                             return Err(internal("not a sorter"));
                         };
-                        res = s.rewind();
+                        res = s.rewind_checked()?;
                     } else {
                         let bt = btree_of!(pc_);
                         let r = bt.bc_first(&mut pc_.cur);
@@ -6279,7 +6284,7 @@ impl Vdbe {
                         let Some(s) = pc_.sorter.as_mut() else {
                             return Err(internal("not a sorter"));
                         };
-                        ok = s.next();
+                        ok = s.next_checked()?;
                     } else {
                         let bt = btree_of!(pc_);
                         if pc_.cur.e_state >= CURSOR_REQUIRESEEK {
@@ -6433,7 +6438,7 @@ impl Vdbe {
                     let Some(s) = c.sorter.as_mut() else {
                         return Err(internal("not a sorter"));
                     };
-                    s.write(&self.a_mem[op.p2 as usize].z);
+                    s.write_checked(&self.a_mem[op.p2 as usize].z)?;
                 }
 
                 OP_DeferredSeek | OP_IdxRowid => {
