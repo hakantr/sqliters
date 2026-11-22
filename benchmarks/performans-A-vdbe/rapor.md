@@ -2382,3 +2382,8 @@ Varsayılan veya BINARY tanımlı düz sütunda 132 profil ve 9.264 geri çağr�
 ## V6b.415 — Koşullu WITHOUT ROWID OR kolları
 
 Yerel sayısal ve sıralı bileşik filtreler anahtar kopyasından önce çalışıyor. Dört biçimde 64 UTF-16 sonucu ve 96 tam EXPLAIN planı eşleşti. Önceki 14 biçim, uygulama karşılaştırıcısı ve C yeniden açışı korundu. OFF 1295/1/325, ON 1293/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,263 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_415.md).
+
+
+## V6b.416 — Örtük şema kolasyonu bellek sıralaması
+
+Şemadan gelen NOCASE, RTRIM ve uygulama kolasyonu tam bellek sıralamasında her Rust kipinde 222 profil ve 15.648 adım boyunca C ile eşleşti. Unicode ve NUL için 216 ek kayıt, özgün hata ve 18 DELETE/WAL dosyası doğrulandı. Aynı kaynakla 180 olağan ertelenmiş yabancı anahtar çalıştırması da C ile eş. OFF 1296/1/325, ON 1294/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,272 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_416.md).

@@ -1489,6 +1489,69 @@ fn group64_registered_binary_implicit_memory_sort_checks_column_collation() {
 }
 
 #[test]
+fn group64_registered_schema_collations_drive_implicit_memory_sort() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for name in ["NOCASE", "RTRIM", "app_order"] {
+            let db = Connection::open_in_memory().unwrap();
+            if name == "app_order" {
+                db.register_collation(name, str::cmp).unwrap();
+            }
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}'; PRAGMA temp_store=MEMORY;
+                 CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT COLLATE {name});
+                 INSERT INTO items VALUES (1,'A'),(2,'a'),(3,'B'),(4,'b'),(5,NULL),(6,'A ');"
+            ))
+            .unwrap();
+            let mut statement = db.prepare("SELECT id FROM items ORDER BY v NULLS LAST,id").unwrap();
+            let StepResult::Row(row) = statement.step().unwrap() else {
+                panic!("missing initial row for {encoding}/{name}");
+            };
+            assert_eq!(row.values(), &[Value::Integer(1)]);
+            statement.reset().unwrap();
+            db.register_collation("BINARY", |_, _| panic!("unselected BINARY comparator"))
+                .unwrap();
+
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = Arc::clone(&calls);
+            db.register_collation(name, move |left, right| {
+                seen.lock().unwrap().push((left.to_owned(), right.to_owned()));
+                right.cmp(left)
+            })
+            .unwrap();
+            let expected = [
+                ("B", "b"), ("b", "A "), ("B", "A "), ("A", "a"),
+                ("a", "b"), ("a", "B"), ("A", "B"), ("A", "A "),
+            ]
+            .map(|(left, right)| (left.to_owned(), right.to_owned()));
+            assert!(calls.lock().unwrap().is_empty());
+            let StepResult::Row(row) = statement.step().unwrap() else {
+                panic!("missing registered row for {encoding}/{name}");
+            };
+            assert_eq!(row.values(), &[Value::Integer(4)]);
+            assert_eq!(std::mem::take(&mut *calls.lock().unwrap()), expected);
+            statement.reset().unwrap();
+
+            let seen = Arc::clone(&calls);
+            let failure = SqliteError::new(ErrorCode::Schema, "ordinary implicit sort callback error");
+            let injected = failure.clone();
+            db.register_fallible_collation(name, move |left, right| {
+                let mut observed = seen.lock().unwrap();
+                observed.push((left.to_owned(), right.to_owned()));
+                if observed.len() == 2 {
+                    Err(injected.clone())
+                } else {
+                    Ok(right.cmp(left))
+                }
+            })
+            .unwrap();
+            assert_eq!(statement.step().unwrap_err(), failure);
+            assert_eq!(statement.reset().unwrap_err(), failure);
+            assert_eq!(std::mem::take(&mut *calls.lock().unwrap()), expected[..2]);
+        }
+    }
+}
+
+#[test]
 fn numeric_blob_boolean_predicates_follow_database_encoding() {
     use Value::{Integer, Null};
 

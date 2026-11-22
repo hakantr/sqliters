@@ -7318,7 +7318,7 @@ fn exec_single_select_core(
 /// collations. With a single rowid scan, the full memory sorter receives the
 /// same records in the same order as SQLite's complete OP_SorterOpen path.
 fn complete_memory_sort_collation<'a>(
-    db_set: &DatabaseSet,
+    db_set: &'a DatabaseSet,
     core: &SelectCore,
     order_by: &'a [OrderByTerm],
     limit: Option<&LimitClause>,
@@ -7374,10 +7374,7 @@ fn complete_memory_sort_collation<'a>(
     if Some(key_index) == table.rowid_alias_col || !rowid_tail {
         return None;
     }
-    explicit.or_else(|| {
-        let column = &table.columns[key_index];
-        (column.collation == Collation::Binary && column.custom_collation.is_none()).then_some("BINARY")
-    })
+    Some(explicit.unwrap_or_else(|| table.columns[key_index].collation_name()))
 }
 
 fn registered_memory_sort_builtin(
@@ -7401,17 +7398,18 @@ pub(crate) fn registered_builtin_memory_sort(
     encoding: TextEncoding,
 ) -> bool {
     let Some(Stmt::Select(select)) = stmt else { return false };
-    let collation = match select.order_by.first().map(|term| &term.expr) {
-        Some(Expr::Collate { collation, .. }) => collation,
-        Some(Expr::Column(_)) => "BINARY",
-        _ => return false,
+    let has_override = match select.order_by.first().map(|term| &term.expr) {
+        Some(Expr::Collate { collation, .. }) => registered_memory_sort_builtin(collation, encoding, collations),
+        Some(Expr::Column(_)) => ["BINARY", "NOCASE", "RTRIM"].iter()
+            .any(|name| registered_memory_sort_builtin(name, encoding, collations)),
+        _ => false,
     };
-    select.ctes.is_empty()
+    has_override
+        && select.ctes.is_empty()
         && select.body.compounds.is_empty()
-        && registered_memory_sort_builtin(collation, encoding, collations)
         && complete_memory_sort_collation(
             db_set, &select.body.head, &select.order_by, select.limit.as_ref(),
-        ).is_some()
+        ).is_some_and(|name| registered_memory_sort_builtin(name, encoding, collations))
 }
 
 fn exec_single_select_core_inner(
