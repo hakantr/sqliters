@@ -2272,3 +2272,8 @@ Exact V6b.389 tabanıyla 684 gözlemde fiziksel NOCASE indeksinin beslediği 32 
 ## V6b.393 — UTF-16 satır CASE kısmi sıralaması
 
 Kısmi ORDER BY ve LIMIT/OFFSET iki matriste 288 UTF-16 sonucunu C ile eşitledi. Önceki 558 gözlem, C planları ve koruma yolları aynı. C 13/13, Rust rowvalue8 25/25 ve delete2 1/1 iki kipte. OFF 1274/1/325, ON 1271/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,256 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_393.md).
+
+
+## V6b.394 — UTF-16 sabit rowid listesi taraması
+
+660 gözlemde tamsayı eğilimli tek alanlı sabit rowid listeleri için 48 UTF-16 sonucu C ile eşleşti. Önceki 558 envanter gözlemi ve üyelik kontrolleri aynı. C 22/22, beş odak Rust testi iki kipte ve bağlantı korumaları geçti. OFF 1275/1/325, ON 1272/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,242 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_394.md).

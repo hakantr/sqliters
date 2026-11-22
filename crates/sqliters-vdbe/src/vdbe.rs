@@ -1062,6 +1062,103 @@ fn ordered_in_key(
     written && probed
 }
 
+/// A literal IN list driving a rowid lookup is a private one-column set. Its
+/// records use integer affinity and database encoding before index insertion.
+fn literal_rowid_list_key(prog: &Program, open_index: usize, open: &VdbeOp, key: &KeyInfo) -> bool {
+    if open.opcode != OP_OpenEphemeral || open.p2 != 1 || open.p3 != 0 || open.p5 != 0
+        || key.n_key_field != 1 || key.n_all_field != 2
+        || !matches!(key.a_coll.as_slice(), [None, None]) || key.a_sort_flags != [0, 0]
+    {
+        return false;
+    }
+    let ops = &prog.a_op;
+    let cursor = open.p1;
+    let Some([begin, once]) = open_index.checked_sub(2).and_then(|start| ops.get(start..open_index)) else {
+        return false;
+    };
+    if begin.opcode != OP_BeginSubrtn || begin.p1 != 0 || begin.p4 != P4::NotUsed
+        || once.opcode != OP_Once || once.p3 != 0
+    {
+        return false;
+    }
+    let ret = once.p2 as usize;
+    let Some([null_row, return_op, scan, column, skip_null, seek]) = ret.checked_sub(1)
+        .and_then(|start| start.checked_add(6).and_then(|end| ops.get(start..end))) else {
+        return false;
+    };
+    let step_index = skip_null.p2 as usize;
+    let Some(step) = ops.get(step_index) else { return false };
+    if null_row.opcode != OP_NullRow || null_row.p1 != cursor
+        || return_op.opcode != OP_Return || return_op.p1 != begin.p2
+        || return_op.p2 as usize != open_index - 1 || return_op.p3 != 1
+        || !matches!((scan.opcode, step.opcode), (OP_Rewind, OP_Next) | (OP_Last, OP_Prev))
+        || scan.p1 != cursor || scan.p2 as usize != step_index + 1 || scan.p5 != 0
+        || column.opcode != OP_Column || column.p1 != cursor || column.p2 != 0
+        || column.p4 != P4::NotUsed || column.p5 != 0
+        || skip_null.opcode != OP_IsNull || skip_null.p1 != column.p3
+        || seek.opcode != OP_SeekRowid || seek.p1 == cursor || seek.p3 != column.p3
+        || seek.p2 != skip_null.p2 || seek.p4 != P4::NotUsed || seek.p5 != 0
+        || step_index < ret + 5 || step.p1 != cursor || step.p2 as usize != ret + 2
+        || step.p3 != 0 || step.p5 != 0
+    {
+        return false;
+    }
+
+    let build = open_index + 1..ret - 1;
+    let Some(entries) = ops.get(build.clone()) else { return false };
+    if entries.is_empty() || entries.len() % 3 != 0 || !entries.chunks_exact(3).all(|entry| {
+        let [value, record, insert] = entry else { return false };
+        matches!(value.opcode, OP_Integer | OP_Int64 | OP_Real | OP_String8 | OP_String | OP_Null | OP_Blob | OP_Variable)
+            && value.p2 == record.p1 && record.opcode == OP_MakeRecord && record.p2 == 1 && record.p5 == 0
+            && matches!(&record.p4, P4::Dynamic(affinity) if affinity.as_slice() == [SQLITE_AFF_INTEGER])
+            && insert.opcode == OP_IdxInsert && insert.p1 == cursor && insert.p2 == record.p3
+            && insert.p3 == record.p1 && insert.p4 == P4::Int32(1) && insert.p5 == 0
+    }) {
+        return false;
+    }
+
+    let mut physical_read = false;
+    for (index, op) in ops.iter().enumerate() {
+        if (op.opcode == OP_OpenDup && op.p2 == cursor)
+            || (matches!(op.opcode, OP_DeferredSeek | OP_SorterData) && op.p3 == cursor)
+        {
+            return false;
+        }
+        let opens = matches!(op.opcode, OP_OpenRead | OP_OpenWrite | OP_ReopenIdx | OP_OpenDup
+            | OP_OpenAutoindex | OP_OpenEphemeral | OP_SorterOpen | OP_OpenPseudo | OP_VOpen);
+        if opens && op.p1 == seek.p1 {
+            if physical_read || index >= ret || op.opcode != OP_OpenRead || op.p2 <= 1
+                || op.p3 != 0 || op.p5 != 0 || !matches!(op.p4, P4::Int32(n) if n > 0)
+            {
+                return false;
+            }
+            physical_read = true;
+        }
+        if op.p1 != cursor || index == open_index {
+            continue;
+        }
+        if opens {
+            return false;
+        }
+        let expected = match op.opcode {
+            OP_IdxInsert => build.contains(&index),
+            OP_NullRow => index == ret - 1,
+            OP_Rewind | OP_Last => index == ret + 1,
+            OP_Column => index == ret + 2,
+            OP_Next | OP_Prev => index == step_index,
+            OP_IdxDelete | OP_NotFound | OP_Found | OP_NoConflict | OP_SeekLT | OP_SeekLE
+            | OP_SeekGE | OP_SeekGT | OP_SeekRowid | OP_NotExists | OP_IfNoHope | OP_Insert
+            | OP_Delete | OP_IdxLE | OP_IdxGT | OP_IdxLT | OP_IdxGE | OP_RowData | OP_Rowid
+            | OP_IdxRowid | OP_DeferredSeek | OP_Count | OP_Sort | OP_ResetSorter | OP_SorterInsert => false,
+            _ => true,
+        };
+        if !expected {
+            return false;
+        }
+    }
+    physical_read
+}
+
 /// SRT_DistFifo packs the row in the database encoding before probing its
 /// private duplicate set, and inserts from those same normalized registers.
 fn recursive_fifo_key(
@@ -1707,10 +1804,11 @@ fn unsupported(
                 && recursive_fifo_key(prog, index, op, k, |coll| {
                     binary_in_key_encoding(coll) || (builtin_collations && builtin_read_key_collation(coll, k.enc))
                 });
+            let rowid_list = row_case_encoding == Some(k.enc) && literal_rowid_list_key(prog, index, op, k);
             if k.enc != 1 && !prog.references_like
                 && !(binary_sort || binary_group_compare || builtin_group || streamed_group
                     || distinct || physical_index
-                    || membership || builtin_sort || limit_sort || partial_sort || recursive_fifo)
+                    || membership || builtin_sort || limit_sort || partial_sort || recursive_fifo || rowid_list)
             {
                 return Some("UTF-16 key".to_owned());
             }

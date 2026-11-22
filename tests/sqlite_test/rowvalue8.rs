@@ -1648,3 +1648,82 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_literal_rowid_list_steps() {
+    sqliters_tcltest::run_test_script(
+        "row_case_literal_rowid_list_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE words(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO words VALUES(1,1,10),(2,2,20);
+        CREATE TABLE picks(id INTEGER PRIMARY KEY,ref INTEGER,label TEXT);
+        INSERT INTO picks VALUES(-9223372036854775808,1,'min'),(-1,1,'minus'),
+           (0,1,'zero'),(2,1,'two'),(3,2,'unused'),(4,1,'four'),(8,1,'eight'),
+           (9223372036854775807,1,'max');
+        CREATE VIEW chosen AS
+          SELECT p.id,CASE (SELECT a,b FROM words w WHERE w.id=p.ref)
+             WHEN (2,20) THEN 'Three ' ELSE p.label END AS token
+          FROM picks p;
+    }
+    do_execsql_test literal-rowid-row-case-$encoding.mixed {
+        SELECT id,token FROM chosen
+          WHERE id IN (2,3,3.0,'003','3e0','  4 ',NULL,3.75,'0x0',X'30',-1)
+          ORDER BY id;
+    } {-1 minus 2 two 3 {Three } 4 four}
+    do_execsql_test literal-rowid-row-case-$encoding.reverse {
+        SELECT id,token FROM chosen WHERE id IN (2,3.0,3,'4',NULL,-1) ORDER BY id DESC;
+    } {4 four 3 {Three } 2 two -1 minus}
+    do_execsql_test literal-rowid-row-case-$encoding.limits {
+        SELECT token FROM chosen WHERE id IN (-9223372036854775808,
+           '9223372036854775807',9223372036854775807,9223372036854775808.0,NULL)
+           ORDER BY id;
+    } {min max}
+    do_execsql_test literal-rowid-row-case-$encoding.null-empty {
+        SELECT 'missing' COLLATE NOCASE IN
+          (SELECT token FROM chosen WHERE id IN (NULL,NULL,'bad',X'30',3.75)),
+          NULL COLLATE RTRIM NOT IN (SELECT token FROM chosen WHERE id IN ());
+    } {0 1}
+    do_execsql_test literal-rowid-row-case-$encoding.nested {
+        SELECT ('Three' COLLATE RTRIM,'THREE ' COLLATE NOCASE) IN
+          (SELECT token,token FROM chosen WHERE id IN (2,3,'003',NULL)),
+          'THREE ' COLLATE NOCASE NOT IN
+          (SELECT token FROM chosen WHERE id IN (2,3.0,'3e0',NULL));
+    } {1 0}
+    do_test literal-rowid-row-case-$encoding.reprepare {
+        set s [sqlite3_prepare_v2 db {
+            SELECT id,token FROM chosen WHERE id IN (?1,?2,3,NULL) ORDER BY id
+        } -1]
+        sqlite3_bind_text $s 1 004 -1
+        sqlite3_bind_double $s 2 2.0
+        set before {}
+        while {[set rc [sqlite3_step $s]] eq "SQLITE_ROW"} {
+            lappend before [sqlite3_column_int $s 0] [sqlite3_column_text $s 1]
+        }
+        lappend before $rc
+        sqlite3_reset $s
+        execsql {CREATE INDEX picks_ref ON picks(ref);}
+        sqlite3_bind_null $s 1
+        sqlite3_bind_int $s 2 8
+        set after {}
+        while {[set rc [sqlite3_step $s]] eq "SQLITE_ROW"} {
+            lappend after [sqlite3_column_int $s 0] [sqlite3_column_text $s 1]
+        }
+        lappend after $rc
+        list $before $after [sqlite3_finalize $s]
+    } {{2 two 3 {Three } 4 four SQLITE_DONE} {3 {Three } 8 eight SQLITE_DONE} SQLITE_OK}
+    do_execsql_test literal-rowid-row-case-$encoding.changes {
+        SELECT changes(),total_changes();
+    } {8 10}
+}
+finish_test
+
+"#,
+    );
+}
