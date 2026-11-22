@@ -1306,3 +1306,79 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_builtin_order_sort_and_limit() {
+    sqliters_tcltest::run_test_script(
+        "row_case_builtin_order_sort_and_limit",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE words(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO words VALUES(1,1,10),(2,2,20);
+        CREATE TABLE picks(id INTEGER PRIMARY KEY,ref INTEGER,label TEXT);
+        INSERT INTO picks VALUES(1,1,'a'),(2,1,'A'),(3,1,'b  '),(4,1,'b'),(5,2,'unused'),
+            (6,1,NULL),(7,1,'a '),(8,1,char(256)),(9,1,char(128512)),(10,1,'b '),(11,1,'');
+        CREATE VIEW ranked AS
+            SELECT p.id, CASE (SELECT a,b FROM words WHERE id=p.ref)
+                WHEN (2,20) THEN 'z' ELSE p.label END AS label
+              FROM picks p;
+    }
+    do_execsql_test builtin-order-$encoding.full-nocase {
+        SELECT id FROM ranked ORDER BY label COLLATE NOCASE ASC NULLS LAST,id;
+    } {11 1 2 7 4 10 3 5 8 9 6}
+    do_execsql_test builtin-order-$encoding.full-rtrim {
+        SELECT id FROM ranked ORDER BY label COLLATE RTRIM DESC NULLS FIRST,id DESC;
+    } {6 9 8 5 10 4 3 7 1 2 11}
+    do_execsql_test builtin-order-$encoding.final-sort {
+        CREATE TABLE grouped(id INTEGER PRIMARY KEY,g INTEGER,t TEXT);
+        INSERT INTO grouped VALUES(1,1,'b '),(2,1,'b '),(3,2,'a'),(4,2,'a'),(5,3,'A '),
+            (6,3,'A '),(7,4,NULL),(8,4,NULL),(9,5,'Z'),(10,5,'Z');
+        SELECT g,count(*),min(id) FROM grouped
+          GROUP BY g
+          ORDER BY (CASE (SELECT 1,10) WHEN (1,10) THEN min(t) END) COLLATE NOCASE DESC NULLS FIRST,g;
+    } {4 2 7 5 2 9 1 2 1 3 2 5 2 2 3}
+    do_execsql_test builtin-order-$encoding.limit-nocase {
+        SELECT id FROM ranked ORDER BY label COLLATE NOCASE NULLS LAST,id LIMIT 3 OFFSET 1;
+    } {1 2 7}
+    do_execsql_test builtin-order-$encoding.limit-rtrim {
+        SELECT id FROM ranked ORDER BY label COLLATE RTRIM DESC NULLS FIRST,id DESC LIMIT 4 OFFSET 2;
+    } {8 5 10 4}
+    do_execsql_test builtin-order-$encoding.zero {
+        SELECT id FROM ranked ORDER BY label COLLATE NOCASE NULLS LAST,id LIMIT 0;
+    } {}
+    do_execsql_test builtin-order-$encoding.negative {
+        SELECT id FROM ranked ORDER BY label COLLATE NOCASE NULLS LAST,id LIMIT -1 OFFSET 8;
+        SELECT id FROM ranked ORDER BY label COLLATE NOCASE NULLS LAST,id LIMIT 2 OFFSET -4;
+    } {8 9 6 11 1}
+    do_catchsql_test builtin-order-$encoding.limit-error {
+        SELECT id FROM ranked ORDER BY label COLLATE NOCASE,id LIMIT 'three';
+    } {1 {datatype mismatch}}
+    do_test builtin-order-$encoding.reprepare {
+        set s [sqlite3_prepare_v2 db {
+            SELECT id FROM ranked WHERE id>=?1
+              ORDER BY label COLLATE NOCASE NULLS LAST,id LIMIT ?2 OFFSET ?3
+        } -1]
+        sqlite3_bind_int $s 1 1
+        sqlite3_bind_int $s 2 2
+        sqlite3_bind_int $s 3 1
+        set first [list [sqlite3_step $s] [sqlite3_column_name $s 0] [sqlite3_column_int $s 0]]
+        set second [list [sqlite3_step $s] [sqlite3_column_int $s 0]]
+        set done1 [sqlite3_step $s]
+        sqlite3_reset $s
+        execsql {CREATE INDEX picks_ref ON picks(ref);}
+        sqlite3_bind_int $s 1 3
+        sqlite3_bind_int $s 2 1
+        sqlite3_bind_int $s 3 2
+        set third [list [sqlite3_step $s] [sqlite3_column_int $s 0]]
+        list $first $second $done1 $third [sqlite3_step $s] [sqlite3_finalize $s]
+    } {{SQLITE_ROW id 1} {SQLITE_ROW 2} SQLITE_DONE {SQLITE_ROW 4} SQLITE_DONE SQLITE_OK}
+}
+finish_test
+"#,
+    );
+}

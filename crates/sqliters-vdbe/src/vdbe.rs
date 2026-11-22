@@ -1141,15 +1141,15 @@ fn fifo_duplicate_producer(ops: &[VdbeOp], probe: usize, width: i32, queue: i32)
 
 /// ORDER BY LIMIT keeps an ordered private index with a sequence field
 /// and evicts the last entry before appending a better candidate.
-fn binary_limit_sort_key(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
+fn limit_sort_key(prog: &Program, open: &VdbeOp, key: &KeyInfo, builtin_collations: bool) -> bool {
     let order_width = i32::from(key.n_key_field);
     let record_width = i32::from(key.n_all_field);
     if open.opcode != OP_OpenEphemeral || open.p2 != record_width || open.p3 != 0
         || open.p5 != 0 || order_width == 0 || record_width <= order_width
         || key.a_coll.len() != record_width as usize
-        || !key.a_coll.iter().flatten().all(|collation| {
+        || !(key.a_coll.iter().flatten().all(|collation| {
             collation.name.eq_ignore_ascii_case("BINARY") && collation.enc == key.enc
-        })
+        }) || (builtin_collations && builtin_order_key(key)))
     {
         return false;
     }
@@ -1205,6 +1205,51 @@ fn builtin_read_key_collation(coll: &CollSeq, key_encoding: u8) -> bool {
     (coll.name.eq_ignore_ascii_case("BINARY") && coll.enc == key_encoding)
         || ((coll.name.eq_ignore_ascii_case("NOCASE") || coll.name.eq_ignore_ascii_case("RTRIM"))
             && coll.enc == crate::vdbeaux::SQLITE_UTF8)
+}
+
+/// ORDER BY puts only its ordering terms in the key prefix. The remaining
+/// fields are sequence or result data, with default flags and no collation.
+fn builtin_order_key(key: &KeyInfo) -> bool {
+    let width = usize::from(key.n_key_field);
+    let fields = usize::from(key.n_all_field);
+    width > 0 && width < fields
+        && key.a_coll.len() == fields && key.a_sort_flags.len() == fields
+        && key.a_coll[..width].iter().all(|field| field.as_deref()
+            .is_some_and(|coll| builtin_read_key_collation(coll, key.enc)))
+        && key.a_coll[width..].iter().all(Option::is_none)
+        && key.a_sort_flags[..width].iter().all(|&flag| flag & !(KEYINFO_ORDER_DESC | KEYINFO_ORDER_BIGNULL) == 0)
+        && key.a_sort_flags[width..].iter().all(|&flag| flag == 0)
+}
+
+/// A complete ORDER BY sorter writes packed records and reads each one
+/// through its paired pseudo cursor. Block sorts have a ResetSorter.
+fn builtin_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
+    if open.opcode != OP_SorterOpen || open.p3 != 0 || open.p5 != 0
+        || open.p2 != i32::from(key.n_all_field) || !builtin_order_key(key)
+    {
+        return false;
+    }
+    let cursor = open.p1;
+    if prog.a_op.iter().any(|op| op.p1 == cursor && matches!(op.opcode, OP_ResetSorter | OP_SequenceTest)) {
+        return false;
+    }
+    let stores_records = prog.a_op.windows(2).any(|ops| {
+        let [record, insert] = ops else { return false };
+        record.opcode == OP_MakeRecord && record.p4 == P4::NotUsed
+            && (i32::from(key.n_key_field)..=open.p2).contains(&record.p2)
+            && insert.opcode == OP_SorterInsert && insert.p1 == cursor && insert.p2 == record.p3
+            && insert.p3 == record.p1 && insert.p4 == P4::Int32(record.p2) && insert.p5 == 0
+    });
+    stores_records && prog.a_op.windows(3).enumerate().any(|(index, ops)| {
+        let [pseudo, sort, data] = ops else { return false };
+        pseudo.opcode == OP_OpenPseudo && pseudo.p1 == data.p3 && pseudo.p2 == data.p2
+            && sort.opcode == OP_SorterSort && sort.p1 == cursor
+            && data.opcode == OP_SorterData && data.p1 == cursor
+            && prog.a_op.iter().any(|next| {
+                next.opcode == OP_SorterNext && next.p1 == cursor
+                    && usize::try_from(next.p2).ok() == Some(index + 2)
+            })
+    })
 }
 
 /// GROUP BY shares one KeyInfo between its sorter and register comparison. Keep
@@ -1473,11 +1518,13 @@ fn unsupported(
                         && c.name.eq_ignore_ascii_case("NOCASE") && c.enc == crate::vdbeaux::SQLITE_UTF8)
                 });
             let binary_membership = row_case_encoding == Some(k.enc) && binary_in_key(prog, op, k);
-            let binary_limit_sort = row_case_encoding == Some(k.enc) && binary_limit_sort_key(prog, op, k);
+            let builtin_sort = builtin_collations && row_case_encoding == Some(k.enc)
+                && builtin_order_sorter(prog, op, k);
+            let limit_sort = row_case_encoding == Some(k.enc) && limit_sort_key(prog, op, k, builtin_collations);
             let binary_fifo = row_case_encoding == Some(k.enc) && binary_recursive_fifo_key(prog, index, op, k);
             if k.enc != 1 && !prog.references_like
                 && !(binary_sort || binary_group_compare || builtin_group || distinct || physical_index
-                    || binary_membership || binary_limit_sort || binary_fifo)
+                    || binary_membership || builtin_sort || limit_sort || binary_fifo)
             {
                 return Some("UTF-16 key".to_owned());
             }
