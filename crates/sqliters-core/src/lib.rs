@@ -5960,7 +5960,7 @@ fn compile_parsed_stmt(
     // which never shift on `DETACH`. Attached `slots[2..]` queries run via `MaterializedRead`
     // keyed by `SchemaInstanceId` so `DETACH` slot-collapse never shifts active cursor indices!
     match &stmt {
-        Stmt::Select(sel) => {
+        Stmt::Select(sel) if !engine::schema_free_read_has_collation_override(sel, collations) => {
             if let Some(fp) =
                 fast_read::try_compile_fast_read_plan(sel, db_set, functions, collations)
                 && fp.db_id == DatabaseId::MAIN

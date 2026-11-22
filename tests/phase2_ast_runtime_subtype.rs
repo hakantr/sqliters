@@ -1049,6 +1049,107 @@ fn group64_returning_qualified_error_byte_offsets() {
 }
 
 #[test]
+fn group64_registered_builtin_name_collations_on_scalar_reads() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}'; CREATE TABLE hold(x);"
+        ))
+        .unwrap();
+        let mut stmt = db.prepare("SELECT ?1 COLLATE NOCASE = ?2").unwrap();
+        stmt.bind_text(1, "A").unwrap();
+        stmt.bind_text(2, "a").unwrap();
+        let StepResult::Row(before) = stmt.step().unwrap() else {
+            panic!("missing stock scalar row in {encoding}");
+        };
+        assert_eq!(before.values(), &[Value::Integer(1)]);
+        assert_eq!(stmt.step().unwrap(), StepResult::Done);
+        stmt.reset().unwrap();
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for (collation, name) in [("NoCaSe", "NOCASE"), ("rtrim", "RTRIM")] {
+            let seen = Arc::clone(&calls);
+            db.register_collation(collation, move |left, right| {
+                seen.lock()
+                    .unwrap()
+                    .push((name, left.to_owned(), right.to_owned()));
+                right.cmp(left)
+            })
+            .unwrap();
+        }
+        let StepResult::Row(after) = stmt.step().unwrap() else {
+            panic!("missing reprepared scalar row in {encoding}");
+        };
+        assert_eq!(after.values(), &[Value::Integer(0)]);
+        assert_eq!(stmt.step().unwrap(), StepResult::Done);
+        stmt.reset().unwrap();
+        stmt.bind_text(2, "A").unwrap();
+        let StepResult::Row(rebound) = stmt.step().unwrap() else {
+            panic!("missing rebound scalar row in {encoding}");
+        };
+        assert_eq!(rebound.values(), &[Value::Integer(1)]);
+        assert_eq!(stmt.step().unwrap(), StepResult::Done);
+        stmt.reset().unwrap();
+
+        let mixed = db
+            .query(
+                "SELECT 'A' = 'a' COLLATE NOCASE,
+                        'x ' COLLATE RTRIM > 'x' COLLATE NOCASE,
+                        'A' COLLATE BINARY = 'a' COLLATE NOCASE,
+                        1 COLLATE RTRIM = 1, NULL COLLATE NOCASE IS 'x'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            mixed.rows[0].values(),
+            &[
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(1),
+                Value::Integer(0),
+            ],
+            "{encoding}"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                ("NOCASE", "A".to_owned(), "a".to_owned()),
+                ("NOCASE", "A".to_owned(), "A".to_owned()),
+                ("NOCASE", "A".to_owned(), "a".to_owned()),
+                ("RTRIM", "x ".to_owned(), "x".to_owned()),
+            ],
+            "{encoding}"
+        );
+
+        for collation in ["NOCASE", "RTRIM"] {
+            let errors = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&errors);
+            db.register_fallible_collation(collation, move |_, _| {
+                seen.fetch_add(1, AtomicOrdering::Relaxed);
+                Err(SqliteError::new(ErrorCode::Error, "ordinary comparator error"))
+            })
+            .unwrap();
+            let mut fallible = db
+                .prepare(&format!("SELECT ?1 COLLATE {collation} = ?2"))
+                .unwrap();
+            fallible.bind_text(1, "x").unwrap();
+            fallible.bind_text(2, "x ").unwrap();
+            assert_eq!(errors.load(AtomicOrdering::Relaxed), 0);
+            for expected_calls in 1..=2 {
+                let error = fallible.step().unwrap_err();
+                assert_eq!(error.code, ErrorCode::Error);
+                assert_eq!(error.message, "ordinary comparator error", "{encoding}: {collation}");
+                let error = fallible.reset().unwrap_err();
+                assert_eq!(error.code, ErrorCode::Error);
+                assert_eq!(error.message, "ordinary comparator error", "{encoding}: {collation}");
+                assert_eq!(errors.load(AtomicOrdering::Relaxed), expected_calls);
+            }
+        }
+    }
+}
+
+#[test]
 fn numeric_blob_boolean_predicates_follow_database_encoding() {
     use Value::{Integer, Null};
 

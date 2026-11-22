@@ -642,11 +642,13 @@ fn read_machine_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, scope: ReadMachineScope, bound_values: Option<&[Value]>,
     precompiled: Option<Box<Program>>,
 ) -> Result<Option<Arc<Program>>> {
-    if !matches!(stmt, Some(Stmt::Select(_))) {
-        return Ok(None);
-    }
+    let Some(Stmt::Select(select)) = stmt else { return Ok(None) };
     if let Some(blocker) = read_codegen_blocker(inner) {
         trace(blocker, raw_sql);
+        return Ok(None);
+    }
+    if crate::engine::schema_free_read_has_collation_override(select, &inner.collations) {
+        trace("fallback: registered scalar collation override", raw_sql);
         return Ok(None);
     }
     let prepared = if scope == ReadMachineScope::SchemaFree {

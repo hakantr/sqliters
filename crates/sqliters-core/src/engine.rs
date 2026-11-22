@@ -174,6 +174,8 @@ pub struct StmtTxTracker {
     /// Nesting of `execute_read_body` / `execute_write_body` (a statement run from inside
     /// another one). The cursors of a statement are closed when the outermost one ends.
     pub exec_depth: u32,
+    /// A schema-free SELECT with an explicit registered NOCASE or RTRIM comparison.
+    pub(crate) explicit_collation_override: bool,
     /// The rowids a `rowid IN (...)` loop seeks, ascending (left by the access plan for the
     /// replay of the loop's cursor, `cscan.rs`).
     pub c_rowid_in: Option<Vec<i64>>,
@@ -2875,7 +2877,11 @@ fn execute_read_body_inner(
             {
                 ctx.stmt_tx.top_core = &sel.body.head as *const SelectCore as usize;
             }
+            let use_override = ctx.stmt_tx.exec_depth == 1 && !internal
+                && schema_free_read_has_collation_override(sel, ctx.collations);
+            let saved = std::mem::replace(&mut ctx.stmt_tx.explicit_collation_override, use_override);
             let res = exec_select(ctx, sel, params, &[], &CteStore::default());
+            ctx.stmt_tx.explicit_collation_override = saved;
             if ctx.stmt_tx.exec_depth == 1 && !internal {
                 ctx.stmt_tx.top_core = 0;
             }
@@ -2888,6 +2894,67 @@ fn execute_read_body_inner(
         } => exec_pragma(ctx, schema.as_deref(), name, value.as_ref()),
         _ => unreachable!("execute_read_body called on non-read statement"),
     }
+}
+
+/// A single projected row has no scan, index, or sort callback schedule to
+/// preserve. Use its fallible comparator only for an explicitly chosen name.
+pub(crate) fn schema_free_read_has_collation_override(
+    select: &SelectStmt,
+    collations: &CollationRegistry,
+) -> bool {
+    if (collations.get_custom("NOCASE").is_none() && collations.get_custom("RTRIM").is_none())
+        || !select.ctes.is_empty() || !select.body.compounds.is_empty()
+        || !select.order_by.is_empty() || select.limit.is_some()
+    {
+        return false;
+    }
+    let SelectCore::Select {
+        distinct: false, projection, from: None, selection: None, group_by, having: None, windows,
+    } = &select.body.head else { return false };
+    if !group_by.is_empty() || !windows.is_empty() {
+        return false;
+    }
+    let mut uses_override = false;
+    for column in projection {
+        let ResultColumn::Expr { expr, .. } = column else { return false };
+        match expr {
+            Expr::Binary { left, op, right }
+                if matches!(op, BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le
+                    | BinaryOp::Gt | BinaryOp::Ge | BinaryOp::Is | BinaryOp::IsNot)
+                    && scalar_operand(left) && scalar_operand(right) =>
+            {
+                uses_override |= scalar_operand_may_be_text(left) && scalar_operand_may_be_text(right)
+                    && explicit_comparison_collation(left, right)
+                        .is_some_and(|name| registered_builtin_name_collation(name, collations));
+            }
+            Expr::IsNull { expr, .. } if scalar_operand(expr) => {}
+            _ if scalar_operand(expr) => {}
+            _ => return false,
+        }
+    }
+    uses_override
+}
+
+fn scalar_operand(expr: &Expr) -> bool {
+    match expr {
+        Expr::Collate { expr, .. } => scalar_operand(expr),
+        Expr::Null | Expr::Bool(_) | Expr::Integer(_) | Expr::Float(_) | Expr::String(_)
+        | Expr::Blob(_) | Expr::Bind(_) => true,
+        _ => false,
+    }
+}
+
+fn scalar_operand_may_be_text(expr: &Expr) -> bool {
+    match expr {
+        Expr::Collate { expr, .. } => scalar_operand_may_be_text(expr),
+        Expr::String(_) | Expr::Bind(_) => true,
+        _ => false,
+    }
+}
+
+fn registered_builtin_name_collation(name: &str, collations: &CollationRegistry) -> bool {
+    (name.eq_ignore_ascii_case("NOCASE") || name.eq_ignore_ascii_case("RTRIM"))
+        && collations.get_custom(name).is_some()
 }
 
 /// Fast-path VDBE execution for compiled single-table DML (`INSERT`, `UPDATE`, `DELETE`) programs.
@@ -20655,20 +20722,20 @@ fn eval_row_value_comparison(
     }
 }
 
+fn explicit_comparison_collation<'a>(left: &'a Expr, right: &'a Expr) -> Option<&'a str> {
+    [left, right].into_iter().find_map(|expr| match expr {
+        Expr::Collate { collation, .. } => Some(collation.as_str()),
+        _ => None,
+    })
+}
+
 fn resolve_custom_binary_collation_name<'a>(
     left: &'a Expr,
     right: &'a Expr,
     scopes: &'a [EvalRow],
 ) -> Option<&'a str> {
-    if let Expr::Collate { collation, .. } = left {
-        return Collation::from_name(collation)
-            .is_none()
-            .then_some(collation.as_str());
-    }
-    if let Expr::Collate { collation, .. } = right {
-        return Collation::from_name(collation)
-            .is_none()
-            .then_some(collation.as_str());
+    if let Some(collation) = explicit_comparison_collation(left, right) {
+        return Collation::from_name(collation).is_none().then_some(collation);
     }
     for e in [left, right] {
         if let Expr::Column(cref) = e {
@@ -20699,7 +20766,13 @@ fn eval_scalar_comparison_in_scopes(
     scopes: &[EvalRow],
 ) -> Result<Value> {
     let enc = ctx.encoding();
-    if let Some(cname) = resolve_custom_binary_collation_name(left_expr, right_expr, scopes) {
+    let explicit_override = if ctx.stmt_tx.explicit_collation_override {
+        explicit_comparison_collation(left_expr, right_expr)
+            .filter(|name| registered_builtin_name_collation(name, ctx.collations))
+    } else {
+        None
+    };
+    if let Some(cname) = explicit_override.or_else(|| resolve_custom_binary_collation_name(left_expr, right_expr, scopes)) {
         let mut svc = ExecutionContext {
             interrupt_flag: ctx.interrupt_flag,
             runtime: ctx.runtime,

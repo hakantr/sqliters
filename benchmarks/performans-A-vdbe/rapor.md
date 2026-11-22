@@ -2317,3 +2317,8 @@ Kısmi ORDER BY ve LIMIT/OFFSET iki matriste 288 UTF-16 sonucunu C ile eşitledi
 ## V6b.402 — UTF-16 sabit VALUES kümesi aramaları
 
 300 gözlemde sabit VALUES kümesi için 40 UTF-16 sonucu C ile eşleşti. Önceki 558 kayıt ve altı dosya açılışı eş. C fixture 10/10 ve Rust rowvalue8 32/32, delete2 1/1 iki kipte. OFF 1282/1/325, ON 1280/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,233 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_402.md).
+
+
+## V6b.403 — Uygulama kayıtlı skaler kolasyonları
+
+Tek satırlı kaynak tablosuz karşılaştırmalarda kayıtlı NOCASE ve RTRIM çağrıları iki kipte ayrı ayrı 696/696 C eş. Group64 5/5, hata ve reset davranışı geçti. Altı sağlıklı DELETE/WAL imajı ve C yeniden açılışı eş. OFF 1283/1/325, ON 1281/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_403.md).
