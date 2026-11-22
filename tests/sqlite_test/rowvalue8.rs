@@ -2549,3 +2549,42 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_without_rowid_primary_arms() {
+    sqliters_tcltest::run_test_script(
+        "row_case_without_rowid_primary_arms",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE detail(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO detail VALUES(1,1,10),(2,2,20);
+        CREATE TABLE packed(tag TEXT COLLATE RTRIM,seq INTEGER,ref INTEGER,label TEXT,
+                            PRIMARY KEY(tag DESC,seq)) WITHOUT ROWID;
+        CREATE INDEX packed_by_seq ON packed(seq);
+        CREATE INDEX packed_by_ref ON packed(ref);
+        INSERT INTO packed VALUES ('A',1,1,'p-one'),('A ',2,2,'p-two'),('A'||char(160),3,1,'p-nbsp'),
+           ('a ',1,3,'lower'),(char(256)||' ',2,1,'p-wide'),('B',1,1,'p-b');
+    }
+    set select {SELECT seq,quote(tag),CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+        WHEN (2,20) THEN 'changed' ELSE p.label END FROM packed p WHERE}
+    foreach {name condition} {
+        first {tag='A' OR seq=2 OR ref=1}
+        middle {seq=2 OR tag='A' OR ref=1}
+        last {seq=2 OR ref=1 OR tag='A'}
+        two-primary {(tag='A' AND seq>1) OR seq=2 OR (tag='B' AND seq<3) OR ref=1}
+    } {
+        do_execsql_test row-case-primary-arms-$encoding.$name \
+            "$select $condition ORDER BY seq,tag;" {1 'A' p-one 1 'B' p-b 2 {'A '} changed 2 {'Ā '} p-wide 3 {'A '} p-nbsp}
+    }
+    do_execsql_test row-case-primary-arms-$encoding.primary-only \
+        "$select (tag='A' AND seq>1) OR (tag='B' AND seq<3) ORDER BY seq,tag;" {1 'B' p-b 2 {'A '} changed}
+}
+finish_test
+"#,
+    );
+}
