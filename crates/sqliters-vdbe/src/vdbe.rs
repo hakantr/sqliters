@@ -5084,7 +5084,7 @@ impl Vdbe {
                         self.a_agg[reg] = Some(ctx);
                     }
                     let is_value = op.p3 != 0;
-                    let rv: Mem = match self.a_agg[reg].as_mut() {
+                    let mut rv: Mem = match self.a_agg[reg].as_mut() {
                         Some(AggCtx::MinMax { best, .. }) => best.clone().unwrap_or_else(Mem::null),
                         Some(AggCtx::Win(w)) => w.value(!is_value).unwrap_or_else(Mem::null),
                         Some(AggCtx::Host(a)) => {
@@ -5103,6 +5103,8 @@ impl Vdbe {
                         }
                         None => Mem::null(),
                     };
+                    // OP_AggFinal and OP_AggValue expose text in the database encoding.
+                    rv.change_encoding(host.text_encoding() as u8);
                     if rv.too_big(limit_length) {
                         return Err(too_big());
                     }

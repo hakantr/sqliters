@@ -696,3 +696,78 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_aggregate_text_keeps_database_encoding() {
+    sqliters_tcltest::run_test_script(
+        "row_case_aggregate_text_keeps_database_encoding",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach {encoding first second combined repeated} {
+    UTF-8 41 42 412D42 542D54
+    UTF-16le 4100 4200 41002D004200 54002D005400
+    UTF-16be 0041 0042 0041002D0042 0054002D0054
+} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE entries(id INTEGER PRIMARY KEY, label TEXT, amount INTEGER, data BLOB);
+        INSERT INTO entries VALUES(1,'A',4,X'0102'),(2,'B',3,X'AA'),(3,NULL,NULL,NULL);
+    }
+    do_test aggregate-text-$encoding.bound {
+        set s [sqlite3_prepare_v2 db {
+            SELECT CASE (SELECT 7,11)
+                WHEN (7,11) THEN hex(CAST(group_concat(?1,'-') AS BLOB)) ELSE '?' END
+              FROM entries WHERE id<3
+        } -1]
+        sqlite3_bind_text $s 1 T 1
+        set first_rc [sqlite3_step $s]
+        list $first_rc [sqlite3_column_text $s 0] [sqlite3_step $s] [sqlite3_finalize $s]
+    } [list SQLITE_ROW $repeated SQLITE_DONE SQLITE_OK]
+    set window_sql {
+        SELECT id, CASE (SELECT 7,11)
+          WHEN (7,11) THEN hex(CAST(
+            group_concat(label,?2) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING)
+            AS BLOB)) ELSE '?' END AS encoded
+        FROM entries WHERE id>=?1 ORDER BY id
+    }
+    do_test aggregate-text-$encoding.prepare-window {
+        set s [sqlite3_prepare_v2 db $window_sql -1]
+        sqlite3_bind_int $s 1 1
+        sqlite3_bind_text $s 2 - 1
+        list [sqlite3_column_name $s 0] [sqlite3_column_name $s 1]
+    } {id encoded}
+    foreach {id bytes} [list 1 $first 2 $combined 3 $combined] {
+        do_test aggregate-text-$encoding.window.$id {
+            list [sqlite3_step $s] [sqlite3_column_int $s 0] [sqlite3_column_text $s 1]
+        } [list SQLITE_ROW $id $bytes]
+    }
+    do_test aggregate-text-$encoding.done {
+        list [sqlite3_step $s] [sqlite3_finalize $s]
+    } {SQLITE_DONE SQLITE_OK}
+    do_test aggregate-text-$encoding.reprepare-window {
+        set s [sqlite3_prepare_v2 db $window_sql -1]
+        sqlite3_bind_int $s 1 1
+        sqlite3_bind_text $s 2 - 1
+        set before [list [sqlite3_step $s] [sqlite3_column_int $s 0] [sqlite3_column_text $s 1]]
+        sqlite3_reset $s
+        execsql {CREATE TABLE unrelated(id INTEGER PRIMARY KEY);}
+        sqlite3_bind_int $s 1 2
+        sqlite3_bind_text $s 2 : 1
+        set after [list [sqlite3_step $s] [sqlite3_column_int $s 0] [sqlite3_column_text $s 1]]
+        list $before $after [sqlite3_finalize $s]
+    } [list [list SQLITE_ROW 1 $first] [list SQLITE_ROW 2 $second] SQLITE_OK]
+    do_execsql_test aggregate-text-$encoding.non-text {
+        SELECT CASE (SELECT 7,11) WHEN (7,11) THEN sum(amount) ELSE 0 END,
+               CASE (SELECT 7,11) WHEN (7,11) THEN hex(max(data)) ELSE '?' END,
+               CASE (SELECT 7,11) WHEN (7,11) THEN typeof(max(data)) ELSE '?' END
+          FROM entries;
+        SELECT CASE (SELECT 7,11) WHEN (7,11) THEN typeof(group_concat(label)) ELSE '?' END
+          FROM entries WHERE id=3;
+    } {7 AA blob null}
+}
+finish_test
+"#,
+    );
+}
