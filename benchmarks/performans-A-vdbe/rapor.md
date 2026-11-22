@@ -2407,3 +2407,8 @@ V6b.417 tabanındaki 21 hedef biçimde 336 UTF-16 farkı kapandı. 504 tam EXPLA
 ## V6b.420 — Uygulama kolasyonlu MEMORY LIMIT ve OFFSET
 
 Altı sağlıklı DELETE/WAL dosyasında 372 profil ve iki Rust kipinde toplam 21.732 adım C ile eşleşti. 300 önceki karşılaştırıcı farkı kapandı. Özgün geri çağrı hatası, genişletilmiş kod, ofset, reset, yeniden hazırlama ve yetkilendirici denetlendi. OFF 1300/1/325, ON 1298/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,275 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_420.md).
+
+
+## V6b.421 — Adım adım PMA birleştirmesi
+
+PMA okuyucu ağacı ve 16 üstündeki ara gruplar C ile aynı adım düzeninde ilerliyor. 36 önceki PMA farkı kapandı. Bellek ve LIMIT kontrolleriyle 60 doğrulama, 8.988 adım ve 68.068 karşılaştırma kaydı eş. Her kipte odak testi geçti. OFF 1301/1/325, ON 1299/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,264 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_421.md).

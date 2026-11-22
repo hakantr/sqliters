@@ -9,13 +9,11 @@
 //! the same order as the general one for the records they are chosen for, so the general
 //! comparator is used), `sqlite3VdbeSorterCompare`, `sqlite3VdbeSorterRowkey`.
 //!
-//! What is different: a PMA ("packed memory array") is not written to a temporary file; it
-//! is kept as a sorted run in memory, and the runs are merged pairwise when the sorter is
-//! rewound instead of through `MergeEngine` / `IncrMerger` trees. Both merges take the
-//! record of the earlier run on a tie (`vdbeMergeEngineCompare`: "iRes<0 || (iRes==0 &&
-//! pReadr1<pReadr2)"), so the output order — including the order of equal keys — is C's.
+//! PMA runs are held in memory. Their merge uses C's reader tree and
+//! bounded intermediate batches. This preserves comparison order across
+//! `SorterSort` and `SorterNext` while keeping the current storage backend.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use sqliters_types::{TextEncoding, Value};
@@ -118,6 +116,141 @@ pub fn file_sort_fits_default_pma<'a>(
     true
 }
 
+/// `SORTER_MAX_MERGE_COUNT`
+const PMA_FANOUT: usize = 16;
+
+#[derive(Debug, Default)]
+struct PmaReader {
+    records: VecDeque<Vec<u8>>,
+    child: Option<Box<PmaMerge>>,
+}
+
+impl PmaReader {
+    fn refill(&mut self, key: &KeyInfoRt, refill_bytes: usize) {
+        let Some(child) = &mut self.child else { return };
+        let mut remaining = refill_bytes;
+        // vdbeIncrPopulate writes each record then advances the input, even
+        // when the record just written is the last one that fits.
+        while let Some(record) = child.current() {
+            let bytes = record.len() + sqlite3_varint_len(record.len() as u64) as usize;
+            let Some(rest) = remaining.checked_sub(bytes) else { break };
+            let Some(record) = child.pop(key, refill_bytes) else { break };
+            self.records.push_back(record);
+            remaining = rest;
+        }
+    }
+}
+
+/// A C `MergeEngine` reader tree. The leaves keep the original PMA order.
+#[derive(Debug)]
+struct PmaMerge {
+    readers: Vec<PmaReader>,
+    winners: Vec<usize>,
+}
+
+impl PmaMerge {
+    fn new(mut readers: Vec<PmaReader>, width: usize) -> Self {
+        readers.resize_with(width, PmaReader::default);
+        Self { readers, winners: vec![0; width] }
+    }
+
+    fn from_runs(runs: Vec<Vec<Vec<u8>>>) -> Self {
+        let mut readers: Vec<_> = runs.into_iter().map(|run| PmaReader {
+            records: run.into(),
+            child: None,
+        }).collect();
+        if readers.len() <= PMA_FANOUT {
+            let width = readers.len().next_power_of_two().max(2);
+            return Self::new(readers, width);
+        }
+        let mut leaf_level = true;
+        while readers.len() > PMA_FANOUT {
+            let mut parents = Vec::with_capacity(readers.len().div_ceil(PMA_FANOUT));
+            let mut inputs = readers.into_iter();
+            loop {
+                let group: Vec<_> = inputs.by_ref().take(PMA_FANOUT).collect();
+                if group.is_empty() {
+                    break;
+                }
+                let width = if leaf_level { group.len().next_power_of_two().max(2) } else { PMA_FANOUT };
+                parents.push(PmaReader {
+                    records: VecDeque::new(),
+                    child: Some(Box::new(Self::new(group, width))),
+                });
+            }
+            readers = parents;
+            leaf_level = false;
+        }
+        Self::new(readers, PMA_FANOUT)
+    }
+
+    fn initialize(&mut self, key: &KeyInfoRt, refill_bytes: usize) {
+        for reader in &mut self.readers {
+            if let Some(child) = &mut reader.child {
+                child.initialize(key, refill_bytes);
+                reader.refill(key, refill_bytes);
+            }
+        }
+        // vdbeMergeEngineInit visits the nodes from the end of the tree.
+        let width = self.winners.len();
+        for node in (1..width).rev() {
+            let left_child = 2 * node;
+            let (left, right) = if left_child < width {
+                (self.winners[left_child], self.winners[left_child + 1])
+            } else {
+                (left_child - width, left_child + 1 - width)
+            };
+            self.winners[node] = self.choose(key, left, right);
+        }
+    }
+
+    fn choose(&self, key: &KeyInfoRt, left: usize, right: usize) -> usize {
+        match (self.readers[left].records.front(), self.readers[right].records.front()) {
+            (None, _) => right,
+            (Some(_), None) => left,
+            (Some(a), Some(b)) => {
+                let rhs = sqlite3_vdbe_record_unpack(key, b, usize::from(key.n_key_field));
+                let cmp = VdbeSorter::compare(key, a, &rhs);
+                if cmp < 0 || (cmp == 0 && left < right) { left } else { right }
+            }
+        }
+    }
+
+    fn current(&self) -> Option<&[u8]> {
+        self.readers[self.winners[1]].records.front().map(Vec::as_slice)
+    }
+
+    fn pop(&mut self, key: &KeyInfoRt, refill_bytes: usize) -> Option<Vec<u8>> {
+        let previous = self.winners[1];
+        let reader = &mut self.readers[previous];
+        let result = reader.records.pop_front()?;
+        if reader.records.is_empty() {
+            reader.refill(key, refill_bytes);
+        }
+
+        // vdbeMergeEngineStep keeps the winner in the same argument slot
+        // while bringing in the sibling of each updated node.
+        let mut left = previous & !1;
+        let mut right = previous | 1;
+        let mut node = (self.winners.len() + previous) / 2;
+        loop {
+            let winner = self.choose(key, left, right);
+            self.winners[node] = winner;
+            if node == 1 {
+                break;
+            }
+            let sibling = self.winners[node ^ 1];
+            if winner == left {
+                right = sibling;
+            } else {
+                left = sibling;
+            }
+            node /= 2;
+        }
+        Some(result)
+    }
+}
+
 /// `struct VdbeSorter`.
 #[derive(Debug)]
 pub struct VdbeSorter {
@@ -138,6 +271,10 @@ pub struct VdbeSorter {
     pmas: Vec<Vec<Vec<u8>>>,
     /// `bUsePMA`
     b_use_pma: bool,
+    /// `mxKeysize`, including the length varint.
+    largest_pma_record: usize,
+    pma_merge: Option<PmaMerge>,
+    refill_bytes: usize,
     /// After `sqlite3VdbeSorterRewind`: the sorted records and the position in them.
     out: Vec<Vec<u8>>,
     pos: usize,
@@ -164,6 +301,9 @@ impl VdbeSorter {
             list: Vec::new(),
             pmas: Vec::new(),
             b_use_pma: false,
+            largest_pma_record: 0,
+            pma_merge: None,
+            refill_bytes: 0,
             out: Vec::new(),
             pos: 0,
             n_pma: 0,
@@ -257,6 +397,7 @@ impl VdbeSorter {
             }
         }
         self.sz_pma += n_pma;
+        self.largest_pma_record = self.largest_pma_record.max(n_pma as usize);
         if self.use_a_memory {
             // ROUND8(nReq)
             self.i_memory += (n_req + 7) & !7;
@@ -267,6 +408,7 @@ impl VdbeSorter {
     /// `sqlite3VdbeSorterRewind(pCsr, &bEof)`: returns `bEof`.
     pub fn rewind(&mut self) -> bool {
         self.pos = 0;
+        self.pma_merge = None;
         if !self.b_use_pma {
             if self.list.is_empty() {
                 self.out = Vec::new();
@@ -275,29 +417,23 @@ impl VdbeSorter {
             self.out = self.sort_list();
             return false;
         }
-        // Write the current in-memory list to a PMA, then merge all PMAs: the earlier PMA
-        // wins a tie.
         self.flush_pma();
-        let key_info = Arc::clone(&self.key_info);
-        let mut runs = std::mem::take(&mut self.pmas);
-        while runs.len() > 1 {
-            let mut next: Vec<Vec<Vec<u8>>> = Vec::with_capacity(runs.len().div_ceil(2));
-            let mut it = runs.into_iter();
-            while let Some(a) = it.next() {
-                match it.next() {
-                    Some(b) => next.push(Self::merge(&key_info, a, b)),
-                    None => next.push(a),
-                }
-            }
-            runs = next;
-        }
-        self.out = runs.pop().unwrap_or_default();
-        self.out.is_empty()
+        self.refill_bytes = (self.mx_pma_size as usize / 2).max(self.largest_pma_record + 9);
+        let mut merge = PmaMerge::from_runs(std::mem::take(&mut self.pmas));
+        merge.initialize(&self.key_info, self.refill_bytes);
+        let empty = merge.current().is_none();
+        self.pma_merge = Some(merge);
+        self.out.clear();
+        empty
     }
 
     /// `sqlite3VdbeSorterNext(db, pCsr)`: `true` is `SQLITE_OK`, `false` is `SQLITE_DONE`.
     #[inline]
     pub fn next(&mut self) -> bool {
+        if let Some(merge) = &mut self.pma_merge {
+            merge.pop(&self.key_info, self.refill_bytes);
+            return merge.current().is_some();
+        }
         // (the record is released as C frees it)
         if let Some(r) = self.out.get_mut(self.pos) {
             *r = Vec::new();
@@ -309,6 +445,9 @@ impl VdbeSorter {
     /// `vdbeSorterRowkey`
     #[inline]
     pub fn rowkey(&self) -> &[u8] {
+        if let Some(merge) = &self.pma_merge {
+            return merge.current().unwrap_or_default();
+        }
         self.out.get(self.pos).map_or(&[], |v| v.as_slice())
     }
 
@@ -330,6 +469,9 @@ impl VdbeSorter {
     pub fn reset(&mut self) {
         self.list.clear();
         self.pmas.clear();
+        self.pma_merge = None;
+        self.largest_pma_record = 0;
+        self.refill_bytes = 0;
         self.out.clear();
         self.pos = 0;
         self.b_use_pma = false;
@@ -405,4 +547,59 @@ impl RowSet {
         }
         v
     }
+}
+
+#[cfg(test)]
+#[test]
+fn pma_merge_calls_comparator_on_each_step() {
+    use crate::vdbemem::CollRt;
+    use sqliters_types::{CustomCollation, decode_record, encode_record};
+    use std::sync::Mutex;
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&calls);
+    let collation = CollRt::from_custom(CustomCollation::new("app_order", move |left, right| {
+        seen.lock().unwrap().push((left.as_bytes()[0], right.as_bytes()[0]));
+        Ok(right.cmp(left))
+    }));
+    let key = Arc::new(KeyInfoRt {
+        enc: 1,
+        n_key_field: 1,
+        n_all_field: 1,
+        a_sort_flags: vec![0],
+        a_coll: vec![Some(Arc::new(collation))],
+    });
+    let mut sorter = VdbeSorter::init(&key, 0, 512, 1, false);
+    let padding = "x".repeat(60_000);
+    for label in ["d", "a", "c", "b"] {
+        sorter.write(&encode_record(&[Value::Text(format!("{label}{padding}").into())]));
+    }
+    let take_calls = || std::mem::take(&mut *calls.lock().unwrap());
+    let current = |sorter: &VdbeSorter| {
+        let row = decode_record(sorter.rowkey()).unwrap();
+        let Value::Text(text) = &row[0] else { panic!("expected a text key") };
+        text.as_bytes()[0]
+    };
+    assert_eq!(take_calls(), [(b'd', b'a')]);
+    assert!(!sorter.rewind());
+    assert_eq!(sorter.n_pma, 2);
+    assert_eq!(current(&sorter), b'd');
+    assert_eq!(take_calls(), [(b'c', b'b'), (b'd', b'c')]);
+
+    assert!(sorter.next());
+    assert_eq!(current(&sorter), b'c');
+    assert_eq!(take_calls(), [(b'a', b'c')]);
+    assert!(sorter.next());
+    assert_eq!(current(&sorter), b'b');
+    assert_eq!(take_calls(), [(b'a', b'b')]);
+    assert!(sorter.next());
+    assert_eq!(current(&sorter), b'a');
+    assert!(take_calls().is_empty());
+    assert!(!sorter.next());
+    assert!(sorter.rowkey().is_empty());
+
+    sorter.reset();
+    assert!(sorter.rewind());
+    assert!(sorter.rowkey().is_empty());
+    assert!(take_calls().is_empty());
 }
