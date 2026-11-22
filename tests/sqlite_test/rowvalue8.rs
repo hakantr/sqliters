@@ -2110,3 +2110,61 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_constant_values_integer_sets() {
+    sqliters_tcltest::run_test_script(
+        "row_case_constant_values_integer_sets",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE words(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO words VALUES (1,1,10),(2,2,20),(3,3,30),(4,4,40);
+        CREATE TABLE picks(id INTEGER PRIMARY KEY,ref INTEGER,label TEXT);
+        INSERT INTO picks VALUES (2,1,'two'),(3,2,'unused'),(4,1,'four'),
+            (7,3,'seven'),(8,1,'eight'),(9,4,'nine'),(11,NULL,'null');
+        CREATE INDEX picks_ref ON picks(ref);
+        CREATE VIEW chosen AS SELECT p.id,p.ref,
+          CASE (SELECT a,b FROM words w WHERE w.id=p.ref)
+           WHEN (2,20) THEN 'Three ' ELSE p.label END AS token FROM picks p;
+    }
+    do_execsql_test row-case-values-set-$encoding.rowid {
+        SELECT id,token FROM chosen WHERE id IN (VALUES(3),(4),(3.0),('003'),(NULL),(3.5))
+          ORDER BY id DESC;
+    } {4 four 3 {Three }}
+    do_execsql_test row-case-values-set-$encoding.secondary {
+        SELECT p.id,CASE (SELECT a,b FROM words WHERE id=p.ref)
+                     WHEN (3,30) THEN 'third' ELSE p.label END
+        FROM picks p INDEXED BY picks_ref WHERE p.ref IN (VALUES(1),(3.0),('003'),(4),(NULL))
+        ORDER BY p.ref DESC,p.id DESC;
+    } {9 nine 7 third 8 eight 4 four 2 two}
+    do_test row-case-values-set-$encoding.reset {
+        set stmt [sqlite3_prepare_v2 db {
+            SELECT id,token FROM chosen WHERE id IN (VALUES(?1),(?2),(4),(NULL)) ORDER BY id
+        } -1]
+        sqlite3_bind_int $stmt 1 2
+        sqlite3_bind_int $stmt 2 3
+        set first {}
+        while {[set rc [sqlite3_step $stmt]] eq "SQLITE_ROW"} {
+            lappend first [sqlite3_column_int $stmt 0] [sqlite3_column_text $stmt 1]
+        }
+        lappend first $rc
+        sqlite3_reset $stmt
+        sqlite3_bind_null $stmt 1
+        sqlite3_bind_int $stmt 2 9
+        set second {}
+        while {[set rc [sqlite3_step $stmt]] eq "SQLITE_ROW"} {
+            lappend second [sqlite3_column_int $stmt 0] [sqlite3_column_text $stmt 1]
+        }
+        lappend second $rc
+        list $first $second [sqlite3_finalize $stmt]
+    } {{2 two 3 {Three } 4 four SQLITE_DONE} {4 four 9 nine SQLITE_DONE} SQLITE_OK}
+}
+finish_test
+"#,
+    );
+}

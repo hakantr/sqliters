@@ -1063,6 +1063,56 @@ fn ordered_in_key(
     written && probed
 }
 
+fn in_list_value_output(value: &VdbeOp) -> Option<i32> {
+    match value.opcode {
+        OP_Integer | OP_Int64 | OP_Real | OP_String8 | OP_String | OP_Null | OP_Blob | OP_Variable => Some(value.p2),
+        OP_Add | OP_Subtract | OP_Multiply | OP_Divide | OP_Remainder
+            if value.p4 == P4::NotUsed && value.p5 == 0 => Some(value.p3),
+        _ => None,
+    }
+}
+
+fn stores_integer_set_record(record: &VdbeOp, insert: &VdbeOp, cursor: i32, output: i32) -> bool {
+    output == record.p1 && record.opcode == OP_MakeRecord && record.p2 == 1 && record.p5 == 0
+        && matches!(&record.p4, P4::Dynamic(affinity) if affinity.as_slice() == [SQLITE_AFF_INTEGER])
+        && insert.opcode == OP_IdxInsert && insert.p1 == cursor && insert.p2 == record.p3
+        && insert.p3 == record.p1 && insert.p4 == P4::Int32(1) && insert.p5 == 0
+}
+
+/// Multi-row VALUES may produce the IN set from a single-column coroutine.
+/// Each yield supplies the register copied into the ordinary set record.
+fn constant_values_set(
+    ops: &[VdbeOp], entries: &[VdbeOp], open: usize, ret: usize, cursor: i32,
+) -> bool {
+    let [init, read, copy, record, insert, repeat] = entries else { return false };
+    if init.opcode != OP_InitCoroutine || init.p2 != 0
+        || read.opcode != OP_Yield || read.p1 != init.p1 || read.p2 as usize != ret - 1 || read.p5 != 0
+        || copy.opcode != OP_Copy || copy.p3 != 0 || copy.p5 != 2
+        || !stores_integer_set_record(record, insert, cursor, copy.p2)
+        || repeat.opcode != OP_Goto || repeat.p2 as usize != open + 2
+    {
+        return false;
+    }
+    let Ok(entry) = usize::try_from(init.p3) else { return false };
+    let Some(first) = entry.checked_sub(1).and_then(|i| ops.get(i)) else { return false };
+    if first.opcode != OP_InitCoroutine || first.p1 != init.p1 || first.p3 != init.p3 {
+        return false;
+    }
+    let Some(end) = usize::try_from(first.p2).ok().and_then(|i| i.checked_sub(1)) else {
+        return false;
+    };
+    if end >= open || !ops.get(end).is_some_and(|op| op.opcode == OP_EndCoroutine && op.p1 == init.p1) {
+        return false;
+    }
+    ops.get(entry..end).is_some_and(|rows| {
+        !rows.is_empty() && rows.len() % 2 == 0 && rows.chunks_exact(2).all(|row| {
+            let [value, yield_row] = row else { return false };
+            in_list_value_output(value) == Some(copy.p1) && yield_row.opcode == OP_Yield
+                && yield_row.p1 == init.p1 && yield_row.p2 == 0 && yield_row.p5 == 0
+        })
+    })
+}
+
 /// An IN list driving an integer lookup is a private one-column set. Its
 /// records use integer affinity and database encoding before index insertion.
 fn integer_probe_list_key(
@@ -1100,16 +1150,28 @@ fn integer_probe_list_key(
     let Some(step) = ops.get(step_index) else { return false };
     let secondary = probe.opcode != OP_SeekRowid;
     let seek = if secondary {
-        let Some([seek, stop]) = ops.get(ret + 5..ret + 7) else { return false };
-        if probe.opcode != OP_Affinity || probe.p1 != column.p3 || probe.p2 != 1 || probe.p5 != 0
-            || !matches!(&probe.p4, P4::Dynamic(affinity)
-                if matches!(affinity.as_slice(), [SQLITE_AFF_INTEGER | SQLITE_AFF_NUMERIC]))
-            || !matches!((seek.opcode, stop.opcode), (OP_SeekGE, OP_IdxGT) | (OP_SeekLE, OP_IdxLT))
+        // A SELECT set is already normalized by its integer-affinity record.
+        // Literal lists may still have a separate affinity at the index seek.
+        let seek_index = if probe.opcode == OP_Affinity {
+            if probe.p1 != column.p3 || probe.p2 != 1 || probe.p5 != 0
+                || !matches!(&probe.p4, P4::Dynamic(affinity)
+                    if matches!(affinity.as_slice(), [SQLITE_AFF_INTEGER | SQLITE_AFF_NUMERIC]))
+            {
+                return false;
+            }
+            ret + 5
+        } else if reusable {
+            ret + 4
+        } else {
+            return false;
+        };
+        let Some([seek, stop]) = ops.get(seek_index..seek_index + 2) else { return false };
+        if !matches!((seek.opcode, stop.opcode), (OP_SeekGE, OP_IdxGT) | (OP_SeekLE, OP_IdxLT))
             || seek.p4 != P4::Int32(1) || stop.p1 != seek.p1 || stop.p2 != seek.p2
             || stop.p3 != seek.p3 || stop.p4 != P4::Int32(1) || stop.p5 != 0
-            || !ops.get(ret + 7..step_index).is_some_and(|body| body.iter().any(|next| {
+            || !ops.get(seek_index + 2..step_index).is_some_and(|body| body.iter().any(|next| {
                 matches!((seek.opcode, next.opcode), (OP_SeekGE, OP_Next) | (OP_SeekLE, OP_Prev))
-                    && next.p1 == seek.p1 && next.p2 as usize == ret + 6
+                    && next.p1 == seek.p1 && next.p2 as usize == seek_index + 1
             }))
         {
             return false;
@@ -1139,19 +1201,11 @@ fn integer_probe_list_key(
 
     let build = open_index + 1..ret - 1;
     let Some(entries) = ops.get(build.clone()) else { return false };
-    if entries.is_empty() || entries.len() % 3 != 0 || !entries.chunks_exact(3).all(|entry| {
+    let direct_records = !entries.is_empty() && entries.len() % 3 == 0 && entries.chunks_exact(3).all(|entry| {
         let [value, record, insert] = entry else { return false };
-        let output = match value.opcode {
-            OP_Integer | OP_Int64 | OP_Real | OP_String8 | OP_String | OP_Null | OP_Blob | OP_Variable => value.p2,
-            OP_Add | OP_Subtract | OP_Multiply | OP_Divide | OP_Remainder
-                if value.p4 == P4::NotUsed && value.p5 == 0 => value.p3,
-            _ => return false,
-        };
-        output == record.p1 && record.opcode == OP_MakeRecord && record.p2 == 1 && record.p5 == 0
-            && matches!(&record.p4, P4::Dynamic(affinity) if affinity.as_slice() == [SQLITE_AFF_INTEGER])
-            && insert.opcode == OP_IdxInsert && insert.p1 == cursor && insert.p2 == record.p3
-            && insert.p3 == record.p1 && insert.p4 == P4::Int32(1) && insert.p5 == 0
-    }) {
+        in_list_value_output(value).is_some_and(|output| stores_integer_set_record(record, insert, cursor, output))
+    });
+    if !(direct_records || (reusable && constant_values_set(ops, entries, open_index, ret, cursor))) {
         return false;
     }
 
