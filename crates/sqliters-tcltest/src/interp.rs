@@ -1312,7 +1312,7 @@ impl TclInterp {
         }
         self.builtins.remove(&name);
         if let Some(host_rc) = self.host.clone() {
-            crate::harness::delete_host_cmd_if_exists(&host_rc, &name);
+            crate::harness::delete_host_cmd_if_exists(&host_rc, self, &name);
         }
         self.procs.insert(
             name,
@@ -1369,7 +1369,7 @@ impl TclInterp {
             }
         } else if in_host {
             if let Some(host_rc) = self.host.clone() {
-                crate::harness::rename_or_delete_host_cmd(&host_rc, old, new)?;
+                crate::harness::rename_or_delete_host_cmd(&host_rc, self, old, new)?;
             }
         } else if let Some(target) = self.builtins.remove(old)
             && !new.is_empty()

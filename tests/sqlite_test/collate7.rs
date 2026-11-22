@@ -1,5 +1,4 @@
 #[test]
-#[ignore = "2/8 subtests passed; pending: collate7 edge cases"]
 fn test_collate7() {
     sqliters_tcltest::run_test_script(
         "collate7",
@@ -101,6 +100,66 @@ foreach encoding {UTF-8 UTF-16le UTF-16be} {
     SELECT value FROM words WHERE value<'abc';
     PRAGMA integrity_check;
   } {A ok}
+}
+finish_test
+"#,
+    );
+}
+
+#[test]
+fn test_collation_v2_comparator_and_destructor_order() {
+    sqliters_tcltest::run_test_script(
+        "collation_v2_comparator_and_destructor_order",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+proc ci_compare {left right} { string compare -nocase $left $right }
+proc reverse_compare {left right} { string compare $right $left }
+set ::collation_events {}
+
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    set ::collation_events {}
+    execsql "PRAGMA encoding='$encoding'"
+    sqlite3_create_collation_v2 db custom_order ci_compare {lappend ::collation_events first}
+    execsql {CREATE TABLE words(v TEXT COLLATE custom_order); INSERT INTO words VALUES('a'),('B');}
+    do_execsql_test collation-v2-order-$encoding.1 {
+        SELECT v FROM words WHERE v='A';
+        SELECT v FROM words ORDER BY v;
+    } {a a B}
+    do_test collation-v2-order-$encoding.2 {
+        sqlite3_create_collation_v2 db CUSTOM_ORDER reverse_compare {lappend ::collation_events second}
+        set ::collation_events
+    } {first}
+    do_execsql_test collation-v2-order-$encoding.3 {
+        SELECT v FROM words ORDER BY v;
+    } {a B}
+    do_test collation-v2-order-$encoding.4 {
+        sqlite_delete_collation db custom_order
+        set ::collation_events
+    } {first second}
+    do_catchsql_test collation-v2-order-$encoding.5 {
+        SELECT v FROM words ORDER BY v;
+    } {1 {no such collation sequence: custom_order}}
+    do_test collation-v2-order-$encoding.6 {
+        sqlite3_create_collation_v2 db custom_order ci_compare {lappend ::collation_events third}
+        db close
+        set ::collation_events
+    } {first second third}
+    do_test collation-v2-order-$encoding.7 {
+        sqlite3 db :memory:
+        sqlite3_create_collation_v2 db custom_order ci_compare {lappend ::collation_events fourth}
+        rename db {}
+        set ::collation_events
+    } {first second third fourth}
+    do_test collation-v2-order-$encoding.8 {
+        sqlite3 db :memory:
+        sqlite3_create_collation_v2 db custom_order ci_compare {lappend ::collation_events fifth}
+        sqlite3 db :memory:
+        db close
+        set ::collation_events
+    } {first second third fourth fifth}
 }
 finish_test
 "#,

@@ -2142,3 +2142,8 @@ Literal koşul eşliği ve IS NOT NULL çıkarımı C ile eşleşti. 360 profil 
 ## V6b.367 — Rowid görünüm DELETE karma aralığında tetikleyici sırası
 
 216 görünüm silme profilinde 300 fark kapandı. 648 C yeniden açılışı doğrulandı. OFF 1243/1/329, ON 1240/4/329. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_367.md).
+
+
+## V6b.368 — Tcl karşılaştırma işlevi ve sonlandırma geri çağrısı
+
+C ve iki Rust kipinde eski collate7 kapsamı ve üç kodlamadaki 24 ek yaşam döngüsü kontrolü geçti. OFF 1245/1/328, ON 1242/4/328. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,263 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_368.md).

@@ -949,8 +949,9 @@ pub(crate) fn list_host_cmds(host: &SharedHost) -> Vec<String> {
     host.borrow().cmd_table.keys().cloned().collect()
 }
 
-pub(crate) fn delete_host_cmd_if_exists(host: &SharedHost, name: &str) {
+pub(crate) fn delete_host_cmd_if_exists(host: &SharedHost, interp: &mut TclInterp, name: &str) {
     let target = host.borrow_mut().cmd_table.remove(name);
+    let _interp = enter_interp_scope(interp);
     match target {
         Some(HostCmdTarget::Db(db_id)) => invoke_db_delete_hook(host, db_id),
         Some(HostCmdTarget::Backup(backup_id)) => invoke_backup_delete_hook(host, backup_id),
@@ -958,13 +959,19 @@ pub(crate) fn delete_host_cmd_if_exists(host: &SharedHost, name: &str) {
     }
 }
 
-pub(crate) fn rename_or_delete_host_cmd(host: &SharedHost, old: &str, new: &str) -> TclResult<()> {
+pub(crate) fn rename_or_delete_host_cmd(
+    host: &SharedHost,
+    interp: &mut TclInterp,
+    old: &str,
+    new: &str,
+) -> TclResult<()> {
     let Some(target) = host.borrow_mut().cmd_table.remove(old) else {
         return Err(TclControl::Error(format!(
             "can't rename \"{old}\": command doesn't exist"
         )));
     };
     if new.is_empty() {
+        let _interp = enter_interp_scope(interp);
         match target {
             HostCmdTarget::Db(db_id) => invoke_db_delete_hook(host, db_id),
             HostCmdTarget::Backup(backup_id) => invoke_backup_delete_hook(host, backup_id),
@@ -1790,12 +1797,18 @@ fn dispatch_host_builtin(
         "test_override_sum" => cmd_override_sum(host, invoked_name, args),
         "sqlite3_create_aggregate" => cmd_create_aggregate(host, invoked_name, args),
         "add_test_collate" => cmd_add_test_collate(host, invoked_name, args),
-        "sqlite3_create_collation_v2" => cmd_create_collation_v2(host, invoked_name, args),
+        "sqlite3_create_collation_v2" => {
+            let _interp = enter_interp_scope(interp);
+            cmd_create_collation_v2(host, invoked_name, args)
+        }
         "sqlite3_create_function" | "sqlite3_create_function_v2" => {
             cmd_create_function_v2(host, invoked_name, args)
         }
         "sqlite_delete_function" => cmd_delete_function(host, invoked_name, args),
-        "sqlite_delete_collation" => cmd_delete_collation(host, invoked_name, args),
+        "sqlite_delete_collation" => {
+            let _interp = enter_interp_scope(interp);
+            cmd_delete_collation(host, invoked_name, args)
+        }
         "sqlite3_busy_timeout" => cmd_busy_timeout(host, invoked_name, args),
         "load_static_extension" => cmd_load_static_extension(host, invoked_name, args),
         "register_dbstat_vtab" => cmd_register_dbstat_vtab(host, invoked_name, args),
@@ -1925,7 +1938,7 @@ fn open_db_cmd(host: &SharedHost, interp: &mut TclInterp, args: &[String]) -> Tc
     // Per `tclsqlite.c:DbMain`, only after the new connection opens successfully do we
     // replace any existing Tcl command of the same name (running its delete hook once).
     interp.remove_non_host_cmd(&handle_name);
-    delete_host_cmd_if_exists(host, &handle_name);
+    delete_host_cmd_if_exists(host, interp, &handle_name);
 
     let _ = host.borrow_mut().register_new_db(handle_name, conn);
     Ok(String::new())
@@ -1959,7 +1972,10 @@ fn dispatch_db_method(
     }
     let sub = args[0].as_str();
     match sub {
-        "close" => db_close_cmd(host, db_name, db_id),
+        "close" => {
+            let _interp = enter_interp_scope(interp);
+            db_close_cmd(host, db_name, db_id)
+        }
         "nullvalue" | "null" => {
             let mut h = host.borrow_mut();
             let Some(DbSlot::Present(db)) = h.dbs.get_mut(&db_id) else {
@@ -2063,7 +2079,10 @@ fn dispatch_db_method(
         "deserialize" => db_deserialize_cmd(host, db_name, db_id, &args[1..]),
         "config" => db_config_subcmd(host, db_name, db_id, &args[1..]),
         "function" | "func" => db_function_cmd(host, db_name, db_id, &args[1..]),
-        "collate" => db_collate_cmd(host, db_name, db_id, &args[1..]),
+        "collate" => {
+            let _interp = enter_interp_scope(interp);
+            db_collate_cmd(host, db_name, db_id, &args[1..])
+        }
         "busy" => db_busy_cmd(host, db_name, db_id, &args[1..]),
         "progress" => db_progress_cmd(host, db_name, db_id, &args[1..]),
         "authorizer" | "auth" => db_authorizer_cmd(host, db_name, db_id, &args[1..]),
@@ -3453,8 +3472,11 @@ fn cmd_reset_db(host: &SharedHost, interp: &mut TclInterp) -> TclResult<String> 
         let _ = st.finalize();
     }
     if let Some(db_id) = existing_db_id {
-        let _ = db_close_cmd(host, "db", db_id);
-        delete_host_cmd_if_exists(host, "db");
+        {
+            let _interp = enter_interp_scope(interp);
+            let _ = db_close_cmd(host, "db", db_id);
+        }
+        delete_host_cmd_if_exists(host, interp, "db");
     }
 
     // 2. Remove `test.db` and rollback/WAL sidecars now that handles are closed.
@@ -4657,8 +4679,39 @@ fn db_collate_cmd(
             .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
         return Ok(String::new());
     }
-    let cmd_words = parse_list(&proc_name).unwrap_or_else(|_| vec![proc_name.clone()]);
+    register_tcl_collation(&conn, col_name, &proc_name, None)
+}
+
+struct TclCollationDestructor {
+    script: String,
+    installed: AtomicBool,
+}
+
+impl Drop for TclCollationDestructor {
+    fn drop(&mut self) {
+        if self.installed.load(Ordering::Acquire) {
+            let _ = eval_global_in_active_interp(&self.script);
+        }
+    }
+}
+
+fn register_tcl_collation(
+    conn: &Connection,
+    col_name: &str,
+    proc_name: &str,
+    destructor: Option<&str>,
+) -> TclResult<String> {
+    let cmd_words = parse_list(proc_name).unwrap_or_else(|_| vec![proc_name.to_owned()]);
+    let destructor = destructor.filter(|script| !script.is_empty()).map(|script| {
+        Arc::new(TclCollationDestructor {
+            script: script.to_owned(),
+            installed: AtomicBool::new(false),
+        })
+    });
+    let callback_destructor = destructor.clone();
     conn.create_fallible_collation(col_name, move |lhs, rhs| {
+        // The registered comparator owns the Tcl destructor.
+        let _destructor = &callback_destructor;
         let mut call_words = cmd_words.clone();
         call_words.push(lhs.to_string());
         call_words.push(rhs.to_string());
@@ -4686,6 +4739,10 @@ fn db_collate_cmd(
         }
     })
     .map_err(|e| TclControl::Error(sqlite_err_text(&e)))?;
+    if let Some(destructor) = destructor {
+        // sqlite3_create_collation_v2 leaves ownership with the caller on failure.
+        destructor.installed.store(true, Ordering::Release);
+    }
     Ok(String::new())
 }
 
@@ -5258,7 +5315,7 @@ fn cmd_sqlite3_backup(
     };
 
     interp.remove_non_host_cmd(&cmd_name);
-    delete_host_cmd_if_exists(host, &cmd_name);
+    delete_host_cmd_if_exists(host, interp, &cmd_name);
 
     let mut h = host.borrow_mut();
     let backup_id = h.next_backup_id;
@@ -5762,21 +5819,16 @@ fn cmd_add_test_collate(
 
 fn cmd_create_collation_v2(
     host: &SharedHost,
-    _invoked_name: &str,
+    invoked_name: &str,
     args: &[String],
 ) -> TclResult<String> {
-    if args.len() < 4 {
-        return Ok("SQLITE_OK".to_string());
-    }
-    let db_tok = &args[0];
-    let col_name = &args[1];
-    let cmp_proc = args.get(3).cloned().unwrap_or_default();
-    let Some(db_id) = host.borrow().resolve_db_id(db_tok) else {
-        return Ok("SQLITE_OK".to_string());
+    let [db_tok, col_name, comparator, destructor] = args else {
+        return Err(TclControl::Error(format!(
+            "wrong # args: should be \"{invoked_name} DB-HANDLE NAME CMP-PROC DEL-PROC\""
+        )));
     };
-    let sub_args = vec![col_name.clone(), cmp_proc];
-    let _ = db_collate_cmd(host, db_tok, db_id, &sub_args);
-    Ok("SQLITE_OK".to_string())
+    let (_, conn, _) = resolve_db_conn_and_cmd_name(host, db_tok)?;
+    register_tcl_collation(&conn, col_name, comparator, Some(destructor))
 }
 
 fn cmd_create_function_v2(
