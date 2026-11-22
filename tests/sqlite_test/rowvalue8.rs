@@ -510,3 +510,33 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_default_text_keeps_database_encoding() {
+    sqliters_tcltest::run_test_script(
+        "row_case_default_text_keeps_database_encoding",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach {encoding expected} {UTF-8 C480 UTF-16le 0001 UTF-16be 0100} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    do_execsql_test column-default-encoding-$encoding {
+        CREATE TABLE listing(id INTEGER PRIMARY KEY);
+        INSERT INTO listing(id) VALUES(1);
+        ALTER TABLE listing ADD COLUMN label TEXT DEFAULT 'Ā';
+        ALTER TABLE listing ADD COLUMN amount INTEGER DEFAULT 5;
+        ALTER TABLE listing ADD COLUMN data BLOB DEFAULT X'0102';
+        INSERT INTO listing(id,label) VALUES(2,'Ā');
+        INSERT INTO listing VALUES(3,NULL,6,X'03');
+        SELECT id,
+               CASE (SELECT 7,11)
+                 WHEN (7,11) THEN hex(CAST(label AS BLOB)) ELSE '?' END,
+               amount, hex(data), typeof(label), typeof(data)
+          FROM listing ORDER BY id;
+    } [list 1 $expected 5 0102 text blob 2 $expected 5 0102 text blob 3 {} 6 03 null blob]
+}
+finish_test
+"#,
+    );
+}

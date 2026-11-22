@@ -3134,7 +3134,11 @@ impl Vdbe {
                             // default value or a NULL.
                             if pc_.n_hdr_parsed <= p2 {
                                 match &op.p4 {
-                                    P4::Mem(v) => self.a_mem[p3].set_from_value(v),
+                                    P4::Mem(v) => {
+                                        // C pre-encodes sqlite3ColumnDefault in ENC(db).
+                                        self.a_mem[p3].set_from_value(v);
+                                        self.a_mem[p3].change_encoding(encoding);
+                                    }
                                     _ => self.a_mem[p3].set_null(),
                                 }
                                 break 'col;

@@ -2202,3 +2202,8 @@ Sırasız geçici BINARY anahtar kullanan salt okunur CASE sorgularında 720 gö
 ## V6b.379 — CTE ve ifade alt sorgusu üzerinden görünüm CASE eşliği
 
 Gerçekten başvurulan özyinelemesiz CTE ve ifade alt sorgularında kalıcı görünüm çözümü korunuyor. C ve iki Rust kipinde 660 gözlemde 130 fark kapandı. Altı C açılışı ve önceki DEFAULT testi geçti. OFF 1257/1/325, ON 1254/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,283 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_379.md).
+
+
+## V6b.380 — Eski satırda sütun varsayılanının metin kodlaması
+
+Sonradan eklenmiş TEXT DEFAULT sütununu eski fiziksel kayıttan okuyan VDBE, metni bağlantının veritabanı kodlamasına getiriyor. 324 gözlemde 16 C farkı kapandı. Önceki DISTINCT geçişinin 24 Rust sonucu korundu. OFF 1258/1/325, ON 1255/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,267 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_380.md).
