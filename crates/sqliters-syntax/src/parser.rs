@@ -1940,7 +1940,7 @@ impl<'a> Parser<'a> {
                 };
                 let upsert_clauses = self.parse_upsert_clauses()?;
                 if self.eat(TokenKind::Returning) {
-                    let _ = self.parse_projection(true)?;
+                    let _ = self.parse_projection()?;
                     return Err(SqliteError::new(
                         ErrorCode::Error,
                         "cannot use RETURNING in a trigger",
@@ -2107,7 +2107,7 @@ impl<'a> Parser<'a> {
         if !self.eat(TokenKind::Returning) {
             return Ok(Vec::new());
         }
-        self.parse_projection(true)
+        self.parse_projection()
     }
 
     fn parse_pragma(&mut self) -> Result<Stmt> {
@@ -2332,7 +2332,7 @@ impl<'a> Parser<'a> {
         }
 
         // SELECT allows nm.* and requires a column name in three-part expressions.
-        let projection = self.parse_projection(false)?;
+        let projection = self.parse_projection()?;
 
         let from = if self.eat(TokenKind::From) {
             Some(self.parse_from_clause()?)
@@ -2525,7 +2525,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_projection(&mut self, allow_schema_table_star: bool) -> Result<Vec<ResultColumn>> {
+    fn parse_projection(&mut self) -> Result<Vec<ResultColumn>> {
         let mut cols = Vec::new();
         loop {
             if self.eat(TokenKind::Star) {
@@ -2539,23 +2539,6 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::Star)?;
                 cols.push(ResultColumn::TableStar {
                     schema: None,
-                    table: tbl,
-                });
-            } else if allow_schema_table_star
-                && (Self::can_be_ident(self.peek().kind) || Self::is_join_kw(self.peek().kind))
-                && self.peek_n(1).kind == TokenKind::Dot
-                && (Self::can_be_ident(self.peek_n(2).kind)
-                    || Self::is_join_kw(self.peek_n(2).kind))
-                && self.peek_n(3).kind == TokenKind::Dot
-                && self.peek_n(4).kind == TokenKind::Star
-            {
-                let schema = self.parse_nm()?;
-                self.expect(TokenKind::Dot)?;
-                let tbl = self.parse_nm()?;
-                self.expect(TokenKind::Dot)?;
-                self.expect(TokenKind::Star)?;
-                cols.push(ResultColumn::TableStar {
-                    schema: Some(schema),
                     table: tbl,
                 });
             } else {

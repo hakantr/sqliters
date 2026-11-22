@@ -986,6 +986,14 @@ fn group64_dml_alias_and_returning_wildcard_and_qualifier_c_parity() {
             "RETURNING may not use \"TABLE.*\" wildcards",
         ),
         (
+            "CREATE TABLE rt(id INT, v INT); DELETE FROM main.rt RETURNING main.rt.*;",
+            "near \"*\": syntax error",
+        ),
+        (
+            "CREATE TABLE rt(id INT, v INT); UPDATE main.rt SET v = 3 RETURNING main.rt.*;",
+            "near \"*\": syntax error",
+        ),
+        (
             "CREATE TABLE rt(id INT, v INT); INSERT INTO main.rt AS al VALUES (1, 10) RETURNING al.v;",
             "no such column: al.v",
         ),
@@ -1009,15 +1017,6 @@ fn group64_dml_alias_and_returning_wildcard_and_qualifier_c_parity() {
         let r_err = run_rust_script(&r_conn, bad_sql).expect_err("Rust must reject RETURNING form");
         assert_eq!(r_err.message, expected_msg, "SQL: {bad_sql}");
     }
-
-    // Also verify 3-part `RETURNING main.rt.*` is rejected with the exact wildcard error in Rust
-    let r_conn = Connection::open_in_memory().unwrap();
-    let r_err = run_rust_script(
-        &r_conn,
-        "CREATE TABLE rt(id INT, v INT); DELETE FROM main.rt RETURNING main.rt.*;",
-    )
-    .expect_err("Rust must reject RETURNING main.rt.*");
-    assert_eq!(r_err.message, "RETURNING may not use \"TABLE.*\" wildcards");
 }
 
 #[test]

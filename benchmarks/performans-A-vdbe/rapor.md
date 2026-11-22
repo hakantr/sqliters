@@ -2282,3 +2282,8 @@ Kısmi ORDER BY ve LIMIT/OFFSET iki matriste 288 UTF-16 sonucunu C ile eşitledi
 ## V6b.395 — Özyinelemeli satır CASE öncelik kuyruğu
 
 360 gözlemde özyinelemeli öncelik kuyruğu için 56 UTF-16 sonucu C ile eşleşti. 558 seçili gözlem aynı. V6b.388 tabanına karşı 2.052 geniş gözlemde kalan 432 fark kapandı. C 13/13 ve Rust rowvalue8 27/27, delete2 1/1 iki kipte. OFF 1276/1/325, ON 1273/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,262 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_395.md).
+
+
+## V6b.396 — Üç parçalı RETURNING joker tanısı
+
+144 Rust native sonucu içinde 20 wildcard tanısı C ile aynı hata kodu, mesaj ve byte ofsetine geldi. Ek 42 vaka iki kipte eş. Mevcut Group64 testi C referansıyla iki kipte geçti, tüm dosya SHA ve yeniden açılışlar eş. OFF 1276/1/325, ON 1274/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,256 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_396.md).
