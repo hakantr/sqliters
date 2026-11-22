@@ -52707,7 +52707,12 @@ fn validate_update_static_inner(
                     && upd.returning.is_empty()
                     && matches!(
                         effective_or_conflict,
-                        Some(ConflictAction::Fail | ConflictAction::Ignore)
+                        None | Some(
+                            ConflictAction::Abort
+                                | ConflictAction::Fail
+                                | ConflictAction::Ignore
+                                | ConflictAction::Rollback
+                        )
                     )
                 {
                     validate_fk_update_action_keys_static(db_set, db_id, &tbl, &modified)?;

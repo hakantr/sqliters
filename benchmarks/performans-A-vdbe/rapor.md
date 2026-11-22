@@ -2152,3 +2152,8 @@ C ve iki Rust kipinde eski collate7 kapsamı ve üç kodlamadaki 24 ek yaşam d�
 ## V6b.369 — Satır değerli CASE karşılaştırması
 
 İki ve üç öğeli CASE karşılaştırmasında 100 fark kapandı. Adım, NULL, karşılaştırma sırası ve geçersiz genişlik tanıları C ile eş. OFF 1246/1/328, ON 1243/4/328. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,268 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_369.md).
+
+
+## V6b.370 — Varsayılan, ABORT ve ROLLBACK UPDATE hazırlama tanısı
+
+Yabancı anahtar eylem önceliği üç ek çatışma kipinde C ile eşleşti. 882 salt okunur kontroldeki 120 tanı farkı kapandı. OFF 1247/1/328, ON 1244/4/328. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_370.md).

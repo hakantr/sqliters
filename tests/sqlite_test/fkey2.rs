@@ -1890,3 +1890,48 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_without_rowid_update_reports_fk_action_key_across_conflicts() {
+    sqliters_tcltest::run_test_script(
+        "without_rowid_update_reports_fk_action_key_across_conflicts",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach {scenario first_action second_action child} {
+  cascade CASCADE {NO ACTION} ref_first
+  set_null {SET NULL} {NO ACTION} ref_first
+  set_default {SET DEFAULT} {SET NULL} ref_first
+  restrict RESTRICT {NO ACTION} ref_first
+  no_action {NO ACTION} {NO ACTION} ref_second
+} {
+  reset_db
+  execsql {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INT, revision INT, note TEXT,
+                        PRIMARY KEY(id,revision)) WITHOUT ROWID;
+  }
+  execsql "CREATE TABLE ref_first(key INT REFERENCES parent(id) ON UPDATE $first_action);
+           CREATE TABLE ref_second(key INT REFERENCES parent(id) ON UPDATE $second_action
+                                   DEFERRABLE INITIALLY DEFERRED);"
+  foreach {name conflict} {plain {} abort {OR ABORT} rollback {OR ROLLBACK}} {
+    do_catchsql_test fk-action-key-$name-$scenario \
+      "UPDATE $conflict parent SET id=7,revision=revision WHERE id=1;" \
+      [list 1 "foreign key mismatch - \"$child\" referencing \"parent\""]
+  }
+  if {$scenario eq "restrict"} {
+    do_catchsql_test fk-action-key-deferred-restrict {
+      PRAGMA defer_foreign_keys=ON;
+      UPDATE OR ABORT parent SET id=7,revision=revision WHERE id=1;
+    } {1 {foreign key mismatch - "ref_second" referencing "parent"}}
+  }
+}
+do_execsql_test fk-action-key-valid-parent {
+  CREATE UNIQUE INDEX parent_id ON parent(id);
+  UPDATE OR ABORT parent SET id=7,revision=revision WHERE id=1;
+  PRAGMA integrity_check;
+} {ok}
+finish_test
+"#,
+    );
+}
