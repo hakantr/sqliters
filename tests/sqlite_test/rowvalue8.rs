@@ -2168,3 +2168,93 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_mixed_rowid_or_steps() {
+    sqliters_tcltest::run_test_script(
+        "row_case_mixed_rowid_or_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+proc mixed_or_observe {id} {
+    lappend ::seen $id
+    return $id
+}
+proc mixed_or_rows {stmt} {
+    set rows {}
+    while {[set rc [sqlite3_step $stmt]] eq "SQLITE_ROW"} {
+        lappend rows [sqlite3_column_int $stmt 0] [sqlite3_column_text $stmt 1]
+    }
+    lappend rows $rc
+    return $rows
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    db function mixed_or_observe -argcount 1 mixed_or_observe
+    execsql {
+        CREATE TABLE detail(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO detail VALUES(1,1,10),(2,2,20);
+        CREATE TABLE items(id INTEGER PRIMARY KEY,tag TEXT COLLATE RTRIM,ref INTEGER,label TEXT);
+        INSERT INTO items VALUES(1,'A',1,'one'),(2,'A ',2,'two'),(3,'B',1,'three'),
+           (4,'a',1,'lower'),(5,NULL,1,'nil'),(6,'B ',2,'six');
+        CREATE INDEX items_tag ON items(tag);
+    }
+    set result_expr {CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+                     WHEN (2,20) THEN 'changed' ELSE p.label END}
+    foreach {suffix predicate} {primary-first {id=1 OR tag='A '}
+                                 secondary-first {tag='A ' OR id=1}} {
+        do_test mixed-rowid-or-$encoding.$suffix {
+            set ::seen {}
+            set rows [execsql "SELECT mixed_or_observe(id),$result_expr FROM items p
+                               WHERE $predicate ORDER BY id;"]
+            list $rows [lsort -integer $::seen]
+        } {{1 one 2 changed} {1 2}}
+    }
+    foreach {suffix predicate} {primary-first {id=?1 OR (tag>=?2 AND tag<?3)}
+                                 secondary-first {(tag>=?2 AND tag<?3) OR id=?1}} {
+        do_test mixed-rowid-or-$encoding.range-$suffix {
+            set s [sqlite3_prepare_v2 db "SELECT id,$result_expr FROM items p
+                                        WHERE $predicate ORDER BY id;" -1]
+            sqlite3_bind_int $s 1 1
+            sqlite3_bind_text $s 2 A -1
+            sqlite3_bind_text $s 3 B -1
+            set overlap [mixed_or_rows $s]
+            sqlite3_reset $s
+            sqlite3_bind_null $s 1
+            sqlite3_bind_text $s 2 B -1
+            sqlite3_bind_text $s 3 C -1
+            set range [mixed_or_rows $s]
+            sqlite3_reset $s
+            sqlite3_bind_text $s 1 005 -1
+            sqlite3_bind_null $s 2
+            set point [mixed_or_rows $s]
+            sqlite3_reset $s
+            sqlite3_bind_null $s 1
+            set empty [mixed_or_rows $s]
+            list $overlap $range $point $empty [sqlite3_finalize $s]
+        } {{1 one 2 changed SQLITE_DONE} {3 three 6 changed SQLITE_DONE} {5 nil SQLITE_DONE} SQLITE_DONE SQLITE_OK}
+    }
+    do_test mixed-rowid-or-$encoding.reprepare {
+        set s [sqlite3_prepare_v2 db "SELECT id,$result_expr FROM items p
+                                    WHERE tag=?2 OR id=?1 ORDER BY id;" -1]
+        sqlite3_bind_int $s 1 2
+        sqlite3_bind_text $s 2 A -1
+        set before [mixed_or_rows $s]
+        sqlite3_reset $s
+        execsql {CREATE INDEX items_ref ON items(ref);}
+        sqlite3_bind_int $s 1 5
+        sqlite3_bind_text $s 2 B -1
+        set after [mixed_or_rows $s]
+        list $before $after [sqlite3_finalize $s]
+    } {{1 one 2 changed SQLITE_DONE} {3 three 5 nil 6 changed SQLITE_DONE} SQLITE_OK}
+    do_execsql_test mixed-rowid-or-$encoding.changes {
+        SELECT changes(),total_changes();
+    } {6 8}
+}
+finish_test
+
+"#,
+    );
+}

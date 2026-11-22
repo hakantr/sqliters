@@ -1777,8 +1777,11 @@ fn rowid_or_index_cursor(prog: &Program, cursor: i32, encoding: u8) -> bool {
             _ => {}
         }
     }
-    let [first, _, ..] = branches.as_slice() else { return false };
+    let [first, ..] = branches.as_slice() else { return false };
     let first = *first;
+    if branches.len() == 1 {
+        return mixed_rowid_or_cursor(ops, first, encoding);
+    }
     let Some([null, ret]) = first.checked_sub(2).and_then(|start| ops.get(start..first)) else {
         return false;
     };
@@ -1801,44 +1804,110 @@ fn rowid_or_index_cursor(prog: &Program, cursor: i32, encoding: u8) -> bool {
     for (branch, &start) in branches.iter().enumerate() {
         let stop = branches.get(branch + 1).copied().unwrap_or(end);
         let open = &ops[start];
-        let P4::KeyInfo(key) = &open.p4 else { return false };
-        if open.p2 <= 1 || open.p3 != 0 || !matches!(open.p5, 0 | OPFLAG_SEEKEQ)
-            || key.enc != encoding || *root_keys.entry(open.p2).or_insert(&open.p4) != &open.p4
-        {
+        if *root_keys.entry(open.p2).or_insert(&open.p4) != &open.p4 {
             return false;
         }
-        let Some(tail) = stop.checked_sub(5) else { return false };
-        let Some([defer, rowid, set, call, next]) = ops.get(tail..stop) else { return false };
+        let Some((branch_table, set, call)) = rowid_or_secondary_branch(ops, start, stop, encoding) else {
+            return false;
+        };
         let set_number = if stop == end { -1 } else { branch as i32 };
-        if defer.opcode != OP_DeferredSeek || defer.p1 != cursor || defer.p2 != 0 || defer.p3 == cursor
-            || defer.p5 != 0 || !matches!(&defer.p4, P4::IntArray(map)
-                if map.iter().all(|&field| field <= u32::from(key.n_all_field)))
-            || *table.get_or_insert(defer.p3) != defer.p3
-            || rowid.opcode != OP_IdxRowid || rowid.p1 != cursor || rowid.p2 <= 0
-            || set.opcode != OP_RowSetTest || set.p1 != null.p2 || set.p3 != rowid.p2
-            || set.p2 as usize != stop - 1 || set.p4 != P4::Int32(set_number)
-            || call.opcode != OP_Gosub || call.p1 != ret.p2 || call.p2 as usize != end + 1
-            || next.opcode != OP_Next || next.p1 != cursor || next.p5 != 0
-        {
-            return false;
-        }
-        let bound = next.p2 as usize;
-        let Some(prefix) = ops.get(start + 1..bound) else { return false };
-        let mut seeks = prefix.iter().filter(|op| op.p1 == cursor && matches!(op.opcode, OP_SeekGE | OP_SeekGT));
-        let Some(seek) = seeks.next() else { return false };
-        let Some(limit) = ops.get(bound) else { return false };
-        if seeks.next().is_some() || bound >= tail || seek.p2 as usize != stop
-            || !matches!(seek.p4, P4::Int32(width) if (1..=i32::from(key.n_key_field)).contains(&width))
-            || !matches!(limit.opcode, OP_IdxGE | OP_IdxGT) || limit.p1 != cursor || limit.p2 as usize != stop
-            || limit.p4 != seek.p4 || seek.p5 != 0 || limit.p5 != 0
-            || (open.p5 == OPFLAG_SEEKEQ && (seek.opcode != OP_SeekGE || limit.opcode != OP_IdxGT
-                || !std::ptr::eq(seek, &ops[bound - 1]) || seek.p3 != limit.p3))
+        if *table.get_or_insert(branch_table) != branch_table
+            || set.p1 != null.p2 || set.p4 != P4::Int32(set_number)
+            || call.p1 != ret.p2 || call.p2 as usize != end + 1
         {
             return false;
         }
     }
-    ops[..first].iter().any(|op| op.opcode == OP_OpenRead && Some(op.p1) == table
+    table.is_some_and(|table| rowid_or_table_read(&ops[..first], table))
+}
+
+fn rowid_or_table_read(ops: &[VdbeOp], table: i32) -> bool {
+    ops.iter().any(|op| op.opcode == OP_OpenRead && op.p1 == table
         && op.p2 > 1 && op.p3 == 0 && op.p5 == 0 && matches!(op.p4, P4::Int32(n) if n > 0))
+}
+
+fn rowid_or_secondary_branch(
+    ops: &[VdbeOp], start: usize, stop: usize, encoding: u8,
+) -> Option<(i32, &VdbeOp, &VdbeOp)> {
+    let open = &ops[start];
+    let cursor = open.p1;
+    let P4::KeyInfo(key) = &open.p4 else { return None };
+    if open.p2 <= 1 || open.p3 != 0 || !matches!(open.p5, 0 | OPFLAG_SEEKEQ) || key.enc != encoding {
+        return None;
+    }
+    let tail = stop.checked_sub(5)?;
+    let [defer, rowid, set, call, next] = ops.get(tail..stop)? else { return None };
+    if defer.opcode != OP_DeferredSeek || defer.p1 != cursor || defer.p2 != 0 || defer.p3 == cursor
+        || defer.p5 != 0 || !matches!(&defer.p4, P4::IntArray(map)
+            if map.iter().all(|&field| field <= u32::from(key.n_all_field)))
+        || rowid.opcode != OP_IdxRowid || rowid.p1 != cursor || rowid.p2 <= 0
+        || set.opcode != OP_RowSetTest || set.p3 != rowid.p2 || set.p2 as usize != stop - 1
+        || call.opcode != OP_Gosub || next.opcode != OP_Next || next.p1 != cursor || next.p5 != 0
+    {
+        return None;
+    }
+    let bound = next.p2 as usize;
+    let mut seeks = ops.get(start + 1..bound)?.iter()
+        .filter(|op| op.p1 == cursor && matches!(op.opcode, OP_SeekGE | OP_SeekGT));
+    let seek = seeks.next()?;
+    let limit = ops.get(bound)?;
+    if seeks.next().is_some() || bound >= tail || seek.p2 as usize != stop
+        || !matches!(seek.p4, P4::Int32(width) if (1..=i32::from(key.n_key_field)).contains(&width))
+        || !matches!(limit.opcode, OP_IdxGE | OP_IdxGT) || limit.p1 != cursor || limit.p2 as usize != stop
+        || limit.p4 != seek.p4 || seek.p5 != 0 || limit.p5 != 0
+        || (open.p5 == OPFLAG_SEEKEQ && (seek.opcode != OP_SeekGE || limit.opcode != OP_IdxGT
+            || !std::ptr::eq(seek, &ops[bound - 1]) || seek.p3 != limit.p3))
+    {
+        return None;
+    }
+    Some((defer.p3, set, call))
+}
+
+/// A two-branch OR may pair one secondary scan with a direct point lookup on
+/// the same rowid table. Both branches feed the same RowSet and subroutine.
+fn mixed_rowid_or_cursor(ops: &[VdbeOp], start: usize, encoding: u8) -> bool {
+    let cursor = ops[start].p1;
+    let Some(next) = ops[start + 1..].iter().position(|op| op.opcode == OP_Next && op.p1 == cursor) else {
+        return false;
+    };
+    let stop = start + next + 2;
+    let Some((table, indexed_set, indexed_call)) = rowid_or_secondary_branch(ops, start, stop, encoding) else {
+        return false;
+    };
+    let Some(end) = usize::try_from(indexed_call.p2).ok().and_then(|body| body.checked_sub(1)) else {
+        return false;
+    };
+    let (first, direct_start, direct_stop, direct_phase) = match indexed_set.p4 {
+        P4::Int32(0) if stop < end => (start, stop, end, -1),
+        P4::Int32(-1) if stop == end => {
+            let Some(direct) = start.checked_sub(5) else { return false };
+            (direct, direct, start, 0)
+        }
+        _ => return false,
+    };
+    let Some([value, seek, rowid, set, call]) = ops.get(direct_start..direct_stop) else {
+        return false;
+    };
+    let Some([null, ret]) = first.checked_sub(2).and_then(|init| ops.get(init..first)) else {
+        return false;
+    };
+    let Some(goto) = ops.get(end) else { return false };
+    let Some(body_return) = (goto.p2 as usize).checked_sub(1).and_then(|at| ops.get(at)) else {
+        return false;
+    };
+    matches!(value.opcode, OP_Integer | OP_Int64 | OP_Variable)
+        && seek.opcode == OP_SeekRowid && seek.p1 == table && seek.p3 == value.p2
+        && seek.p2 as usize == direct_stop && seek.p4 == P4::NotUsed && seek.p5 == 0
+        && rowid.opcode == OP_Rowid && rowid.p1 == table && rowid.p2 > 0
+        && set.opcode == OP_RowSetTest && set.p1 == indexed_set.p1 && set.p3 == rowid.p2
+        && set.p2 as usize == direct_stop && set.p4 == P4::Int32(direct_phase)
+        && call.opcode == OP_Gosub && call.p1 == indexed_call.p1 && call.p2 == indexed_call.p2
+        && null.opcode == OP_Null && null.p1 == 0 && null.p2 == set.p1 && null.p2 > 0 && null.p3 == 0
+        && ret.opcode == OP_Integer && ret.p1 as usize == end && ret.p2 == call.p1
+        && ret.p2 > 0 && ret.p2 != null.p2 && goto.opcode == OP_Goto && goto.p2 as usize > end + 1
+        && body_return.opcode == OP_Return && body_return.p1 == ret.p2
+        && body_return.p2 == call.p2 && body_return.p3 == 0
+        && rowid_or_table_read(&ops[..first], table)
 }
 
 fn unsupported(
