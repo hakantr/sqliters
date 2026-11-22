@@ -1935,15 +1935,14 @@ enum WithoutRowidOrPhase {
 /// key and tracks duplicates in a private index with the same KeyInfo.
 fn without_rowid_or_admissions(prog: &Program, encoding: u8) -> Vec<WithoutRowidOrAdmission> {
     let ops = &prog.a_op;
-    ops.windows(4).enumerate().filter_map(|(start, group)| {
-        let [table, seen, ret, first] = group else { return None };
+    ops.windows(3).enumerate().filter_map(|(start, group)| {
+        let [table, seen, ret] = group else { return None };
         let P4::KeyInfo(key) = &table.p4 else { return None };
         if table.opcode != OP_OpenRead || table.p2 <= 1 || table.p3 != 0 || table.p5 != 0
             || seen.opcode != OP_OpenEphemeral || seen.p2 != i32::from(key.n_key_field)
             || seen.p3 != 0 || seen.p5 != 0 || seen.p4 != table.p4 || key.n_key_field < 2
             || !without_rowid_or_key(key, encoding)
-            || ret.opcode != OP_Integer || ret.p2 <= 0 || first.opcode != OP_ReopenIdx
-            || seen.p1 == table.p1 || seen.p1 == first.p1 || table.p1 == first.p1
+            || ret.opcode != OP_Integer || ret.p2 <= 0 || seen.p1 == table.p1
         {
             return None;
         }
@@ -1958,32 +1957,43 @@ fn without_rowid_or_admissions(prog: &Program, encoding: u8) -> Vec<WithoutRowid
         {
             return None;
         }
-        let reopens: Vec<_> = ops.iter().enumerate().filter_map(|(pc, op)| {
-            (op.opcode == OP_ReopenIdx && op.p1 == first.p1).then_some(pc)
-        }).take(4).collect();
-        let [first_reopen, .., last_reopen] = reopens.as_slice() else { return None };
-        if !matches!(reopens.len(), 2 | 3) || *first_reopen != first_pc || *last_reopen >= end {
+        let secondary_offset = ops.get(first_pc..end)?.iter()
+            .position(|op| op.opcode == OP_ReopenIdx)?;
+        let secondary = &ops[first_pc + secondary_offset];
+        if secondary.p1 == seen.p1 || secondary.p1 == table.p1 {
             return None;
         }
-        let mut root_keys = BTreeMap::new();
-        let mut seen_operations = Vec::new();
-        let ends = reopens.iter().copied().skip(1).chain(Some(end));
-        for (offset, (&open_pc, stop)) in reopens.iter().zip(ends).enumerate() {
-            let open = &ops[open_pc];
-            if open.p2 == table.p2 || *root_keys.entry(open.p2).or_insert(&open.p4) != &open.p4 {
+        let reopens: Vec<_> = ops.iter().enumerate().filter_map(|(pc, op)| {
+            (op.opcode == OP_ReopenIdx && op.p1 == secondary.p1).then_some(pc)
+        }).take(4).collect();
+        let seen_operations = if let [open] = reopens.as_slice() {
+            without_rowid_primary_or_branches(ops, first_pc..end, *open, table, seen, ret, encoding)?
+        } else {
+            let [first_reopen, .., last_reopen] = reopens.as_slice() else { return None };
+            if !matches!(reopens.len(), 2 | 3) || *first_reopen != first_pc || *last_reopen >= end {
                 return None;
             }
-            let phase = if offset == 0 {
-                WithoutRowidOrPhase::First
-            } else if stop == end {
-                WithoutRowidOrPhase::Last
-            } else {
-                WithoutRowidOrPhase::Middle
-            };
-            let operations = without_rowid_or_branch(ops, open_pc, stop, table, seen, ret, encoding, phase)?;
-            seen_operations.extend(operations.into_iter().flatten());
-        }
-        let cursors = [table.p1, seen.p1, first.p1];
+            let mut root_keys = BTreeMap::new();
+            let mut seen_operations = Vec::new();
+            let ends = reopens.iter().copied().skip(1).chain(Some(end));
+            for (offset, (&open_pc, stop)) in reopens.iter().zip(ends).enumerate() {
+                let open = &ops[open_pc];
+                if open.p2 == table.p2 || *root_keys.entry(open.p2).or_insert(&open.p4) != &open.p4 {
+                    return None;
+                }
+                let phase = if offset == 0 {
+                    WithoutRowidOrPhase::First
+                } else if stop == end {
+                    WithoutRowidOrPhase::Last
+                } else {
+                    WithoutRowidOrPhase::Middle
+                };
+                let operations = without_rowid_or_branch(ops, open_pc, stop, table, seen, ret, encoding, phase)?;
+                seen_operations.extend(operations.into_iter().flatten());
+            }
+            seen_operations
+        };
+        let cursors = [table.p1, seen.p1, secondary.p1];
         if ops.iter().enumerate().any(|(pc, op)| {
             (op.opcode == OP_OpenDup && cursors.contains(&op.p2))
                 || (matches!(op.opcode, OP_DeferredSeek | OP_SorterData) && op.p3 == seen.p1)
@@ -2098,6 +2108,83 @@ fn without_rowid_or_branch(
     }
     or_index_seek_bounds(ops, start, stop, tail, index_key)?;
     Some([probe.map(|_| stop - 2 - dedup.len()), insert.map(|_| stop - 3)])
+}
+
+/// One of the arms reads the primary B-tree on the table cursor, so it
+/// takes the leading key fields directly and needs no secondary lookup.
+fn without_rowid_primary_or_branches(
+    ops: &[VdbeOp], arms: std::ops::Range<usize>, secondary: usize, table: &VdbeOp,
+    seen: &VdbeOp, ret: &VdbeOp, encoding: u8,
+) -> Option<Vec<usize>> {
+    let P4::KeyInfo(key) = &table.p4 else { return None };
+    let open = ops.get(secondary)?;
+    if !arms.contains(&secondary) || open.p2 == table.p2
+        || ops[arms.clone()].iter().filter(|op| op.opcode == OP_ReopenIdx).count() != 1
+    {
+        return None;
+    }
+    let (indirect, direct) = if secondary == arms.start {
+        let next = ops[secondary + 1..arms.end].iter()
+            .position(|op| op.opcode == OP_Next && op.p1 == open.p1)?;
+        let split = secondary + next + 2;
+        (
+            without_rowid_or_branch(ops, secondary, split, table, seen, ret, encoding, WithoutRowidOrPhase::First)?,
+            without_rowid_primary_arm(ops, split, arms.end, table, seen, ret, key, false)?,
+        )
+    } else {
+        (
+            without_rowid_or_branch(ops, secondary, arms.end, table, seen, ret, encoding, WithoutRowidOrPhase::Last)?,
+            without_rowid_primary_arm(ops, arms.start, secondary, table, seen, ret, key, true)?,
+        )
+    };
+    Some(indirect.into_iter().flatten().chain(Some(direct)).collect())
+}
+
+fn without_rowid_primary_arm(
+    ops: &[VdbeOp], start: usize, stop: usize, table: &VdbeOp, seen: &VdbeOp, ret: &VdbeOp,
+    key: &KeyInfo, insert: bool,
+) -> Option<usize> {
+    let width = usize::from(key.n_key_field);
+    let tail = stop.checked_sub(width + 3 + usize::from(insert))?;
+    if tail <= start {
+        return None;
+    }
+    let (keys, tail_ops) = ops.get(tail..stop)?.split_at(width);
+    let (dedup, source, call, next) = match tail_ops {
+        [record, store, call, next] if insert && record.opcode == OP_MakeRecord
+            && record.p2 == width as i32 && record.p3 == store.p2 && record.p4 == P4::NotUsed
+            && record.p5 == 0 && store.opcode == OP_IdxInsert && store.p2 > 0
+            && store.p3 == record.p1 => (store, record.p1, call, next),
+        [probe, call, next] if !insert && probe.opcode == OP_Found
+            && probe.p2 as usize == stop - 1 => (probe, probe.p3, call, next),
+        _ => return None,
+    };
+    if dedup.p1 != seen.p1 || dedup.p4 != P4::Int32(width as i32) || dedup.p5 != 0 || source <= 0
+        || call.opcode != OP_Gosub || call.p1 != ret.p2 || call.p2 != ret.p1 + 1 || call.p3 != 0
+        || next.opcode != OP_Next || next.p1 != table.p1 || next.p2 as usize != tail - 1
+        || next.p3 != 0 || next.p5 != 0
+    {
+        return None;
+    }
+    for (field, column) in keys.iter().enumerate() {
+        if column.opcode != OP_Column || column.p1 != table.p1 || column.p2 != field as i32
+            || column.p3 != source.checked_add(field as i32)? || column.p4 != P4::NotUsed || column.p5 != 0
+        {
+            return None;
+        }
+    }
+    let bound = ops.get(tail.checked_sub(1)?)?;
+    let mut seeks = ops.get(start..tail - 1)?.iter().filter(|op|
+        op.p1 == table.p1 && matches!(op.opcode, OP_SeekGE | OP_SeekGT));
+    let seek = seeks.next()?;
+    let valid_width = |op: &VdbeOp| matches!(op.p4, P4::Int32(n) if (1..=i32::from(key.n_key_field)).contains(&n));
+    if seeks.next().is_some() || seek.p2 as usize != stop || seek.p5 != 0 || !valid_width(seek)
+        || !matches!(bound.opcode, OP_IdxGE | OP_IdxGT) || bound.p1 != table.p1
+        || bound.p2 as usize != stop || bound.p5 != 0 || !valid_width(bound)
+    {
+        return None;
+    }
+    Some(stop - 3)
 }
 
 fn unsupported(

@@ -2410,3 +2410,64 @@ finish_test
 "#,
     );
 }
+
+
+#[test]
+fn test_row_case_without_rowid_primary_or_steps() {
+    sqliters_tcltest::run_test_script(
+        "row_case_without_rowid_primary_or_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE detail(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO detail VALUES(1,1,10),(2,2,20);
+        CREATE TABLE packed(tag TEXT COLLATE RTRIM,seq INTEGER,ref INTEGER,label TEXT,
+                            PRIMARY KEY(tag DESC,seq)) WITHOUT ROWID;
+        CREATE INDEX packed_by_seq ON packed(seq);
+        CREATE INDEX packed_by_label ON packed(label);
+        INSERT INTO packed VALUES ('A',1,1,'p-one'),('A ',2,2,'p-two'),('A'||char(160),3,1,'p-nbsp'),
+           ('a ',1,1,'p-lower'),(char(256)||' ',2,1,'p-wide'),('B',1,1,'p-b');
+    }
+    do_execsql_test row-case-primary-or-$encoding.primary-first {
+        SELECT seq,quote(tag),CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+            WHEN (2,20) THEN 'changed' ELSE p.label END
+        FROM packed p WHERE tag='A' OR seq=2 ORDER BY seq,tag;
+    } {1 'A' p-one 2 {'A '} changed 2 {'Ā '} p-wide}
+    do_execsql_test row-case-primary-or-$encoding.primary-second {
+        SELECT seq,quote(tag),CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+            WHEN (2,20) THEN 'changed' ELSE p.label END
+        FROM packed p WHERE seq=2 OR tag='A' ORDER BY seq,tag;
+    } {1 'A' p-one 2 {'A '} changed 2 {'Ā '} p-wide}
+    do_execsql_test row-case-primary-or-$encoding.primary-range {
+        SELECT seq,quote(tag),CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+            WHEN (2,20) THEN 'changed' ELSE p.label END
+        FROM packed p WHERE (tag='A' AND seq>=2) OR label='p-b' ORDER BY seq,tag;
+    } {1 'B' p-b 2 {'A '} changed}
+    do_test row-case-primary-or-$encoding.reset {
+        set s [sqlite3_prepare_v2 db {
+            SELECT seq,CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+               WHEN (2,20) THEN 'changed' ELSE p.label END
+            FROM packed p WHERE seq=?1 OR tag=?2 ORDER BY seq,tag;
+        } -1]
+        sqlite3_bind_int $s 1 2
+        sqlite3_bind_text $s 2 {A } -1
+        set first {}
+        while {[set rc [sqlite3_step $s]] eq "SQLITE_ROW"} {
+            lappend first [sqlite3_column_int $s 0] [sqlite3_column_text $s 1]
+        }
+        lappend first $rc
+        sqlite3_reset $s
+        sqlite3_bind_null $s 1
+        sqlite3_bind_text $s 2 B -1
+        set second [list [sqlite3_step $s] [sqlite3_column_int $s 0] [sqlite3_column_text $s 1]]
+        list $first $second [sqlite3_step $s] [sqlite3_finalize $s]
+    } {{1 p-one 2 changed 2 p-wide SQLITE_DONE} {SQLITE_ROW 1 p-b} SQLITE_DONE SQLITE_OK}
+}
+finish_test
+"#,
+    );
+}

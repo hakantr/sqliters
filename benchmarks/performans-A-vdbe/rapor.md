@@ -2352,3 +2352,8 @@ Tam bileşik birincil anahtar, üç kolda aynı geçici indeksle yönetiliyor. O
 ## V6b.409 — Kayıtlı NOCASE ve RTRIM bellek sıralaması
 
 Açık NOCASE ve RTRIM ile tam bellek sıralamasında uygulama karşılaştırıcıları her Rust kipinde 360 profil ve 25.416 adım boyunca C ile eşleşti. Aynı deyimde FILE ve MEMORY geçişi, callback argüman sırası ve özgün hata aktarımı doğrulandı. 72 kapsam dışı sıralama profili önceki davranışını korudu. OFF 1289/1/325, ON 1287/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,255 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_409.md).
+
+
+## V6b.410 — Birincil ve ikincil WITHOUT ROWID OR kolları
+
+Birincil B-tree kolu bileşik anahtarı tablo imlecinden alıyor. İkincil kol aynı anahtar alanlarıyla tabloda konumu doğruluyor. 160 UTF-16 sonucu ve 240 tam EXPLAIN planı C ile eşleşti. İki kolun sırası, aralık genişlikleri, NULL bağlama ve C yeniden açma denetlendi. OFF 1290/1/325, ON 1288/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,261 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_410.md).
