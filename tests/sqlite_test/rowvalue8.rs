@@ -1043,3 +1043,266 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_binary_ordered_limit_and_offset() {
+    sqliters_tcltest::run_test_script(
+        "row_case_binary_ordered_limit_and_offset",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE words(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+        INSERT INTO words VALUES (1,1,10),(2,2,20);
+        CREATE TABLE picks(id INTEGER PRIMARY KEY, ref INTEGER, label TEXT);
+        INSERT INTO picks VALUES (1,1,'A'),(2,1,'B'),(3,1,char(256)),
+            (4,1,'A'),(5,2,'unused'),(6,1,NULL),(7,1,'C'),(8,1,char(128512));
+        CREATE VIEW ranked AS
+            SELECT p.id, CASE (SELECT a,b FROM words WHERE id=p.ref)
+                WHEN (2,20) THEN 'Z' ELSE p.label END AS label
+              FROM picks p;
+    }
+    if {$encoding eq "UTF-16le"} {
+        set asc {8 1 4}
+        set desc {7 2 4}
+    } else {
+        set asc {4 2 7}
+        set desc {3 5 7}
+    }
+    do_execsql_test row-case-limit-$encoding.asc {
+        SELECT id FROM ranked ORDER BY label COLLATE BINARY ASC NULLS LAST,id LIMIT 3 OFFSET 1;
+    } $asc
+    do_execsql_test row-case-limit-$encoding.desc {
+        SELECT id FROM ranked ORDER BY label COLLATE BINARY DESC NULLS FIRST,id DESC LIMIT 3 OFFSET 2;
+    } $desc
+    do_execsql_test row-case-limit-$encoding.zero {
+        SELECT id FROM ranked ORDER BY label COLLATE BINARY,id LIMIT 0;
+    } {}
+    do_test row-case-limit-$encoding.reprepare {
+        set s [sqlite3_prepare_v2 db {
+            SELECT id FROM ranked ORDER BY label COLLATE BINARY NULLS LAST,id LIMIT ?1 OFFSET 1
+        } -1]
+        sqlite3_bind_int $s 1 1
+        set first [list [sqlite3_step $s] [sqlite3_column_int $s 0]]
+        set done1 [sqlite3_step $s]
+        sqlite3_reset $s
+        execsql {CREATE INDEX picks_ref ON picks(ref);}
+        sqlite3_bind_int $s 1 2
+        set second [list [sqlite3_step $s] [sqlite3_column_int $s 0]]
+        set third [list [sqlite3_step $s] [sqlite3_column_int $s 0]]
+        list $first $done1 $second $third [sqlite3_step $s] [sqlite3_finalize $s]
+    } [list [list SQLITE_ROW [lindex $asc 0]] SQLITE_DONE \
+            [list SQLITE_ROW [lindex $asc 0]] [list SQLITE_ROW [lindex $asc 1]] SQLITE_DONE SQLITE_OK]
+}
+finish_test
+"#,
+    );
+}
+
+#[test]
+fn test_row_case_nocase_index_probe() {
+    sqliters_tcltest::run_test_script(
+        "row_case_nocase_index_probe",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE tuple_word(k TEXT COLLATE NOCASE PRIMARY KEY,a INTEGER,b INTEGER) WITHOUT ROWID;
+        INSERT INTO tuple_word VALUES ('alpha',1,10),('beta',2,20),
+            (char(256)||'a',3,30),(char(257)||'A',4,40);
+        CREATE TABLE lookup(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE,s TEXT COLLATE BINARY,a INTEGER,b INTEGER);
+        INSERT INTO lookup VALUES (1,'alpha','x',1,10),(2,'ALPHA','y',2,20),
+            (3,'beta','x',3,30),(4,'beta','Y',4,40);
+        CREATE INDEX lookup_key ON lookup(k,s,a,b);
+    }
+    do_execsql_test row-case-nocase-index-$encoding.primary {
+        SELECT CASE (SELECT a,b FROM tuple_word WHERE k='ALPHA')
+                    WHEN (1,10) THEN 'first' ELSE '-' END,
+               CASE (SELECT a,b FROM tuple_word WHERE k=char(256)||'A')
+                    WHEN (3,30) THEN 'upper' ELSE '-' END,
+               CASE (SELECT a,b FROM tuple_word WHERE k='absent')
+                    WHEN (1,10) THEN 'first' ELSE '-' END;
+    } {first upper -}
+    do_execsql_test row-case-nocase-index-$encoding.composite {
+        SELECT CASE (SELECT a,b FROM lookup INDEXED BY lookup_key WHERE k='AlPhA' AND s='y')
+                   WHEN (2,20) THEN 'hit' ELSE 'miss' END,
+               CASE (SELECT a,b FROM lookup INDEXED BY lookup_key WHERE k='AlPhA' AND s='Y')
+                   WHEN (2,20) THEN 'hit' ELSE 'miss' END;
+    } {hit miss}
+    do_test row-case-nocase-index-$encoding.reprepare {
+        set s [sqlite3_prepare_v2 db {
+            SELECT CASE (SELECT a,b FROM tuple_word WHERE k=?1)
+                        WHEN (1,10) THEN 'first' WHEN (2,20) THEN 'second' ELSE '-' END
+        } -1]
+        sqlite3_bind_text $s 1 ALPHA -1
+        set rc [sqlite3_step $s]
+        set first [list $rc [sqlite3_column_text $s 0]]
+        sqlite3_reset $s
+        execsql {CREATE TABLE reprepare_control(id INTEGER PRIMARY KEY);}
+        sqlite3_bind_text $s 1 BETA -1
+        set rc [sqlite3_step $s]
+        set second [list $rc [sqlite3_column_text $s 0]]
+        list $first $second [sqlite3_step $s] [sqlite3_finalize $s]
+    } {{SQLITE_ROW first} {SQLITE_ROW second} SQLITE_DONE SQLITE_OK}
+}
+finish_test
+"#,
+    );
+}
+
+#[test]
+fn test_recursive_union_row_case_duplicate_steps() {
+    sqliters_tcltest::run_test_script(
+        "recursive_union_row_case_duplicate_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+proc fifo_case_note {v} {
+    lappend ::calls $v
+    return $v
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding'; PRAGMA trusted_schema=ON;"
+    db function fifo_case_note -argcount 1 fifo_case_note
+    execsql {
+        CREATE TABLE words(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        CREATE TABLE picks(id INTEGER PRIMARY KEY,ref INTEGER,token);
+        INSERT INTO words VALUES(1,1,10),(2,2,20);
+        INSERT INTO picks VALUES(1,1,'A'),(2,1,char(256)),(3,1,'A'),(4,999,NULL),
+            (5,1,1),(6,1,1.0),(7,1,X'410042'),(8,1,'A'||char(0)||'B'),
+            (9,1,char(66376)),(10,2,'obsolete'),(11,999,NULL);
+        CREATE VIEW choices AS
+          SELECT p.id,CASE (SELECT a,fifo_case_note(b) FROM words w WHERE w.id=p.ref)
+            WHEN (2,20) THEN 'replacement' ELSE p.token END AS token
+          FROM picks p;
+    }
+    set sql {
+        WITH RECURSIVE wave(value) AS (
+            SELECT token FROM choices WHERE id<=?1
+            UNION
+            SELECT value FROM wave
+        )
+        SELECT typeof(value),CASE typeof(value) WHEN 'text'
+            THEN printf('%d:%d:%d',unicode(value),length(value),instr(value,char(0)))
+            ELSE quote(value) END FROM wave
+    }
+    set s [sqlite3_prepare_v2 db $sql -1]
+    sqlite3_bind_int $s 1 11
+    foreach {step type value calls} {
+        1 text 65:1:0 {10 10 10 10 10 10 10 10 20}
+        2 text 256:1:0 {}
+        3 null NULL {}
+        4 integer 1 {}
+        5 blob X'410042' {}
+        6 text 65:1:2 {}
+        7 text 66376:1:0 {}
+        8 text 114:11:0 {}
+    } {
+        do_test fifo-row-case-$encoding.step.$step {
+            set ::calls {}
+            set rc [sqlite3_step $s]
+            list $rc [sqlite3_column_text $s 0] [sqlite3_column_text $s 1] $::calls
+        } [list SQLITE_ROW $type $value $calls]
+    }
+    do_test fifo-row-case-$encoding.reprepare {
+        set ::calls {}
+        set before [list [sqlite3_step $s] $::calls]
+        sqlite3_reset $s
+        execsql {CREATE INDEX picks_ref ON picks(ref);}
+        sqlite3_bind_int $s 1 2
+        set rc [sqlite3_step $s]
+        set after [list $rc [sqlite3_column_text $s 1] $::calls]
+        list $before $after [sqlite3_finalize $s]
+    } {{SQLITE_DONE {}} {SQLITE_ROW 65:1:0 {10 10}} SQLITE_OK}
+    do_test fifo-row-case-$encoding.empty {
+        set ::calls {}
+        set s [sqlite3_prepare_v2 db $sql -1]
+        sqlite3_bind_int $s 1 0
+        list [sqlite3_step $s] $::calls [sqlite3_finalize $s]
+    } {SQLITE_DONE {} SQLITE_OK}
+    do_execsql_test fifo-row-case-$encoding.changes {
+        SELECT changes(),total_changes();
+    } {11 13}
+}
+finish_test
+
+"#,
+    );
+}
+
+#[test]
+fn test_row_case_builtin_distinct_collations_and_steps() {
+    sqliters_tcltest::run_test_script(
+        "row_case_builtin_distinct_collations_and_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+proc observe_builtin_distinct {x} {
+    lappend ::distinct_calls $x
+    return [expr {int($x)}]
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    db function observe_builtin_distinct -argcount 1 observe_builtin_distinct
+    execsql {
+        CREATE TABLE message(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        CREATE TABLE feed(id INTEGER PRIMARY KEY,ref INTEGER,label TEXT);
+        INSERT INTO message VALUES(1,1,10),(2,2,20),(3,3,30);
+        INSERT INTO feed VALUES(1,3,'other'),(2,1,'a'),(3,3,'other'),(4,2,'B'),(5,2,'b'),(6,9,NULL),(7,9,NULL);
+    }
+    set sql {
+        SELECT DISTINCT CASE (SELECT a,observe_builtin_distinct(b) FROM message m WHERE m.id=f.ref)
+                        WHEN (3,30) THEN ?1 ELSE f.label END COLLATE NOCASE AS label
+          FROM feed f
+    }
+    set s [sqlite3_prepare_v2 db $sql -1]
+    sqlite3_bind_text $s 1 A -1
+    foreach {step label calls} {1 A 30 2 B {10 30 20} 3 {} 20} {
+        do_test builtin-distinct-$encoding.step.$step {
+            set ::distinct_calls {}
+            list [sqlite3_step $s] [sqlite3_column_name $s 0] [sqlite3_column_text $s 0] $::distinct_calls
+        } [list SQLITE_ROW label $label $calls]
+    }
+    do_test builtin-distinct-$encoding.done {
+        set ::distinct_calls {}
+        list [sqlite3_step $s] $::distinct_calls
+    } {SQLITE_DONE {}}
+    do_test builtin-distinct-$encoding.reprepare {
+        sqlite3_reset $s
+        execsql {CREATE INDEX feed_ref ON feed(ref);}
+        sqlite3_bind_text $s 1 Z -1
+        set ::distinct_calls {}
+        set first [list [sqlite3_step $s] [sqlite3_column_text $s 0] $::distinct_calls]
+        set ::distinct_calls {}
+        set second [list [sqlite3_step $s] [sqlite3_column_text $s 0] $::distinct_calls]
+        list $first $second [sqlite3_finalize $s]
+    } {{SQLITE_ROW Z 30} {SQLITE_ROW a 10} SQLITE_OK}
+    do_execsql_test builtin-distinct-$encoding.default {
+        CREATE TABLE notes(id INTEGER PRIMARY KEY,ref INTEGER);
+        INSERT INTO notes VALUES(1,2),(2,3),(3,2);
+        ALTER TABLE notes ADD COLUMN label TEXT DEFAULT 'A ';
+        INSERT INTO notes VALUES(4,2,'A'),(5,2,'a'),(6,3,'other');
+        SELECT DISTINCT CASE (SELECT a,b FROM message m WHERE m.id=n.ref)
+                        WHEN (3,30) THEN 'marker' ELSE n.label END COLLATE RTRIM FROM notes n;
+    } {{A } marker a}
+    do_execsql_test builtin-distinct-$encoding.mixed {
+        CREATE TABLE mixed(id INTEGER PRIMARY KEY,label TEXT,pad TEXT,code INTEGER);
+        INSERT INTO mixed VALUES(1,'A','x ',1),(2,'a','x',1),(3,'a','x',2),(4,'A','x ',2),(5,'b','x',1);
+        SELECT DISTINCT code COLLATE BINARY,
+                        (CASE (SELECT 7,11) WHEN (7,11) THEN label END) COLLATE NOCASE,
+                        pad COLLATE RTRIM FROM mixed;
+    } {1 A {x } 2 a x 1 b x}
+}
+finish_test
+"#,
+    );
+}

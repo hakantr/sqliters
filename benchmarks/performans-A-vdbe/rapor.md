@@ -2242,3 +2242,8 @@ Salt okunur CASE alt sorgusunda BINARY IN ve NOT IN anahtarları aynı kodlamayl
 ## V6b.387 — UTF-16 CASE gruplamasında yerleşik kolasyonlar
 
 Aynı gruplama anahtarını paylaşan sıralayıcı ve karşılaştırma adımlarında NOCASE ve RTRIM C kodlamasıyla yürütülüyor. 558 gözlemde 24 fark kapandı. Uygulamanın kayıtlı karşılaştırıcıları ve yetkilendirme kontrolleri korunuyor. OFF 1265/1/325, ON 1262/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_387.md).
+
+
+## V6b.388 — UTF-16 satır CASE anahtarları
+
+558 gözlemli exact karşılaştırmada son 48 fark kapandı. FIFO UNION, BINARY TOP-N LIMIT/OFFSET, NOCASE fiziksel arama ve NOCASE/RTRIM DISTINCT düzeltildi. İki kipte 372/372 Rust sonucu ve altı C salt okunur dosya açılışı eş. Daha geniş 1.188 gözlemde önceki eş sonuçlar korundu. OFF 1269/1/325, ON 1266/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,209 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_388.md).

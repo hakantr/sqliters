@@ -951,18 +951,18 @@ fn sqlite3_log_est(mut x: u64) -> i16 {
 
 /// The reason why the machine does not run `prog` (`None`: every opcode is ported).
 pub fn unsupported_reason(prog: &Program) -> Option<String> {
-    unsupported(prog, false, ReadKeyScope::Utf8, None)
+    unsupported(prog, false, ReadKeyScope::Utf8, None, false)
 }
 
 /// [`unsupported_reason`] for a program that writes (`OP_Transaction` with `P2!=0`, the
 /// write opcodes).
 pub fn unsupported_reason_write(prog: &Program) -> Option<String> {
-    unsupported(prog, true, ReadKeyScope::Utf8, None)
+    unsupported(prog, true, ReadKeyScope::Utf8, None, false)
 }
 
 /// Allow BINARY UTF-16 sorter keys for the checked mapped and row CASE reads.
 pub fn unsupported_reason_mapped_read(prog: &Program) -> Option<String> {
-    unsupported(prog, false, ReadKeyScope::BinarySorter, None)
+    unsupported(prog, false, ReadKeyScope::BinarySorter, None, false)
 }
 
 /// Keys a checked row CASE read can use in the database's encoding.
@@ -973,6 +973,8 @@ pub fn unsupported_reason_row_case_read(
         ReadKeyScope::BuiltinGroup
     } else if grouped {
         ReadKeyScope::BinaryGroup
+    } else if distinct && builtin_collations {
+        ReadKeyScope::BuiltinDistinct
     } else if distinct {
         ReadKeyScope::BinaryDistinct
     } else {
@@ -981,18 +983,18 @@ pub fn unsupported_reason_row_case_read(
     let row_case_encoding = (prog.read_only
         && matches!(encoding, crate::vdbeaux::SQLITE_UTF16LE | crate::vdbeaux::SQLITE_UTF16BE))
         .then_some(encoding);
-    unsupported(prog, false, key_scope, row_case_encoding)
+    unsupported(prog, false, key_scope, row_case_encoding, builtin_collations)
 }
 
 /// select.c's unordered DISTINCT probes its private index before storing the same key.
-fn binary_distinct_key(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
+fn unordered_distinct_key(
+    prog: &Program, open: &VdbeOp, key: &KeyInfo, supports_collation: impl Fn(&CollSeq) -> bool,
+) -> bool {
     let n = i32::from(key.n_key_field);
     if open.opcode != OP_OpenEphemeral || open.p2 != 0 || open.p3 != 0
         || open.p5 != BTREE_UNORDERED || n == 0 || i32::from(key.n_all_field) != n + 1
         || !key.a_coll.get(..n as usize).is_some_and(|fields| {
-            fields.iter().all(|c| c.as_ref().is_some_and(|c| {
-                c.name.eq_ignore_ascii_case("BINARY") && c.enc == key.enc
-            }))
+            fields.iter().all(|field| field.as_deref().is_some_and(&supports_collation))
         })
     {
         return false;
@@ -1060,6 +1062,124 @@ fn binary_in_key(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
     written && probed
 }
 
+/// SRT_DistFifo packs the row in the database encoding before probing its
+/// private duplicate set, and inserts from those same normalized registers.
+fn binary_recursive_fifo_key(prog: &Program, open_index: usize, open: &VdbeOp, key: &KeyInfo) -> bool {
+    let width = i32::from(key.n_key_field);
+    let fields = usize::from(key.n_all_field);
+    if open.opcode != OP_OpenEphemeral || open.p2 != width || open.p3 != 0 || open.p5 != 0
+        || width == 0 || fields != width as usize + 1
+        || key.a_sort_flags.len() != fields || key.a_sort_flags.iter().any(|&flag| flag != 0)
+        || !matches!(key.a_coll.split_last(), Some((None, collations))
+            if collations.len() == width as usize && collations.iter().all(|c|
+                c.as_deref().is_some_and(|c| c.name.eq_ignore_ascii_case("BINARY") && c.enc == key.enc)))
+    {
+        return false;
+    }
+
+    let Some([current, queue]) = open_index.checked_sub(2).and_then(|i| prog.a_op.get(i..open_index)) else {
+        return false;
+    };
+    if current.opcode != OP_OpenPseudo || current.p3 != width || current.p5 != 0
+        || queue.opcode != OP_OpenEphemeral || queue.p1.checked_add(1) != Some(open.p1)
+        || queue.p2 != width || queue.p3 != 0 || queue.p5 != 0 || queue.p4 != P4::NotUsed
+    {
+        return false;
+    }
+
+    let mut producers = 0;
+    for (index, op) in prog.a_op.iter().enumerate() {
+        if (op.opcode == OP_OpenDup && op.p2 == open.p1)
+            || (matches!(op.opcode, OP_DeferredSeek | OP_SorterData) && op.p3 == open.p1)
+        {
+            return false;
+        }
+        if op.p1 != open.p1 || index == open_index {
+            continue;
+        }
+        match op.opcode {
+            OP_Found => {
+                if !fifo_duplicate_producer(&prog.a_op, index, width, queue.p1) {
+                    return false;
+                }
+                producers += 1;
+            }
+            OP_IdxInsert => {
+                if !index.checked_sub(1).and_then(|i| prog.a_op.get(i))
+                    .is_some_and(|found| found.opcode == OP_Found && found.p1 == open.p1)
+                {
+                    return false;
+                }
+            }
+            OP_OpenRead | OP_ReopenIdx | OP_OpenDup | OP_OpenAutoindex | OP_OpenEphemeral
+            | OP_SorterOpen | OP_OpenPseudo | OP_NotFound | OP_NoConflict | OP_IdxDelete
+            | OP_SeekLT | OP_SeekLE | OP_SeekGE | OP_SeekGT | OP_SeekRowid | OP_NotExists
+            | OP_IfNoHope | OP_Insert | OP_Delete | OP_IdxLE | OP_IdxGT | OP_IdxLT | OP_IdxGE
+            | OP_Rewind | OP_Last | OP_Next | OP_Prev | OP_Sort | OP_SeekEnd
+            | OP_Column | OP_RowData | OP_Rowid | OP_IdxRowid | OP_DeferredSeek => return false,
+            _ => {}
+        }
+    }
+    // The seed and recursive SELECT each fill the same FIFO.
+    producers >= 2
+}
+
+fn fifo_duplicate_producer(ops: &[VdbeOp], probe: usize, width: i32, queue: i32) -> bool {
+    let Some([record, found, index, rowid, insert]) = probe.checked_sub(1)
+        .and_then(|start| ops.get(start..probe + 4)) else {
+        return false;
+    };
+    record.opcode == OP_MakeRecord && record.p2 == width && record.p3 == found.p3
+        && record.p4 == P4::NotUsed && record.p5 == 0
+        && found.p2 as usize == probe + 4 && found.p4 == P4::Int32(0) && found.p5 == 0
+        && index.opcode == OP_IdxInsert && index.p1 == found.p1 && index.p2 == record.p3
+        && index.p3 == record.p1 && index.p4 == P4::Int32(width) && index.p5 == 0
+        && rowid.opcode == OP_NewRowid && rowid.p1 == queue && rowid.p3 == 0 && rowid.p5 == 0
+        && insert.opcode == OP_Insert && insert.p1 == queue && insert.p2 == record.p3
+        && insert.p3 == rowid.p2 && insert.p4 == P4::NotUsed && insert.p5 == OPFLAG_APPEND
+}
+
+/// ORDER BY LIMIT keeps an ordered private index with a sequence field
+/// and evicts the last entry before appending a better candidate.
+fn binary_limit_sort_key(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
+    let order_width = i32::from(key.n_key_field);
+    let record_width = i32::from(key.n_all_field);
+    if open.opcode != OP_OpenEphemeral || open.p2 != record_width || open.p3 != 0
+        || open.p5 != 0 || order_width == 0 || record_width <= order_width
+        || key.a_coll.len() != record_width as usize
+        || !key.a_coll.iter().flatten().all(|collation| {
+            collation.name.eq_ignore_ascii_case("BINARY") && collation.enc == key.enc
+        })
+    {
+        return false;
+    }
+    let cursor = open.p1;
+    let Some(key_base) = prog.a_op.windows(5).find_map(|ops| {
+        let [seq, limited, last, compare, delete] = ops else { return None };
+        (seq.opcode == OP_Sequence && seq.p1 == cursor
+            && limited.opcode == OP_IfNotZero
+            && last.opcode == OP_Last && last.p1 == cursor && last.p2 == 0
+            && compare.opcode == OP_IdxLE && compare.p1 == cursor && compare.p4 == P4::Int32(order_width)
+            && seq.p2 == compare.p3 + order_width
+            && delete.opcode == OP_Delete && delete.p1 == cursor && delete.p2 == 0 && delete.p5 == 0)
+            .then_some(compare.p3)
+    }) else {
+        return false;
+    };
+    // A result column already present in ORDER BY is stored only once, so
+    // the record can occupy fewer fields than the cursor declaration.
+    let stores_records = prog.a_op.windows(2).any(|ops| {
+        let [record, insert] = ops else { return false };
+        record.opcode == OP_MakeRecord && record.p1 == key_base
+            && (order_width + 1..=record_width).contains(&record.p2)
+            && matches!(record.p4, P4::NotUsed)
+            && insert.opcode == OP_IdxInsert && insert.p1 == cursor && insert.p5 == 0
+            && insert.p2 == record.p3 && insert.p3 == record.p1 && insert.p4 == P4::Int32(record.p2)
+    });
+    stores_records
+        && prog.a_op.iter().any(|op| op.opcode == OP_Sort && op.p1 == cursor)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReadKeyScope {
     Utf8,
@@ -1067,6 +1187,7 @@ enum ReadKeyScope {
     BinaryGroup,
     BuiltinGroup,
     BinaryDistinct,
+    BuiltinDistinct,
 }
 
 fn group_compare_width(prog: &Program, index: usize, op: &VdbeOp, key: &KeyInfo) -> Option<usize> {
@@ -1080,15 +1201,16 @@ fn group_compare_width(prog: &Program, index: usize, op: &VdbeOp, key: &KeyInfo)
     .then_some(width)
 }
 
+fn builtin_read_key_collation(coll: &CollSeq, key_encoding: u8) -> bool {
+    (coll.name.eq_ignore_ascii_case("BINARY") && coll.enc == key_encoding)
+        || ((coll.name.eq_ignore_ascii_case("NOCASE") || coll.name.eq_ignore_ascii_case("RTRIM"))
+            && coll.enc == crate::vdbeaux::SQLITE_UTF8)
+}
+
 /// GROUP BY shares one KeyInfo between its sorter and register comparison. Keep
 /// additional UTF-16 collation support tied to that pair.
 fn builtin_group_key(prog: &Program, key: &Arc<KeyInfo>) -> bool {
-    let supported = |coll: &CollSeq| {
-        (coll.name.eq_ignore_ascii_case("BINARY") && coll.enc == key.enc)
-            || ((coll.name.eq_ignore_ascii_case("NOCASE") || coll.name.eq_ignore_ascii_case("RTRIM"))
-                && coll.enc == crate::vdbeaux::SQLITE_UTF8)
-    };
-    if !key.a_coll.iter().flatten().all(|coll| supported(coll)) {
+    if !key.a_coll.iter().flatten().all(|coll| builtin_read_key_collation(coll, key.enc)) {
         return false;
     }
     let shares_key = |op: &VdbeOp| {
@@ -1104,6 +1226,7 @@ fn builtin_group_key(prog: &Program, key: &Arc<KeyInfo>) -> bool {
 
 fn unsupported(
     prog: &Program, write: bool, key_scope: ReadKeyScope, row_case_encoding: Option<u8>,
+    builtin_collations: bool,
 ) -> Option<String> {
     if !prog.p_program.is_empty() && !write {
         return Some("sub-programs".to_owned());
@@ -1333,17 +1456,28 @@ fn unsupported(
                         k.a_coll[..width].iter().all(Option::is_some)
                     }))
                 && builtin_group_key(prog, k);
-            let binary_distinct = key_scope == ReadKeyScope::BinaryDistinct
-                && matches!(k.enc, 2 | 3) && binary_distinct_key(prog, op, k);
+            let distinct = matches!(key_scope, ReadKeyScope::BinaryDistinct | ReadKeyScope::BuiltinDistinct)
+                && matches!(k.enc, 2 | 3)
+                && unordered_distinct_key(prog, op, k, |coll| {
+                    binary_in_key_encoding(coll)
+                        || (key_scope == ReadKeyScope::BuiltinDistinct && row_case_encoding == Some(k.enc)
+                            && builtin_read_key_collation(coll, k.enc))
+                });
             // Static BINARY fields (including implicit rowid tails) have no CollSeq.
-            let binary_physical_index = row_case_encoding == Some(k.enc)
+            let physical_index = row_case_encoding == Some(k.enc)
                 && op.opcode == OP_OpenRead && op.p2 > 1 && op.p3 == 0
                 && k.n_key_field > 0 && k.n_key_field <= k.n_all_field
                 && k.a_coll.len() == usize::from(k.n_all_field)
-                && k.a_coll.iter().flatten().all(|c| binary_in_key_encoding(c));
+                && k.a_coll.iter().flatten().all(|c| {
+                    binary_in_key_encoding(c) || (builtin_collations
+                        && c.name.eq_ignore_ascii_case("NOCASE") && c.enc == crate::vdbeaux::SQLITE_UTF8)
+                });
             let binary_membership = row_case_encoding == Some(k.enc) && binary_in_key(prog, op, k);
+            let binary_limit_sort = row_case_encoding == Some(k.enc) && binary_limit_sort_key(prog, op, k);
+            let binary_fifo = row_case_encoding == Some(k.enc) && binary_recursive_fifo_key(prog, index, op, k);
             if k.enc != 1 && !prog.references_like
-                && !(binary_sort || binary_group_compare || builtin_group || binary_distinct || binary_physical_index || binary_membership)
+                && !(binary_sort || binary_group_compare || builtin_group || distinct || physical_index
+                    || binary_membership || binary_limit_sort || binary_fifo)
             {
                 return Some("UTF-16 key".to_owned());
             }
