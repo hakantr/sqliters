@@ -6505,10 +6505,23 @@ fn refine_prepare_error(
         if let Some(diagnostic) = vdbe_host::scalar_when_row_subquery_error(inner, select, sql, &error.message) {
             return diagnostic;
         }
-        return select_name_error_offset(inner, sql, error);
+        return prepare_name_error_offset(inner, sql, error, |_| true);
     }
     if inner.authorizer.is_some() {
         return error;
+    }
+    let has_returning = match stmt {
+        Some(Stmt::Insert(insert)) => !insert.returning.is_empty(),
+        Some(Stmt::Update(update)) => !update.returning.is_empty(),
+        Some(Stmt::Delete(delete)) => !delete.returning.is_empty(),
+        _ => false,
+    };
+    if has_returning
+        && error.message.strip_prefix("no such column: ").is_some_and(|name| name.contains('.'))
+    {
+        return prepare_name_error_offset(inner, sql, error, |offset| {
+            returning_qualified_column_offset(sql, offset)
+        });
     }
     // sqlite3StartTable uses the original input token and its byte offset.
     let create_name = matches!(
@@ -6542,10 +6555,11 @@ fn refine_prepare_error(
 
 /// Add the parser's byte offset when the C and legacy resolvers agree about
 /// the column or function diagnostic.
-fn select_name_error_offset(
+fn prepare_name_error_offset(
     inner: &ConnectionInner,
     sql: &str,
     error: SqliteError,
+    accepts_offset: impl FnOnce(usize) -> bool,
 ) -> SqliteError {
     let column_error = error.message.starts_with("no such column: ")
         || error.message.starts_with("ambiguous column name: ");
@@ -6563,6 +6577,7 @@ fn select_name_error_offset(
         && (message == error.message
             || (!column_error && message.eq_ignore_ascii_case(&error.message)))
         && let Ok(offset) = usize::try_from(offset)
+        && accepts_offset(offset)
     {
         if column_error {
             error.with_offset(offset)
@@ -6572,6 +6587,28 @@ fn select_name_error_offset(
     } else {
         error
     }
+}
+
+/// The resolver points to the first token of a qualified name. Use the
+/// parsed statement's top-level RETURNING marker to check its ownership.
+fn returning_qualified_column_offset(sql: &str, offset: usize) -> bool {
+    use sqliters_syntax::{TokenKind, tokenize};
+
+    let Ok(tokens) = tokenize(sql) else { return false };
+    let Some(index) = tokens.iter().position(|token| token.offset == offset) else { return false };
+    if tokens.get(index + 1).map(|token| token.kind) != Some(TokenKind::Dot) {
+        return false;
+    }
+    let mut depth = 0usize;
+    for token in &tokens[..index] {
+        match token.kind {
+            TokenKind::Lp => depth += 1,
+            TokenKind::Rp => depth = depth.saturating_sub(1),
+            TokenKind::Returning if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The parser actions for generated columns reject constraints in SQL order,

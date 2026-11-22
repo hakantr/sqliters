@@ -2292,3 +2292,8 @@ Kısmi ORDER BY ve LIMIT/OFFSET iki matriste 288 UTF-16 sonucunu C ile eşitledi
 ## V6b.397 — UTF-16 satır CASE fiziksel RTRIM indeksleri
 
 480 gözlemde fiziksel RTRIM aramaları ve indeks üzerinden gruplama 104 UTF-16 sonucunu eşitledi. C ile 312 plan eş, önceki 558 gözlem korundu. C fixture 19/19, ilişkili dört Rust testi iki kipte geçti. OFF 1277/1/325, ON 1275/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,260 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_397.md).
+
+
+## V6b.398 — RETURNING nitelikli ad hata ofsetleri
+
+Önceki 72 native vaka iki kipte 72/72. Ek 198 vakada 108 OFF ve 72 ON UTF-8 bayt ofseti C ile eşleşti. 594 ana dosya ve C yeniden açılışı eş. Joker, authorizer ve önceki RTRIM akışları korundu. OFF 1278/1/325, ON 1276/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_398.md).

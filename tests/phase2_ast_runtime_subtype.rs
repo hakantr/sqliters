@@ -1020,6 +1020,35 @@ fn group64_dml_alias_and_returning_wildcard_and_qualifier_c_parity() {
 }
 
 #[test]
+fn group64_returning_qualified_error_byte_offsets() {
+    let cases = [
+        ("INSERT INTO main.rt AS al VALUES(3,30) RETURNING al.v;", "al.v", 49),
+        ("UPDATE main.rt SET v=v+1 RETURNING main.rt.v;", "main.rt.v", 35),
+        ("DELETE FROM rt RETURNING (SELECT \"雪\".\"été\");", "雪.été", 33),
+        ("UPDATE rt SET v=12 RETURNING (SELECT [é].[値]);", "é.値", 37),
+        ("/* öncül 🧪 */ UPDATE rt SET v=v+1 RETURNING 'İstanbul', CASE WHEN 1 THEN é.v END;", "é.v", 79),
+        ("/* 'föl.v' */ INSERT INTO rt AS föl VALUES(3,30) RETURNING 'föl.v', /* föl.v */ föl.v;", "föl.v", 84),
+    ];
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}'; CREATE TABLE rt(id INTEGER PRIMARY KEY,v INT); INSERT INTO rt VALUES(1,10);"
+        )).unwrap();
+        for (sql, name, offset) in cases {
+            for legacy in [true, false] {
+                let prepared = if legacy { connection.prepare_v1(sql) } else { connection.prepare(sql) };
+                let error = prepared.err().expect("RETURNING name resolution should fail during prepare");
+                assert_eq!(error.code, ErrorCode::Error, "{encoding}: {sql}");
+                assert_eq!(error.message, format!("no such column: {name}"), "{encoding}: {sql}");
+                assert_eq!(error.c_offset(), offset, "{encoding}: {sql}");
+            }
+        }
+        let unchanged = connection.query("SELECT id,v FROM rt", &[]).unwrap();
+        assert_eq!(unchanged.rows[0].values(), &[Value::Integer(1), Value::Integer(10)]);
+    }
+}
+
+#[test]
 fn numeric_blob_boolean_predicates_follow_database_encoding() {
     use Value::{Integer, Null};
 
