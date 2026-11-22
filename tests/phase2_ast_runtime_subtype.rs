@@ -1269,6 +1269,72 @@ fn group64_custom_collation_memory_sort_preserves_callback_order_and_error() {
 }
 
 #[test]
+fn group64_registered_builtin_memory_sort_tracks_current_temp_store() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for name in ["NOCASE", "RTRIM"] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}'; PRAGMA temp_store=FILE;
+                 CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO items VALUES (1,'A'),(2,'a'),(3,'B'),(4,'b'),(5,NULL),(6,'A ');"
+            ))
+            .unwrap();
+            let mut statement = db
+                .prepare(&format!("SELECT id FROM items ORDER BY v COLLATE {name} NULLS LAST,id"))
+                .unwrap();
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = Arc::clone(&calls);
+            db.register_collation(name, move |left, right| {
+                seen.lock().unwrap().push((left.to_owned(), right.to_owned()));
+                right.cmp(left)
+            })
+            .unwrap();
+
+            let expected = [
+                ("B", "b"), ("b", "A "), ("B", "A "), ("A", "a"),
+                ("a", "b"), ("a", "B"), ("A", "B"), ("A", "A "),
+            ]
+            .map(|(left, right)| (left.to_owned(), right.to_owned()));
+            for (mode, first) in [("FILE", 1), ("MEMORY", 4), ("FILE", 1), ("MEMORY", 4)] {
+                db.execute_batch(&format!("PRAGMA temp_store={mode};")).unwrap();
+                let StepResult::Row(row) = statement.step().unwrap() else {
+                    panic!("missing first row in {encoding}/{name}/{mode}");
+                };
+                assert_eq!(row.values(), &[Value::Integer(first)]);
+                let observed = std::mem::take(&mut *calls.lock().unwrap());
+                if mode == "MEMORY" {
+                    assert_eq!(observed, expected, "{encoding}/{name}");
+                } else {
+                    assert!(observed.is_empty());
+                }
+                statement.reset().unwrap();
+            }
+
+            let seen = Arc::clone(&calls);
+            db.register_fallible_collation(name, move |left, right| {
+                let mut observed = seen.lock().unwrap();
+                observed.push((left.to_owned(), right.to_owned()));
+                if observed.len() == 2 {
+                    Err(SqliteError::new(ErrorCode::Schema, "ordinary callback error"))
+                } else {
+                    Ok(right.cmp(left))
+                }
+            })
+            .unwrap();
+            for _ in 0..2 {
+                let error = statement.step().unwrap_err();
+                assert_eq!(error.code, ErrorCode::Schema);
+                assert_eq!(error.message, "ordinary callback error");
+                let error = statement.reset().unwrap_err();
+                assert_eq!(error.code, ErrorCode::Schema);
+                assert_eq!(error.message, "ordinary callback error");
+                assert_eq!(std::mem::take(&mut *calls.lock().unwrap()), expected[..2]);
+            }
+        }
+    }
+}
+
+#[test]
 fn numeric_blob_boolean_predicates_follow_database_encoding() {
     use Value::{Integer, Null};
 

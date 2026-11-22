@@ -10057,6 +10057,7 @@ impl Statement {
                     compiled_v1_expire_generation,
                     ref compiled_slot_cookies,
                     ref compiled_fast_read,
+                    ref stmt,
                     ref params,
                     ref mut lifecycle,
                     ..
@@ -10066,6 +10067,7 @@ impl Statement {
                 let result = if let Err(e) = inner.ensure_usable() {
                     Some(Err(e))
                 } else if inner.trace_hook.is_some() || inner.authorizer.is_some()
+                    || engine::registered_builtin_memory_sort(stmt.as_ref(), &inner.db_set, &inner.collations)
                     || inner.db_set.main_slot().btree.as_ref().is_some_and(|bt| bt.pager().uses_fetch())
                 {
                     None
@@ -10445,8 +10447,16 @@ impl Statement {
         }
     }
 
+    fn uses_registered_builtin_memory_sort(&self, inner: &ConnectionInner) -> bool {
+        self.category == Some(StmtCategory::Read)
+            && !self.c_machine_fixed
+            && engine::registered_builtin_memory_sort(self.stmt.as_ref(), &inner.db_set, &inner.collations)
+    }
+
     fn mapped_read_program(&self, inner: &ConnectionInner) -> Option<Arc<sqliters_vdbe::vdbeaux::Program>> {
-        if self.category != Some(StmtCategory::Read) || self.c_machine.is_some() || self.expired {
+        if self.category != Some(StmtCategory::Read) || self.c_machine.is_some() || self.expired
+            || self.uses_registered_builtin_memory_sort(inner)
+        {
             return None;
         }
         vdbe_host::mapped_table_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len())
@@ -10462,7 +10472,7 @@ impl Statement {
             return fast_res;
         }
         let mut mapped_program = self.mapped_read_program(inner);
-        if mapped_program.is_none() {
+        if mapped_program.is_none() && !self.uses_registered_builtin_memory_sort(inner) {
             if let Some(fast_res) = self.try_fast_read_plan(hid, shared, inner) {
                 return fast_res;
             }
@@ -10911,7 +10921,9 @@ impl Statement {
                     }
                 }
 
-                if mapped_program.is_none() && let Some(ref prog) = self.compiled_vdbe {
+                if mapped_program.is_none() && !self.uses_registered_builtin_memory_sort(inner)
+                    && let Some(ref prog) = self.compiled_vdbe
+                {
                     let tx_db_mask = prog.referenced_db_mask();
                     let mut rem = tx_db_mask;
                     while rem != 0 {
@@ -11038,7 +11050,9 @@ impl Statement {
                         }
                     }
 
-                    if let Some(ref prog_final) = self.compiled_vdbe {
+                    if let Some(ref prog_final) = self.compiled_vdbe
+                        && !self.uses_registered_builtin_memory_sort(inner)
+                    {
                         if !inner.is_autocommit()
                             && (!read_instances.is_empty() || inner.db_set.any_in_transaction())
                         {
@@ -11315,7 +11329,9 @@ impl Statement {
 
                 // Diagnostic switch SQLITERS_VDBE_EXEC: the statement runs on the port of C's
                 // virtual machine, one row per step.
-                if self.c_machine.is_some() || mapped_program.is_some() {
+                if (self.c_machine.is_some() || mapped_program.is_some())
+                    && !self.uses_registered_builtin_memory_sort(inner)
+                {
                     match self.machine_start(hid, shared, inner, lease_cursors, read_instances, mapped_program) {
                         MachineStart::Stepped(r) => return r,
                         // (the program is of another schema version, or names a database the

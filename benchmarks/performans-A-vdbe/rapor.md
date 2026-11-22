@@ -2347,3 +2347,8 @@ Her Rust kipinde 180 dar bellek sıralama profili ve 12.708 callback/adım optim
 ## V6b.408 — Üç ikincil indeksli WITHOUT ROWID OR
 
 Tam bileşik birincil anahtar, üç kolda aynı geçici indeksle yönetiliyor. Ortadaki kol önce arıyor ve yalnız yeni anahtarı mevcut arama konumuna ekliyor. 176 UTF-16 sonucu ve 264 tam EXPLAIN planı C ile eşleşti. Önceki iki kollu sonuçlar, C yeniden açma kontrolleri ve uygulama karşılaştırıcısı sınırları korundu. OFF 1288/1/325, ON 1286/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,281 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_408.md).
+
+
+## V6b.409 — Kayıtlı NOCASE ve RTRIM bellek sıralaması
+
+Açık NOCASE ve RTRIM ile tam bellek sıralamasında uygulama karşılaştırıcıları her Rust kipinde 360 profil ve 25.416 adım boyunca C ile eşleşti. Aynı deyimde FILE ve MEMORY geçişi, callback argüman sırası ve özgün hata aktarımı doğrulandı. 72 kapsam dışı sıralama profili önceki davranışını korudu. OFF 1289/1/325, ON 1287/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,255 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_409.md).

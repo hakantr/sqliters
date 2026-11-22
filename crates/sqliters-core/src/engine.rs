@@ -7317,37 +7317,36 @@ fn exec_single_select_core(
 /// The relational executor already owns explicitly named application
 /// collations. With a single rowid scan, the full memory sorter receives the
 /// same records in the same order as SQLite's complete OP_SorterOpen path.
-fn use_complete_memory_sort(
-    ctx: &ExecContext<'_>,
+fn complete_memory_sort_collation<'a>(
+    db_set: &DatabaseSet,
     core: &SelectCore,
-    order_by: &[OrderByTerm],
+    order_by: &'a [OrderByTerm],
     limit: Option<&LimitClause>,
-) -> bool {
-    if !ctx.db_set.temp_store().is_memory() || limit.is_some()
-        || ctx.stmt_tx.top_core != core as *const SelectCore as usize
-        || ctx.db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0
+) -> Option<&'a str> {
+    if !db_set.temp_store().is_memory() || limit.is_some()
+        || db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0
     {
-        return false;
+        return None;
     }
     let SelectCore::Select {
         distinct: false, projection, from: Some(from), selection: None,
         group_by, having: None, windows,
-    } = core else { return false };
+    } = core else { return None };
     let TableOrSubquery::Table {
         name, table_args: None, alias: None, indexed_by: None,
-    } = &from.head else { return false };
+    } = &from.head else { return None };
     if !from.joins.is_empty() || !group_by.is_empty() || !windows.is_empty() {
-        return false;
+        return None;
     }
-    let Some((DatabaseId::MAIN, table)) = ctx.db_set.find_user_table_in_set(name) else {
-        return false;
+    let Some((DatabaseId::MAIN, table)) = db_set.find_user_table_in_set(name) else {
+        return None;
     };
     if table.without_rowid || table.root_pgno <= 1
         || table.columns.iter().any(|column| column.generated.is_some())
-        || ctx.db_set.slots()[DatabaseId::MAIN.index()].schema.indexes.iter()
+        || db_set.slots()[DatabaseId::MAIN.index()].schema.indexes.iter()
             .any(|index| index.table_name.eq_ignore_ascii_case(&table.name))
     {
-        return false;
+        return None;
     }
     let column_index = |expr: &Expr| {
         let Expr::Column(column) = expr else { return None };
@@ -7359,19 +7358,35 @@ fn use_complete_memory_sort(
     if !projection.iter().all(|column| matches!(column,
         ResultColumn::Expr { expr, alias: None, .. } if column_index(expr).is_some()))
     {
-        return false;
+        return None;
     }
-    let Some((first, trailing)) = order_by.split_first() else { return false };
-    let Expr::Collate { expr, collation } = &first.expr else { return false };
-    let Some(key_index) = column_index(expr) else { return false };
-    key_index != table.rowid_alias_col.unwrap_or(usize::MAX)
-        && Collation::from_name(collation).is_none()
-        && ctx.collations.get_custom(collation).is_some()
-        && match trailing {
-            [] => true,
-            [last] => column_index(&last.expr).is_some_and(|index| Some(index) == table.rowid_alias_col),
-            _ => false,
-        }
+    let (first, trailing) = order_by.split_first()?;
+    let Expr::Collate { expr, collation } = &first.expr else { return None };
+    let key_index = column_index(expr)?;
+    let rowid_tail = match trailing {
+        [] => true,
+        [last] => column_index(&last.expr).is_some_and(|index| Some(index) == table.rowid_alias_col),
+        _ => false,
+    };
+    (Some(key_index) != table.rowid_alias_col && rowid_tail).then_some(collation)
+}
+
+/// Prefer the checked relational comparator only for the current memory sort.
+pub(crate) fn registered_builtin_memory_sort(
+    stmt: Option<&Stmt>,
+    db_set: &DatabaseSet,
+    collations: &CollationRegistry,
+) -> bool {
+    let Some(Stmt::Select(select)) = stmt else { return false };
+    let Some(OrderByTerm { expr: Expr::Collate { collation, .. }, .. }) = select.order_by.first() else {
+        return false;
+    };
+    select.ctes.is_empty()
+        && select.body.compounds.is_empty()
+        && registered_builtin_name_collation(collation, collations)
+        && complete_memory_sort_collation(
+            db_set, &select.body.head, &select.order_by, select.limit.as_ref(),
+        ).is_some()
 }
 
 fn exec_single_select_core_inner(
@@ -8373,12 +8388,26 @@ fn exec_single_select_core_inner(
             }
             if !order_by.is_empty() {
                 let enc = ctx.encoding();
+                let memory_collation = if ctx.stmt_tx.top_core == core as *const SelectCore as usize {
+                    complete_memory_sort_collation(ctx.db_set, core, order_by, limit)
+                        .filter(|name| {
+                            if Collation::from_name(name).is_none() {
+                                ctx.collations.get_custom(name).is_some()
+                            } else {
+                                registered_builtin_name_collation(name, ctx.collations)
+                            }
+                        })
+                } else {
+                    None
+                };
                 let mut specs: Vec<KeySortOrder> = Vec::with_capacity(order_by.len());
-                for ob in order_by {
+                for (index, ob) in order_by.iter().enumerate() {
                     let nulls_last = ob.nulls_last.unwrap_or(ob.desc);
-                    if let Some(cname) =
-                        infer_order_by_custom_collation(&ob.expr, &expanded_proj, &sample_cols)
-                    {
+                    let custom_collation = memory_collation
+                        .filter(|_| index == 0)
+                        .map(str::to_owned)
+                        .or_else(|| infer_order_by_custom_collation(&ob.expr, &expanded_proj, &sample_cols));
+                    if let Some(cname) = custom_collation {
                         specs.push(
                             ctx.collations
                                 .resolve_key_sort_order(&cname, ob.desc, nulls_last)?,
@@ -8398,7 +8427,7 @@ fn exec_single_select_core_inner(
                     result_rows_with_sort.sort_by(|(_, sa), (_, sb)| {
                         compare_value_slices_infallible(sa, sb, &specs, enc)
                     });
-                } else if use_complete_memory_sort(ctx, core, order_by, limit) {
+                } else if memory_collation.is_some() {
                     result_rows_with_sort = sqliters_vdbe::vdbesort::sort_memory_rows(
                         result_rows_with_sort,
                         |(_, sa), (_, sb)| compare_value_slices(sa, sb, &specs, enc),
