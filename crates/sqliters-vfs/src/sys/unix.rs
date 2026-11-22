@@ -77,25 +77,44 @@ pub(crate) const O_NOFOLLOW: i32 = 0;
 
 /// Selects the first usable directory in the Unix temporary-file search.
 fn temp_file_dir() -> Option<PathBuf> {
+    const W_OK: i32 = 2;
+    const X_OK: i32 = 1;
     std::env::var_os("SQLITE_TMPDIR")
         .into_iter()
         .chain(std::env::var_os("TMPDIR"))
         .map(PathBuf::from)
         .chain(["/var/tmp", "/usr/tmp", "/tmp", "."].map(PathBuf::from))
-        .find(|dir| {
-            if !dir.is_dir() {
-                return false;
-            }
-            const W_OK: i32 = 2;
-            const X_OK: i32 = 1;
-            CString::new(dir.as_os_str().as_bytes()).is_ok_and(|path| {
-                // SAFETY: path is a valid NUL-terminated string for this access(2) call.
-                unsafe { access(path.as_ptr(), W_OK | X_OK) == 0 }
-            })
-        })
+        .find(|dir| dir.is_dir() && path_access(dir, W_OK | X_OK))
 }
 
-/// `unixOpen` first tries an unnamed inode, then selects a directory for the named fallback.
+fn path_access(path: &Path, mode: i32) -> bool {
+    CString::new(path.as_os_str().as_bytes()).is_ok_and(|path| {
+        // SAFETY: path is a valid NUL-terminated string for this access(2) call.
+        unsafe { access(path.as_ptr(), mode) == 0 }
+    })
+}
+
+/// `unixGetTempname` allows one NUL for the filename and a second for the VFS.
+fn named_temp_path(directory: &Path) -> Result<PathBuf> {
+    for _ in 0..11 {
+        let mut random = [0; 8];
+        crate::fill_random_bytes(&mut random);
+        let mut name = directory.as_os_str().to_os_string();
+        name.push("/etilqs_");
+        name.push(format!("{:x}", u64::from_ne_bytes(random)));
+        if name.as_bytes().len() > MAX_PATHNAME - 2 {
+            break;
+        }
+        let path = PathBuf::from(name);
+        const F_OK: i32 = 0;
+        if !path_access(&path, F_OK) {
+            return Ok(path);
+        }
+    }
+    Err(SqliteError::new(ErrorCode::Error, ErrorCode::Error.as_str()))
+}
+
+/// `unixOpen` first tries an unnamed inode, then constructs its named fallback.
 pub(crate) fn open_anonymous_temp() -> Result<(PathBuf, Option<File>)> {
     #[cfg(target_os = "linux")]
     if let Some(dir) = temp_file_dir()
@@ -103,9 +122,10 @@ pub(crate) fn open_anonymous_temp() -> Result<(PathBuf, Option<File>)> {
     {
         return Ok((dir, Some(file)));
     }
-    temp_file_dir().map(|dir| (dir, None)).ok_or_else(|| {
+    let directory = temp_file_dir().ok_or_else(|| {
         SqliteError::with_extended(extended::SQLITE_IOERR_GETTEMPPATH, "disk I/O error")
-    })
+    })?;
+    Ok((named_temp_path(&directory)?, None))
 }
 
 /// `unixOpen` first tries an unnamed inode for disposable temporary files.

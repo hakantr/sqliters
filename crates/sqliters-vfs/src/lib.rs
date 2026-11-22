@@ -3513,14 +3513,14 @@ impl Vfs for OsVfs {
             && flags.contains(OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::EXCLUSIVE | OpenFlags::DELETEONCLOSE)
             && (flags.contains(OpenFlags::TEMP_JOURNAL) || flags.contains(OpenFlags::TRANSIENT_DB));
         #[cfg(unix)]
-        let (temp_directory, unnamed) = if anonymous_temp {
-            let (directory, file) = sys::unix::open_anonymous_temp()?;
-            (Some(directory), file)
+        let (temp_path, unnamed) = if anonymous_temp {
+            let (path, file) = sys::unix::open_anonymous_temp()?;
+            (Some(path), file)
         } else {
             (None, None)
         };
         #[cfg(not(unix))]
-        let (temp_directory, unnamed): (Option<PathBuf>, Option<File>) = (None, None);
+        let (temp_path, unnamed): (Option<PathBuf>, Option<File>) = (None, None);
 
         let target_path = match path {
             Some(p) => {
@@ -3549,10 +3549,7 @@ impl Vfs for OsVfs {
                     sys::windows::win_full_pathname(p)?
                 }
             }
-            None => match temp_directory {
-                Some(directory) => make_temp_file_path_in(&directory),
-                None => make_temp_file_path(),
-            },
+            None => temp_path.unwrap_or_else(make_temp_file_path),
         };
 
         // Pre-open geometry conflict check on existing Unix inodes so we don't even open a
@@ -3891,10 +3888,6 @@ fn fill_random_bytes(buf: &mut [u8]) {
 }
 
 fn make_temp_file_path() -> PathBuf {
-    make_temp_file_path_in(&std::env::temp_dir())
-}
-
-fn make_temp_file_path_in(directory: &Path) -> PathBuf {
     // Prefix "etilqs_" matches SQLITE_TEMP_FILE_PREFIX in sqlite/src/os.h!
     let mut rnd = [0u8; 10];
     fill_random_bytes(&mut rnd);
@@ -3902,7 +3895,7 @@ fn make_temp_file_path_in(directory: &Path) -> PathBuf {
     for b in rnd {
         suffix.push_str(&format!("{b:02x}"));
     }
-    directory.join(format!("etilqs_{suffix}"))
+    std::env::temp_dir().join(format!("etilqs_{suffix}"))
 }
 
 #[cfg(test)]
