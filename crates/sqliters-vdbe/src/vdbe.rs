@@ -22,7 +22,7 @@
 #![allow(unexpected_cfgs, non_upper_case_globals, dead_code)]
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use sqliters_btree::Btree;
 use sqliters_btree::btcursor::{BTREE_AUXDELETE, BTREE_SEEK_EQ, BcParked, BtCursor, CURSOR_REQUIRESEEK};
@@ -848,6 +848,8 @@ pub struct Vdbe {
     /// P4 operands bound to the connection, by address
     rt: Vec<OpRt>,
     rt_ready: bool,
+    /// The first application comparison failure from the private LIMIT index.
+    limit_sort_error: Option<Arc<Mutex<Option<SqliteError>>>>,
     /// Scratch buffers
     scratch: Vec<u8>,
     u_temp: Vec<u32>,
@@ -1462,14 +1464,18 @@ fn priority_queue_producer(
 /// ORDER BY LIMIT keeps an ordered private index with a sequence field
 /// and evicts the last entry before appending a better candidate.
 fn limit_sort_key(prog: &Program, open: &VdbeOp, key: &KeyInfo, builtin_collations: bool) -> bool {
+    (key.a_coll.iter().flatten().all(|collation| {
+        collation.name.eq_ignore_ascii_case("BINARY") && collation.enc == key.enc
+    }) || (builtin_collations && builtin_order_key(key)))
+        && ordered_limit_index(prog, open, key)
+}
+
+fn ordered_limit_index(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
     let order_width = i32::from(key.n_key_field);
     let record_width = i32::from(key.n_all_field);
     if open.opcode != OP_OpenEphemeral || open.p2 != record_width || open.p3 != 0
         || open.p5 != 0 || order_width == 0 || record_width <= order_width
         || key.a_coll.len() != record_width as usize
-        || !(key.a_coll.iter().flatten().all(|collation| {
-            collation.name.eq_ignore_ascii_case("BINARY") && collation.enc == key.enc
-        }) || (builtin_collations && builtin_order_key(key)))
     {
         return false;
     }
@@ -1498,6 +1504,24 @@ fn limit_sort_key(prog: &Program, open: &VdbeOp, key: &KeyInfo, builtin_collatio
     });
     stores_records
         && prog.a_op.iter().any(|op| op.opcode == OP_Sort && op.p1 == cursor)
+}
+
+/// Validate the cursor and key that can call an application comparator.
+#[doc(hidden)]
+pub fn custom_limit_sort_open(prog: &Program, name: &str, enc: u8) -> Option<usize> {
+    let mut opens = prog.a_op.iter().enumerate().filter(|(_, op)| op.opcode == OP_OpenEphemeral);
+    let (pc, op) = opens.next()?;
+    let P4::KeyInfo(key) = &op.p4 else { return None };
+    (opens.next().is_none() && key.enc == enc && ordered_limit_index(prog, op, key)
+        && key.a_coll.first().and_then(Option::as_deref).is_some_and(|coll| {
+            // The generator tags an application CollSeq with the key encoding.
+            // The bound runtime uses the encoding of the registered callback (UTF-8).
+            coll.name.eq_ignore_ascii_case(name) && coll.enc == key.enc
+        })
+        && key.a_coll[1..].iter().flatten().all(|coll| {
+            coll.name.eq_ignore_ascii_case("BINARY") && coll.enc == key.enc
+        }))
+        .then_some(pc)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3020,6 +3044,7 @@ impl Vdbe {
         let init_p1 = prog.a_op.first().map_or(0, |op| op.p1);
         let n_op = prog.a_op.len();
         let mwf = prog.min_write_file_format;
+        let limit_sort_error = prog.fallible_limit_sort_open.map(|_| Arc::new(Mutex::new(None)));
         Vdbe {
             prog,
             preformat_cell: Vec::new(),
@@ -3037,6 +3062,7 @@ impl Vdbe {
             a_rowset: Vec::new(),
             rt: vec![OpRt::None; n_op],
             rt_ready: false,
+            limit_sort_error,
             scratch: Vec::new(),
             u_temp: Vec::new(),
             min_write_file_format: mwf,
@@ -3100,13 +3126,18 @@ impl Vdbe {
     /// Binds the collations of the program to the connection.
     fn make_rt<H: VdbeHost>(&mut self, host: &mut H) -> Result<()> {
         let prog = Arc::clone(&self.prog);
-        self.rt = Self::bind_ops(&prog.a_op, host)?;
+        self.rt = Self::bind_ops(&prog.a_op, host,
+            prog.fallible_limit_sort_open.zip(self.limit_sort_error.as_ref()))?;
         self.rt_ready = true;
         Ok(())
     }
 
     /// The P4 operands of `a_op` bound to the connection (collations, key infos).
-    fn bind_ops<H: VdbeHost>(a_op: &[VdbeOp], host: &mut H) -> Result<Vec<OpRt>> {
+    fn bind_ops<H: VdbeHost>(
+        a_op: &[VdbeOp],
+        host: &mut H,
+        limit_sort: Option<(usize, &Arc<Mutex<Option<SqliteError>>>)>,
+    ) -> Result<Vec<OpRt>> {
         let mut rt = vec![OpRt::None; a_op.len()];
         let find = |c: &CollSeq, host: &mut H| -> Result<Arc<CollRt>> {
             if let Some(mut b) = builtin_coll(&c.name) {
@@ -3124,8 +3155,12 @@ impl Vdbe {
                 P4::KeyInfo(k) => {
                     let k: &KeyInfo = k;
                     let mut a_coll = Vec::with_capacity(k.a_coll.len());
-                    for c in &k.a_coll {
+                    for (field, c) in k.a_coll.iter().enumerate() {
                         a_coll.push(match c {
+                            Some(c) if field == 0 && limit_sort.is_some_and(|(pc, _)| i == pc) => {
+                                let (_, error) = limit_sort.expect("checked sort address");
+                                Some(Arc::new(fallible_limit_collation(find(c, host)?, error)?))
+                            }
                             Some(c) => Some(find(c, host)?),
                             None => None,
                         });
@@ -3365,7 +3400,7 @@ impl Vdbe {
         let key = Arc::as_ptr(&sp) as usize;
         let rt = match self.sub_rt.iter().position(|(k, _)| *k == key) {
             Some(i) => self.sub_rt.swap_remove(i).1,
-            None => Self::bind_ops(&sp.a_op, host)?,
+            None => Self::bind_ops(&sp.a_op, host, None)?,
         };
         let FrameRt { a_mem, ap_csr, a_agg, a_rowset, a_frame } = *child;
         let n_op = sp.a_op.len();
@@ -3473,6 +3508,19 @@ impl Vdbe {
         self.err_pc = usize::MAX;
         self.not_halted = false;
         self.halt_rc = None;
+        if let Some(error) = &self.limit_sort_error {
+            *error.lock().unwrap() = None;
+        }
+    }
+
+    fn limit_sort_callback_error(&self) -> Option<SqliteError> {
+        self.limit_sort_error.as_ref().and_then(|error| error.lock().unwrap().clone())
+    }
+
+    /// A callback's error is distinct from an OP_Transaction schema mismatch.
+    #[doc(hidden)]
+    pub fn has_limit_sort_callback_error(&self) -> bool {
+        self.limit_sort_error.as_ref().is_some_and(|error| error.lock().unwrap().is_some())
     }
 
     /// `sqlite3_stmt_status(pStmt, op, resetFlag)` for the counters the machine keeps
@@ -6229,6 +6277,9 @@ impl Vdbe {
                         bt.bc_insert(&mut c.cur, 0, &self.a_mem[op.p2 as usize].z, flags, seek_result, Some(&mut r))
                     };
                     c.cache_status = CACHE_STALE;
+                    if let Some(error) = self.limit_sort_callback_error() {
+                        return Err(error);
+                    }
                     rc?;
                 }
 
@@ -6374,8 +6425,12 @@ impl Vdbe {
                     let bt = btree_of!(pc_);
                     let mut r = UnpackedRecord::new(ki, &self.a_mem[p3..p3 + n_field], n_field as u16, default_rc);
                     // Inlined version of sqlite3VdbeIdxKeyCompare()
-                    let mut res = sqlite3_vdbe_idx_key_compare(bt, &mut pc_.cur, &mut r, &mut self.scratch)?;
+                    let comparison = sqlite3_vdbe_idx_key_compare(bt, &mut pc_.cur, &mut r, &mut self.scratch);
+                    if let Some(error) = self.limit_sort_callback_error() {
+                        return Err(error);
+                    }
                     // End of inlined sqlite3VdbeIdxKeyCompare()
+                    let mut res = comparison?;
                     if (op.opcode & 1) == (OP_IdxLT & 1) {
                         res = -res;
                     } else {
@@ -6979,6 +7034,33 @@ fn mem_from_runtime(rv: &RuntimeValue) -> Mem {
 /// The key order of an ephemeral index as the b-tree layer's index insert takes it: C compares
 /// `nKeyField + 1` fields (`sqlite3VdbeAllocUnpackedRecord`), the fields past `nKeyField` in
 /// binary ascending order. A NULL sorts last when exactly one of DESC / BIGNULL is set.
+fn fallible_limit_collation(
+    collation: Arc<CollRt>,
+    failure: &Arc<Mutex<Option<SqliteError>>>,
+) -> Result<CollRt> {
+    let Some(custom) = &collation.custom else {
+        return Err(internal("LIMIT sort without its registered collation"));
+    };
+    let compare = Arc::clone(&custom.comparator);
+    let failure = Arc::clone(failure);
+    let mut collation = (*collation).clone();
+    collation.cmp = Arc::new(move |a, b| {
+        if failure.lock().unwrap().is_some() {
+            return 0;
+        }
+        let a = String::from_utf8_lossy(a);
+        let b = String::from_utf8_lossy(b);
+        match compare(&a, &b) {
+            Ok(order) => order as i32,
+            Err(error) => {
+                *failure.lock().unwrap() = Some(error);
+                0
+            }
+        }
+    });
+    Ok(collation)
+}
+
 fn key_sort_orders(k: &KeyInfoRt) -> Vec<KeySortOrder> {
     let n = (usize::from(k.n_key_field) + 1).min(usize::from(k.n_all_field).max(1));
     (0..n)

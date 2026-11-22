@@ -1605,6 +1605,75 @@ fn group64_small_file_sort_preserves_custom_callback_order_and_error() {
 }
 
 #[test]
+fn group64_memory_limit_sort_preserves_custom_callbacks_and_error() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}'; PRAGMA temp_store=MEMORY;
+             CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO items VALUES (1,'A'),(2,'a'),(3,'B'),(4,'b'),(5,NULL),(6,'A ');"
+        ))
+        .unwrap();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        db.register_collation("app_order", move |left, right| {
+            seen.lock().unwrap().push((left.to_owned(), right.to_owned()));
+            right.cmp(left)
+        })
+        .unwrap();
+        let mut statement = db.prepare(
+            "SELECT id FROM items ORDER BY v COLLATE app_order NULLS LAST,id LIMIT ?1 OFFSET ?2",
+        )
+        .unwrap();
+        statement.bind(1, Value::Integer(3)).unwrap().bind(2, Value::Integer(1)).unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+        let expected = [
+            ("A", "a"), ("a", "B"), ("A", "B"), ("B", "b"),
+            ("a", "b"), ("A", "A "), ("a", "A "), ("B", "A "),
+        ]
+        .map(|(left, right)| (left.to_owned(), right.to_owned()));
+        for id in [2, 3, 6] {
+            let StepResult::Row(row) = statement.step().unwrap() else {
+                panic!("missing LIMIT sort row in {encoding}");
+            };
+            assert_eq!(row.values(), &[Value::Integer(id)]);
+            let compared = std::mem::take(&mut *calls.lock().unwrap());
+            if id == 2 {
+                assert_eq!(compared, expected);
+            } else {
+                assert!(compared.is_empty());
+            }
+        }
+        assert!(matches!(statement.step().unwrap(), StepResult::Done));
+        statement.reset().unwrap();
+
+        db.execute_batch("PRAGMA temp_store=FILE").unwrap();
+        assert!(matches!(statement.step().unwrap(), StepResult::Row(_)));
+        assert_eq!(statement.machine_stmt_status(4, false), 0);
+        statement.reset().unwrap();
+        calls.lock().unwrap().clear();
+        db.execute_batch("PRAGMA temp_store=MEMORY").unwrap();
+
+        let seen = Arc::clone(&calls);
+        let failure = SqliteError::new(ErrorCode::Schema, "ordinary LIMIT sort callback error").with_offset(13);
+        let injected = failure.clone();
+        db.register_fallible_collation("app_order", move |left, right| {
+            let mut observed = seen.lock().unwrap();
+            observed.push((left.to_owned(), right.to_owned()));
+            if observed.len() == 2 {
+                Err(injected.clone())
+            } else {
+                Ok(right.cmp(left))
+            }
+        })
+        .unwrap();
+        assert_eq!(statement.step().unwrap_err(), failure);
+        assert_eq!(statement.reset().unwrap_err(), failure);
+        assert_eq!(std::mem::take(&mut *calls.lock().unwrap()), expected[..2], "{encoding}");
+    }
+}
+
+#[test]
 fn numeric_blob_boolean_predicates_follow_database_encoding() {
     use Value::{Integer, Null};
 

@@ -759,6 +759,7 @@ impl Vdbe {
             change_cnt_on: self.change_cnt_on,
             references_like: self.references_like,
             group_sorter_owns_rows: self.group_sorter_owns_rows,
+            fallible_limit_sort_open: None,
         }
     }
 }
@@ -815,6 +816,8 @@ pub struct Program {
     pub references_like: bool,
     /// A simple GROUP BY completes its input scan before emitting sorter results.
     pub group_sorter_owns_rows: bool,
+    /// Address of the checked ORDER BY LIMIT private index's OpenEphemeral.
+    pub fallible_limit_sort_open: Option<usize>,
     /// `usesStmtJournal`
     pub uses_stmt_journal: bool,
     /// `explain`: 0 normal, 1 EXPLAIN, 2 EXPLAIN QUERY PLAN

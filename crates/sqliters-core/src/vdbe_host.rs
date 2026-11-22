@@ -129,6 +129,54 @@ pub(crate) fn machine_program_with_prepare(
     read_machine_program(inner, stmt, raw_sql, n_param, ReadMachineScope::Standard, None, prepared)
 }
 
+/// A plain ORDER BY with LIMIT uses a private index rather than the full sorter.
+#[allow(non_upper_case_globals)]
+pub(crate) fn custom_limit_sort_read_program(
+    inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
+) -> Option<Arc<Program>> {
+    use sqliters_vdbe::opcodes::*;
+    let Some(Stmt::Select(select)) = stmt else { return None };
+    if inner.authorizer.is_some() || !inner.db_set.temp_store().is_memory() {
+        return None;
+    }
+    let (name, root) = crate::engine::custom_limit_order_collation(select, &inner.db_set, &inner.collations)?;
+    let PrepareResult::Program(mut program) = crate::cgen::c_prepare(inner, sql).0 else {
+        return None;
+    };
+    if !program.read_only || program.explain != 0 || program.btree_mask != 1
+        || !program.p_program.is_empty() || program.n_var as usize != n_param
+    {
+        return None;
+    }
+    let open = sqliters_vdbe::vdbe::custom_limit_sort_open(
+        &program, name, inner.effective_encoding() as u8,
+    )?;
+    let mut reads = program.a_op.iter().filter(|op| op.opcode == OP_OpenRead);
+    let read = reads.next()?;
+    let sort = &program.a_op[open];
+    if reads.next().is_some() || read.p1 == sort.p1 || read.p2 != root as i32 || read.p3 != 0
+        || !matches!(read.p4, P4::Int32(_))
+    {
+        return None;
+    }
+    if !program.a_op.iter().enumerate().all(|(pc, op)| match op.opcode {
+        OP_Init | OP_Integer | OP_Int64 | OP_Variable | OP_MustBeInt
+        | OP_OffsetLimit | OP_IfNot | OP_IfNotZero | OP_IfPos | OP_AddImm
+        | OP_MakeRecord | OP_ResultRow | OP_Goto | OP_Halt | OP_OpenRead => true,
+        OP_OpenEphemeral => pc == open,
+        OP_Transaction => op.p1 == 0 && op.p2 == 0,
+        OP_Rewind | OP_Rowid => op.p1 == read.p1,
+        OP_Column | OP_Next => op.p1 == read.p1 || op.p1 == sort.p1,
+        OP_Sequence | OP_Last | OP_IdxLE | OP_Delete | OP_IdxInsert | OP_Sort => op.p1 == sort.p1,
+        _ => false,
+    }) {
+        return None;
+    }
+    program.fallible_limit_sort_open = Some(open);
+    trace("machine: custom LIMIT sorter", sql);
+    Some(Arc::new(*program))
+}
+
 /// A materialized legacy read cannot hold the page that C has at ResultRow. Use the
 /// streaming machine for a single mapped b-tree when its program uses only the
 /// cursor, projection, rowid-bound, count and binary sorter operations below.
@@ -2119,6 +2167,7 @@ pub(crate) fn step(
     if let Err(e) = &res
         && e.code == ErrorCode::Corrupt
         && e.extended_code == ErrorCode::Corrupt as i32
+        && !vm.has_limit_sort_callback_error()
         && !inner.is_autocommit()
     {
         inner.db_set.set_corrupt_rdonly(true);

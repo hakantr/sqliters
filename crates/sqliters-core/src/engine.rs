@@ -7314,18 +7314,13 @@ fn exec_single_select_core(
     res
 }
 
-/// The relational executor already owns explicitly named application
-/// collations. With a single rowid scan, the full memory sorter receives the
-/// same records in the same order as SQLite's complete OP_SorterOpen path.
-fn complete_order_sort_collation<'a>(
+/// A full ORDER BY can receive rows directly from one main rowid scan.
+fn main_rowid_order_collation<'a>(
     db_set: &'a DatabaseSet,
     core: &SelectCore,
     order_by: &'a [OrderByTerm],
-    limit: Option<&LimitClause>,
-) -> Option<&'a str> {
-    if limit.is_some()
-        || db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0
-    {
+) -> Option<(&'a str, u32)> {
+    if db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0 {
         return None;
     }
     let SelectCore::Select {
@@ -7374,7 +7369,39 @@ fn complete_order_sort_collation<'a>(
     if Some(key_index) == table.rowid_alias_col || !rowid_tail {
         return None;
     }
-    Some(explicit.unwrap_or_else(|| table.columns[key_index].collation_name()))
+    Some((explicit.unwrap_or_else(|| table.columns[key_index].collation_name()), table.root_pgno))
+}
+
+fn complete_order_sort_collation<'a>(
+    db_set: &'a DatabaseSet,
+    core: &SelectCore,
+    order_by: &'a [OrderByTerm],
+    limit: Option<&LimitClause>,
+) -> Option<&'a str> {
+    if limit.is_some() {
+        return None;
+    }
+    main_rowid_order_collation(db_set, core, order_by).map(|(name, _)| name)
+}
+
+pub(crate) fn custom_limit_order_collation<'a>(
+    select: &'a SelectStmt,
+    db_set: &'a DatabaseSet,
+    collations: &CollationRegistry,
+) -> Option<(&'a str, u32)> {
+    let limit = select.limit.as_ref()?;
+    let simple_bound = |expr: &Expr| match expr {
+        Expr::Integer(_) | Expr::Bind(_) => true,
+        Expr::Unary { op: UnaryOp::Negate | UnaryOp::Plus, expr } => matches!(expr.as_ref(), Expr::Integer(_)),
+        _ => false,
+    };
+    if !select.ctes.is_empty() || !select.body.compounds.is_empty()
+        || !simple_bound(&limit.limit) || limit.offset.as_ref().is_some_and(|expr| !simple_bound(expr))
+    {
+        return None;
+    }
+    main_rowid_order_collation(db_set, &select.body.head, &select.order_by)
+        .filter(|(name, _)| Collation::from_name(name).is_none() && collations.get_custom(name).is_some())
 }
 
 fn registered_memory_sort_builtin(

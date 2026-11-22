@@ -8081,10 +8081,11 @@ impl Statement {
                 };
                 MachineStart::Stepped(fin_res.map(|()| StepResult::Done))
             }
-            Err(e) if e.code == ErrorCode::Schema => {
+            Err(e) if e.code == ErrorCode::Schema && !vm.has_limit_sort_callback_error() => {
                 // SQLITE_SCHEMA from OP_Transaction (the schema cookie or generation is not the
                 // one the program was generated for): sqlite3Reprepare, then run again — once.
                 let counters = vm.a_counter;
+                let limit_sort = vm.prog.fallible_limit_sort_open.is_some();
                 drop(vm);
                 if self.c_machine_fixed {
                     let _ = inner.finish_activity(
@@ -8101,7 +8102,11 @@ impl Statement {
                     return MachineStart::Stepped(Err(e));
                 }
                 if !retried
-                    && let Ok(Some(prog)) = vdbe_host::machine_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len())
+                    && let Some(prog) = if limit_sort {
+                        vdbe_host::custom_limit_sort_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len())
+                    } else {
+                        vdbe_host::machine_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len()).ok().flatten()
+                    }
                 {
                     self.c_machine = Some(prog);
                     self.reprepare_machine_vm(counters);
@@ -8215,7 +8220,12 @@ impl Statement {
         if is_explain || artifacts.category != Some(StmtCategory::Read) {
             return Ok(None);
         }
-        let result = if has_like {
+        let custom_limit = vdbe_host::custom_limit_sort_read_program(
+            inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param,
+        );
+        let result = if custom_limit.is_some() {
+            Ok(custom_limit)
+        } else if has_like {
             vdbe_host::like_machine_program(inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param, bound_values)
         } else if vdbe_host::exec_switch_on() {
             vdbe_host::machine_program_with_prepare(
@@ -10151,6 +10161,7 @@ impl Statement {
             && self.c_machine.as_ref().map_or(self.requires_schema, |program| program.b_is_reader);
         if file_reader && !self.read_io_during_prepare
             && let Err(error) = &result && error.code == ErrorCode::IoErr
+            && !self.c_machine_vm.as_ref().is_some_and(|vm| vm.has_limit_sort_callback_error())
             && let Some(hid) = self.handle_id
         {
             let error = inner.abort_read_io_error(hid, error, shared);
@@ -10463,7 +10474,8 @@ impl Statement {
         {
             return None;
         }
-        vdbe_host::mapped_table_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len())
+        vdbe_host::custom_limit_sort_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len())
+            .or_else(|| vdbe_host::mapped_table_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len()))
     }
 
     fn start_execution_in_session(
@@ -10474,6 +10486,14 @@ impl Statement {
     ) -> Result<StepResult> {
         if let Some(fast_res) = self.try_fast_compiled_main_write(hid, shared, inner) {
             return fast_res;
+        }
+        // TEMP may change without expiring a held statement when the TEMP schema
+        // is unopened. The private sort must still use the active storage policy.
+        let limit_sort_in_memory = inner.db_set.temp_store().is_memory();
+        if !limit_sort_in_memory
+            && self.c_machine_vm.as_ref().is_some_and(|vm| vm.prog.fallible_limit_sort_open.is_some())
+        {
+            self.c_machine_vm = None;
         }
         let mut mapped_program = self.mapped_read_program(inner);
         if mapped_program.is_none() && !self.uses_registered_builtin_memory_sort(inner) {
@@ -11333,7 +11353,9 @@ impl Statement {
 
                 // Diagnostic switch SQLITERS_VDBE_EXEC: the statement runs on the port of C's
                 // virtual machine, one row per step.
-                if (self.c_machine.is_some() || mapped_program.is_some())
+                if (self.c_machine.as_ref().is_some_and(|prog| {
+                    prog.fallible_limit_sort_open.is_none() || limit_sort_in_memory
+                }) || mapped_program.is_some())
                     && !self.uses_registered_builtin_memory_sort(inner)
                 {
                     match self.machine_start(hid, shared, inner, lease_cursors, read_instances, mapped_program) {
