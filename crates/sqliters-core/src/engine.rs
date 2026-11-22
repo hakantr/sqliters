@@ -126,7 +126,7 @@ pub struct StmtTxTracker {
     pub(crate) prepared_reverse_order: bool,
     /// The top-level view UPDATE has a plain numeric range in an existing write snapshot.
     pub(crate) view_update_range_tokens: bool,
-    /// The top-level rowid view UPDATE has two ranges with plain integer limits.
+    /// The top-level rowid view write has two ranges with plain integer limits.
     pub(crate) rowid_view_text_range_tokens: bool,
     /// Named trigger recursion is fixed by the prepared program.
     pub(crate) prepared_recursive_triggers: Option<bool>,
@@ -32735,8 +32735,15 @@ fn main_direct_view_update_source<'db>(
     {
         return None;
     }
+    main_direct_view_dml_source(&update.table, db_set)
+}
+
+fn main_direct_view_dml_source<'db>(
+    target: &QualifiedName,
+    db_set: &'db DatabaseSet,
+) -> Option<(&'db ViewSchema, &'db TableSchema, &'db [ResultColumn], Option<&'db str>)> {
     let (DatabaseId::MAIN, RelationRef::View(view)) =
-        db_set.find_relation_ref_in_set(&update.table).ok()??
+        db_set.find_relation_ref_in_set(target).ok()??
     else {
         return None;
     };
@@ -33076,13 +33083,23 @@ pub(crate) fn view_update_range_tokens(stmt: &Stmt, db_set: &DatabaseSet, sql: &
 }
 
 pub(crate) fn rowid_view_text_range_tokens(stmt: &Stmt, db_set: &DatabaseSet, sql: &str) -> bool {
-    let Stmt::Update(update) = stmt else {
-        return false;
+    let (selection, source) = match stmt {
+        Stmt::Update(update)
+            if update.returning.iter().all(|item| view_dml_named_column(item).is_some()) =>
+        {
+            (update.selection.as_ref(), main_direct_view_update_source(update, db_set))
+        }
+        Stmt::Delete(delete)
+            if delete.alias.is_none()
+                && delete.indexed_by.is_none()
+                && delete.ctes.is_empty()
+                && delete.returning.is_empty() =>
+        {
+            (delete.selection.as_ref(), main_direct_view_dml_source(&delete.table, db_set))
+        }
+        _ => return false,
     };
-    if !update.returning.iter().all(|item| view_dml_named_column(item).is_some()) {
-        return false;
-    }
-    let Some(Expr::Binary { left, op: BinaryOp::And, right }) = update.selection.as_ref() else {
+    let Some(Expr::Binary { left, op: BinaryOp::And, right }) = selection else {
         return false;
     };
     let (Some((left_col, left_op, left_bound)), Some((right_col, right_op, right_bound))) =
@@ -33098,7 +33115,7 @@ pub(crate) fn rowid_view_text_range_tokens(stmt: &Stmt, db_set: &DatabaseSet, sq
         && integer_bound(left_bound)
         && integer_bound(right_bound)
         && matches!((left_op, right_op), (BinaryOp::Gt, BinaryOp::Lt) | (BinaryOp::Lt, BinaryOp::Gt))
-        && main_direct_view_update_source(update, db_set).is_some_and(|(_, table, projection, alias)| {
+        && source.is_some_and(|(_, table, projection, alias)| {
             !table.without_rowid
                 && alias.is_none()
                 && projection.iter().all(|item| view_dml_named_column(item).is_some())
@@ -33134,7 +33151,8 @@ fn view_dml_indexed_select(
             if matches!(
                 predicate,
                 ViewDmlIndexPredicate::UpdateRange | ViewDmlIndexPredicate::UpdateReturningRange
-            ) =>
+            ) || (predicate == ViewDmlIndexPredicate::DeleteRange
+                && ctx.stmt_tx.rowid_view_text_range_tokens) =>
         {
             (view_dml_index_term(left)?, Some(view_dml_index_term(right)?))
         }
