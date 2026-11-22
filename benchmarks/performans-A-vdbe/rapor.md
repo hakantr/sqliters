@@ -2332,3 +2332,8 @@ Tek satırlı kaynak tablosuz karşılaştırmalarda kayıtlı NOCASE ve RTRIM �
 ## V6b.405 — Skaler doğruluk projeksiyonunda kayıtlı kolasyon
 
 Karma IS TRUE projeksiyonlarında önceki altı fark kapandı. Her Rust kipinde 1.374 C kayıt ve 33 projeksiyon kontrolü eş. Önceki 696 geri çağrı kaydı korundu. Group64 6/6, hata/reset ve sağlıklı dosya açılışları geçti. OFF 1285/1/325, ON 1283/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_405.md).
+
+
+## V6b.406 — UTF-16 WITHOUT ROWID iki dallı OR
+
+İki fiziksel OR dalı ve bileşik PK için ölçülen 144 UTF-16 sonuç C ile eş. Exact OFF ve ON rowvalue8 34/34, C fixture 16/16. 216 tam C planı ve önceki 558 gözlem eş. OFF 1286/1/325, ON 1284/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_406.md).

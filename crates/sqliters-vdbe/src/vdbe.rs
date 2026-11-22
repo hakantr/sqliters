@@ -1846,6 +1846,16 @@ fn rowid_or_secondary_branch(
     {
         return None;
     }
+    or_index_seek_bounds(ops, start, stop, tail, key)?;
+    Some((defer.p3, set, call))
+}
+
+fn or_index_seek_bounds(
+    ops: &[VdbeOp], start: usize, stop: usize, tail: usize, key: &KeyInfo,
+) -> Option<()> {
+    let open = &ops[start];
+    let cursor = open.p1;
+    let next = &ops[stop - 1];
     let bound = next.p2 as usize;
     let mut seeks = ops.get(start + 1..bound)?.iter()
         .filter(|op| op.p1 == cursor && matches!(op.opcode, OP_SeekGE | OP_SeekGT));
@@ -1860,7 +1870,7 @@ fn rowid_or_secondary_branch(
     {
         return None;
     }
-    Some((defer.p3, set, call))
+    Some(())
 }
 
 /// A two-branch OR may pair one secondary scan with a direct point lookup on
@@ -1910,6 +1920,143 @@ fn mixed_rowid_or_cursor(ops: &[VdbeOp], start: usize, encoding: u8) -> bool {
         && rowid_or_table_read(&ops[..first], table)
 }
 
+/// WITHOUT ROWID multi-index OR locates rows with the table's full primary
+/// key and tracks duplicates in a private index with the same KeyInfo.
+fn without_rowid_or_admissions(prog: &Program, encoding: u8) -> Vec<[usize; 3]> {
+    let ops = &prog.a_op;
+    ops.windows(4).enumerate().filter_map(|(start, group)| {
+        let [table, seen, ret, first] = group else { return None };
+        let P4::KeyInfo(key) = &table.p4 else { return None };
+        if table.opcode != OP_OpenRead || table.p2 <= 1 || table.p3 != 0 || table.p5 != 0
+            || seen.opcode != OP_OpenEphemeral || seen.p2 != i32::from(key.n_key_field)
+            || seen.p3 != 0 || seen.p5 != 0 || seen.p4 != table.p4 || key.n_key_field < 2
+            || !without_rowid_or_key(key, encoding)
+            || ret.opcode != OP_Integer || ret.p2 <= 0 || first.opcode != OP_ReopenIdx
+            || seen.p1 == table.p1 || seen.p1 == first.p1 || table.p1 == first.p1
+        {
+            return None;
+        }
+        let first_pc = start + 3;
+        let end = usize::try_from(ret.p1).ok()?;
+        let goto = ops.get(end)?;
+        let body_end = usize::try_from(goto.p2).ok()?.checked_sub(1)?;
+        let body_return = ops.get(body_end)?;
+        if goto.opcode != OP_Goto || body_end <= end + 1
+            || body_return.opcode != OP_Return || body_return.p1 != ret.p2
+            || body_return.p2 as usize != end + 1 || body_return.p3 != 0
+        {
+            return None;
+        }
+        let mut reopens = ops.iter().enumerate().filter_map(|(pc, op)| {
+            (op.opcode == OP_ReopenIdx && op.p1 == first.p1).then_some(pc)
+        });
+        if reopens.next()? != first_pc {
+            return None;
+        }
+        let second_pc = reopens.next()?;
+        let second = &ops[second_pc];
+        if reopens.next().is_some() || second_pc >= end || first.p2 == table.p2 || second.p2 == table.p2
+            || (first.p2 == second.p2 && first.p4 != second.p4)
+        {
+            return None;
+        }
+        let store = without_rowid_or_branch(ops, first_pc, second_pc, table, seen, ret, encoding, true)?;
+        let probe = without_rowid_or_branch(ops, second_pc, end, table, seen, ret, encoding, false)?;
+        let cursors = [table.p1, seen.p1, first.p1];
+        if ops.iter().enumerate().any(|(pc, op)| {
+            (op.opcode == OP_OpenDup && cursors.contains(&op.p2))
+                || (matches!(op.opcode, OP_DeferredSeek | OP_SorterData) && op.p3 == seen.p1)
+                || (cursors.contains(&op.p1)
+                && match op.opcode {
+                    OP_OpenRead => pc != start,
+                    OP_OpenEphemeral => pc != start + 1,
+                    OP_ReopenIdx => pc != first_pc && pc != second_pc,
+                    OP_OpenWrite | OP_OpenDup | OP_OpenAutoindex | OP_OpenPseudo | OP_SorterOpen
+                    | OP_VOpen | OP_Insert | OP_Delete | OP_IdxDelete | OP_ResetSorter => true,
+                    OP_IdxInsert => pc != store,
+                    OP_Found if op.p1 == seen.p1 => pc != probe,
+                    OP_NotFound | OP_NoConflict | OP_SeekLT | OP_SeekLE | OP_SeekGE | OP_SeekGT
+                    | OP_SeekRowid | OP_NotExists | OP_IfNoHope | OP_IdxLE | OP_IdxGT | OP_IdxLT
+                    | OP_IdxGE | OP_Rewind | OP_Last | OP_Next | OP_Prev | OP_Sort | OP_SeekEnd
+                    | OP_Column | OP_RowData | OP_Rowid | OP_IdxRowid | OP_DeferredSeek
+                    | OP_SorterInsert | OP_NewRowid | OP_Count if op.p1 == seen.p1 => true,
+                    _ => false,
+                })
+        }) {
+            return None;
+        }
+        Some([start + 1, first_pc, second_pc])
+    }).collect()
+}
+
+fn without_rowid_or_key(key: &KeyInfo, encoding: u8) -> bool {
+    key.enc == encoding && key.n_key_field > 0 && key.n_key_field <= key.n_all_field
+        && key.a_coll.len() == usize::from(key.n_all_field)
+        && key.a_sort_flags.len() == usize::from(key.n_all_field)
+        && key.a_sort_flags.iter().all(|&flags| flags & !KEYINFO_ORDER_DESC == 0)
+        && key.a_coll.iter().flatten().all(|coll| builtin_read_key_collation(coll, encoding))
+}
+
+fn without_rowid_or_branch(
+    ops: &[VdbeOp], start: usize, stop: usize, table: &VdbeOp, seen: &VdbeOp, ret: &VdbeOp,
+    encoding: u8, insert: bool,
+) -> Option<usize> {
+    let open = &ops[start];
+    let cursor = open.p1;
+    let P4::KeyInfo(index_key) = &open.p4 else { return None };
+    let P4::KeyInfo(primary_key) = &table.p4 else { return None };
+    if open.p2 <= 1 || open.p3 != 0 || !matches!(open.p5, 0 | OPFLAG_SEEKEQ)
+        || !without_rowid_or_key(index_key, encoding)
+    {
+        return None;
+    }
+    let width = usize::from(primary_key.n_key_field);
+    let tail = stop.checked_sub(2 * width + 4 + usize::from(insert))?;
+    if tail <= start {
+        return None;
+    }
+    let (lookup, tail_ops) = ops.get(tail..stop)?.split_at(width);
+    let (place, tail_ops) = tail_ops.split_first()?;
+    let (keys, tail_ops) = tail_ops.split_at(width);
+    let continuation = (stop - 1) as i32;
+    if place.opcode != OP_NotFound || place.p1 != table.p1 || place.p2 != continuation
+        || place.p3 <= 0 || place.p4 != P4::Int32(width as i32) || place.p5 != 0
+    {
+        return None;
+    }
+    let (dedup, source, call, next) = match tail_ops {
+        [record, store, call, next] if insert && record.opcode == OP_MakeRecord
+            && record.p2 == width as i32 && record.p3 == store.p2 && record.p4 == P4::NotUsed
+            && record.p5 == 0 && store.opcode == OP_IdxInsert && store.p2 > 0
+            && store.p3 == record.p1 => (store, record.p1, call, next),
+        [probe, call, next] if !insert && probe.opcode == OP_Found
+            && probe.p2 == continuation => (probe, probe.p3, call, next),
+        _ => return None,
+    };
+    if dedup.p1 != seen.p1 || dedup.p4 != P4::Int32(width as i32) || dedup.p5 != 0 || source <= 0
+        || call.opcode != OP_Gosub || call.p1 != ret.p2 || call.p2 != ret.p1 + 1 || call.p3 != 0
+        || next.opcode != OP_Next || next.p1 != cursor || next.p2 as usize != tail - 1 || next.p5 != 0
+    {
+        return None;
+    }
+    for (field, (to_table, to_set)) in lookup.iter().zip(keys).enumerate() {
+        let physical_field = usize::try_from(to_table.p2).ok()?;
+        for (column, register) in [(to_table, place.p3), (to_set, source)] {
+            if column.opcode != OP_Column || column.p1 != cursor || column.p2 != to_table.p2
+                || column.p3 != register.checked_add(field as i32)?
+                || column.p4 != P4::NotUsed || column.p5 != 0
+            {
+                return None;
+            }
+        }
+        if index_key.a_coll.get(physical_field)? != &primary_key.a_coll[field] {
+            return None;
+        }
+    }
+    or_index_seek_bounds(ops, start, stop, tail, index_key)?;
+    Some(stop - 3)
+}
+
 fn unsupported(
     prog: &Program, write: bool, key_scope: ReadKeyScope, row_case_encoding: Option<u8>,
     builtin_collations: bool,
@@ -1921,6 +2068,10 @@ fn unsupported(
         && prog.a_op.iter().any(|op| op.opcode == OP_SorterOpen);
     let partial_order = match row_case_encoding {
         Some(encoding) if builtin_collations && key_scope == ReadKeyScope::BinarySorter => partial_order_pairs(prog, encoding),
+        _ => Vec::new(),
+    };
+    let without_rowid_or = match row_case_encoding {
+        Some(encoding) if !write && builtin_collations => without_rowid_or_admissions(prog, encoding),
         _ => Vec::new(),
     };
     let mut reopen_or_checked = BTreeMap::new();
@@ -2165,8 +2316,11 @@ fn unsupported(
                     binary_in_key_encoding(c) || (builtin_collations && builtin_read_key_collation(c, k.enc))
                 })
                 && (op.opcode == OP_OpenRead || (op.opcode == OP_ReopenIdx
-                    && *reopen_or_checked.entry(op.p1)
-                        .or_insert_with(|| rowid_or_index_cursor(prog, op.p1, k.enc))));
+                    && (without_rowid_or.iter().any(|&[_, first, second]| index == first || index == second)
+                        || *reopen_or_checked.entry(op.p1)
+                            .or_insert_with(|| rowid_or_index_cursor(prog, op.p1, k.enc)))));
+            let without_rowid_or_set = row_case_encoding == Some(k.enc)
+                && without_rowid_or.iter().any(|&[seen, _, _]| index == seen);
             let membership = row_case_encoding == Some(k.enc)
                 && ordered_in_key(prog, op, k, |coll| {
                     binary_in_key_encoding(coll) || (builtin_collations && builtin_read_key_collation(coll, k.enc))
@@ -2189,7 +2343,7 @@ fn unsupported(
                 });
             if k.enc != 1 && !prog.references_like
                 && !(binary_sort || binary_group_compare || builtin_group || streamed_group
-                    || distinct || physical_index
+                    || distinct || physical_index || without_rowid_or_set
                     || membership || builtin_sort || limit_sort || partial_sort || recursive_fifo || rowid_list || recursive_priority)
             {
                 return Some("UTF-16 key".to_owned());
