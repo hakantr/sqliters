@@ -306,6 +306,7 @@ pub struct Pager {
     /// Backing `.db` handle (`None` for lazy file-backed `PrivateTemporary` prior to first spill,
     /// or after [`Pager::close`]).
     file: Option<Box<dyn VfsFile>>,
+    private_file_kind: OpenFlags,
     journal_file: Option<Box<dyn VfsFile>>,
     wal: Option<Wal>,
 
@@ -504,6 +505,19 @@ impl Pager {
         )
     }
 
+    /// Opens the anonymous, journal-less backing of a single ephemeral index.
+    #[doc(hidden)]
+    pub fn open_transient_index(
+        vfs: Arc<dyn Vfs>,
+        mut options: PagerOpenOptions,
+    ) -> Result<Self> {
+        options.temp_in_memory = false;
+        let mut pager = Self::open_private_temporary(vfs, options)?;
+        pager.private_file_kind = OpenFlags::TRANSIENT_DB;
+        pager.journal_mode = JournalMode::Off;
+        Ok(pager)
+    }
+
     /// Opens a database on `vfs` using explicit [`PagerOpenOptions`].
     ///
     /// Does **not** read or validate the 100-byte database header, inspect `-wal`, or replay any
@@ -644,6 +658,7 @@ impl Pager {
             wal_path,
             shm_path,
             file,
+            private_file_kind: OpenFlags::TEMP_DB,
             journal_file: None,
             wal: None,
             readonly,
@@ -2316,7 +2331,7 @@ impl Pager {
         {
             // pager.c:4493–4502: open only when a dirty list reaches the file.
             let file = self.vfs.open(None, OpenFlags::READWRITE | OpenFlags::CREATE
-                | OpenFlags::EXCLUSIVE | OpenFlags::TEMP_DB | OpenFlags::DELETEONCLOSE)?;
+                | OpenFlags::EXCLUSIVE | self.private_file_kind | OpenFlags::DELETEONCLOSE)?;
             self.file = Some(file);
         }
         let ps = u64::from(self.header.page_size);

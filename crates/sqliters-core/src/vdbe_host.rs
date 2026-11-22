@@ -131,7 +131,7 @@ pub(crate) fn machine_program_with_prepare(
 
 pub(crate) fn custom_sort_policy_matches(inner: &ConnectionInner, program: &Program) -> bool {
     if program.fallible_limit_sort_open.is_some() {
-        !inner.authorizer.is_some() && inner.db_set.temp_store().is_memory()
+        !inner.authorizer.is_some()
     } else if program.fallible_file_sort_open.is_some() {
         file_sort_policy(inner)
     } else {
@@ -147,11 +147,13 @@ fn file_sort_policy(inner: &ConnectionInner) -> bool {
 pub(crate) fn custom_sort_read_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
 ) -> Option<Arc<Program>> {
-    if file_sort_policy(inner) {
-        custom_file_sort_read_program(inner, stmt, sql, n_param)
-    } else {
-        custom_limit_sort_read_program(inner, stmt, sql, n_param)
-    }
+    custom_limit_sort_read_program(inner, stmt, sql, n_param).or_else(|| {
+        if file_sort_policy(inner) {
+            custom_file_sort_read_program(inner, stmt, sql, n_param)
+        } else {
+            None
+        }
+    })
 }
 
 /// A plain ORDER BY with LIMIT uses a private index rather than the full sorter.
@@ -161,7 +163,7 @@ fn custom_limit_sort_read_program(
 ) -> Option<Arc<Program>> {
     use sqliters_vdbe::opcodes::*;
     let Some(Stmt::Select(select)) = stmt else { return None };
-    if inner.authorizer.is_some() || !inner.db_set.temp_store().is_memory() {
+    if inner.authorizer.is_some() {
         return None;
     }
     let (name, root) = crate::engine::custom_limit_order_collation(select, &inner.db_set, &inner.collations)?;
@@ -1354,6 +1356,19 @@ macro_rules! host_common {
 }
 
 impl VdbeHost for MachineHost<'_> {
+    fn open_limit_sort_index(&mut self) -> Result<Btree> {
+        if self.db_set.temp_store().is_memory() {
+            return self.open_ephemeral();
+        }
+        let opts = PagerOpenOptions {
+            lock_geometry: Some(self.db_set.lock_geometry()),
+            ..PagerOpenOptions::default()
+        };
+        let mut index = Btree::open_transient_index(Arc::clone(self.db_set.disk_vfs()), opts)?;
+        index.begin_write()?;
+        Ok(index)
+    }
+
     fn text_encoding(&self) -> TextEncoding { self.encoding }
     fn btree(&mut self, i_db: usize) -> Option<&mut Btree> {
         self.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut())

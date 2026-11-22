@@ -1649,9 +1649,9 @@ fn group64_memory_limit_sort_preserves_custom_callbacks_and_error() {
 
         db.execute_batch("PRAGMA temp_store=FILE").unwrap();
         assert!(matches!(statement.step().unwrap(), StepResult::Row(_)));
-        assert_eq!(statement.machine_stmt_status(4, false), 0);
+        assert!(statement.machine_stmt_status(4, false) > 0);
+        assert_eq!(std::mem::take(&mut *calls.lock().unwrap()), expected);
         statement.reset().unwrap();
-        calls.lock().unwrap().clear();
         db.execute_batch("PRAGMA temp_store=MEMORY").unwrap();
 
         let seen = Arc::clone(&calls);
@@ -1737,6 +1737,78 @@ fn group64_file_sort_delivers_pma_comparisons_between_steps() {
         assert_eq!(seen[..14], before_first);
         assert_eq!(seen[14..], [(b'k', b'q')]);
     }
+}
+
+#[test]
+fn group64_file_limit_spills_only_to_a_transient_index() {
+    use sqliters::OpenFlags;
+    use sqliters::vfs::{OsVfs, Vfs, VfsFile};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    struct RejectTransient {
+        delegate: OsVfs,
+        opens: AtomicUsize,
+    }
+    impl Vfs for RejectTransient {
+        fn name(&self) -> &str {
+            "reject-transient-index"
+        }
+        fn open(&self, path: Option<&Path>, flags: OpenFlags) -> Result<Box<dyn VfsFile>> {
+            if path.is_none() && flags.contains(OpenFlags::TRANSIENT_DB) {
+                assert_eq!(flags.0, 0x41e);
+                self.opens.fetch_add(1, AtomicOrdering::Relaxed);
+                return Err(SqliteError::new(ErrorCode::CantOpen, "ordinary transient index open failure"));
+            }
+            self.delegate.open(path, flags)
+        }
+        fn delete(&self, path: &Path, sync_dir: bool) -> Result<()> {
+            self.delegate.delete(path, sync_dir)
+        }
+        fn exists(&self, path: &Path) -> Result<bool> {
+            self.delegate.exists(path)
+        }
+        fn full_pathname(&self, path: &Path) -> Result<PathBuf> {
+            self.delegate.full_pathname(path)
+        }
+    }
+
+    let vfs = Arc::new(RejectTransient { delegate: OsVfs::default(), opens: AtomicUsize::new(0) });
+    let db = Connection::open_with_vfs(
+        vfs.clone(), Some(Path::new(":memory:")), OpenFlags::READWRITE | OpenFlags::CREATE,
+    )
+    .unwrap();
+    db.execute_batch(
+        "CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT, payload BLOB);
+         INSERT INTO items VALUES (1,'A',zeroblob(2900001)),(2,'b',zeroblob(2900002));
+         PRAGMA temp_store=FILE;",
+    )
+    .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    db.register_collation("app_order", move |left, right| {
+        seen.fetch_add(1, AtomicOrdering::Relaxed);
+        right.cmp(left)
+    })
+    .unwrap();
+    let mut statement = db
+        .prepare("SELECT id,payload FROM items ORDER BY v COLLATE app_order,id LIMIT 1")
+        .unwrap();
+    assert_eq!(vfs.opens.load(AtomicOrdering::Relaxed), 0);
+    let failure = SqliteError::new(ErrorCode::CantOpen, "ordinary transient index open failure");
+    assert_eq!(statement.step().unwrap_err(), failure);
+    assert_eq!(statement.reset().unwrap_err(), failure);
+    assert_eq!(vfs.opens.load(AtomicOrdering::Relaxed), 1);
+    assert_eq!(calls.load(AtomicOrdering::Relaxed), 0);
+
+    db.execute_batch("PRAGMA temp_store=MEMORY").unwrap();
+    let StepResult::Row(row) = statement.step().unwrap() else {
+        panic!("missing sorted row after restoring memory temp storage");
+    };
+    assert_eq!(row.get_i64(0), Some(2));
+    assert!(calls.load(AtomicOrdering::Relaxed) > 0);
+    assert_eq!(vfs.opens.load(AtomicOrdering::Relaxed), 1);
+    statement.reset().unwrap();
 }
 
 #[test]

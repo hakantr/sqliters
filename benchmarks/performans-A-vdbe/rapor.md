@@ -2437,3 +2437,8 @@ Aritmetik filtre, rowid üst sınırı ve LENGTH üreticisi kapsamındaki 128 UT
 ## V6b.426 — İkinci PMA dosyasının tamponlu birleştirme I/O sırası
 
 1.577.890 okuma ve yazmanın ofsetleri ile boyutları ve 24 açma ve kapama tam eşleşti. 2.052 adım ile 16.033 karşılaştırma eş, 12 ara PMA callback hatasında I/O durdu. OFF 1306/1/325, ON 1304/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_426.md).
+
+
+## V6b.427 — FILE ve DEFAULT LIMIT/OFFSET geçici B-tree akışı
+
+Literal ve bağlı parametreli 576 C profilinde 1.440 adım ve 461.760 VFS okuma ve yazması eşleşti. Açma, okuma ve yazma hataları ile işlem durumu doğrulandı. 48 uygulama hatasından sonra ek G/Ç olmadı. OFF 1307/1/325, ON 1305/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,265 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_427.md).

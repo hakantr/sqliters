@@ -13,6 +13,7 @@ use sqliters_btree::btcursor::{BtCursor, IdxKeyCompare};
 use sqliters_types::{Result, SqliteError};
 
 use crate::vdbeaux::{KEYINFO_ORDER_BIGNULL, KEYINFO_ORDER_DESC};
+use crate::vdbesort::SortCallbackError;
 use crate::vdbemem::{
     CollRt, MEM_BLOB, MEM_INT, MEM_INT_REAL, MEM_NULL, MEM_REAL, MEM_STR, MEM_ZERO, Mem, bin_coll_func, sqlite3_int_float_compare,
 };
@@ -218,6 +219,7 @@ pub struct UnpackedRecord<'a> {
     u_i: i64,
     /// The comparator `sqlite3VdbeFindCompare` selected.
     pub x_compare: RecordCompare,
+    pub(crate) sort_error: Option<&'a SortCallbackError>,
 }
 
 impl<'a> UnpackedRecord<'a> {
@@ -233,6 +235,7 @@ impl<'a> UnpackedRecord<'a> {
             eq_seen: false,
             u_i: 0,
             x_compare: RecordCompare::General,
+            sort_error: None,
         }
     }
 
@@ -285,6 +288,14 @@ impl IdxKeyCompare for UnpackedRecord<'_> {
     #[inline]
     fn compare_general(&mut self, cell_key: &[u8]) -> i32 {
         sqlite3_vdbe_record_compare_with_skip(cell_key, self, false)
+    }
+    fn check_callback_error(&self) -> Result<()> {
+        if let Some(failure) = self.sort_error
+            && let Some(failure) = failure.lock().unwrap().as_ref()
+        {
+            return Err(failure.clone());
+        }
+        Ok(())
     }
     #[inline]
     fn has_error(&self) -> bool {

@@ -86,6 +86,10 @@ pub trait IdxKeyCompare {
     fn compare_general(&mut self, cell_key: &[u8]) -> i32 {
         self.compare(cell_key)
     }
+    /// An application comparator may stop this private index search immediately.
+    fn check_callback_error(&self) -> Result<()> {
+        Ok(())
+    }
     /// `pIdxKey->errCode != 0`
     fn has_error(&self) -> bool;
     /// `pIdxKey->errCode = 0`
@@ -1028,11 +1032,11 @@ impl Btree {
             return Ok(99);
         }
         let mut n_cell = usize::from(d[cell]);
-        if n_cell <= usize::from(m.max1byte_payload) {
+        let payload = if n_cell <= usize::from(m.max1byte_payload) {
             if cell + n_cell >= d.len() {
                 return Ok(99);
             }
-            Ok(key.compare(&d[cell + 1..cell + 1 + n_cell]))
+            &d[cell + 1..cell + 1 + n_cell]
         } else if d[cell + 1] & 0x80 == 0 && {
             n_cell = ((n_cell & 0x7f) << 7) + usize::from(d[cell + 1]);
             n_cell <= usize::from(m.max_local)
@@ -1040,10 +1044,13 @@ impl Btree {
             if cell + n_cell >= d.len() {
                 return Ok(99);
             }
-            Ok(key.compare(&d[cell + 2..cell + 2 + n_cell]))
+            &d[cell + 2..cell + 2 + n_cell]
         } else {
-            Ok(99)
-        }
+            return Ok(99);
+        };
+        let order = key.compare(payload);
+        key.check_callback_error()?;
+        Ok(order)
     }
 
     /// `cursorOnLastPage`
@@ -1142,6 +1149,7 @@ impl Btree {
                         key.compare_general(&cell_key)
                     }
                 };
+                key.check_callback_error()?;
                 if c < 0 {
                     lwr = idx + 1;
                 } else if c > 0 {

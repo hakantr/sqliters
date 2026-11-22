@@ -558,6 +558,12 @@ impl Btree {
         Self::from_open_pager(Pager::open_private_temporary(vfs, options)?)
     }
 
+    /// Opens the private backing for a single, dynamically sorted index.
+    #[doc(hidden)]
+    pub fn open_transient_index(vfs: Arc<dyn Vfs>, options: PagerOpenOptions) -> Result<Self> {
+        Self::from_open_pager(Pager::open_transient_index(vfs, options)?)
+    }
+
     #[inline]
     pub const fn lock_byte_page(&self) -> Pgno {
         self.pager.lock_byte_page()

@@ -127,6 +127,11 @@ pub trait VdbeHost {
     /// `sqlite3BtreeOpen(db->pVfs, 0, db, &pBtx, BTREE_OMIT_JOURNAL | BTREE_SINGLE | p5, ..)`
     /// followed by `sqlite3BtreeBeginTrans(pBtx, 1, 0)`.
     fn open_ephemeral(&mut self) -> Result<Btree>;
+
+    /// A checked ORDER BY LIMIT owns one private index and may spill in FILE mode.
+    fn open_limit_sort_index(&mut self) -> Result<Btree> {
+        self.open_ephemeral()
+    }
     /// `db->aLimit[SQLITE_LIMIT_LENGTH]`
     fn limit_length(&self) -> i32;
     /// `AtomicLoad(&db->u1.isInterrupted)`: `Err(SQLITE_INTERRUPT)` when set.
@@ -5470,7 +5475,11 @@ impl Vdbe {
                         e.bt.clear_tree(root)?;
                     } else {
                         self.allocate_cursor(host, ci, op.p2, CURTYPE_BTREE)?;
-                        let mut bt = host.open_ephemeral()?;
+                        let mut bt = if self.prog.fallible_limit_sort_open == Some(pc) {
+                            host.open_limit_sort_index()?
+                        } else {
+                            host.open_ephemeral()?
+                        };
                         let key_info = match &self.rt[pc] {
                             OpRt::KeyInfo(k) => Some(Arc::clone(k)),
                             _ => None,
@@ -6398,9 +6407,13 @@ impl Vdbe {
                         _ => 0,
                     };
                     let p3 = op.p3 as usize;
+                    let sort_error = self.prog.fallible_limit_sort_open
+                        .filter(|&open| self.prog.a_op[open].p1 == op.p1)
+                        .and(self.sort_callback_error.as_ref());
                     let rc = if n_mem > 0 {
                         // "r.aMem = pX->aMem; r.nField = pX->nMem; r.default_rc = 0"
                         let mut r = UnpackedRecord::new(&ki, &self.a_mem[p3..p3 + n_mem], n_mem as u16, 0);
+                        r.sort_error = sort_error;
                         r.find_compare();
                         bt.bc_insert(&mut c.cur, 0, &self.a_mem[op.p2 as usize].z, flags, seek_result, Some(&mut r))
                     } else {
@@ -6410,6 +6423,7 @@ impl Vdbe {
                             return Err(corrupt());
                         }
                         let mut r = UnpackedRecord::new(&ki, &mems, mems.len() as u16, 0);
+                        r.sort_error = sort_error;
                         r.find_compare();
                         bt.bc_insert(&mut c.cur, 0, &self.a_mem[op.p2 as usize].z, flags, seek_result, Some(&mut r))
                     };
