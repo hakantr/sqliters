@@ -19590,15 +19590,46 @@ fn eval_expr_rt(
             branches,
             else_expr,
         } => {
-            let op_val = match operand {
-                Some(oe) => Some(eval_expr(ctx, oe, params, scopes, ctes, agg_group)?),
-                None => None,
+            let row_base = if let Some(Expr::RowValue(members)) = operand.as_deref() {
+                let values = members.iter().map(|expr| eval_expr(ctx, expr, params, scopes, ctes, agg_group))
+                    .collect::<Result<Vec<_>>>()?;
+                Some((members, values))
+            } else {
+                None
+            };
+            let op_val = if row_base.is_none() && let Some(oe) = operand {
+                Some(eval_expr(ctx, oe, params, scopes, ctes, agg_group)?)
+            } else {
+                None
             };
             let op_aff = operand
                 .as_ref()
                 .and_then(|oe| infer_expr_affinity_in_scopes(oe, scopes, ctx.db_set, ctes));
             for (we, te) in branches {
-                let cond_true = if let (Some(base), Some(oe)) = (&op_val, operand.as_ref()) {
+                let cond_true = if let Some((left, values)) = &row_base {
+                    let Expr::RowValue(right) = we else {
+                        return Err(SqliteError::new(ErrorCode::Error, "row value misused"));
+                    };
+                    if left.len() != right.len() {
+                        return Err(SqliteError::new(ErrorCode::Error, "row value misused"));
+                    }
+                    let mut matched = true;
+                    for ((left, lhs), right) in left.iter().zip(values).zip(right) {
+                        let rhs = eval_expr(ctx, right, params, scopes, ctes, agg_group)?;
+                        let left_affinity = infer_expr_affinity_in_scopes(left, scopes, ctx.db_set, ctes);
+                        let right_affinity = infer_expr_affinity_in_scopes(right, scopes, ctx.db_set, ctes);
+                        let affinity = sqlite_compare_affinity(left_affinity, right_affinity);
+                        let equal = eval_scalar_comparison_in_scopes(
+                            ctx, Opcode::Eq, left, lhs, right, &rhs, affinity, scopes,
+                        )?.truthiness();
+                        if equal == Some(false) {
+                            matched = false;
+                            break;
+                        }
+                        matched &= equal == Some(true);
+                    }
+                    matched
+                } else if let (Some(base), Some(oe)) = (&op_val, operand.as_ref()) {
                     let wv = eval_expr(ctx, we, params, scopes, ctes, agg_group)?;
                     let w_aff = infer_expr_affinity_in_scopes(we, scopes, ctx.db_set, ctes);
                     let comp_aff = sqlite_compare_affinity(op_aff, w_aff);
@@ -56652,33 +56683,28 @@ fn validate_expr_static_with_win_stage(
             branches,
             else_expr,
         } => {
-            if let Some(op) = operand {
-                validate_expr_static_with_win(
-                    op,
-                    scopes,
-                    db_set,
-                    ctes,
-                    functions,
-                    allow_agg,
-                    inside_agg,
-                    allow_win,
-                    resolved_defs,
-                    visited_ctes,
-                )?;
-            }
+            let validate_case_operand = |expr: &Expr, row: bool, visited_ctes: &mut Vec<(usize, usize)>| {
+                if row {
+                    validate_tuple_expr_static_with_win(
+                        expr, scopes, db_set, ctes, functions, allow_agg, inside_agg,
+                        allow_win, resolved_defs, visited_ctes,
+                    )
+                } else {
+                    validate_expr_static_with_win(
+                        expr, scopes, db_set, ctes, functions, allow_agg, inside_agg,
+                        allow_win, resolved_defs, visited_ctes,
+                    ).map(|()| 1)
+                }
+            };
+            let row_case = matches!(operand.as_deref(), Some(Expr::RowValue(_)));
+            let width = operand.as_deref()
+                .map(|expr| validate_case_operand(expr, row_case, visited_ctes)).transpose()?;
             for (w, t) in branches {
-                validate_expr_static_with_win(
-                    w,
-                    scopes,
-                    db_set,
-                    ctes,
-                    functions,
-                    allow_agg,
-                    inside_agg,
-                    allow_win,
-                    resolved_defs,
-                    visited_ctes,
-                )?;
+                let when_is_row = row_case && matches!(w, Expr::RowValue(_));
+                let when_width = validate_case_operand(w, when_is_row, visited_ctes)?;
+                if row_case && (!when_is_row || width != Some(when_width)) {
+                    return Err(SqliteError::new(ErrorCode::Error, "row value misused"));
+                }
                 validate_expr_static_with_win(
                     t,
                     scopes,

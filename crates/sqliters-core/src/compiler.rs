@@ -2822,10 +2822,19 @@ pub fn expr_contains_subquery(expr: &Expr) -> bool {
             branches,
             else_expr,
         } => {
-            operand.as_deref().is_some_and(expr_contains_subquery)
-                || branches
-                    .iter()
-                    .any(|(w, t)| expr_contains_subquery(w) || expr_contains_subquery(t))
+            let vector = matches!(operand.as_deref(), Some(Expr::RowValue(_)))
+                && branches.iter().all(|(when, _)| matches!(when, Expr::RowValue(_)));
+            let contains_nested = |expr: &Expr| {
+                if vector && let Expr::RowValue(members) = expr {
+                    members.iter().any(expr_contains_subquery)
+                } else {
+                    expr_contains_subquery(expr)
+                }
+            };
+            operand.as_deref().is_some_and(contains_nested)
+                || branches.iter().any(|(when, then)| {
+                    contains_nested(when) || expr_contains_subquery(then)
+                })
                 || else_expr.as_deref().is_some_and(expr_contains_subquery)
         }
         Expr::FunctionCall {
@@ -5956,6 +5965,28 @@ fn infer_expr_collation_name<'a>(expr: &'a Expr, tbl: &'a TableSchema) -> &'a st
 // Expression -> VDBE Register Compiler (`sqlite3ExprCode`)
 // ============================================================================
 
+fn emit_case_equality(
+    prog: &mut VdbeProgram,
+    binding: Option<&TableBinding<'_>>,
+    (left, lhs): (&Expr, i32),
+    (right, rhs): (&Expr, i32),
+    result: i32,
+) {
+    let table = binding.map(|binding| (binding.tbl, binding.schema_name));
+    let alias = binding.and_then(|binding| binding.alias);
+    let left_affinity = compiler_expr_affinity(left, table, alias);
+    let right_affinity = compiler_expr_affinity(right, table, alias);
+    let affinity = sqlite_compare_affinity(left_affinity, right_affinity);
+    let comparison = Instruction::new(Opcode::Eq, lhs, rhs, result)
+        .with_p5(u16::from(affinity_to_p5(affinity)));
+    let collation = if let Some(name) = resolve_custom_binary_collation(left, right, binding) {
+        P4::Str(name)
+    } else {
+        P4::Collation(resolve_binary_collation(left, right, binding))
+    };
+    prog.emit(comparison.with_p4(collation));
+}
+
 fn compile_expr(
     prog: &mut VdbeProgram,
     expr: &Expr,
@@ -6367,7 +6398,18 @@ fn compile_expr(
             branches,
             else_expr,
         } => {
-            let op_reg = if let Some(op_e) = operand {
+            let row_base = if let Some(Expr::RowValue(members)) = operand.as_deref() {
+                let mut registers = Vec::with_capacity(members.len());
+                for member in members {
+                    let register = prog.alloc_register();
+                    compile_expr(prog, member, binding, functions, register)?;
+                    registers.push(register);
+                }
+                Some((members, registers))
+            } else {
+                None
+            };
+            let op_reg = if row_base.is_none() && let Some(op_e) = operand {
                 let r = prog.alloc_register();
                 compile_expr(prog, op_e, binding, functions, r)?;
                 Some(r)
@@ -6377,41 +6419,46 @@ fn compile_expr(
 
             let mut end_jumps = Vec::new();
             for (when_e, then_e) in branches {
-                let cond_reg = prog.alloc_register();
-                if let Some(base_r) = op_reg {
-                    let w_reg = prog.alloc_register();
-                    compile_expr(prog, when_e, binding, functions, w_reg)?;
-                    let op_e = operand.as_ref().unwrap();
-                    let l_aff = compiler_expr_affinity(
-                        op_e,
-                        binding.map(|b| (b.tbl, b.schema_name)),
-                        binding.and_then(|b| b.alias),
-                    );
-                    let r_aff = compiler_expr_affinity(
-                        when_e,
-                        binding.map(|b| (b.tbl, b.schema_name)),
-                        binding.and_then(|b| b.alias),
-                    );
-                    let comp_aff = sqlite_compare_affinity(l_aff, r_aff);
-                    let mut ins = Instruction::new(Opcode::Eq, base_r, w_reg, cond_reg)
-                        .with_p5(u16::from(affinity_to_p5(comp_aff)));
-                    if let Some(custom_coll) =
-                        resolve_custom_binary_collation(op_e, when_e, binding)
-                    {
-                        ins = ins.with_p4(P4::Str(custom_coll));
-                    } else {
-                        let coll = resolve_binary_collation(op_e, when_e, binding);
-                        ins = ins.with_p4(P4::Collation(coll));
+                let mut next_when = Vec::new();
+                if let Some((left, registers)) = &row_base {
+                    let Expr::RowValue(right) = when_e else {
+                        return Err(SqliteError::new(ErrorCode::Error, "row value misused"));
+                    };
+                    if left.len() != right.len() {
+                        return Err(SqliteError::new(ErrorCode::Error, "row value misused"));
                     }
-                    prog.emit(ins);
+                    let mut comparisons = Vec::with_capacity(left.len());
+                    for ((left, base), right) in left.iter().zip(registers).zip(right) {
+                        let rhs = prog.alloc_register();
+                        compile_expr(prog, right, binding, functions, rhs)?;
+                        let result = prog.alloc_register();
+                        emit_case_equality(prog, binding, (left, *base), (right, rhs), result);
+                        // An unequal field ends this WHEN. A NULL comparison still
+                        // evaluates the remaining fields, just as sqlite3ExprIfFalse does.
+                        next_when.push(prog.emit(Instruction::new(Opcode::JumpIfFalse, result, 0, 0)));
+                        comparisons.push(result);
+                    }
+                    for result in comparisons {
+                        next_when.push(prog.emit(Instruction::new(Opcode::JumpIfNull, result, 0, 0)));
+                    }
                 } else {
-                    compile_expr(prog, when_e, binding, functions, cond_reg)?;
+                    let cond_reg = prog.alloc_register();
+                    if let Some(base_r) = op_reg {
+                        let w_reg = prog.alloc_register();
+                        compile_expr(prog, when_e, binding, functions, w_reg)?;
+                        let op_e = operand.as_ref().unwrap();
+                        emit_case_equality(prog, binding, (op_e, base_r), (when_e, w_reg), cond_reg);
+                    } else {
+                        compile_expr(prog, when_e, binding, functions, cond_reg)?;
+                    }
+                    next_when.push(prog.emit(Instruction::new(Opcode::JumpIfFalse, cond_reg, 0, 1)));
                 }
-                let j_false = prog.emit(Instruction::new(Opcode::JumpIfFalse, cond_reg, 0, 1));
                 compile_expr(prog, then_e, binding, functions, dest)?;
                 end_jumps.push(prog.emit(goto_placeholder()));
                 let next_branch = prog.current_addr();
-                prog.patch_p2(j_false, next_branch);
+                for jump in next_when {
+                    prog.patch_p2(jump, next_branch);
+                }
             }
 
             if let Some(el) = else_expr {
