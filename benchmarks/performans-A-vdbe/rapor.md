@@ -2427,3 +2427,8 @@ Bağlantı VFS dosyasındaki seviye 0 PMA biçimi, 8.530 C yazma ve okuma ile e�
 ## V6b.424 — Kullanıcı API üzerinden FILE sıralama geri çağrıları
 
 108 C profili, 15.156 adım, 98.652 tam argüman çifti eş. 84 eski fark kapandı. 60 callback ve 12 VFS açma hatası özgün kodla döndü. OFF 1304/1/325, ON 1302/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,278 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_424.md).
+
+
+## V6b.425 — WITHOUT ROWID OR için ek IN ifade biçimleri
+
+Aritmetik filtre, rowid üst sınırı ve LENGTH üreticisi kapsamındaki 128 UTF-16 farkı kapandı. 192 tam C planı ve iki Rust kipinde 43 odak testi doğrulandı. OFF 1305/1/325, ON 1303/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,272 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_425.md).

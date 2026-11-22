@@ -2260,7 +2260,7 @@ fn without_rowid_or_list_records(
         }
         if function {
             if record_affinity.as_slice() != [SQLITE_AFF_INTEGER]
-                || !or_list_builtin_abs(values, entry_pc, record.p1, sub_return, or_return)
+                || !or_list_builtin_literal(values, entry_pc, record.p1, sub_return, or_return)
             {
                 return None;
             }
@@ -2282,20 +2282,25 @@ fn without_rowid_or_list_records(
     (count >= 2).then_some(affinity?)
 }
 
-/// Only SQLite's registered built-in abs() has the verified constant
-/// argument and error behavior for this list producer.
-fn or_list_builtin_abs(values: &[VdbeOp], pc: usize, output: i32, sub_return: i32, or_return: i32) -> bool {
+/// The verified built-ins produce integer or NULL values from their
+/// respective literal argument types.
+fn or_list_builtin_literal(values: &[VdbeOp], pc: usize, output: i32, sub_return: i32, or_return: i32) -> bool {
     const SQLITE_FUNC_CONSTANT: u32 = 0x0000_0800;
     let [once, arg, call, copy] = values else { return false };
     let P4::FuncCtx(ctx) = &call.p4 else { return false };
     let builtin = SQLITE_FUNC_BUILTIN | SQLITE_FUNC_CONSTANT;
+    let valid_arg = match ctx.p_func.name.as_str() {
+        "abs" => matches!(arg.opcode, OP_Integer | OP_Int64 | OP_Null),
+        "length" => matches!(arg.opcode, OP_String8 | OP_String | OP_Blob | OP_Null),
+        _ => false,
+    };
     once.opcode == OP_Once && once.p2 as usize == pc + 3 && once.p3 == 0 && once.p5 == 0
-        && matches!(arg.opcode, OP_Integer | OP_Int64 | OP_Null)
+        && valid_arg
         && (arg.opcode != OP_Null || arg.p3 == 0 || arg.p3 == arg.p2) && arg.p5 == 0
         && call.opcode == OP_Function && call.p1 == 1 && call.p2 == arg.p2 && call.p5 == 0
         && ctx.argc == 1 && ctx.i_op as usize == pc + 2 && ctx.p_func.n_arg == 1
         && ctx.p_func.func_flags & builtin == builtin && ctx.p_func.user_data == 0
-        && !ctx.p_func.x_finalize && !ctx.p_func.x_value && ctx.p_func.name.eq_ignore_ascii_case("abs")
+        && !ctx.p_func.x_finalize && !ctx.p_func.x_value
         && [arg.p2, call.p3].iter().all(|&reg| reg > 0 && reg != sub_return && reg != or_return)
         && call.p3 != arg.p2 && copy.opcode == OP_SCopy && copy.p1 == call.p3 && copy.p2 == output
         && copy.p3 == 0 && copy.p4 == P4::NotUsed && copy.p5 == 0
@@ -2336,12 +2341,34 @@ fn without_rowid_or_select_set<'a>(
         return None;
     }
     let expected = match (&open.p4, probe) {
-        (P4::Int32(fields), [scan, filter @ ..]) if open.p5 == 0 && column.p2 < *fields
+        (P4::Int32(fields), [scan, body @ ..]) if open.p5 == 0 && column.p2 < *fields
             && scan.opcode == OP_Rewind && scan.p1 == from && scan.p2 == end
-            && scan.p3 == 0 && scan.p5 == 0 && next.p2 as usize == build.start + 2
-            && next.p3 == 0 && next.p5 == 1
-            && or_list_table_filter(ops, filter, from, *fields, end - 1, [sub_return, or_return], encoding)
-            => SQLITE_AFF_NUMERIC,
+            && scan.p3 == 0 && scan.p5 == 0 && next.p3 == 0 => {
+            let mut protected = [sub_return, or_return, 0];
+            let first = build.start + 2;
+            let (filter, repeat, flags) = match body {
+                [limit, rowid, stop, filter @ ..] if matches!(limit.opcode, OP_Integer | OP_Int64)
+                    && limit.p2 > 0 && limit.p5 == 0 && !protected.contains(&limit.p2)
+                    && limit.p2 != column.p3 && limit.p2 != record.p3
+                    && rowid.opcode == OP_Rowid && rowid.p1 == from && rowid.p2 > 0
+                    && !protected.contains(&rowid.p2) && rowid.p2 != limit.p2
+                    && rowid.p3 == 0 && rowid.p4 == P4::NotUsed && rowid.p5 == 0
+                    && matches!(stop.opcode, OP_Ge | OP_Gt) && stop.p1 == limit.p2 && stop.p2 == end
+                    && stop.p3 == rowid.p2 && stop.p4 == P4::NotUsed
+                    && stop.p5 == (u16::from(SQLITE_AFF_NUMERIC) | SQLITE_JUMPIFNULL) => {
+                    // Only the first visit loads the upper bound; Next returns to Rowid.
+                    protected[2] = limit.p2;
+                    (filter, first + 1, 0)
+                }
+                filter => (filter, first, 1),
+            };
+            if next.p2 as usize != repeat || next.p5 != flags
+                || !or_list_table_filter(ops, filter, from, *fields, end - 1, &protected, encoding)
+            {
+                return None;
+            }
+            SQLITE_AFF_NUMERIC
+        }
         (P4::KeyInfo(key), [value, seek, bound]) if open.p5 == OPFLAG_SEEKEQ
             && without_rowid_or_key(key, encoding)
             && key.a_coll.get(column.p2 as usize) == Some(collation)
@@ -2372,20 +2399,35 @@ fn without_rowid_or_select_set<'a>(
 
 fn or_list_table_filter(
     ops: &[VdbeOp], filter: &[VdbeOp], cursor: i32, fields: i32, next: i32,
-    returns: [i32; 2], encoding: u8,
+    protected: &[i32], encoding: u8,
 ) -> bool {
     if filter.is_empty() {
         return true;
     }
-    let [column, compare] = filter else { return false };
-    column.opcode == OP_Column && column.p1 == cursor && (0..fields).contains(&column.p2)
-        && column.p3 > 0 && !returns.contains(&column.p3) && column.p4 == P4::NotUsed && column.p5 == 0
-        && matches!(compare.opcode, OP_Eq | OP_Ne | OP_Lt | OP_Le | OP_Gt | OP_Ge)
-        && compare.p2 == next && compare.p3 == column.p3 && compare.p1 != column.p3
-        && !returns.contains(&compare.p1) && or_list_initial_integer(ops, compare.p1)
-        && compare.p5 == (u16::from(SQLITE_AFF_INTEGER) | SQLITE_JUMPIFNULL)
-        && matches!(&compare.p4, P4::CollSeq(coll)
-            if coll.enc == encoding && coll.name.eq_ignore_ascii_case("BINARY"))
+    let [column, expr @ .., compare] = filter else { return false };
+    if column.opcode != OP_Column || column.p1 != cursor || !(0..fields).contains(&column.p2)
+        || column.p3 <= 0 || protected.contains(&column.p3) || column.p4 != P4::NotUsed || column.p5 != 0
+    {
+        return false;
+    }
+    let (value, affinity) = match expr {
+        [] if matches!(&compare.p4, P4::CollSeq(coll)
+            if coll.enc == encoding && coll.name.eq_ignore_ascii_case("BINARY")) => {
+            (column.p3, SQLITE_AFF_INTEGER)
+        }
+        [arith] if matches!(arith.opcode, OP_Add | OP_Subtract)
+            && arith.p2 == column.p3 && arith.p1 != column.p3 && !protected.contains(&arith.p1)
+            && or_list_initial_integer(ops, arith.p1)
+            && arith.p3 > 0 && arith.p3 != column.p3 && arith.p3 != arith.p1
+            && !protected.contains(&arith.p3) && arith.p4 == P4::NotUsed && arith.p5 == 0
+            && compare.p4 == P4::NotUsed => (arith.p3, SQLITE_AFF_NONE),
+        _ => return false,
+    };
+    matches!(compare.opcode, OP_Eq | OP_Ne | OP_Lt | OP_Le | OP_Gt | OP_Ge)
+        && compare.p2 == next && compare.p3 == value
+        && compare.p1 != value && compare.p1 != column.p3 && !protected.contains(&compare.p1)
+        && or_list_initial_integer(ops, compare.p1)
+        && compare.p5 == (u16::from(affinity) | SQLITE_JUMPIFNULL)
 }
 
 fn without_rowid_or_owned_cursor(ops: &[VdbeOp], cursor: i32, allowed: impl Fn(usize) -> bool) -> bool {

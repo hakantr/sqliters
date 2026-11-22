@@ -2819,3 +2819,62 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_without_rowid_or_in_expressions_steps() {
+    sqliters_tcltest::run_test_script(
+        "row_case_without_rowid_or_in_expressions_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+proc or_expression_rhs_rows {stmt} {
+    set rows {}
+    while {[set rc [sqlite3_step $stmt]] eq "SQLITE_ROW"} {
+        lappend rows [sqlite3_column_int $stmt 0] [sqlite3_column_text $stmt 1]
+    }
+    lappend rows $rc
+    return $rows
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE detail(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO detail VALUES(1,1,10),(2,2,20),(3,3,30),(4,1,NULL);
+        CREATE TABLE packed(tag TEXT COLLATE RTRIM,seq INTEGER,ref INTEGER,label TEXT,
+                            PRIMARY KEY(tag DESC,seq)) WITHOUT ROWID;
+        INSERT INTO packed VALUES ('A',1,1,'p-one'),('A ',2,2,'p-two'),
+            ('B',1,1,'p-b'),(char(256)||' ',2,1,'p-wide'),('C',3,3,'p-other');
+        CREATE INDEX packed_by_seq ON packed(seq);
+        CREATE INDEX packed_by_label ON packed(label);
+    }
+    set expression {CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+                     WHEN (2,20) THEN 'changed' ELSE p.label END}
+    foreach {suffix condition expected} {
+        arithmetic {tag='A' OR seq IN (SELECT a FROM detail WHERE b+1>15) OR label='p-two'}
+            {1 p-one 2 changed 2 p-wide 3 p-other}
+        rowid-bound {tag='A' OR seq IN (SELECT a FROM detail WHERE b>0 AND id<3) OR label='p-two'}
+            {1 p-one 1 p-b 2 changed 2 p-wide}
+        arithmetic-rowid-bound {tag='A' OR seq IN (SELECT a FROM detail WHERE b-4>12 AND id<=2) OR label='p-two'}
+            {1 p-one 2 changed 2 p-wide}
+    } {
+        do_test or-expression-rhs-$encoding.$suffix {
+            execsql "SELECT seq,$expression FROM packed p WHERE $condition ORDER BY seq,tag;"
+        } $expected
+    }
+    do_test or-expression-rhs-$encoding.length-reset {
+        set s [sqlite3_prepare_v2 db "SELECT seq,$expression FROM packed p
+                                    WHERE tag='A' OR seq IN (length('Āéx'),length(X'0102'),length(NULL))
+                                        OR label='p-two'
+                                    ORDER BY seq,tag;" -1]
+        set first [or_expression_rhs_rows $s]
+        sqlite3_reset $s
+        set second [or_expression_rhs_rows $s]
+        list $first $second [sqlite3_finalize $s]
+    } {{1 p-one 2 changed 2 p-wide 3 p-other SQLITE_DONE} {1 p-one 2 changed 2 p-wide 3 p-other SQLITE_DONE} SQLITE_OK}
+    do_execsql_test or-expression-rhs-$encoding.changes {SELECT changes(),total_changes();} {5 9}
+}
+finish_test
+"#,
+    );
+}
