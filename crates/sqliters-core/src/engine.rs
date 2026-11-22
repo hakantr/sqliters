@@ -7361,14 +7361,23 @@ fn complete_memory_sort_collation<'a>(
         return None;
     }
     let (first, trailing) = order_by.split_first()?;
-    let Expr::Collate { expr, collation } = &first.expr else { return None };
-    let key_index = column_index(expr)?;
+    let (key, explicit) = match &first.expr {
+        Expr::Collate { expr, collation } => (expr.as_ref(), Some(collation.as_str())),
+        expr => (expr, None),
+    };
+    let key_index = column_index(key)?;
     let rowid_tail = match trailing {
         [] => true,
         [last] => column_index(&last.expr).is_some_and(|index| Some(index) == table.rowid_alias_col),
         _ => false,
     };
-    (Some(key_index) != table.rowid_alias_col && rowid_tail).then_some(collation)
+    if Some(key_index) == table.rowid_alias_col || !rowid_tail {
+        return None;
+    }
+    explicit.or_else(|| {
+        let column = &table.columns[key_index];
+        (column.collation == Collation::Binary && column.custom_collation.is_none()).then_some("BINARY")
+    })
 }
 
 fn registered_memory_sort_builtin(
@@ -7392,8 +7401,10 @@ pub(crate) fn registered_builtin_memory_sort(
     encoding: TextEncoding,
 ) -> bool {
     let Some(Stmt::Select(select)) = stmt else { return false };
-    let Some(OrderByTerm { expr: Expr::Collate { collation, .. }, .. }) = select.order_by.first() else {
-        return false;
+    let collation = match select.order_by.first().map(|term| &term.expr) {
+        Some(Expr::Collate { collation, .. }) => collation,
+        Some(Expr::Column(_)) => "BINARY",
+        _ => return false,
     };
     select.ctes.is_empty()
         && select.body.compounds.is_empty()

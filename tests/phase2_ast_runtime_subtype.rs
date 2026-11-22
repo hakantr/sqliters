@@ -1412,6 +1412,83 @@ fn group64_registered_binary_memory_sort_uses_utf8_slot_only() {
 }
 
 #[test]
+fn group64_registered_binary_implicit_memory_sort_checks_column_collation() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for declaration in ["", " COLLATE BINARY", " COLLATE NOCASE", " COLLATE RTRIM"] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}'; PRAGMA temp_store=MEMORY;
+                 CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT{declaration});
+                 INSERT INTO items VALUES (1,'A'),(2,'a'),(3,'B'),(4,'b'),(5,NULL),(6,'A ');"
+            ))
+            .unwrap();
+            let mut statement = db.prepare("SELECT id FROM items ORDER BY v NULLS LAST,id").unwrap();
+            let StepResult::Row(row) = statement.step().unwrap() else {
+                panic!("missing stock row for {encoding}/{declaration}");
+            };
+            assert_eq!(row.values(), &[Value::Integer(1)]);
+            statement.reset().unwrap();
+
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = Arc::clone(&calls);
+            db.register_collation("binary", move |left, right| {
+                seen.lock().unwrap().push((left.to_owned(), right.to_owned()));
+                right.cmp(left)
+            })
+            .unwrap();
+            let uses_callback = encoding == "UTF-8"
+                && matches!(declaration, "" | " COLLATE BINARY");
+            let expected = [
+                ("B", "b"), ("b", "A "), ("B", "A "), ("A", "a"),
+                ("a", "b"), ("a", "B"), ("A", "B"), ("A", "A "),
+            ]
+            .map(|(left, right)| (left.to_owned(), right.to_owned()));
+
+            for _ in 0..2 {
+                let StepResult::Row(row) = statement.step().unwrap() else {
+                    panic!("missing registration row for {encoding}/{declaration}");
+                };
+                let observed = std::mem::take(&mut *calls.lock().unwrap());
+                if uses_callback {
+                    assert_eq!(row.values(), &[Value::Integer(4)]);
+                    assert_eq!(observed, expected);
+                } else {
+                    assert_eq!(row.values(), &[Value::Integer(1)]);
+                    assert!(observed.is_empty());
+                }
+                statement.reset().unwrap();
+            }
+
+            let seen = Arc::clone(&calls);
+            let failure = SqliteError::new(ErrorCode::Schema, "ordinary implicit BINARY sort error");
+            let injected = failure.clone();
+            db.register_fallible_collation("BINARY", move |left, right| {
+                let mut observed = seen.lock().unwrap();
+                observed.push((left.to_owned(), right.to_owned()));
+                if observed.len() == 2 {
+                    Err(injected.clone())
+                } else {
+                    Ok(right.cmp(left))
+                }
+            })
+            .unwrap();
+            if uses_callback {
+                assert_eq!(statement.step().unwrap_err(), failure);
+                assert_eq!(statement.reset().unwrap_err(), failure);
+                assert_eq!(std::mem::take(&mut *calls.lock().unwrap()), expected[..2]);
+            } else {
+                let StepResult::Row(row) = statement.step().unwrap() else {
+                    panic!("missing native collation row for {encoding}/{declaration}");
+                };
+                assert_eq!(row.values(), &[Value::Integer(1)]);
+                assert!(calls.lock().unwrap().is_empty());
+                statement.reset().unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn numeric_blob_boolean_predicates_follow_database_encoding() {
     use Value::{Integer, Null};
 

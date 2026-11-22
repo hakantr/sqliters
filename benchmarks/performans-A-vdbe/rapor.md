@@ -2372,3 +2372,8 @@ Birincil ve ikincil kollar C planındaki adım sınırlarıyla aynı geçici ana
 ## V6b.413 — Açık UTF-8 BINARY bellek sıralaması
 
 Kayıtlı UTF-8 BINARY karşılaştırıcısı C ile her Rust kipinde 4.236 adım ve 36 Unicode/NUL gözleminde eş. Native UTF-16 sıraları C ile karşılaştırıcısız eşleşti. Karşılaştırma hatasının özgün kodu ve ofseti, aynı deyim FILE/MEMORY geçişi ve altı dosyanın baytları doğrulandı. OFF 1293/1/325, ON 1291/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,269 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_413.md).
+
+
+## V6b.414 — Örtük UTF-8 BINARY bellek sıralaması
+
+Varsayılan veya BINARY tanımlı düz sütunda 132 profil ve 9.264 geri çağrı adımı her Rust kipinde C ile eş. Doğal UTF-16 ve önceki 864 açık sıralama profili korunuyor. Hata sırası, yeniden hazırlama ve 12 C dosyası doğrulandı. OFF 1294/1/325, ON 1292/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,249 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_414.md).
