@@ -377,3 +377,71 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_binary_distinct_row_case_steps() {
+    sqliters_tcltest::run_test_script(
+        "binary_distinct_row_case_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+proc mark_distinct {x} {
+    lappend ::callbacks $x
+    return [expr {int($x)}]
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    db function mark_distinct -argcount 1 mark_distinct
+    execsql {
+        CREATE TABLE message(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+        CREATE TABLE feed(id INTEGER PRIMARY KEY, ref INTEGER, label TEXT);
+        INSERT INTO message VALUES(1,1,10),(2,2,20),(3,3,30);
+        INSERT INTO feed VALUES(1,3,'other'),(2,1,'A'),(3,3,'other'),(4,2,'a'),(5,2,'a'),
+                               (6,9,NULL),(7,9,NULL);
+    }
+    set sql {
+        SELECT DISTINCT CASE
+          (SELECT a,mark_distinct(b) FROM message m WHERE m.id=f.ref)
+          WHEN (3,30) THEN ?1 ELSE f.label END COLLATE BINARY
+        FROM feed f
+    }
+    set s [sqlite3_prepare_v2 db $sql -1]
+    sqlite3_bind_text $s 1 A -1
+    foreach {step expected callback} {1 A {30} 2 a {10 30 20} 3 {} {20}} {
+        do_test binary-distinct-case-$encoding.step.$step {
+            set ::callbacks {}
+            set code [sqlite3_step $s]
+            list $code [sqlite3_column_text $s 0] $::callbacks
+        } [list SQLITE_ROW $expected $callback]
+    }
+    do_test binary-distinct-case-$encoding.done {
+        set ::callbacks {}
+        list [sqlite3_step $s] $::callbacks
+    } {SQLITE_DONE {}}
+    do_test binary-distinct-case-$encoding.reprepare {
+        sqlite3_reset $s
+        execsql {CREATE INDEX feed_ref ON feed(ref);}
+        sqlite3_bind_text $s 1 Z -1
+        set ::callbacks {}
+        set c1 [sqlite3_step $s]
+        set first [list $c1 [sqlite3_column_text $s 0] $::callbacks]
+        set ::callbacks {}
+        set c2 [sqlite3_step $s]
+        set second [list $c2 [sqlite3_column_text $s 0] $::callbacks]
+        list $first $second [sqlite3_finalize $s]
+    } {{SQLITE_ROW Z 30} {SQLITE_ROW A 10} SQLITE_OK}
+    do_execsql_test binary-distinct-case-$encoding.added-default {
+        CREATE TABLE notes(id INTEGER PRIMARY KEY, ref INTEGER);
+        INSERT INTO notes VALUES(1,2),(2,2),(3,3),(4,2);
+        ALTER TABLE notes ADD COLUMN label TEXT DEFAULT 'A';
+        INSERT INTO notes VALUES(5,2,'A'),(6,3,'A'),(7,2,'other'),(8,2,'other');
+        SELECT DISTINCT CASE (SELECT a,b FROM message m WHERE m.id=n.ref)
+            WHEN (3,30) THEN 'marker' ELSE n.label END COLLATE BINARY
+            FROM notes n;
+    } {A marker other}
+}
+finish_test
+"#,
+    );
+}

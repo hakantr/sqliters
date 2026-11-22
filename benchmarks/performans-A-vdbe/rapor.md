@@ -2192,3 +2192,8 @@ Kalıcı görünümden gelen alt sorgulu satır CASE adım davranışı iki Rust
 ## V6b.377 — UTF-16 BINARY satır CASE gruplaması
 
 Salt okunur satır CASE sorgularında BINARY grup karşılaştırmaları kendi UTF-16 kodlamasında yürütülüyor. 12 profilde 432 gözlem ve 80 kapanan fark doğrulandı. Diğer sonuçlar ve dosya özetleri aynı. İki Rust kipi ve C odak testleri geçti. OFF 1255/1/325, ON 1252/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,254 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_377.md).
+
+
+## V6b.378 — UTF-16 BINARY satır CASE tekilleştirmesi
+
+Sırasız geçici BINARY anahtar kullanan salt okunur CASE sorgularında 720 gözlem ve 80 kapanan fark doğrulandı. Sonradan eklenmiş TEXT DEFAULT değerlerini okuyan eski fiziksel satırlar için 24 ek C eşleşmesi ve 12 C açılışı geçti. OFF 1256/1/325, ON 1253/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,268 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_378.md).

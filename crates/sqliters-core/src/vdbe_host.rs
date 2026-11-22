@@ -648,8 +648,14 @@ fn read_machine_program(
                     if select.ctes.is_empty() && select.body.compounds.is_empty()
                         && matches!(&select.body.head, sqliters_syntax::SelectCore::Select { group_by, .. }
                             if !group_by.is_empty()));
+                let distinct_case = matches!(stmt, Some(Stmt::Select(select))
+                    if select.ctes.is_empty() && select.body.compounds.is_empty()
+                        && matches!(&select.body.head, sqliters_syntax::SelectCore::Select { distinct: true, group_by, .. }
+                            if group_by.is_empty()));
                 if grouped_case {
                     sqliters_vdbe::vdbe::unsupported_reason_binary_group_read(&p)
+                } else if distinct_case {
+                    sqliters_vdbe::vdbe::unsupported_reason_binary_distinct_read(&p)
                 } else {
                     sqliters_vdbe::vdbe::unsupported_reason_mapped_read(&p)
                 }
