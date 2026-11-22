@@ -1923,6 +1923,7 @@ fn mixed_rowid_or_cursor(ops: &[VdbeOp], start: usize, encoding: u8) -> bool {
 struct WithoutRowidOrAdmission {
     seen: usize,
     reopens: Vec<usize>,
+    in_set: Option<usize>,
 }
 
 enum WithoutRowidOrPhase {
@@ -1957,7 +1958,7 @@ fn without_rowid_or_admissions(prog: &Program, encoding: u8) -> Vec<WithoutRowid
         {
             return None;
         }
-        let (reopens, seen_operations, secondary) =
+        let (reopens, seen_operations, secondary, in_set) =
             without_rowid_or_arms(ops, first_pc..end, table, seen, ret, encoding)?;
         let cursors: Vec<_> = [table.p1, seen.p1].into_iter().chain(secondary).collect();
         if ops.iter().enumerate().any(|(pc, op)| {
@@ -1982,7 +1983,7 @@ fn without_rowid_or_admissions(prog: &Program, encoding: u8) -> Vec<WithoutRowid
         }) {
             return None;
         }
-        Some(WithoutRowidOrAdmission { seen: start + 1, reopens })
+        Some(WithoutRowidOrAdmission { seen: start + 1, reopens, in_set })
     }).collect()
 }
 
@@ -2004,12 +2005,12 @@ impl WithoutRowidOrPhase {
     }
 }
 
-/// All arms return to the next key on either the table B-tree or the
-/// shared secondary cursor. SQLite places that Next at the end of each arm.
+/// An arm can advance a physical range directly, or advance it inside
+/// a scan of a private literal IN set.
 fn without_rowid_or_arms(
     ops: &[VdbeOp], arms: std::ops::Range<usize>, table: &VdbeOp,
     seen: &VdbeOp, ret: &VdbeOp, encoding: u8,
-) -> Option<(Vec<usize>, Vec<usize>, Option<i32>)> {
+) -> Option<(Vec<usize>, Vec<usize>, Option<i32>, Option<usize>)> {
     let P4::KeyInfo(key) = &table.p4 else { return None };
     let region = ops.get(arms.clone())?;
     if region.is_empty() {
@@ -2023,21 +2024,39 @@ fn without_rowid_or_arms(
     let mut reopens = Vec::new();
     let mut seen_operations = Vec::new();
     let mut root_keys = BTreeMap::new();
-    for (offset, next) in region.iter().enumerate().filter(|(_, op)| {
-        op.opcode == OP_Next && (op.p1 == table.p1 || Some(op.p1) == secondary)
-    }) {
-        let stop = arms.start + offset + 1;
-        let phase = match (start == arms.start, stop == arms.end) {
+    let mut in_set = None;
+    while start < arms.end {
+        let open = &ops[start];
+        let inner_index = open.opcode == OP_ReopenIdx;
+        let physical = if inner_index { open } else { table };
+        let rhs = without_rowid_or_literal_in(
+            ops, start + usize::from(inner_index), arms.end, physical, seen.p1, ret.p2, encoding,
+        );
+        let (stop, arm_end, cursor, unique_bound) = if let Some(rhs) = rhs {
+            if in_set.replace(rhs.open).is_some() {
+                return None;
+            }
+            let arm_end = rhs.step + 1;
+            let stop = if rhs.unique_bound.is_some() { arm_end } else { rhs.step };
+            (stop, arm_end, physical.p1, rhs.unique_bound)
+        } else {
+            let offset = ops[start..arms.end].iter().position(|op| {
+                op.opcode == OP_Next && (op.p1 == table.p1 || Some(op.p1) == secondary)
+            })?;
+            let next = start + offset;
+            (next + 1, next + 1, ops[next].p1, None)
+        };
+        let phase = match (start == arms.start, arm_end == arms.end) {
             (true, true) => return None,
             (true, false) => WithoutRowidOrPhase::First,
             (false, true) => WithoutRowidOrPhase::Last,
             (false, false) => WithoutRowidOrPhase::Middle,
         };
-        let operations = if next.p1 == table.p1 {
-            without_rowid_primary_arm(ops, start, stop, table, seen, ret, key, phase)?
+        let operations = if cursor == table.p1 {
+            without_rowid_primary_arm(ops, start, stop, table, seen, ret, key, phase, unique_bound)?
         } else {
-            let open = &ops[start];
-            if open.opcode != OP_ReopenIdx || open.p1 != next.p1 || open.p2 == table.p2
+            if open.opcode != OP_ReopenIdx || open.p1 != cursor || Some(cursor) != secondary
+                || open.p2 == table.p2
                 || *root_keys.entry(open.p2).or_insert(&open.p4) != &open.p4
             {
                 return None;
@@ -2046,12 +2065,175 @@ fn without_rowid_or_arms(
             without_rowid_or_branch(ops, start, stop, table, seen, ret, encoding, phase)?
         };
         seen_operations.extend(operations.into_iter().flatten());
-        start = stop;
+        start = arm_end;
     }
     if start != arms.end || region.iter().filter(|op| op.opcode == OP_ReopenIdx).count() != reopens.len() {
         return None;
     }
-    Some((reopens, seen_operations, secondary))
+    Some((reopens, seen_operations, secondary, in_set))
+}
+
+struct OrLiteralIn {
+    open: usize,
+    step: usize,
+    unique_bound: Option<usize>,
+}
+
+/// The private set is built once from literals and bindings. Its complete
+/// key is loaded into the physical equality probe before each arm visit.
+fn without_rowid_or_literal_in(
+    ops: &[VdbeOp], start: usize, end: usize, physical: &VdbeOp,
+    seen: i32, return_reg: i32, encoding: u8,
+) -> Option<OrLiteralIn> {
+    let [begin, once, open] = ops.get(start..start + 3)? else { return None };
+    let P4::KeyInfo(key) = &open.p4 else { return None };
+    let P4::KeyInfo(physical_key) = &physical.p4 else { return None };
+    let width = usize::from(key.n_key_field);
+    let cursor = open.p1;
+    let unique = width > 1;
+    if begin.opcode != OP_BeginSubrtn || begin.p1 != 0 || begin.p2 <= 0
+        || begin.p2 == return_reg || begin.p3 != 0 || begin.p5 != 0
+        || once.opcode != OP_Once || once.p3 != 0 || once.p5 != 0
+        || open.opcode != OP_OpenEphemeral || open.p2 != width as i32
+        || open.p3 != 0 || open.p5 != 0 || cursor == physical.p1 || cursor == seen
+        || width == 0 || (unique && (physical.opcode != OP_OpenRead || key.n_key_field != physical_key.n_key_field))
+        || !without_rowid_or_key(key, encoding) || physical_key.enc != encoding
+        || usize::from(key.n_all_field) != width + 1 || key.a_sort_flags.iter().any(|&flag| flag != 0)
+    {
+        return None;
+    }
+    let (None, colls) = key.a_coll.split_last()? else { return None };
+    for (field, coll) in colls.iter().enumerate() {
+        let coll = coll.as_deref()?;
+        if !physical_key.a_coll.get(field).is_some_and(|physical| match physical {
+            Some(physical) => physical.as_ref() == coll,
+            None => coll.name.eq_ignore_ascii_case("BINARY") && coll.enc == encoding,
+        }) {
+            return None;
+        }
+    }
+    let ret_pc = usize::try_from(once.p2).ok()?;
+    let [null_row, ret, scan] = ops.get(ret_pc.checked_sub(1)?..ret_pc + 2)? else { return None };
+    let step_pc = usize::try_from(scan.p2).ok()?.checked_sub(1)?;
+    let step = ops.get(step_pc)?;
+    let columns = ret_pc + 2..ret_pc + 2 + width * 2;
+    if ret_pc <= start + 3 || step_pc >= end || step_pc < columns.end
+        || null_row.opcode != OP_NullRow || null_row.p1 != cursor || null_row.p5 != 0
+        || ret.opcode != OP_Return || ret.p1 != begin.p2 || ret.p2 as usize != start + 1
+        || ret.p3 != 1 || ret.p5 != 0
+        || !matches!((scan.opcode, step.opcode), (OP_Rewind, OP_Next) | (OP_Last, OP_Prev))
+        || scan.p1 != cursor || scan.p3 != 0 || scan.p5 != 0
+        || step.p1 != cursor || step.p2 as usize != columns.start || step.p3 != 0 || step.p5 != 0
+    {
+        return None;
+    }
+    let build = start + 3..ret_pc - 1;
+    let affinity = without_rowid_or_list_records(ops.get(build.clone())?, cursor, width, begin.p2, return_reg)?;
+    match &begin.p4 {
+        P4::NotUsed if !unique => {}
+        P4::SubrtnSig(sig) if unique && sig.b_complete && sig.i_table == cursor
+            && sig.i_addr as usize == start + 1 && sig.reg_return == begin.p2
+            && sig.z_aff.as_bytes() == affinity => {}
+        _ => return None,
+    }
+    let first_reg = ops[columns.start].p3;
+    for (field, pair) in ops.get(columns.clone())?.chunks_exact(2).enumerate() {
+        let [column, skip] = pair else { return None };
+        if column.opcode != OP_Column || column.p1 != cursor || column.p2 != field as i32
+            || column.p3 != first_reg.checked_add(field as i32)? || column.p3 <= 0 || column.p3 == return_reg
+            || column.p4 != P4::NotUsed || column.p5 != 0 || skip.opcode != OP_IsNull
+            || skip.p1 != column.p3 || skip.p2 as usize != step_pc || skip.p5 != 0
+        {
+            return None;
+        }
+    }
+    let seek_pc = if unique {
+        columns.end
+    } else {
+        let aff = ops.get(columns.end)?;
+        if aff.opcode != OP_Affinity || aff.p1 != first_reg || aff.p2 != 1 || aff.p5 != 0
+            || !matches!(&aff.p4, P4::Dynamic(a)
+                if a == affinity || (affinity == [SQLITE_AFF_INTEGER] && a.as_slice() == [SQLITE_AFF_NUMERIC]))
+        {
+            return None;
+        }
+        columns.end + 1
+    };
+    let [seek, bound] = ops.get(seek_pc..seek_pc + 2)? else { return None };
+    if seek.opcode != OP_SeekGE || bound.opcode != OP_IdxGT || seek_pc + 2 >= step_pc
+        || [seek, bound].iter().any(|op| op.p1 != physical.p1 || op.p2 as usize != step_pc
+            || op.p3 != first_reg || op.p4 != P4::Int32(width as i32) || op.p5 != 0)
+        || !ops.get(step_pc - 1).is_some_and(|op| if unique {
+            op.opcode == OP_Gosub
+        } else {
+            op.opcode == OP_Next && op.p1 == physical.p1 && op.p2 as usize == seek_pc + 1
+        })
+        || !without_rowid_or_private_list(ops, cursor, start + 2, build, ret_pc, columns, step_pc)
+    {
+        return None;
+    }
+    Some(OrLiteralIn { open: start + 2, step: step_pc, unique_bound: unique.then_some(seek_pc + 1) })
+}
+
+fn without_rowid_or_list_records(
+    entries: &[VdbeOp], cursor: i32, width: usize, sub_return: i32, or_return: i32,
+) -> Option<&[u8]> {
+    let size = width + 2;
+    let P4::Dynamic(affinity) = &entries.get(width)?.p4 else { return None };
+    if entries.len() < size * 2 || entries.len() % size != 0
+        || affinity.len() != width || !affinity.iter().all(|a| matches!(*a, SQLITE_AFF_INTEGER | SQLITE_AFF_TEXT))
+    {
+        return None;
+    }
+    for entry in entries.chunks_exact(size) {
+        let [values @ .., record, insert] = entry else { return None };
+        let input = record.p1..record.p1.checked_add(width as i32)?;
+        if record.opcode != OP_MakeRecord || record.p1 <= 0 || record.p2 != width as i32
+            || record.p3 <= 0 || record.p3 == or_return || record.p3 == sub_return
+            || input.contains(&record.p3) || input.contains(&or_return) || input.contains(&sub_return)
+            || !matches!(&record.p4, P4::Dynamic(a) if a == affinity) || record.p5 != 0
+            || insert.opcode != OP_IdxInsert || insert.p1 != cursor || insert.p2 != record.p3
+            || insert.p3 != record.p1 || insert.p4 != P4::Int32(width as i32) || insert.p5 != 0
+            || !values.iter().zip(input).all(|(op, reg)| {
+                matches!(op.opcode, OP_Integer | OP_Int64 | OP_Real | OP_String8 | OP_String | OP_Null | OP_Blob | OP_Variable)
+                    && op.p2 == reg && op.p5 == 0 && (op.opcode != OP_Null || op.p3 == 0 || op.p3 == reg)
+            })
+        {
+            return None;
+        }
+    }
+    Some(affinity)
+}
+
+fn without_rowid_or_private_list(
+    ops: &[VdbeOp], cursor: i32, open: usize, build: std::ops::Range<usize>,
+    ret: usize, columns: std::ops::Range<usize>, step: usize,
+) -> bool {
+    ops.iter().enumerate().all(|(pc, op)| {
+        if (op.opcode == OP_OpenDup && op.p2 == cursor)
+            || (matches!(op.opcode, OP_DeferredSeek | OP_SorterData) && op.p3 == cursor)
+        {
+            return false;
+        }
+        if op.p1 != cursor {
+            return true;
+        }
+        match op.opcode {
+            OP_OpenEphemeral => pc == open,
+            OP_IdxInsert => build.contains(&pc),
+            OP_NullRow => pc == ret - 1,
+            OP_Rewind | OP_Last => pc == ret + 1,
+            OP_Column => columns.contains(&pc),
+            OP_Next | OP_Prev => pc == step,
+            OP_OpenRead | OP_OpenWrite | OP_ReopenIdx | OP_OpenDup | OP_OpenAutoindex
+            | OP_OpenPseudo | OP_SorterOpen | OP_VOpen | OP_Insert | OP_Delete | OP_IdxDelete
+            | OP_NotFound | OP_Found | OP_NoConflict | OP_SeekLT | OP_SeekLE | OP_SeekGE
+            | OP_SeekGT | OP_SeekRowid | OP_NotExists | OP_IfNoHope | OP_IdxLE | OP_IdxGT
+            | OP_IdxLT | OP_IdxGE | OP_RowData | OP_Rowid | OP_IdxRowid | OP_DeferredSeek
+            | OP_Count | OP_Sort | OP_ResetSorter | OP_SorterInsert | OP_Close => false,
+            _ => true,
+        }
+    })
 }
 
 fn without_rowid_or_branch(
@@ -2149,7 +2331,7 @@ fn without_rowid_or_seen_ops(
 
 fn without_rowid_primary_arm(
     ops: &[VdbeOp], start: usize, stop: usize, table: &VdbeOp, seen: &VdbeOp, ret: &VdbeOp,
-    key: &KeyInfo, phase: WithoutRowidOrPhase,
+    key: &KeyInfo, phase: WithoutRowidOrPhase, unique_in_bound: Option<usize>,
 ) -> Option<[Option<usize>; 2]> {
     let width = usize::from(key.n_key_field);
     let tail = stop.checked_sub(width + 2 + phase.seen_op_count())?;
@@ -2160,8 +2342,8 @@ fn without_rowid_primary_arm(
     let [dedup @ .., call, next] = tail_ops else { return None };
     let (source, operations) = without_rowid_or_seen_ops(dedup, stop, seen.p1, width, phase)?;
     if call.opcode != OP_Gosub || call.p1 != ret.p2 || call.p2 != ret.p1 + 1 || call.p3 != 0
-        || next.opcode != OP_Next || next.p1 != table.p1
-        || next.p3 != 0 || next.p5 != 0
+        || (unique_in_bound.is_none()
+            && (next.opcode != OP_Next || next.p1 != table.p1 || next.p3 != 0 || next.p5 != 0))
     {
         return None;
     }
@@ -2172,7 +2354,7 @@ fn without_rowid_primary_arm(
             return None;
         }
     }
-    let bound_pc = usize::try_from(next.p2).ok()?;
+    let bound_pc = unique_in_bound.unwrap_or(usize::try_from(next.p2).ok()?);
     if bound_pc >= tail || !without_rowid_or_filter(
         ops, bound_pc + 1..tail, stop - 1, table.p1, table.p1, ret.p2,
     ) {
@@ -2183,9 +2365,10 @@ fn without_rowid_primary_arm(
         op.p1 == table.p1 && matches!(op.opcode, OP_SeekGE | OP_SeekGT));
     let seek = seeks.next()?;
     let valid_width = |op: &VdbeOp| matches!(op.p4, P4::Int32(n) if (1..=i32::from(key.n_key_field)).contains(&n));
-    if seeks.next().is_some() || seek.p2 as usize != stop || seek.p5 != 0 || !valid_width(seek)
+    let seek_end = stop - usize::from(unique_in_bound.is_some());
+    if seeks.next().is_some() || seek.p2 as usize != seek_end || seek.p5 != 0 || !valid_width(seek)
         || !matches!(bound.opcode, OP_IdxGE | OP_IdxGT) || bound.p1 != table.p1
-        || bound.p2 as usize != stop || bound.p5 != 0 || !valid_width(bound)
+        || bound.p2 as usize != seek_end || bound.p5 != 0 || !valid_width(bound)
     {
         return None;
     }
@@ -2478,7 +2661,7 @@ fn unsupported(
                         || *reopen_or_checked.entry(op.p1)
                             .or_insert_with(|| rowid_or_index_cursor(prog, op.p1, k.enc)))));
             let without_rowid_or_set = row_case_encoding == Some(k.enc)
-                && without_rowid_or.iter().any(|group| index == group.seen);
+                && without_rowid_or.iter().any(|group| index == group.seen || group.in_set == Some(index));
             let membership = row_case_encoding == Some(k.enc)
                 && ordered_in_key(prog, op, k, |coll| {
                     binary_in_key_encoding(coll) || (builtin_collations && builtin_read_key_collation(coll, k.enc))

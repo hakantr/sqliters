@@ -2640,3 +2640,70 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_without_rowid_or_literal_in_steps() {
+    sqliters_tcltest::run_test_script(
+        "row_case_without_rowid_or_literal_in_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+proc or_in_rows {stmt} {
+    set rows {}
+    while {[set rc [sqlite3_step $stmt]] eq "SQLITE_ROW"} {
+        lappend rows [sqlite3_column_int $stmt 0] [sqlite3_column_text $stmt 1]
+    }
+    lappend rows $rc
+    return $rows
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE detail(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO detail VALUES(1,1,10),(2,2,20),(3,3,30);
+        CREATE TABLE packed(tag TEXT COLLATE RTRIM,seq INTEGER,ref INTEGER,label TEXT,
+                            PRIMARY KEY(tag DESC,seq)) WITHOUT ROWID;
+        INSERT INTO packed VALUES ('A',1,1,'p-one'),('A ',2,2,'p-two'),
+            ('B',1,1,'p-b'),(char(256)||' ',2,1,'p-wide'),('C',3,3,'p-other');
+        CREATE INDEX packed_by_seq ON packed(seq);
+        CREATE INDEX packed_by_label ON packed(label);
+    }
+    set result_expr {CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+                     WHEN (2,20) THEN 'changed' ELSE p.label END}
+    do_test or-literal-in-$encoding.secondary {
+        execsql "SELECT seq,$result_expr FROM packed p
+                 WHERE tag='A' OR seq IN (1,3,3,NULL,'3') OR label='p-two'
+                 ORDER BY seq,tag;"
+    } {1 p-one 1 p-b 2 changed 3 p-other}
+    do_test or-literal-in-$encoding.primary {
+        execsql "SELECT seq,$result_expr FROM packed p
+                 WHERE seq=2 OR label='p-two' OR tag IN ('A','B','A ',NULL)
+                 ORDER BY seq,tag;"
+    } {1 p-one 1 p-b 2 changed 2 p-wide}
+    do_test or-literal-in-$encoding.full-primary-bind-reset {
+        set s [sqlite3_prepare_v2 db "SELECT seq,$result_expr FROM packed p
+                                    WHERE (tag,seq) IN ((?1,?2),(?3,?4),(?5,?6)) OR seq=2
+                                    ORDER BY seq,tag;" -1]
+        foreach {arg text} {1 A 3 B 5 {A }} {
+            sqlite3_bind_text $s $arg $text -1
+        }
+        foreach arg {2 4 6} {sqlite3_bind_int $s $arg 1}
+        set matched [or_in_rows $s]
+        sqlite3_reset $s
+        foreach arg {1 4 5} {sqlite3_bind_null $s $arg}
+        set no_rhs [or_in_rows $s]
+        sqlite3_reset $s
+        execsql {CREATE INDEX packed_by_ref ON packed(ref);}
+        sqlite3_bind_text $s 3 C -1
+        sqlite3_bind_int $s 4 3
+        set reprepared [or_in_rows $s]
+        list $matched $no_rhs $reprepared [sqlite3_finalize $s]
+    } {{1 p-one 1 p-b 2 changed 2 p-wide SQLITE_DONE} {2 changed 2 p-wide SQLITE_DONE} {2 changed 2 p-wide 3 p-other SQLITE_DONE} SQLITE_OK}
+    do_execsql_test or-literal-in-$encoding.changes {SELECT changes(),total_changes();} {5 8}
+}
+finish_test
+"#,
+    );
+}
