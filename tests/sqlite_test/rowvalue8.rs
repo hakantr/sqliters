@@ -254,3 +254,59 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_persisted_row_case_keeps_subquery_step_boundaries() {
+    sqliters_tcltest::run_test_script(
+        "persisted_row_case_keeps_subquery_step_boundaries",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+proc view_case_result {x} {
+    lappend ::calls $x
+    return [expr {int($x)}]
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding'; PRAGMA trusted_schema=ON;"
+    db function view_case_result -argcount 1 view_case_result
+    execsql {
+        CREATE TABLE words(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+        CREATE TABLE picks(id INTEGER PRIMARY KEY, ref INTEGER);
+        INSERT INTO words VALUES(1,1,10),(2,2,20),(3,3,30);
+        INSERT INTO picks VALUES(1,3),(2,1),(3,6),(4,2);
+        CREATE VIEW picked_word AS
+            SELECT p.id,CASE
+                (SELECT a,view_case_result(b) FROM words w WHERE w.id=p.ref)
+                WHEN (1,10) THEN 'one' WHEN (2,20) THEN 'two'
+                WHEN (3,30) THEN 'three' ELSE '-' END AS word
+            FROM picks p;
+        CREATE VIEW displayed_word(key,text) AS SELECT id,word FROM picked_word;
+    }
+    set sql {SELECT key,text FROM displayed_word ORDER BY key}
+    foreach {step row value calls} {1 1 three 30 2 2 one 10 3 3 - {} 4 4 two 20} {
+        do_test view-row-case-$encoding.step.$step {
+            if {$step == 1} {set s [sqlite3_prepare_v2 db $sql -1]}
+            set ::calls {}
+            set code [sqlite3_step $s]
+            list $code [sqlite3_column_int $s 0] [sqlite3_column_text $s 1] $::calls
+        } [list SQLITE_ROW $row $value $calls]
+    }
+    do_test view-row-case-$encoding.reprepare {
+        set ::calls {}
+        set before [list [sqlite3_step $s] $::calls]
+        sqlite3_reset $s
+        execsql {CREATE INDEX picks_ref ON picks(ref);}
+        set code [sqlite3_step $s]
+        set after [list $code [sqlite3_column_int $s 0] [sqlite3_column_text $s 1] $::calls]
+        list $before $after [sqlite3_finalize $s]
+    } {{SQLITE_DONE {}} {SQLITE_ROW 1 three 30} SQLITE_OK}
+    do_execsql_test view-row-case-$encoding.shadow {
+        WITH displayed_word(key,text) AS (VALUES(42,'local'))
+        SELECT key,text FROM displayed_word;
+    } {42 local}
+}
+finish_test
+"#,
+    );
+}

@@ -457,12 +457,21 @@ pub(crate) fn row_case_read_program(
     n_param: usize,
     bound_values: Option<&[Value]>,
 ) -> Result<Option<Arc<Program>>> {
-    use crate::dml_c::{Walk, walk_select};
-    use sqliters_syntax::Expr;
-
     let Stmt::Select(select) = stmt else {
         return Ok(None);
     };
+    if !select_has_row_case(select)
+        && !crate::engine::any_persisted_view_select(select, &inner.db_set, select_has_row_case)
+    {
+        return Ok(None);
+    }
+    read_machine_program(inner, Some(stmt), sql, n_param, ReadMachineScope::RowCase, bound_values, None)
+}
+
+fn select_has_row_case(select: &sqliters_syntax::SelectStmt) -> bool {
+    use crate::dml_c::{Walk, walk_select};
+    use sqliters_syntax::Expr;
+
     let mut has_row_case = false;
     walk_select(select, &mut |expr| {
         if let Expr::Case { operand: Some(operand), branches, .. } = expr {
@@ -482,10 +491,7 @@ pub(crate) fn row_case_read_program(
         }
         Walk::Deep
     });
-    if !has_row_case {
-        return Ok(None);
-    }
-    read_machine_program(inner, Some(stmt), sql, n_param, ReadMachineScope::RowCase, bound_values, None)
+    has_row_case
 }
 
 /// A direct rowid-table join must keep its two cursors between ResultRow and
