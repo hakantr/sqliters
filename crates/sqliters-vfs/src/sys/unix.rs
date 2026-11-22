@@ -75,6 +75,29 @@ pub(crate) const O_NOFOLLOW: i32 = 0x0100;
 )))]
 pub(crate) const O_NOFOLLOW: i32 = 0;
 
+/// `unixOpen` first tries an unnamed inode for disposable temporary files.
+#[cfg(target_os = "linux")]
+pub(crate) fn open_unnamed_temp(directory: &Path) -> Option<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if O_NOFOLLOW == 0 {
+        return None;
+    }
+    // In the Linux flag layouts listed above, O_DIRECTORY is directly below
+    // O_NOFOLLOW. O_TMPFILE combines it with the common __O_TMPFILE bit.
+    let tmpfile = 0o20_000_000 | (O_NOFOLLOW >> 1);
+    const O_EXCL: i32 = 0o200;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(tmpfile | O_EXCL)
+        .open(directory)
+        .ok()?;
+    apply_created_file_mode(&file, 0o600, None);
+    Some(file)
+}
+
 /// `SQLITE_DEFAULT_FILE_PERMISSIONS` (`os_unix.c`): permission bits requested for a new
 /// database file (the process umask still applies).
 pub(crate) const DEFAULT_FILE_PERMISSIONS: u32 = 0o644;

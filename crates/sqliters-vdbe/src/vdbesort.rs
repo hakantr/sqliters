@@ -160,7 +160,10 @@ impl PmaFile {
 fn open_pma_file(vfs: &dyn Vfs) -> SqlResult<Arc<dyn VfsFile>> {
     let flags = OpenFlags::TEMP_JOURNAL | OpenFlags::READWRITE | OpenFlags::CREATE
         | OpenFlags::EXCLUSIVE | OpenFlags::DELETEONCLOSE;
-    vfs.open(None, flags).map(Arc::from)
+    let file = vfs.open(None, flags)?;
+    // vdbeSorterOpenTempFile issues a hint even with sorter xFetch disabled.
+    let _ = file.mmap_size(0x7fff_0000);
+    Ok(Arc::from(file))
 }
 
 struct PmaWriter<'a> {

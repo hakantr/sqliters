@@ -3586,7 +3586,23 @@ impl Vfs for OsVfs {
             );
         }
 
-        let file = if !readonly {
+        #[cfg(unix)]
+        let anonymous_temp = path.is_none() && !readonly
+            && flags.contains(OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::EXCLUSIVE | OpenFlags::DELETEONCLOSE)
+            && (flags.contains(OpenFlags::TEMP_JOURNAL) || flags.contains(OpenFlags::TRANSIENT_DB));
+        #[cfg(target_os = "linux")]
+        let unnamed = if anonymous_temp {
+            target_path.parent().and_then(sys::unix::open_unnamed_temp)
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let unnamed = None;
+        #[cfg(unix)]
+        let has_unnamed_inode = unnamed.is_some();
+        let file = if let Some(file) = unnamed {
+            file
+        } else if !readonly {
             let mut opts = OpenOptions::new();
             opts.read(true).write(true);
             if flags.contains(OpenFlags::CREATE) || path.is_none() {
@@ -3645,6 +3661,11 @@ impl Vfs for OsVfs {
                     )
                 })?
         };
+
+        #[cfg(unix)]
+        let linked = !has_unnamed_inode && (!anonymous_temp || fs::remove_file(&target_path).is_err());
+        #[cfg(not(unix))]
+        let linked = true;
 
         #[cfg(unix)]
         let (file, inode_key, inode_info) = {
@@ -3742,7 +3763,7 @@ impl Vfs for OsVfs {
 
         Ok(Box::new(OsFile {
             file: Some(file),
-            path: Some(target_path),
+            path: linked.then_some(target_path),
             delete_on_close,
             readonly,
             persist_wal: AtomicBool::new(false),
