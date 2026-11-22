@@ -2297,3 +2297,8 @@ Kısmi ORDER BY ve LIMIT/OFFSET iki matriste 288 UTF-16 sonucunu C ile eşitledi
 ## V6b.398 — RETURNING nitelikli ad hata ofsetleri
 
 Önceki 72 native vaka iki kipte 72/72. Ek 198 vakada 108 OFF ve 72 ON UTF-8 bayt ofseti C ile eşleşti. 594 ana dosya ve C yeniden açılışı eş. Joker, authorizer ve önceki RTRIM akışları korundu. OFF 1278/1/325, ON 1276/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_398.md).
+
+
+## V6b.399 — UTF-16 hesaplanan rowid listeleri
+
+390 gözlemde aritmetik ve yerleşik kolasyonlu rowid listesi için 64 UTF-16 farkı kapandı. Önceki 558 gözlem aynı. C fixture 10/10, Rust rowvalue8 29/29 ve delete2 1/1 iki kipte. OFF 1279/1/325, ON 1277/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,277 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_399.md).

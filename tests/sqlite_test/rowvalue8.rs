@@ -1888,3 +1888,58 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_rowid_expression_lists() {
+    sqliters_tcltest::run_test_script(
+        "row_case_rowid_expression_lists",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE words(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO words VALUES (1,1,10),(2,2,20);
+        CREATE TABLE picks(id INTEGER PRIMARY KEY,ref INTEGER,label TEXT);
+        INSERT INTO picks VALUES (2,1,'two'),(3,2,'unused'),(4,1,'four'),(8,1,'eight');
+        CREATE VIEW chosen AS SELECT p.id,CASE (SELECT a,b FROM words w WHERE w.id=p.ref)
+           WHEN (2,20) THEN 'Three ' ELSE p.label END AS token FROM picks p;
+    }
+    do_execsql_test row-case-rowid-expression-$encoding.arithmetic {
+        SELECT id,token FROM chosen WHERE id IN (1+1,12/4,4*2,-8+9,8%5,NULL,0/0,'3.0')
+           ORDER BY id;
+    } {2 two 3 {Three } 8 eight}
+    do_execsql_test row-case-rowid-expression-$encoding.collations {
+        SELECT id,token FROM chosen WHERE id COLLATE NOCASE IN ('2','2x',3.0,'03',NULL)
+            ORDER BY id DESC;
+        SELECT id,token FROM chosen WHERE id COLLATE RTRIM IN ('2 ',2,4.0,'3.5',NULL)
+            ORDER BY id;
+    } {3 {Three } 2 two 2 two 4 four}
+    do_test row-case-rowid-expression-$encoding.bind-reset {
+        set stmt [sqlite3_prepare_v2 db {
+            SELECT id,token FROM chosen WHERE id IN (?1+1,?2-1,4,0/0) ORDER BY id DESC
+        } -1]
+        sqlite3_bind_int $stmt 1 1
+        sqlite3_bind_int $stmt 2 9
+        set before {}
+        while {[set rc [sqlite3_step $stmt]] eq "SQLITE_ROW"} {
+            lappend before [sqlite3_column_int $stmt 0] [sqlite3_column_text $stmt 1]
+        }
+        lappend before $rc
+        sqlite3_reset $stmt
+        sqlite3_bind_int $stmt 1 2
+        sqlite3_bind_null $stmt 2
+        set after {}
+        while {[set rc [sqlite3_step $stmt]] eq "SQLITE_ROW"} {
+            lappend after [sqlite3_column_int $stmt 0] [sqlite3_column_text $stmt 1]
+        }
+        lappend after $rc
+        list $before $after [sqlite3_finalize $stmt]
+    } {{8 eight 4 four 2 two SQLITE_DONE} {4 four 3 {Three } SQLITE_DONE} SQLITE_OK}
+}
+finish_test
+"#,
+    );
+}

@@ -1062,12 +1062,17 @@ fn ordered_in_key(
     written && probed
 }
 
-/// A literal IN list driving a rowid lookup is a private one-column set. Its
+/// An IN list driving a rowid lookup is a private one-column set. Its
 /// records use integer affinity and database encoding before index insertion.
-fn literal_rowid_list_key(prog: &Program, open_index: usize, open: &VdbeOp, key: &KeyInfo) -> bool {
+fn rowid_expression_list_key(
+    prog: &Program, open_index: usize, open: &VdbeOp, key: &KeyInfo,
+    supports_collation: impl Fn(&CollSeq) -> bool,
+) -> bool {
     if open.opcode != OP_OpenEphemeral || open.p2 != 1 || open.p3 != 0 || open.p5 != 0
         || key.n_key_field != 1 || key.n_all_field != 2
-        || !matches!(key.a_coll.as_slice(), [None, None]) || key.a_sort_flags != [0, 0]
+        || !matches!(key.a_coll.as_slice(), [collation, None]
+            if collation.as_deref().is_none_or(&supports_collation))
+        || key.a_sort_flags != [0, 0]
     {
         return false;
     }
@@ -1108,8 +1113,13 @@ fn literal_rowid_list_key(prog: &Program, open_index: usize, open: &VdbeOp, key:
     let Some(entries) = ops.get(build.clone()) else { return false };
     if entries.is_empty() || entries.len() % 3 != 0 || !entries.chunks_exact(3).all(|entry| {
         let [value, record, insert] = entry else { return false };
-        matches!(value.opcode, OP_Integer | OP_Int64 | OP_Real | OP_String8 | OP_String | OP_Null | OP_Blob | OP_Variable)
-            && value.p2 == record.p1 && record.opcode == OP_MakeRecord && record.p2 == 1 && record.p5 == 0
+        let output = match value.opcode {
+            OP_Integer | OP_Int64 | OP_Real | OP_String8 | OP_String | OP_Null | OP_Blob | OP_Variable => value.p2,
+            OP_Add | OP_Subtract | OP_Multiply | OP_Divide | OP_Remainder
+                if value.p4 == P4::NotUsed && value.p5 == 0 => value.p3,
+            _ => return false,
+        };
+        output == record.p1 && record.opcode == OP_MakeRecord && record.p2 == 1 && record.p5 == 0
             && matches!(&record.p4, P4::Dynamic(affinity) if affinity.as_slice() == [SQLITE_AFF_INTEGER])
             && insert.opcode == OP_IdxInsert && insert.p1 == cursor && insert.p2 == record.p3
             && insert.p3 == record.p1 && insert.p4 == P4::Int32(1) && insert.p5 == 0
@@ -1923,7 +1933,10 @@ fn unsupported(
                 && recursive_fifo_key(prog, index, op, k, |coll| {
                     binary_in_key_encoding(coll) || (builtin_collations && builtin_read_key_collation(coll, k.enc))
                 });
-            let rowid_list = row_case_encoding == Some(k.enc) && literal_rowid_list_key(prog, index, op, k);
+            let rowid_list = row_case_encoding == Some(k.enc)
+                && rowid_expression_list_key(prog, index, op, k, |coll| {
+                    binary_in_key_encoding(coll) || (builtin_collations && builtin_read_key_collation(coll, k.enc))
+                });
             let recursive_priority = row_case_encoding == Some(k.enc)
                 && recursive_priority_key(prog, index, |coll| {
                     binary_in_key_encoding(coll) || (builtin_collations && builtin_read_key_collation(coll, k.enc))
