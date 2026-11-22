@@ -832,3 +832,77 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_recursive_row_case_view_steps() {
+    sqliters_tcltest::run_test_script(
+        "recursive_row_case_view_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+proc recursive_case_note {x} {
+    lappend ::calls $x
+    return [expr {int($x)}]
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding'; PRAGMA trusted_schema=ON;"
+    db function recursive_case_note -argcount 1 recursive_case_note
+    execsql {
+        CREATE TABLE words(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        CREATE TABLE picks(id INTEGER PRIMARY KEY,ref INTEGER);
+        INSERT INTO words VALUES(1,1,10),(2,2,20),(3,3,30);
+        INSERT INTO picks VALUES(1,3),(2,1),(3,9),(4,2);
+        CREATE VIEW choices AS
+          SELECT p.id,CASE (SELECT a,recursive_case_note(b) FROM words w WHERE w.id=p.ref)
+             WHEN (1,10) THEN 'one' WHEN (2,20) THEN 'two' WHEN (3,30) THEN 'three'
+             ELSE '-' END AS label
+          FROM picks p;
+    }
+    set sql {
+        WITH RECURSIVE walk(id,label) AS (
+            SELECT id,label FROM choices WHERE id=?1
+            UNION ALL
+            SELECT v.id,v.label FROM walk w JOIN choices v ON v.id=w.id+1 WHERE w.id<?2
+        )
+        SELECT id,label FROM walk
+    }
+    set s [sqlite3_prepare_v2 db $sql -1]
+    sqlite3_bind_int $s 1 1
+    sqlite3_bind_int $s 2 4
+    foreach {step id label calls} {1 1 three {30} 2 2 one {10} 3 3 - {} 4 4 two {20}} {
+        do_test recursive-row-case-$encoding.step.$step {
+            set ::calls {}
+            set rc [sqlite3_step $s]
+            list $rc [sqlite3_column_int $s 0] [sqlite3_column_text $s 1] $::calls
+        } [list SQLITE_ROW $id $label $calls]
+    }
+    do_test recursive-row-case-$encoding.reprepare {
+        set ::calls {}
+        set before [list [sqlite3_step $s] $::calls]
+        sqlite3_reset $s
+        execsql {CREATE INDEX picks_ref ON picks(ref);}
+        sqlite3_bind_int $s 1 2
+        set rc [sqlite3_step $s]
+        set after [list $rc [sqlite3_column_int $s 0] [sqlite3_column_text $s 1] $::calls]
+        list $before $after [sqlite3_finalize $s]
+    } {{SQLITE_DONE {}} {SQLITE_ROW 2 one 10} SQLITE_OK}
+    do_execsql_test recursive-row-case-$encoding.expression-subquery {
+        WITH RECURSIVE seq(id,label) AS (
+            SELECT 1,(SELECT label FROM choices WHERE id=1)
+            UNION ALL
+            SELECT seq.id+1,(SELECT label FROM choices WHERE id=seq.id+1)
+            FROM seq WHERE seq.id<4
+        )
+        SELECT id,label FROM seq;
+    } {1 three 2 one 3 - 4 two}
+    do_execsql_test recursive-row-case-$encoding.shadow {
+        WITH RECURSIVE choices(id,label) AS (
+            VALUES(1,'lexical') UNION ALL SELECT id+1,label FROM choices WHERE id<2
+        ) SELECT id,label FROM choices;
+    } {1 lexical 2 lexical}
+}
+finish_test
+"#,
+    );
+}

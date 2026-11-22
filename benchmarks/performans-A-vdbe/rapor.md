@@ -2227,3 +2227,8 @@ VDBE toplama ve pencere metin sonuçlarını veritabanının kodlamasına getiri
 ## V6b.384 — Skaler WHEN ile satır CASE hazırlama tanısı
 
 Çok sütunlu alt sorgu ile skaler WHEN karşılaştırmasında C hazırlama tanısı korunuyor. Ana 558 gözlemde 10 ve ek 144 gözlemde 30 fark kapandı. Skaler sonuçlar, tanımsız WHEN adı ve 24 API koruma gözlemi aynı. OFF 1262/1/325, ON 1259/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,270 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_384.md).
+
+
+## V6b.385 — Özyinelemeli CTE içinde görünüm CASE
+
+Özyinelemeli CTE tanımı kendi açık başvurusunu tekrar izlemeksizin başlangıç ve özyineleme kollarındaki görünümleri çözüyor. Ölçülen 40 farkın 32’si kapandı. Diğer sonuçlar ve altı C yeniden açılışı eş kaldı. OFF 1263/1/325, ON 1260/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,258 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_385.md).

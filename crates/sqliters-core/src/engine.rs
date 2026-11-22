@@ -9847,9 +9847,14 @@ pub(crate) fn any_referenced_view_select(
                 let scope_cache = &ctes.scope_caches[scope];
                 if self.active_ctes.iter().any(|(seen, entry)| {
                     *entry == index && Rc::ptr_eq(seen, scope_cache)
-                }) || !matches!(classify_cte_recursion(cte), CteRecursionKind::NonRecursive) {
+                }) || !matches!(
+                    classify_cte_recursion(cte),
+                    CteRecursionKind::NonRecursive | CteRecursionKind::Recursive { .. }
+                ) {
                     return false;
                 }
+                // Visit a recursive definition once. Its self-reference stops at the active
+                // entry above, while other sources in the seed and recursive arms are resolved.
                 let Ok(nested) = ctes.enter_cte_select(self.db_set.expr_depth_limit()) else {
                     return false;
                 };
