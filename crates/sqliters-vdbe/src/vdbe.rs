@@ -21,6 +21,7 @@
 
 #![allow(unexpected_cfgs, non_upper_case_globals, dead_code)]
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use sqliters_btree::Btree;
@@ -1703,6 +1704,89 @@ fn streamed_group_key(prog: &Program, index: usize, op: &VdbeOp, key: &KeyInfo) 
     })
 }
 
+/// WHERE_MULTI_OR visits one rowid table through a reusable index cursor. Each
+/// branch seeks with its own KeyInfo and passes an unseen rowid to the body.
+fn rowid_or_index_cursor(prog: &Program, cursor: i32, encoding: u8) -> bool {
+    let ops = &prog.a_op;
+    let mut branches = Vec::new();
+    for (index, op) in ops.iter().enumerate() {
+        if op.opcode == OP_OpenDup && op.p2 == cursor {
+            return false;
+        }
+        if op.p1 != cursor {
+            continue;
+        }
+        match op.opcode {
+            OP_ReopenIdx => branches.push(index),
+            OP_OpenRead | OP_OpenWrite | OP_OpenDup | OP_OpenAutoindex | OP_OpenEphemeral
+            | OP_OpenPseudo | OP_SorterOpen | OP_VOpen => return false,
+            _ => {}
+        }
+    }
+    let [first, _, ..] = branches.as_slice() else { return false };
+    let first = *first;
+    let Some([null, ret]) = first.checked_sub(2).and_then(|start| ops.get(start..first)) else {
+        return false;
+    };
+    let end = ret.p1 as usize;
+    let Some(goto) = ops.get(end) else { return false };
+    let Some(body_return) = (goto.p2 as usize).checked_sub(1).and_then(|at| ops.get(at)) else {
+        return false;
+    };
+    if null.opcode != OP_Null || null.p1 != 0 || null.p2 <= 0 || null.p3 != 0
+        || ret.opcode != OP_Integer || ret.p2 <= 0 || ret.p2 == null.p2
+        || end <= *branches.last().unwrap() || goto.opcode != OP_Goto || goto.p2 as usize <= end + 1
+        || body_return.opcode != OP_Return || body_return.p1 != ret.p2
+        || body_return.p2 as usize != end + 1 || body_return.p3 != 0
+    {
+        return false;
+    }
+
+    let mut table = None;
+    let mut root_keys = BTreeMap::new();
+    for (branch, &start) in branches.iter().enumerate() {
+        let stop = branches.get(branch + 1).copied().unwrap_or(end);
+        let open = &ops[start];
+        let P4::KeyInfo(key) = &open.p4 else { return false };
+        if open.p2 <= 1 || open.p3 != 0 || !matches!(open.p5, 0 | OPFLAG_SEEKEQ)
+            || key.enc != encoding || *root_keys.entry(open.p2).or_insert(&open.p4) != &open.p4
+        {
+            return false;
+        }
+        let Some(tail) = stop.checked_sub(5) else { return false };
+        let Some([defer, rowid, set, call, next]) = ops.get(tail..stop) else { return false };
+        let set_number = if stop == end { -1 } else { branch as i32 };
+        if defer.opcode != OP_DeferredSeek || defer.p1 != cursor || defer.p2 != 0 || defer.p3 == cursor
+            || defer.p5 != 0 || !matches!(&defer.p4, P4::IntArray(map)
+                if map.iter().all(|&field| field <= u32::from(key.n_all_field)))
+            || *table.get_or_insert(defer.p3) != defer.p3
+            || rowid.opcode != OP_IdxRowid || rowid.p1 != cursor || rowid.p2 <= 0
+            || set.opcode != OP_RowSetTest || set.p1 != null.p2 || set.p3 != rowid.p2
+            || set.p2 as usize != stop - 1 || set.p4 != P4::Int32(set_number)
+            || call.opcode != OP_Gosub || call.p1 != ret.p2 || call.p2 as usize != end + 1
+            || next.opcode != OP_Next || next.p1 != cursor || next.p5 != 0
+        {
+            return false;
+        }
+        let bound = next.p2 as usize;
+        let Some(prefix) = ops.get(start + 1..bound) else { return false };
+        let mut seeks = prefix.iter().filter(|op| op.p1 == cursor && matches!(op.opcode, OP_SeekGE | OP_SeekGT));
+        let Some(seek) = seeks.next() else { return false };
+        let Some(limit) = ops.get(bound) else { return false };
+        if seeks.next().is_some() || bound >= tail || seek.p2 as usize != stop
+            || !matches!(seek.p4, P4::Int32(width) if (1..=i32::from(key.n_key_field)).contains(&width))
+            || !matches!(limit.opcode, OP_IdxGE | OP_IdxGT) || limit.p1 != cursor || limit.p2 as usize != stop
+            || limit.p4 != seek.p4 || seek.p5 != 0 || limit.p5 != 0
+            || (open.p5 == OPFLAG_SEEKEQ && (seek.opcode != OP_SeekGE || limit.opcode != OP_IdxGT
+                || !std::ptr::eq(seek, &ops[bound - 1]) || seek.p3 != limit.p3))
+        {
+            return false;
+        }
+    }
+    ops[..first].iter().any(|op| op.opcode == OP_OpenRead && Some(op.p1) == table
+        && op.p2 > 1 && op.p3 == 0 && op.p5 == 0 && matches!(op.p4, P4::Int32(n) if n > 0))
+}
+
 fn unsupported(
     prog: &Program, write: bool, key_scope: ReadKeyScope, row_case_encoding: Option<u8>,
     builtin_collations: bool,
@@ -1716,6 +1800,7 @@ fn unsupported(
         Some(encoding) if builtin_collations && key_scope == ReadKeyScope::BinarySorter => partial_order_pairs(prog, encoding),
         _ => Vec::new(),
     };
+    let mut reopen_or_checked = BTreeMap::new();
     let subs = prog.p_program.iter().flat_map(|s| s.a_op.iter());
     for (index, op) in prog.a_op.iter().chain(subs).enumerate() {
         let ok = (op.opcode == OP_Expire && op.p1 != 0 && op.p2 == 1) || matches!(
@@ -1950,12 +2035,15 @@ fn unsupported(
                 });
             // Static BINARY fields (including implicit rowid tails) have no CollSeq.
             let physical_index = row_case_encoding == Some(k.enc)
-                && op.opcode == OP_OpenRead && op.p2 > 1 && op.p3 == 0
+                && op.p2 > 1 && op.p3 == 0
                 && k.n_key_field > 0 && k.n_key_field <= k.n_all_field
                 && k.a_coll.len() == usize::from(k.n_all_field)
                 && k.a_coll.iter().flatten().all(|c| {
                     binary_in_key_encoding(c) || (builtin_collations && builtin_read_key_collation(c, k.enc))
-                });
+                })
+                && (op.opcode == OP_OpenRead || (op.opcode == OP_ReopenIdx
+                    && *reopen_or_checked.entry(op.p1)
+                        .or_insert_with(|| rowid_or_index_cursor(prog, op.p1, k.enc))));
             let membership = row_case_encoding == Some(k.enc)
                 && ordered_in_key(prog, op, k, |coll| {
                     binary_in_key_encoding(coll) || (builtin_collations && builtin_read_key_collation(coll, k.enc))

@@ -2010,3 +2010,103 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_reopened_or_indexes() {
+    sqliters_tcltest::run_test_script(
+        "row_case_reopened_or_indexes",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+proc or_observe {id} {
+    lappend ::seen $id
+    return $id
+}
+proc or_read_rows {stmt} {
+    set rows {}
+    while {[set rc [sqlite3_step $stmt]] eq "SQLITE_ROW"} {
+        lappend rows [sqlite3_column_int $stmt 0] [sqlite3_column_text $stmt 1]
+    }
+    lappend rows $rc
+    return $rows
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    db function or_observe -argcount 1 or_observe
+    execsql {
+        CREATE TABLE detail(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO detail VALUES(1,1,10),(2,2,20);
+        CREATE TABLE items(id INTEGER PRIMARY KEY,tag TEXT COLLATE RTRIM,zone TEXT COLLATE NOCASE,
+                           ref INTEGER,label TEXT);
+        INSERT INTO items VALUES(1,'A','west',1,'one'),(2,'A ','WEST',2,'two'),
+            (3,'A  ','east',1,'three'),(4,'a','west',1,'lower'),
+            (5,char(256)||' ','east',1,'repeat'),(6,NULL,'west',2,'nil'),
+            (7,'B ','north',1,'seven'),(8,'A',NULL,1,'repeat');
+        CREATE INDEX tag_rtrim ON items(tag);
+        CREATE INDEX tag_zone ON items(tag,zone DESC);
+        CREATE INDEX zone_nocase ON items(zone);
+        CREATE INDEX label_binary ON items(label);
+        CREATE TABLE repeated(id INTEGER PRIMARY KEY,tag TEXT COLLATE RTRIM,ref INTEGER,label TEXT);
+        INSERT INTO repeated SELECT id,tag,ref,label FROM items;
+        CREATE INDEX repeated_tag ON repeated(tag);
+    }
+    do_test reopened-or-row-case-$encoding.overlap {
+        set ::seen {}
+        set rows [execsql {
+            SELECT or_observe(id),CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+              WHEN (2,20) THEN 'changed' ELSE p.label END
+            FROM items p WHERE tag='A ' OR zone='wEsT' ORDER BY id;
+        }]
+        list $rows [lsort -integer $::seen]
+    } {{1 one 2 changed 3 three 4 lower 6 changed 8 repeat} {1 2 3 4 6 8}}
+    do_execsql_test reopened-or-row-case-$encoding.same-root {
+        SELECT id,CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+          WHEN (2,20) THEN 'changed' ELSE p.label END
+        FROM repeated p WHERE tag='A ' OR tag IS NULL ORDER BY id;
+    } {1 one 2 changed 3 three 6 changed 8 repeat}
+    do_execsql_test reopened-or-row-case-$encoding.three {
+        SELECT id,CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+          WHEN (2,20) THEN 'changed' ELSE p.label END
+        FROM items p WHERE tag='A ' OR zone='east' OR label='repeat' ORDER BY id;
+    } {1 one 2 changed 3 three 5 repeat 8 repeat}
+    do_execsql_test reopened-or-row-case-$encoding.composite {
+        SELECT id,CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+          WHEN (2,20) THEN 'changed' ELSE p.label END
+        FROM items p WHERE (tag='A' AND zone='wEsT') OR label='repeat' ORDER BY id;
+    } {1 one 2 changed 5 repeat 8 repeat}
+    do_execsql_test reopened-or-row-case-$encoding.range {
+        SELECT id,CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+          WHEN (2,20) THEN 'changed' ELSE p.label END
+        FROM items p WHERE (tag>='A' AND tag<'a') OR zone='wEsT' ORDER BY id;
+    } {1 one 2 changed 3 three 4 lower 6 changed 7 seven 8 repeat}
+    do_test reopened-or-row-case-$encoding.reset {
+        set s [sqlite3_prepare_v2 db {
+            SELECT id,CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+              WHEN (2,20) THEN 'changed' ELSE p.label END
+            FROM items p WHERE tag=?1 OR zone=?2 ORDER BY id
+        } -1]
+        sqlite3_bind_text $s 1 {A } -1
+        sqlite3_bind_text $s 2 WEST -1
+        set before [or_read_rows $s]
+        sqlite3_reset $s
+        sqlite3_bind_text $s 1 B -1
+        sqlite3_bind_null $s 2
+        set after [or_read_rows $s]
+        sqlite3_reset $s
+        execsql {CREATE INDEX items_ref ON items(ref);}
+        sqlite3_bind_null $s 1
+        sqlite3_bind_text $s 2 east -1
+        set replanned [or_read_rows $s]
+        list $before $after $replanned [sqlite3_finalize $s]
+    } {{1 one 2 changed 3 three 4 lower 6 changed 8 repeat SQLITE_DONE} {7 seven SQLITE_DONE} {3 three 5 repeat SQLITE_DONE} SQLITE_OK}
+    do_execsql_test reopened-or-row-case-$encoding.changes {
+        SELECT changes(),total_changes();
+    } {8 18}
+}
+finish_test
+
+"#,
+    );
+}
