@@ -2177,3 +2177,8 @@ C ve iki Rust kipinde 141 UPDATE kontrolü geçti. Pencere sorgusunun planı ve 
 ## V6b.374 — UTF-16 alt sorgulu satır CASE sıralayıcısı
 
 Yerleşik BINARY sıralayıcısı kullanan UTF-16 CASE alt sorguları iki Rust kipinde yürütülüyor. 12 disk profilinde 720 gözlem C ile karşılaştırıldı. Önceki 80 fark kapandı. C ve Rust adım, sıralama ve yeniden hazırlama kontrolleri geçti. OFF 1252/1/326, ON 1249/4/326. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,264 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_374.md).
+
+
+## V6b.375 — Canlı iki tablo SELECT imleçleri
+
+Aynı bağlantıda olağan UPDATE veya DELETE sonrası doğrudan iki rowid tablosunun SELECT adımları C ile eşleşiyor. Exact API gözleminde iki kipte 72/72, 48 bayt eş ana dosya grubu ve 144 başarılı C yeniden açılışı. Özgün delete2 paketi çalışma alanı koşusuna alındı. OFF 1253/1/325, ON 1250/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,268 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_375.md).

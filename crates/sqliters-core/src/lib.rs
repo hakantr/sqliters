@@ -8186,7 +8186,12 @@ impl Statement {
                 inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param,
             )
         };
-        let Some(prog) = result? else {
+        let program = result?.or_else(|| {
+            vdbe_host::live_table_join_read_program(
+                inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param, bound_values,
+            )
+        });
+        let Some(prog) = program else {
             return Ok(None);
         };
         artifacts.compiled_vdbe = None;

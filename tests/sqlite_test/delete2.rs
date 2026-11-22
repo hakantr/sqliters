@@ -1,5 +1,4 @@
 #[test]
-#[ignore = "12/13 subtests passed; pending: delete2 edge cases"]
 fn test_delete2() {
     sqliters_tcltest::run_test_script(
         "delete2",

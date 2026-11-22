@@ -444,6 +444,7 @@ enum ReadMachineScope {
     SchemaFree,
     Like,
     RowCase,
+    LiveTableJoin,
 }
 
 /// Legacy expressions do not prepare a row-valued subquery as a CASE operand.
@@ -487,6 +488,75 @@ pub(crate) fn row_case_read_program(
     read_machine_program(inner, Some(stmt), sql, n_param, ReadMachineScope::RowCase, bound_values, None)
 }
 
+/// A direct rowid-table join must keep its two cursors between ResultRow and
+/// the next step, so a write on the same connection can move either cursor.
+#[allow(non_upper_case_globals)]
+pub(crate) fn live_table_join_read_program(
+    inner: &ConnectionInner,
+    stmt: Option<&Stmt>,
+    raw_sql: &str,
+    n_param: usize,
+    bound_values: Option<&[Value]>,
+) -> Option<Arc<Program>> {
+    use sqliters_syntax::{JoinType, SelectCore, TableOrSubquery};
+    use sqliters_vdbe::opcodes::*;
+
+    let Some(Stmt::Select(select)) = stmt else { return None };
+    let SelectCore::Select { from: Some(from), distinct: false, .. } = &select.body.head
+    else { return None };
+    let [join] = from.joins.as_slice() else { return None };
+    if !select.ctes.is_empty() || !select.body.compounds.is_empty()
+        || !matches!(join.join_type, JoinType::Inner | JoinType::Cross)
+        || join.natural || join.constraint.is_some()
+    {
+        return None;
+    }
+    let root = |source: &TableOrSubquery| {
+        let TableOrSubquery::Table { name, table_args: None, .. } = source else { return None };
+        let (db, table) = inner.db_set.find_user_table_in_set(name)?;
+        (db == DatabaseId::MAIN && table.root_pgno > 1 && !table.without_rowid)
+            .then_some(table.root_pgno as i32)
+    };
+    let left = root(&from.head)?;
+    let right = root(&join.right)?;
+    if left == right {
+        return None;
+    }
+    let program = read_machine_program(
+        inner, stmt, raw_sql, n_param, ReadMachineScope::LiveTableJoin, bound_values, None,
+    ).ok()??;
+    if program.btree_mask != 1 || !program.a_op.iter().all(|op| {
+        matches!(op.opcode,
+            OP_Init | OP_Halt | OP_Transaction | OP_Goto | OP_Noop | OP_OpenRead | OP_Close
+            | OP_Rewind | OP_Last | OP_Next | OP_Prev | OP_Rowid | OP_Column | OP_RealAffinity
+            | OP_ResultRow | OP_Integer | OP_Int64 | OP_Real | OP_String8 | OP_String | OP_Null
+            | OP_Variable | OP_Copy | OP_SCopy | OP_Eq | OP_Ne | OP_Lt | OP_Le | OP_Gt | OP_Ge
+            | OP_IsNull | OP_NotNull | OP_If | OP_IfNot)
+        && !matches!(&op.p4, P4::CollSeq(coll) if inner.collations.get_custom(&coll.name).is_some())
+    }) {
+        return None;
+    }
+    let mut rows = program.a_op.iter().enumerate().filter(|(_, op)| op.opcode == OP_ResultRow);
+    let (result_row, _) = rows.next()?;
+    if rows.next().is_some() {
+        return None;
+    }
+    let mut opens = program.a_op.iter().filter(|op| op.opcode == OP_OpenRead);
+    let first = opens.next()?;
+    let second = opens.next()?;
+    let roots = (first.p2, second.p2);
+    if opens.next().is_some() || first.p3 != 0 || second.p3 != 0 || first.p1 == second.p1
+        || (roots != (left, right) && roots != (right, left))
+    {
+        return None;
+    }
+    [first, second].iter().all(|open| {
+        program.a_op.iter().skip(result_row + 1).any(|op| {
+            matches!(op.opcode, OP_Next | OP_Prev) && op.p1 == open.p1 && op.p2 as usize <= result_row
+        })
+    }).then_some(program)
+}
+
 fn read_machine_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, scope: ReadMachineScope, bound_values: Option<&[Value]>,
     precompiled: Option<Box<Program>>,
@@ -524,7 +594,9 @@ fn read_machine_program(
         precompiled.map(PrepareResult::Program)
     };
     if inner.effective_encoding() != TextEncoding::Utf8
-        && !matches!(scope, ReadMachineScope::Like | ReadMachineScope::RowCase)
+        && !matches!(scope, ReadMachineScope::Like
+                | ReadMachineScope::RowCase
+                | ReadMachineScope::LiveTableJoin)
     {
         trace("fallback: UTF-16 database", raw_sql);
         return Ok(None);
@@ -536,7 +608,11 @@ fn read_machine_program(
         PrepareResult::Program(mut p) => {
             if scope == ReadMachineScope::Like && !crate::cgen::program_has_like(&p) { return Ok(None); }
             if scope == ReadMachineScope::SchemaFree && p.btree_mask != 0 { return Ok(None); }
-            if scope == ReadMachineScope::RowCase && !p.read_only { return Ok(None); }
+            if matches!(scope, ReadMachineScope::RowCase | ReadMachineScope::LiveTableJoin)
+                && !p.read_only
+            {
+                return Ok(None);
+            }
             if p.explain != 0 {
                 return Ok(None);
             }
