@@ -1512,3 +1512,64 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_recursive_fifo_builtin_collations() {
+    sqliters_tcltest::run_test_script(
+        "row_case_recursive_fifo_builtin_collations",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE pairings(id INTEGER PRIMARY KEY,a,b);
+        INSERT INTO pairings VALUES (1,1,10),(2,2,20);
+        CREATE TABLE items(id INTEGER PRIMARY KEY,ref INTEGER,token TEXT);
+        INSERT INTO items VALUES (1,1,'A'),(2,1,'a'),(3,1,'A  '),(4,1,'b'),
+          (5,1,'b '),(6,1,NULL),(7,1,'Ā'),(8,1,'ā'),(9,2,'unused');
+        CREATE VIEW rendered AS SELECT i.id,CASE
+           (SELECT a,b FROM pairings WHERE id=i.ref) WHEN (2,20) THEN 'A' ELSE i.token END AS token
+           FROM items i;
+    }
+    do_execsql_test row-case-recursive-builtin-$encoding.nocase {
+        WITH RECURSIVE visit(value,level) AS (
+            SELECT token COLLATE NOCASE,1 FROM rendered
+            UNION SELECT value,level+1 FROM visit WHERE level<2
+        ) SELECT quote(value),level FROM visit;
+    } {'A' 1 {'A  '} 1 'b' 1 {'b '} 1 NULL 1 'Ā' 1 'ā' 1 'A' 2 {'A  '} 2 'b' 2 {'b '} 2 NULL 2 'Ā' 2 'ā' 2}
+    do_execsql_test row-case-recursive-builtin-$encoding.rtrim {
+        WITH RECURSIVE visit(value,level) AS (
+            SELECT token COLLATE RTRIM,1 FROM rendered
+            UNION SELECT value,level+1 FROM visit WHERE level<2
+        ) SELECT quote(value),level FROM visit;
+    } {'A' 1 'a' 1 'b' 1 NULL 1 'Ā' 1 'ā' 1 'A' 2 'a' 2 'b' 2 NULL 2 'Ā' 2 'ā' 2}
+    do_execsql_test row-case-recursive-builtin-$encoding.mixed {
+        WITH RECURSIVE visit(value,suffix,level) AS (
+            SELECT token COLLATE NOCASE,(CASE WHEN id<5 THEN 'x ' ELSE 'x' END) COLLATE RTRIM,1
+              FROM rendered
+            UNION SELECT value,suffix,level+1 FROM visit WHERE level<2
+        ) SELECT quote(value),quote(suffix),level FROM visit;
+    } {'A' {'x '} 1 {'A  '} {'x '} 1 'b' {'x '} 1 {'b '} 'x' 1 NULL 'x' 1 'Ā' 'x' 1 'ā' 'x' 1 'A' {'x '} 2 {'A  '} {'x '} 2 'b' {'x '} 2 {'b '} 'x' 2 NULL 'x' 2 'Ā' 'x' 2 'ā' 'x' 2}
+    do_test row-case-recursive-builtin-$encoding.reset {
+        set stmt [sqlite3_prepare_v2 db {
+            WITH RECURSIVE visit(value,level) AS (
+                SELECT token COLLATE NOCASE,1 FROM rendered WHERE id<=?1
+                UNION SELECT value,level+1 FROM visit WHERE level<2
+            ) SELECT quote(value),level FROM visit;
+        } -1]
+        sqlite3_bind_int $stmt 1 2
+        set first [list [sqlite3_step $stmt] [sqlite3_column_text $stmt 0] [sqlite3_column_int $stmt 1]]
+        set second [list [sqlite3_step $stmt] [sqlite3_column_text $stmt 0] [sqlite3_column_int $stmt 1]]
+        set done [sqlite3_step $stmt]
+        sqlite3_reset $stmt
+        sqlite3_bind_int $stmt 1 4
+        set again [list [sqlite3_step $stmt] [sqlite3_column_text $stmt 0] [sqlite3_column_int $stmt 1]]
+        list $first $second $done $again [sqlite3_finalize $stmt]
+    } {{SQLITE_ROW 'A' 1} {SQLITE_ROW 'A' 2} SQLITE_DONE {SQLITE_ROW 'A' 1} SQLITE_OK}
+}
+finish_test
+"#,
+    );
+}

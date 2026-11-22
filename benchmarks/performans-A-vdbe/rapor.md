@@ -2262,3 +2262,8 @@ Exact V6b.389 tabanıyla 684 gözlemde fiziksel NOCASE indeksinin beslediği 32 
 ## V6b.391 — UTF-16 yerleşik satır CASE üyeliği
 
 510 gözlemde yerleşik NOCASE ve RTRIM kullanan skaler ve satır IN/NOT IN için 80 fark kapandı. Önceki 558 gözlem ve gerekçeleri aynı. C fixture 13/13 ve dört odak Rust testi iki kipte geçti. Bağlantıya kayıtlı kolasyon ve authorizer kontrolü korundu. OFF 1272/1/325, ON 1269/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,249 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_391.md).
+
+
+## V6b.392 — Özyinelemeli FIFO UNION yerleşik kolasyonları
+
+300 gözlemde NOCASE/RTRIM ve karma büyük kayıtlarla 40 UTF-16 özyinelemeli FIFO sonucu C ile eşleşti. Önceki 558 gözlem ve bağlantı korumaları aynı. C fixture 13/13, Rust rowvalue8 24/24 ve delete2 1/1 iki kipte. OFF 1273/1/325, ON 1270/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,269 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_392.md).

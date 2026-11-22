@@ -1064,7 +1064,10 @@ fn ordered_in_key(
 
 /// SRT_DistFifo packs the row in the database encoding before probing its
 /// private duplicate set, and inserts from those same normalized registers.
-fn binary_recursive_fifo_key(prog: &Program, open_index: usize, open: &VdbeOp, key: &KeyInfo) -> bool {
+fn recursive_fifo_key(
+    prog: &Program, open_index: usize, open: &VdbeOp, key: &KeyInfo,
+    supports_collation: impl Fn(&CollSeq) -> bool,
+) -> bool {
     let width = i32::from(key.n_key_field);
     let fields = usize::from(key.n_all_field);
     if open.opcode != OP_OpenEphemeral || open.p2 != width || open.p3 != 0 || open.p5 != 0
@@ -1072,7 +1075,7 @@ fn binary_recursive_fifo_key(prog: &Program, open_index: usize, open: &VdbeOp, k
         || key.a_sort_flags.len() != fields || key.a_sort_flags.iter().any(|&flag| flag != 0)
         || !matches!(key.a_coll.split_last(), Some((None, collations))
             if collations.len() == width as usize && collations.iter().all(|c|
-                c.as_deref().is_some_and(|c| c.name.eq_ignore_ascii_case("BINARY") && c.enc == key.enc)))
+                c.as_deref().is_some_and(&supports_collation)))
     {
         return false;
     }
@@ -1571,11 +1574,14 @@ fn unsupported(
             let builtin_sort = builtin_collations && row_case_encoding == Some(k.enc)
                 && builtin_order_sorter(prog, op, k);
             let limit_sort = row_case_encoding == Some(k.enc) && limit_sort_key(prog, op, k, builtin_collations);
-            let binary_fifo = row_case_encoding == Some(k.enc) && binary_recursive_fifo_key(prog, index, op, k);
+            let recursive_fifo = row_case_encoding == Some(k.enc)
+                && recursive_fifo_key(prog, index, op, k, |coll| {
+                    binary_in_key_encoding(coll) || (builtin_collations && builtin_read_key_collation(coll, k.enc))
+                });
             if k.enc != 1 && !prog.references_like
                 && !(binary_sort || binary_group_compare || builtin_group || streamed_group
                     || distinct || physical_index
-                    || membership || builtin_sort || limit_sort || binary_fifo)
+                    || membership || builtin_sort || limit_sort || recursive_fifo)
             {
                 return Some("UTF-16 key".to_owned());
             }
