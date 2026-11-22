@@ -2112,3 +2112,8 @@ Nitelikli INTEGER PRIMARY KEY eşitliğinde olağan INNER ve LEFT JOIN, reverse_
 ## V6b.361 — WITHOUT ROWID UPDATE yabancı anahtar hazırlama tanısı
 
 42 profilde 120 salt okunur tanı farkı kapandı. 6184 OFF korpusunda C ile eşleşti. OFF 1237/1/329, ON 1234/4/329. DML OFF 396/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,305 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_361.md).
+
+
+## V6b.362 — WITHOUT ROWID UPDATE yabancı anahtar eylem tanısı
+
+Üst tablo UPDATE OR IGNORE ve UPDATE OR FAIL için hazırlama tanı önceliği C ile eşleşti. 42 profil ve 504 salt okunur kontrolde 80 fark kapandı. OFF 1238/1/329, ON 1235/4/329. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,280 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_362.md).

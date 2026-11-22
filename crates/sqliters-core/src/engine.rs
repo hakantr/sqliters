@@ -51440,6 +51440,33 @@ fn validate_fk_oldmask_static(
     result
 }
 
+// sqlite3FkActions runs after sqlite3FkCheck. An invalid referenced key
+// encountered while preparing an action replaces the earlier diagnostic.
+fn validate_fk_update_action_keys_static(
+    db_set: &DatabaseSet,
+    db_id: DatabaseId,
+    table: &TableSchema,
+    modified: &[bool],
+) -> Result<()> {
+    let Some(slot) = db_set.slot(db_id) else {
+        return Ok(());
+    };
+    let changed = |column: usize| modified.get(column).copied().unwrap_or(false);
+    let mut result = Ok(());
+    for (child, fk) in find_referencing_fks(&slot.schema, &table.name) {
+        if fk.on_update == FkAction::NoAction
+            || (fk.on_update == FkAction::Restrict && db_set.c_defer_foreign_keys())
+            || !crate::dml_c::fk_parent_is_modified(table, &fk, &changed)
+        {
+            continue;
+        }
+        if let Err(error) = resolve_fk_parent_cols(&slot.schema, &slot.name, &child.name, &fk) {
+            result = Err(error);
+        }
+    }
+    result
+}
+
 /// Whether `sqlite3GenerateConstraintChecks` codes a REPLACE row delete for this UPDATE: a
 /// rowid change resolved by REPLACE, or a UNIQUE index the statement rewrites (`aRegIdx != 0`)
 /// whose conflicts are resolved by REPLACE.
@@ -52591,14 +52618,30 @@ fn validate_update_static_inner(
                     }
                 }
                 let modified = modified_cols_with_generated(&tbl, &modified);
-                validate_fk_check_static(
+                let fk_check = validate_fk_check_static(
                     db_set,
                     db_id,
                     &tbl,
                     foreign_keys,
                     Some((&modified, chng_rowid)),
                     false,
-                )?;
+                );
+                if fk_check.is_err()
+                    && db_id == DatabaseId::MAIN
+                    && tbl.without_rowid
+                    && tbl.foreign_keys.is_empty()
+                    && trig_depth == 0
+                    && upd.ctes.is_empty()
+                    && upd.from.is_none()
+                    && upd.returning.is_empty()
+                    && matches!(
+                        effective_or_conflict,
+                        Some(ConflictAction::Fail | ConflictAction::Ignore)
+                    )
+                {
+                    validate_fk_update_action_keys_static(db_set, db_id, &tbl, &modified)?;
+                }
+                fk_check?;
                 let check_parent_mask = if tbl.without_rowid {
                     matches!(
                         effective_or_conflict,
