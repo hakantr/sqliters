@@ -11792,10 +11792,14 @@ impl Statement {
                     view_update_range_tokens: !inner.authorizer.is_some()
                         && self.c_machine_write.is_none()
                         && self.stmt.as_ref().is_some_and(|stmt| {
-                            (inner.explicit_tx
+                            inner.explicit_tx
                                 && inner.db_set.main_btree().transaction_state() == TransactionState::Write
-                                && engine::view_update_range_tokens(stmt, &inner.db_set, &self.raw_sql))
-                                || engine::rowid_view_text_range_tokens(stmt, &inner.db_set, &self.raw_sql)
+                                && engine::view_update_range_tokens(stmt, &inner.db_set, &self.raw_sql)
+                        }),
+                    rowid_view_text_range_tokens: !inner.authorizer.is_some()
+                        && self.c_machine_write.is_none()
+                        && self.stmt.as_ref().is_some_and(|stmt| {
+                            engine::rowid_view_text_range_tokens(stmt, &inner.db_set, &self.raw_sql)
                         }),
                     prepared_recursive_triggers: Some(self.compiled_recursive_triggers),
                     prepared_count_changes: Some(self.compiled_count_changes),

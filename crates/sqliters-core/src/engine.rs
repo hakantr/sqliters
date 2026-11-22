@@ -126,6 +126,8 @@ pub struct StmtTxTracker {
     pub(crate) prepared_reverse_order: bool,
     /// The top-level view UPDATE has a plain numeric range in an existing write snapshot.
     pub(crate) view_update_range_tokens: bool,
+    /// The top-level rowid view UPDATE has two ranges with plain integer limits.
+    pub(crate) rowid_view_text_range_tokens: bool,
     /// Named trigger recursion is fixed by the prepared program.
     pub(crate) prepared_recursive_triggers: Option<bool>,
     /// The prepared DML result shape follows CountRows at compilation.
@@ -33077,9 +33079,7 @@ pub(crate) fn rowid_view_text_range_tokens(stmt: &Stmt, db_set: &DatabaseSet, sq
     let Stmt::Update(update) = stmt else {
         return false;
     };
-    if update.returning.is_empty()
-        || !update.returning.iter().all(|item| view_dml_named_column(item).is_some())
-    {
+    if !update.returning.iter().all(|item| view_dml_named_column(item).is_some()) {
         return false;
     }
     let Some(Expr::Binary { left, op: BinaryOp::And, right }) = update.selection.as_ref() else {
@@ -33193,8 +33193,10 @@ fn view_dml_indexed_select(
         }
     }
     let same_returning_range = returning_range && same_range_direction;
+    let rowid_text_range = distinct_columns && ctx.stmt_tx.rowid_view_text_range_tokens;
     if (same_range_direction || distinct_columns)
         && !same_returning_range
+        && !rowid_text_range
         && !ctx.stmt_tx.view_update_range_tokens
     {
         return None;
@@ -33228,17 +33230,12 @@ fn view_dml_indexed_select(
 
     let schema = &ctx.db_set.main_slot().schema;
     let table = schema.find_user_table(&name.name)?;
-    let rowid_text_range = returning_range
-        && !table.without_rowid
-        && distinct_columns
-        && ctx.stmt_tx.view_update_range_tokens;
     if returning_range && distinct_columns && !rowid_text_range {
         return None;
     }
     if (max_eq && !table.without_rowid)
-        || (returning_range
-            && ((!table.without_rowid && !rowid_text_range)
-                || ctx.collations.get_custom("BINARY").is_some()))
+        || (returning_range && !table.without_rowid && !rowid_text_range)
+        || ((returning_range || rowid_text_range) && ctx.collations.get_custom("BINARY").is_some())
         || (table.without_rowid && predicate == ViewDmlIndexPredicate::DeleteRange)
         || (quoted_bound.is_some()
             && ((!returning_range && table.without_rowid)
@@ -33262,7 +33259,7 @@ fn view_dml_indexed_select(
             })
             && table.find_column(&column.column).is_some()
     });
-    if returning_range && !direct_projection {
+    if (returning_range || rowid_text_range) && !direct_projection {
         return None;
     }
     let star = matches!(projection, [ResultColumn::Star]);
