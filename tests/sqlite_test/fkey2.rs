@@ -1810,3 +1810,36 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_without_rowid_update_checks_foreign_key_parent_mask_across_conflicts() {
+    sqliters_tcltest::run_test_script(
+        "without_rowid_update_checks_foreign_key_parent_mask_across_conflicts",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+execsql {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE upstream(k INT PRIMARY KEY);
+  CREATE TABLE parent(k INT PRIMARY KEY, secondary INT,
+                      link INT REFERENCES upstream(k), note TEXT) WITHOUT ROWID;
+  CREATE TABLE child(ref INT REFERENCES parent(secondary));
+}
+foreach {scenario conflict} {default {} ignore {OR IGNORE} fail {OR FAIL} rollback {OR ROLLBACK}} {
+  do_catchsql_test fk-parent-mask-conflict-$scenario "
+    UPDATE $conflict parent SET link=7,note=note WHERE k=1;
+  " {1 {foreign key mismatch - "child" referencing "parent"}}
+}
+do_execsql_test fk-parent-mask-conflict-unchanged {
+  UPDATE OR FAIL parent SET note=note WHERE k=1;
+  SELECT count(*) FROM parent;
+} {0}
+do_execsql_test fk-parent-mask-conflict-valid {
+  CREATE UNIQUE INDEX parent_secondary ON parent(secondary);
+  UPDATE OR IGNORE parent SET link=7 WHERE k=1;
+  PRAGMA integrity_check;
+} {ok}
+finish_test
+"#,
+    );
+}

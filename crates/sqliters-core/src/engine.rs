@@ -52600,7 +52600,15 @@ fn validate_update_static_inner(
                     false,
                 )?;
                 let check_parent_mask = if tbl.without_rowid {
-                    effective_or_conflict == Some(ConflictAction::Abort)
+                    matches!(
+                        effective_or_conflict,
+                        None | Some(
+                            ConflictAction::Abort
+                                | ConflictAction::Fail
+                                | ConflictAction::Ignore
+                                | ConflictAction::Rollback
+                        )
+                    )
                 } else {
                     effective_or_conflict.is_none() && !db_set.has_any_triggers()
                 };
