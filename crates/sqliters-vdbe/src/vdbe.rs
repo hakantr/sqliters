@@ -1920,9 +1920,20 @@ fn mixed_rowid_or_cursor(ops: &[VdbeOp], start: usize, encoding: u8) -> bool {
         && rowid_or_table_read(&ops[..first], table)
 }
 
+struct WithoutRowidOrAdmission {
+    seen: usize,
+    reopens: Vec<usize>,
+}
+
+enum WithoutRowidOrPhase {
+    First,
+    Middle,
+    Last,
+}
+
 /// WITHOUT ROWID multi-index OR locates rows with the table's full primary
 /// key and tracks duplicates in a private index with the same KeyInfo.
-fn without_rowid_or_admissions(prog: &Program, encoding: u8) -> Vec<[usize; 3]> {
+fn without_rowid_or_admissions(prog: &Program, encoding: u8) -> Vec<WithoutRowidOrAdmission> {
     let ops = &prog.a_op;
     ops.windows(4).enumerate().filter_map(|(start, group)| {
         let [table, seen, ret, first] = group else { return None };
@@ -1947,21 +1958,31 @@ fn without_rowid_or_admissions(prog: &Program, encoding: u8) -> Vec<[usize; 3]> 
         {
             return None;
         }
-        let mut reopens = ops.iter().enumerate().filter_map(|(pc, op)| {
+        let reopens: Vec<_> = ops.iter().enumerate().filter_map(|(pc, op)| {
             (op.opcode == OP_ReopenIdx && op.p1 == first.p1).then_some(pc)
-        });
-        if reopens.next()? != first_pc {
+        }).take(4).collect();
+        let [first_reopen, .., last_reopen] = reopens.as_slice() else { return None };
+        if !matches!(reopens.len(), 2 | 3) || *first_reopen != first_pc || *last_reopen >= end {
             return None;
         }
-        let second_pc = reopens.next()?;
-        let second = &ops[second_pc];
-        if reopens.next().is_some() || second_pc >= end || first.p2 == table.p2 || second.p2 == table.p2
-            || (first.p2 == second.p2 && first.p4 != second.p4)
-        {
-            return None;
+        let mut root_keys = BTreeMap::new();
+        let mut seen_operations = Vec::new();
+        let ends = reopens.iter().copied().skip(1).chain(Some(end));
+        for (offset, (&open_pc, stop)) in reopens.iter().zip(ends).enumerate() {
+            let open = &ops[open_pc];
+            if open.p2 == table.p2 || *root_keys.entry(open.p2).or_insert(&open.p4) != &open.p4 {
+                return None;
+            }
+            let phase = if offset == 0 {
+                WithoutRowidOrPhase::First
+            } else if stop == end {
+                WithoutRowidOrPhase::Last
+            } else {
+                WithoutRowidOrPhase::Middle
+            };
+            let operations = without_rowid_or_branch(ops, open_pc, stop, table, seen, ret, encoding, phase)?;
+            seen_operations.extend(operations.into_iter().flatten());
         }
-        let store = without_rowid_or_branch(ops, first_pc, second_pc, table, seen, ret, encoding, true)?;
-        let probe = without_rowid_or_branch(ops, second_pc, end, table, seen, ret, encoding, false)?;
         let cursors = [table.p1, seen.p1, first.p1];
         if ops.iter().enumerate().any(|(pc, op)| {
             (op.opcode == OP_OpenDup && cursors.contains(&op.p2))
@@ -1970,11 +1991,11 @@ fn without_rowid_or_admissions(prog: &Program, encoding: u8) -> Vec<[usize; 3]> 
                 && match op.opcode {
                     OP_OpenRead => pc != start,
                     OP_OpenEphemeral => pc != start + 1,
-                    OP_ReopenIdx => pc != first_pc && pc != second_pc,
+                    OP_ReopenIdx => !reopens.contains(&pc),
                     OP_OpenWrite | OP_OpenDup | OP_OpenAutoindex | OP_OpenPseudo | OP_SorterOpen
                     | OP_VOpen | OP_Insert | OP_Delete | OP_IdxDelete | OP_ResetSorter => true,
-                    OP_IdxInsert => pc != store,
-                    OP_Found if op.p1 == seen.p1 => pc != probe,
+                    OP_IdxInsert => !seen_operations.contains(&pc),
+                    OP_Found if op.p1 == seen.p1 => !seen_operations.contains(&pc),
                     OP_NotFound | OP_NoConflict | OP_SeekLT | OP_SeekLE | OP_SeekGE | OP_SeekGT
                     | OP_SeekRowid | OP_NotExists | OP_IfNoHope | OP_IdxLE | OP_IdxGT | OP_IdxLT
                     | OP_IdxGE | OP_Rewind | OP_Last | OP_Next | OP_Prev | OP_Sort | OP_SeekEnd
@@ -1985,7 +2006,7 @@ fn without_rowid_or_admissions(prog: &Program, encoding: u8) -> Vec<[usize; 3]> 
         }) {
             return None;
         }
-        Some([start + 1, first_pc, second_pc])
+        Some(WithoutRowidOrAdmission { seen: start + 1, reopens })
     }).collect()
 }
 
@@ -1999,8 +2020,8 @@ fn without_rowid_or_key(key: &KeyInfo, encoding: u8) -> bool {
 
 fn without_rowid_or_branch(
     ops: &[VdbeOp], start: usize, stop: usize, table: &VdbeOp, seen: &VdbeOp, ret: &VdbeOp,
-    encoding: u8, insert: bool,
-) -> Option<usize> {
+    encoding: u8, phase: WithoutRowidOrPhase,
+) -> Option<[Option<usize>; 2]> {
     let open = &ops[start];
     let cursor = open.p1;
     let P4::KeyInfo(index_key) = &open.p4 else { return None };
@@ -2011,7 +2032,12 @@ fn without_rowid_or_branch(
         return None;
     }
     let width = usize::from(primary_key.n_key_field);
-    let tail = stop.checked_sub(2 * width + 4 + usize::from(insert))?;
+    let suffix = match phase {
+        WithoutRowidOrPhase::First => 5,
+        WithoutRowidOrPhase::Middle => 6,
+        WithoutRowidOrPhase::Last => 4,
+    };
+    let tail = stop.checked_sub(2 * width + suffix)?;
     if tail <= start {
         return None;
     }
@@ -2024,16 +2050,33 @@ fn without_rowid_or_branch(
     {
         return None;
     }
-    let (dedup, source, call, next) = match tail_ops {
-        [record, store, call, next] if insert && record.opcode == OP_MakeRecord
-            && record.p2 == width as i32 && record.p3 == store.p2 && record.p4 == P4::NotUsed
-            && record.p5 == 0 && store.opcode == OP_IdxInsert && store.p2 > 0
-            && store.p3 == record.p1 => (store, record.p1, call, next),
-        [probe, call, next] if !insert && probe.opcode == OP_Found
-            && probe.p2 == continuation => (probe, probe.p3, call, next),
+    let [dedup @ .., call, next] = tail_ops else { return None };
+    let (probe, insert) = match (phase, dedup) {
+        (WithoutRowidOrPhase::First, [record, store]) => (None, Some((record, store, 0))),
+        (WithoutRowidOrPhase::Middle, [probe, record, store]) => {
+            (Some(probe), Some((record, store, OPFLAG_USESEEKRESULT)))
+        }
+        (WithoutRowidOrPhase::Last, [probe]) => (Some(probe), None),
         _ => return None,
     };
-    if dedup.p1 != seen.p1 || dedup.p4 != P4::Int32(width as i32) || dedup.p5 != 0 || source <= 0
+    // The middle arm may reuse only the seek made by probing this same key.
+    // The inputs are the text and scalar fields read directly from the index.
+    let source = if let Some((record, store, flags)) = insert {
+        if record.opcode != OP_MakeRecord || record.p2 != width as i32 || record.p3 != store.p2
+            || record.p4 != P4::NotUsed || record.p5 != 0 || store.opcode != OP_IdxInsert
+            || store.p1 != seen.p1 || store.p2 <= 0 || store.p3 != record.p1
+            || store.p4 != P4::Int32(width as i32) || store.p5 != flags
+        {
+            return None;
+        }
+        record.p1
+    } else {
+        probe?.p3
+    };
+    if probe.is_some_and(|probe| probe.opcode != OP_Found || probe.p1 != seen.p1
+        || probe.p2 != continuation || probe.p3 != source || probe.p4 != P4::Int32(width as i32)
+        || probe.p5 != 0)
+        || source <= 0
         || call.opcode != OP_Gosub || call.p1 != ret.p2 || call.p2 != ret.p1 + 1 || call.p3 != 0
         || next.opcode != OP_Next || next.p1 != cursor || next.p2 as usize != tail - 1 || next.p5 != 0
     {
@@ -2054,7 +2097,7 @@ fn without_rowid_or_branch(
         }
     }
     or_index_seek_bounds(ops, start, stop, tail, index_key)?;
-    Some(stop - 3)
+    Some([probe.map(|_| stop - 2 - dedup.len()), insert.map(|_| stop - 3)])
 }
 
 fn unsupported(
@@ -2316,11 +2359,11 @@ fn unsupported(
                     binary_in_key_encoding(c) || (builtin_collations && builtin_read_key_collation(c, k.enc))
                 })
                 && (op.opcode == OP_OpenRead || (op.opcode == OP_ReopenIdx
-                    && (without_rowid_or.iter().any(|&[_, first, second]| index == first || index == second)
+                    && (without_rowid_or.iter().any(|group| group.reopens.contains(&index))
                         || *reopen_or_checked.entry(op.p1)
                             .or_insert_with(|| rowid_or_index_cursor(prog, op.p1, k.enc)))));
             let without_rowid_or_set = row_case_encoding == Some(k.enc)
-                && without_rowid_or.iter().any(|&[seen, _, _]| index == seen);
+                && without_rowid_or.iter().any(|group| index == group.seen);
             let membership = row_case_encoding == Some(k.enc)
                 && ordered_in_key(prog, op, k, |coll| {
                     binary_in_key_encoding(coll) || (builtin_collations && builtin_read_key_collation(coll, k.enc))

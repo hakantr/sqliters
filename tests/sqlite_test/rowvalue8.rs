@@ -2332,3 +2332,81 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_three_branch_without_rowid_or_steps() {
+    sqliters_tcltest::run_test_script(
+        "row_case_three_branch_without_rowid_or_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+proc three_arm_or_rows {stmt} {
+    set rows {}
+    while {[set rc [sqlite3_step $stmt]] eq "SQLITE_ROW"} {
+        lappend rows [sqlite3_column_int $stmt 0] [sqlite3_column_text $stmt 1]
+    }
+    lappend rows $rc
+    return $rows
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE detail(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO detail VALUES(1,1,10),(2,2,20),(3,3,30);
+        CREATE TABLE packed(tag TEXT COLLATE RTRIM,seq INTEGER,ref INTEGER,label TEXT,
+                            PRIMARY KEY(tag DESC,seq)) WITHOUT ROWID;
+        INSERT INTO packed VALUES ('A',1,1,'p-one'),('A ',2,2,'p-two'),
+            ('B',1,1,'p-b'),(char(256)||' ',2,1,'p-wide'),('C',3,3,'p-other');
+        CREATE INDEX packed_by_seq ON packed(seq);
+        CREATE INDEX packed_by_label ON packed(label);
+        CREATE INDEX packed_by_ref ON packed(ref);
+    }
+    set result_expr {CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+                     WHEN (2,20) THEN 'changed' ELSE p.label END}
+    foreach {suffix predicate} {label-first {label=?2 OR ref=?3 OR seq=?1}
+                                 ref-first {ref=?3 OR seq=?1 OR label=?2}} {
+        do_test three-arm-or-$encoding.$suffix {
+            set s [sqlite3_prepare_v2 db "SELECT seq,$result_expr FROM packed p
+                                        WHERE $predicate ORDER BY seq,tag;" -1]
+            sqlite3_bind_int $s 1 2
+            sqlite3_bind_text $s 2 p-two -1
+            sqlite3_bind_int $s 3 1
+            set overlap [three_arm_or_rows $s]
+            sqlite3_reset $s
+            sqlite3_bind_null $s 1
+            sqlite3_bind_null $s 3
+            set label [three_arm_or_rows $s]
+            sqlite3_reset $s
+            sqlite3_bind_null $s 2
+            set empty [three_arm_or_rows $s]
+            list $overlap $label $empty [sqlite3_finalize $s]
+        } {{1 p-one 1 p-b 2 changed 2 p-wide SQLITE_DONE} {2 changed SQLITE_DONE} SQLITE_DONE SQLITE_OK}
+    }
+    do_test three-arm-or-$encoding.same-root-reopened {
+        execsql "SELECT seq,$result_expr FROM packed p
+                 WHERE seq=2 OR label='p-two' OR (seq>=1 AND seq<3) ORDER BY seq,tag;"
+    } {1 p-one 1 p-b 2 changed 2 p-wide}
+    do_test three-arm-or-$encoding.reprepare {
+        set s [sqlite3_prepare_v2 db "SELECT seq,$result_expr FROM packed p
+                                    WHERE ref=?3 OR seq=?1 OR label=?2 ORDER BY seq,tag;" -1]
+        sqlite3_bind_int $s 3 1
+        sqlite3_bind_int $s 1 2
+        sqlite3_bind_text $s 2 p-two -1
+        set before [three_arm_or_rows $s]
+        sqlite3_reset $s
+        execsql {CREATE INDEX packed_by_label_ref ON packed(label,ref);}
+        sqlite3_bind_null $s 1
+        sqlite3_bind_text $s 2 p-other -1
+        set after [three_arm_or_rows $s]
+        list $before $after [sqlite3_finalize $s]
+    } {{1 p-one 1 p-b 2 changed 2 p-wide SQLITE_DONE} {1 p-one 1 p-b 2 p-wide 3 p-other SQLITE_DONE} SQLITE_OK}
+    do_execsql_test three-arm-or-$encoding.changes {
+        SELECT changes(),total_changes();
+    } {5 8}
+}
+finish_test
+"#,
+    );
+}
