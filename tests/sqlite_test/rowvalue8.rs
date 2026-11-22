@@ -2588,3 +2588,55 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_without_rowid_or_arm_filters() {
+    sqliters_tcltest::run_test_script(
+        "row_case_without_rowid_or_arm_filters",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE detail(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO detail VALUES(1,1,10),(2,2,20),(3,3,30);
+        CREATE TABLE packed(tag TEXT COLLATE RTRIM,seq INTEGER,ref INTEGER,label TEXT,
+                            PRIMARY KEY(tag DESC,seq)) WITHOUT ROWID;
+        CREATE INDEX packed_by_seq ON packed(seq);
+        CREATE INDEX packed_by_label ON packed(label);
+        INSERT INTO packed VALUES ('A',1,1,'p-one'),('A ',2,2,'p-two'),('A'||char(160),3,1,'p-nbsp'),
+           ('a ',1,3,'lower'),(char(256)||' ',2,1,'p-wide'),('B',1,1,'p-b');
+        CREATE TABLE packed3(tag TEXT COLLATE RTRIM,zone TEXT COLLATE NOCASE,seq INTEGER,
+                             ref INTEGER,label TEXT,PRIMARY KEY(tag DESC,zone,seq)) WITHOUT ROWID;
+        INSERT INTO packed3 VALUES
+            ('A','west',1,1,'first'),('A ','WEST',2,2,'overlap'),('A','east',2,1,'other-zone'),
+            ('a ','west',2,3,'lower'),(char(256)||' ','west ',2,1,'wide'),
+            ('A'||char(160),'west',2,1,'nbsp'),(char(128512)||' ','west',3,1,'astral');
+        CREATE INDEX packed3_by_seq ON packed3(seq);
+    }
+    set select {SELECT seq,quote(tag),CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+        WHEN (2,20) THEN 'changed' ELSE p.label END FROM packed p WHERE}
+    foreach {name condition} {
+        first {(tag='A' AND ref<2) OR seq=2 OR label='p-b'}
+        middle {seq=2 OR (tag='A' AND ref<2) OR label='p-b'}
+    } {
+        do_execsql_test row-case-arm-filter-$encoding.$name \
+            "$select $condition ORDER BY seq,tag;" {1 'A' p-one 1 'B' p-b 2 {'A '} changed 2 {'Ā '} p-wide}
+    }
+    do_execsql_test row-case-arm-filter-$encoding.index {
+        SELECT seq,quote(tag),CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+            WHEN (2,20) THEN 'changed' ELSE p.label END FROM packed p
+        WHERE tag='A' OR (seq=2 AND ref+0>1) OR label='p-b' ORDER BY seq,tag;
+    } {1 'A' p-one 1 'B' p-b 2 {'A '} changed}
+    do_execsql_test row-case-arm-filter-$encoding.tuple {
+        SELECT seq,quote(tag),quote(zone),CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+            WHEN (2,20) THEN 'changed' ELSE p.label END FROM packed3 p
+        WHERE ((tag,zone)>('A','east') AND (tag,zone)<('B','north')) OR seq=2 ORDER BY seq,tag,zone;
+    } {1 'A' 'west' first 2 'A' 'east' other-zone 2 {'A '} 'WEST' changed 2 {'A '} 'west' nbsp 2 {'a '} 'west' lower 2 {'Ā '} {'west '} wide}
+}
+finish_test
+"#,
+    );
+}

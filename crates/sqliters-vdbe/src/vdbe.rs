@@ -2068,14 +2068,19 @@ fn without_rowid_or_branch(
         return None;
     }
     let width = usize::from(primary_key.n_key_field);
-    let tail = stop.checked_sub(2 * width + 3 + phase.seen_op_count())?;
-    if tail <= start {
+    let tail = stop.checked_sub(width + 2 + phase.seen_op_count())?;
+    let next = ops.get(stop.checked_sub(1)?)?;
+    let lookup_start = usize::try_from(next.p2).ok()?.checked_add(1)?;
+    let place_pc = lookup_start.checked_add(width)?;
+    let place = ops.get(place_pc)?;
+    let lookup = ops.get(lookup_start..place_pc)?;
+    let continuation = i32::try_from(stop - 1).ok()?;
+    let (keys, tail_ops) = ops.get(tail..stop)?.split_at(width);
+    if place_pc >= tail || !without_rowid_or_filter(
+        ops, place_pc + 1..tail, stop - 1, table.p1, cursor, ret.p2,
+    ) {
         return None;
     }
-    let (lookup, tail_ops) = ops.get(tail..stop)?.split_at(width);
-    let (place, tail_ops) = tail_ops.split_first()?;
-    let (keys, tail_ops) = tail_ops.split_at(width);
-    let continuation = (stop - 1) as i32;
     if place.opcode != OP_NotFound || place.p1 != table.p1 || place.p2 != continuation
         || place.p3 <= 0 || place.p4 != P4::Int32(width as i32) || place.p5 != 0
     {
@@ -2084,7 +2089,7 @@ fn without_rowid_or_branch(
     let [dedup @ .., call, next] = tail_ops else { return None };
     let (source, operations) = without_rowid_or_seen_ops(dedup, stop, seen.p1, width, phase)?;
     if call.opcode != OP_Gosub || call.p1 != ret.p2 || call.p2 != ret.p1 + 1 || call.p3 != 0
-        || next.opcode != OP_Next || next.p1 != cursor || next.p2 as usize != tail - 1 || next.p5 != 0
+        || next.opcode != OP_Next || next.p1 != cursor || next.p5 != 0
     {
         return None;
     }
@@ -2102,7 +2107,7 @@ fn without_rowid_or_branch(
             return None;
         }
     }
-    or_index_seek_bounds(ops, start, stop, tail, index_key)?;
+    or_index_seek_bounds(ops, start, stop, lookup_start, index_key)?;
     Some(operations)
 }
 
@@ -2155,7 +2160,7 @@ fn without_rowid_primary_arm(
     let [dedup @ .., call, next] = tail_ops else { return None };
     let (source, operations) = without_rowid_or_seen_ops(dedup, stop, seen.p1, width, phase)?;
     if call.opcode != OP_Gosub || call.p1 != ret.p2 || call.p2 != ret.p1 + 1 || call.p3 != 0
-        || next.opcode != OP_Next || next.p1 != table.p1 || next.p2 as usize != tail - 1
+        || next.opcode != OP_Next || next.p1 != table.p1
         || next.p3 != 0 || next.p5 != 0
     {
         return None;
@@ -2167,8 +2172,14 @@ fn without_rowid_primary_arm(
             return None;
         }
     }
-    let bound = ops.get(tail.checked_sub(1)?)?;
-    let mut seeks = ops.get(start..tail - 1)?.iter().filter(|op|
+    let bound_pc = usize::try_from(next.p2).ok()?;
+    if bound_pc >= tail || !without_rowid_or_filter(
+        ops, bound_pc + 1..tail, stop - 1, table.p1, table.p1, ret.p2,
+    ) {
+        return None;
+    }
+    let bound = ops.get(bound_pc)?;
+    let mut seeks = ops.get(start..bound_pc)?.iter().filter(|op|
         op.p1 == table.p1 && matches!(op.opcode, OP_SeekGE | OP_SeekGT));
     let seek = seeks.next()?;
     let valid_width = |op: &VdbeOp| matches!(op.p4, P4::Int32(n) if (1..=i32::from(key.n_key_field)).contains(&n));
@@ -2179,6 +2190,29 @@ fn without_rowid_primary_arm(
         return None;
     }
     Some(operations)
+}
+
+/// Conditions can test the current table row between seeking it and copying
+/// its key. They may skip to the next row but cannot enter another arm.
+fn without_rowid_or_filter(
+    ops: &[VdbeOp], filter: std::ops::Range<usize>, next: usize,
+    table: i32, index: i32, return_reg: i32,
+) -> bool {
+    let Some(steps) = ops.get(filter.clone()) else { return false };
+    steps.iter().enumerate().all(|(offset, op)| match op.opcode {
+        OP_Column => (op.p1 == table || op.p1 == index) && op.p3 != return_reg,
+        OP_Integer | OP_Int64 | OP_Real | OP_String8 => op.p2 != return_reg,
+        OP_Add | OP_Subtract | OP_Multiply | OP_Divide | OP_Remainder | OP_ZeroOrNull => {
+            let output = if op.opcode == OP_ZeroOrNull { op.p2 } else { op.p3 };
+            output != return_reg
+        }
+        OP_Lt | OP_Le | OP_Eq | OP_Ne | OP_Gt | OP_Ge | OP_ElseEq
+        | OP_If | OP_IfNot | OP_IsNull | OP_NotNull | OP_Goto => {
+            let target = op.p2 as usize;
+            (target > filter.start + offset && target <= filter.end) || target == next
+        }
+        _ => false,
+    })
 }
 
 fn unsupported(
