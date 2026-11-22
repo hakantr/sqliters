@@ -2387,3 +2387,8 @@ Yerel sayısal ve sıralı bileşik filtreler anahtar kopyasından önce çalı�
 ## V6b.416 — Örtük şema kolasyonu bellek sıralaması
 
 Şemadan gelen NOCASE, RTRIM ve uygulama kolasyonu tam bellek sıralamasında her Rust kipinde 222 profil ve 15.648 adım boyunca C ile eşleşti. Unicode ve NUL için 216 ek kayıt, özgün hata ve 18 DELETE/WAL dosyası doğrulandı. Aynı kaynakla 180 olağan ertelenmiş yabancı anahtar çalıştırması da C ile eş. OFF 1296/1/325, ON 1294/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,272 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_416.md).
+
+
+## V6b.417 — PMA açmayan özel adlı FILE sıralaması
+
+Sabit C varsayılan PMA tabanı altında kalacağı kayıt baytlarından doğrulanan FILE sıralaması aynı karşılaştırıcı sırasını kullanıyor. Her Rust kipinde 136 profil C ile eşleşti ve 112 karşılaştırıcı dizisi kapandı. Tam callback argümanları, zorlanan tahsis ve gerçek C PMA açma denetimleri ile 180 olağan ertelenmiş yabancı anahtar çalıştırması doğrulandı. OFF 1297/1/325, ON 1295/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,269 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_417.md).

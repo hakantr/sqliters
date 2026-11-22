@@ -1552,6 +1552,59 @@ fn group64_registered_schema_collations_drive_implicit_memory_sort() {
 }
 
 #[test]
+fn group64_small_file_sort_preserves_custom_callback_order_and_error() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}'; PRAGMA temp_store=FILE;
+             CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT, payload BLOB);
+             INSERT INTO items VALUES (1,'A',X'01'),(2,'a',X'02'),(3,'B',X'03'),
+                                      (4,'b',X'04'),(5,NULL,X'05'),(6,'A ',X'06');"
+        ))
+        .unwrap();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        db.register_collation("app_order", move |left, right| {
+            seen.lock().unwrap().push((left.to_owned(), right.to_owned()));
+            right.cmp(left)
+        })
+        .unwrap();
+        let mut statement = db
+            .prepare("SELECT id, payload FROM items ORDER BY v COLLATE app_order NULLS LAST, id")
+            .unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+        let StepResult::Row(row) = statement.step().unwrap() else {
+            panic!("missing first FILE sort row in {encoding}");
+        };
+        assert_eq!(row.values(), &[Value::Integer(4), Value::Blob(vec![4])]);
+        let expected = [
+            ("B", "b"), ("b", "A "), ("B", "A "), ("A", "a"),
+            ("a", "b"), ("a", "B"), ("A", "B"), ("A", "A "),
+        ]
+        .map(|(left, right)| (left.to_owned(), right.to_owned()));
+        assert_eq!(std::mem::take(&mut *calls.lock().unwrap()), expected);
+        statement.reset().unwrap();
+
+        let seen = Arc::clone(&calls);
+        let failure = SqliteError::new(ErrorCode::Schema, "ordinary FILE sort callback error");
+        let injected = failure.clone();
+        db.register_fallible_collation("app_order", move |left, right| {
+            let mut observed = seen.lock().unwrap();
+            observed.push((left.to_owned(), right.to_owned()));
+            if observed.len() == 2 {
+                Err(injected.clone())
+            } else {
+                Ok(right.cmp(left))
+            }
+        })
+        .unwrap();
+        assert_eq!(statement.step().unwrap_err(), failure);
+        assert_eq!(statement.reset().unwrap_err(), failure);
+        assert_eq!(std::mem::take(&mut *calls.lock().unwrap()), expected[..2], "{encoding}");
+    }
+}
+
+#[test]
 fn numeric_blob_boolean_predicates_follow_database_encoding() {
     use Value::{Integer, Null};
 

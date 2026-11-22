@@ -18,6 +18,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use sqliters_types::{TextEncoding, Value};
+
 use crate::vdbeaux_rt::{
     KeyInfoRt, UnpackedRecord, get_varint32, sqlite3_varint_len, sqlite3_vdbe_record_compare_with_skip,
     sqlite3_vdbe_record_unpack,
@@ -79,6 +81,42 @@ const SQLITE_MAX_PMASZ: i64 = 1 << 29;
 const SQLITE_SORTER_PMASZ: i64 = 250;
 /// `sizeof(SorterRecord)` on the reference platform (int + pointer union, 8-byte aligned)
 const SZ_SORTER_RECORD: i64 = 16;
+
+/// A conservative no-PMA bound for full FILE sort records under the pinned
+/// default `szPma`. Callers supply the sort keys and every projected value,
+/// including duplicates that SQLite may omit when packing its sort record.
+/// Packed records contribute at most their 9-byte PMA length prefix on the
+/// split-allocation path. ROUND8(record + 16) covers both allocation paths,
+/// including the split allocator's heap-pressure check against mnPmaSize.
+#[doc(hidden)]
+pub fn file_sort_fits_default_pma<'a>(
+    records: impl IntoIterator<Item = impl IntoIterator<Item = &'a Value>>,
+    page_size: u32,
+    enc: TextEncoding,
+) -> bool {
+    let mut available = i64::from(page_size).saturating_mul(SQLITE_SORTER_PMASZ) as usize;
+    for record in records {
+        let mut packed = 9usize; // Header length varint.
+        for value in record {
+            let bytes = match value {
+                Value::Text(text) => {
+                    // UTF-16 decoding ignores an odd trailing byte. Include it,
+                    // as well as the size of a UTF-8 schema default.
+                    enc.encoded_byte_len(text)
+                        .saturating_add(usize::from(enc != TextEncoding::Utf8))
+                        .max(text.len())
+                }
+                Value::Blob(blob) => blob.len(),
+                Value::Null | Value::Integer(_) | Value::Real(_) => 8,
+            };
+            packed = packed.saturating_add(9).saturating_add(bytes);
+        }
+        let allocation = packed.saturating_add(SZ_SORTER_RECORD as usize + 7) & !7;
+        let Some(rest) = available.checked_sub(allocation) else { return false };
+        available = rest;
+    }
+    true
+}
 
 /// `struct VdbeSorter`.
 #[derive(Debug)]

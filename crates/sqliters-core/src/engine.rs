@@ -7317,13 +7317,13 @@ fn exec_single_select_core(
 /// The relational executor already owns explicitly named application
 /// collations. With a single rowid scan, the full memory sorter receives the
 /// same records in the same order as SQLite's complete OP_SorterOpen path.
-fn complete_memory_sort_collation<'a>(
+fn complete_order_sort_collation<'a>(
     db_set: &'a DatabaseSet,
     core: &SelectCore,
     order_by: &'a [OrderByTerm],
     limit: Option<&LimitClause>,
 ) -> Option<&'a str> {
-    if !db_set.temp_store().is_memory() || limit.is_some()
+    if limit.is_some()
         || db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0
     {
         return None;
@@ -7405,9 +7405,10 @@ pub(crate) fn registered_builtin_memory_sort(
         _ => false,
     };
     has_override
+        && db_set.temp_store().is_memory()
         && select.ctes.is_empty()
         && select.body.compounds.is_empty()
-        && complete_memory_sort_collation(
+        && complete_order_sort_collation(
             db_set, &select.body.head, &select.order_by, select.limit.as_ref(),
         ).is_some_and(|name| registered_memory_sort_builtin(name, encoding, collations))
 }
@@ -8411,8 +8412,9 @@ fn exec_single_select_core_inner(
             }
             if !order_by.is_empty() {
                 let enc = ctx.encoding();
-                let memory_collation = if ctx.stmt_tx.top_core == core as *const SelectCore as usize {
-                    complete_memory_sort_collation(ctx.db_set, core, order_by, limit)
+                let top_level = ctx.stmt_tx.top_core == core as *const SelectCore as usize;
+                let memory_collation = if top_level && ctx.db_set.temp_store().is_memory() {
+                    complete_order_sort_collation(ctx.db_set, core, order_by, limit)
                         .filter(|name| {
                             if Collation::from_name(name).is_none() {
                                 ctx.collations.get_custom(name).is_some()
@@ -8446,11 +8448,21 @@ fn exec_single_select_core_inner(
                     }
                 }
 
+                let file_in_memory = top_level && ctx.db_set.temp_store() == TempStoreMode::File
+                    && complete_order_sort_collation(ctx.db_set, core, order_by, limit)
+                        .is_some_and(|name| Collation::from_name(name).is_none()
+                            && specs[0].custom_collation.as_ref()
+                                .is_some_and(|collation| collation.name.eq_ignore_ascii_case(name)))
+                    && sqliters_vdbe::vdbesort::file_sort_fits_default_pma(
+                        result_rows_with_sort.iter().map(|(projection, keys)| keys.iter().chain(projection)),
+                        ctx.db_set.main_btree().pager().page_size(),
+                        enc,
+                    );
                 if specs.iter().all(|s| s.custom_collation.is_none()) {
                     result_rows_with_sort.sort_by(|(_, sa), (_, sb)| {
                         compare_value_slices_infallible(sa, sb, &specs, enc)
                     });
-                } else if memory_collation.is_some() {
+                } else if memory_collation.is_some() || file_in_memory {
                     result_rows_with_sort = sqliters_vdbe::vdbesort::sort_memory_rows(
                         result_rows_with_sort,
                         |(_, sa), (_, sb)| compare_value_slices(sa, sb, &specs, enc),
