@@ -1,5 +1,4 @@
 #[test]
-#[ignore = "0/3 subtests passed; pending: rowvalue8 edge cases"]
 fn test_rowvalue8() {
     sqliters_tcltest::run_test_script(
         "rowvalue8",
@@ -122,6 +121,70 @@ do_catchsql_test literal-row-case-prepare.4 {
 do_catchsql_test literal-row-case-prepare.5 {
     SELECT CASE 1 WHEN 1 THEN (1,2) ELSE 0 END;
 } {1 {row value misused}}
+finish_test
+"#,
+    );
+}
+
+#[test]
+fn test_correlated_row_case_keeps_subquery_step_boundaries() {
+    sqliters_tcltest::run_test_script(
+        "correlated_row_case_keeps_subquery_step_boundaries",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+proc case_result {x} {
+    lappend ::calls $x
+    return [expr {int($x)}]
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+reset_db
+execsql "PRAGMA encoding='$encoding';"
+db function case_result -argcount 1 case_result
+execsql {
+    CREATE TABLE words(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+    CREATE TABLE picks(id INTEGER PRIMARY KEY, ref INTEGER);
+    INSERT INTO words VALUES(1,1,10),(2,2,20),(3,3,30);
+    INSERT INTO picks VALUES(1,3),(2,1),(3,6),(4,2);
+}
+set sql {
+    SELECT p.id,
+           CASE (SELECT a,case_result(b) FROM words w WHERE w.id=p.ref)
+             WHEN (1,10) THEN 'one' WHEN (2,20) THEN 'two'
+             WHEN (3,30) THEN 'three' ELSE '-' END
+      FROM picks p ORDER BY p.id
+}
+foreach {step row value calls} {1 1 three 30 2 2 one 10 3 3 - {} 4 4 two 20} {
+    do_test correlated-row-case-$encoding.step.$step {
+        if {$step == 1} {set s [sqlite3_prepare_v2 db $sql -1]}
+        set ::calls {}
+        set code [sqlite3_step $s]
+        list $code [sqlite3_column_int $s 0] [sqlite3_column_text $s 1] $::calls
+    } [list SQLITE_ROW $row $value $calls]
+}
+do_test correlated-row-case-$encoding.step.5 {
+    set ::calls {}
+    list [sqlite3_step $s] $::calls [sqlite3_finalize $s]
+} {SQLITE_DONE {} SQLITE_OK}
+do_test correlated-row-case-$encoding.reprepare {
+    set bounded [string map [list "ORDER BY p.id" "WHERE p.id >= ?1 ORDER BY p.id"] $sql]
+    set s [sqlite3_prepare_v2 db $bounded -1]
+    sqlite3_bind_int $s 1 2
+    set ::calls {}
+    set code [sqlite3_step $s]
+    set before [list $code [sqlite3_column_int $s 0] [sqlite3_column_text $s 1] $::calls]
+    sqlite3_reset $s
+    execsql {CREATE INDEX picks_ref ON picks(ref);}
+    sqlite3_bind_int $s 1 4
+    set ::calls {}
+    set code [sqlite3_step $s]
+    set after [list $code [sqlite3_column_int $s 0] [sqlite3_column_text $s 1] $::calls]
+    list $before $after [sqlite3_finalize $s]
+} {{SQLITE_ROW 2 one 10} {SQLITE_ROW 4 two 20} SQLITE_OK}
+do_catchsql_test correlated-row-case-$encoding.width {
+    SELECT CASE (SELECT a,b FROM words) WHEN (1,10,0) THEN 'bad' END;
+} {1 {row value misused}}
+}
 finish_test
 "#,
     );

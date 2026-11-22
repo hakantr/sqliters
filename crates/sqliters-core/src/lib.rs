@@ -5814,6 +5814,29 @@ fn schema_free_read_fallback(
     Ok(Some((artifacts, program)))
 }
 
+fn row_case_read_fallback(
+    inner: &ConnectionInner,
+    stmt: Option<&Stmt>,
+    sql: &str,
+    bound_values: Option<&[Value]>,
+    error: &SqliteError,
+) -> Result<Option<(CompiledArtifacts, Arc<sqliters_vdbe::vdbeaux::Program>)>> {
+    let Some(stmt @ Stmt::Select(_)) = stmt else {
+        return Ok(None);
+    };
+    if error.code != ErrorCode::Error
+        || !(error.message == "row value misused" || error.message.starts_with("sub-select returns "))
+    {
+        return Ok(None);
+    }
+    let mut artifacts = read_artifacts(Some(stmt.clone()), Vec::new());
+    let Some(program) = vdbe_host::row_case_read_program(inner, stmt, sql, artifacts.max_param, bound_values)? else {
+        return Ok(None);
+    };
+    artifacts.column_names = vdbe_host::column_names(&program).unwrap_or_default();
+    Ok(Some((artifacts, program)))
+}
+
 fn prepared_read_roots(stmt: &Stmt, requires_schema: bool, db_set: &DatabaseSet) -> Vec<LeaseCursorSpec> {
     if !requires_schema && matches!(stmt, Stmt::Select(_)) {
         Vec::new()
@@ -8573,6 +8596,7 @@ impl Statement {
         // error is the error of the prepare; a statement C compiles runs C's program on the
         // machine. `err` stays when the generator leaves the statement to the engine.
         let schema_free_fallback = std::cell::RefCell::new(None);
+        let row_case_fallback = std::cell::RefCell::new(None);
         let c_read_decides = |inner: &mut ConnectionInner, stmt: Option<Stmt>, err: SqliteError| -> Result<CompiledArtifacts> {
             let err = refine_prepare_error(inner, stmt.as_ref(), &raw_sql, err);
             if err.code == ErrorCode::Error && err.message.starts_with("no such table:")
@@ -8580,6 +8604,12 @@ impl Statement {
                 && let Some((artifacts, program)) = schema_free_read_fallback(inner, stmt.clone(), &raw_sql)?
             {
                 schema_free_fallback.replace(Some(program));
+                return Ok(artifacts);
+            }
+            if let Some((artifacts, program)) =
+                row_case_read_fallback(inner, stmt.as_ref(), &raw_sql, None, &err)?
+            {
+                row_case_fallback.replace(Some(program));
                 return Ok(artifacts);
             }
             if !vdbe_host::exec_switch_on() || !matches!(stmt, Some(Stmt::Select(_))) {
@@ -8695,6 +8725,8 @@ impl Statement {
 
         let c_machine = if let Some(program) = c_row_pragma.or(c_integer_collation.filter(|p| p.n_var as usize == artifacts.max_param)) {
             apply_data_free_program(&mut artifacts, &program);
+            Some(program)
+        } else if let Some(program) = row_case_fallback.into_inner() {
             Some(program)
         } else {
             Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some(), select_schema_use.as_ref().is_some_and(|u| u.has_like), None, prepared_vtab)?
@@ -9525,6 +9557,17 @@ impl Statement {
                 Self::c_write_of(&shared, inner, parsed_stmt.as_ref(), &self.raw_sql, bound_partial)?
             };
             let mut schema_free_fallback = None;
+            let mut row_case_fallback = None;
+            let mut recover_row_case = |inner: &mut ConnectionInner, err: SqliteError| {
+                let err = refine_prepare_error(inner, parsed_stmt.as_ref(), &self.raw_sql, err);
+                let Some((artifacts, program)) =
+                    row_case_read_fallback(inner, parsed_stmt.as_ref(), &self.raw_sql, Some(&self.params), &err)?
+                else {
+                    return Err(err);
+                };
+                row_case_fallback = Some(program);
+                Ok(artifacts)
+            };
             let mut artifacts = match try_compile(inner, &parsed_stmt) {
                 Ok(a) => a,
                 Err(err) if c_explain.is_some() && err.code == ErrorCode::Error => {
@@ -9549,13 +9592,15 @@ impl Statement {
                         }) =>
                 {
                     if inner.ensure_schemas_loaded_for_prepare(true)? {
-                        try_compile(inner, &parsed_stmt)
-                            .map_err(|e| refine_prepare_error(inner, parsed_stmt.as_ref(), &self.raw_sql, e))?
+                        match try_compile(inner, &parsed_stmt) {
+                            Ok(artifacts) => artifacts,
+                            Err(err) => recover_row_case(inner, err)?,
+                        }
                     } else {
-                        return Err(refine_prepare_error(inner, parsed_stmt.as_ref(), &self.raw_sql, err));
+                        recover_row_case(inner, err)?
                     }
                 }
-                Err(err) => return Err(refine_prepare_error(inner, parsed_stmt.as_ref(), &self.raw_sql, err)),
+                Err(err) => recover_row_case(inner, err)?,
             };
             apply_prepare_auto_vacuum_pragma(inner, &mut artifacts, c_prepared_auto_vacuum);
             if let Some(out) = &c_prepared_pragma {
@@ -9570,6 +9615,8 @@ impl Statement {
             }
             let c_machine = if let Some(program) = c_row_pragma.or(c_integer_collation.filter(|p| p.n_var as usize == artifacts.max_param)) {
                 apply_data_free_program(&mut artifacts, &program);
+                Some(program)
+            } else if let Some(program) = row_case_fallback {
                 Some(program)
             } else {
                 Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some(), select_schema_use.as_ref().is_some_and(|u| u.has_like), Some(&self.params), prepared_vtab)?

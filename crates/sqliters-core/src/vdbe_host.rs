@@ -126,7 +126,7 @@ pub(crate) fn machine_program_with_prepare(
     if !exec_switch_on() {
         return Ok(None);
     }
-    read_machine_program(inner, stmt, raw_sql, n_param, false, false, None, prepared)
+    read_machine_program(inner, stmt, raw_sql, n_param, ReadMachineScope::Standard, None, prepared)
 }
 
 /// A materialized legacy read cannot hold the page that C has at ResultRow. Use the
@@ -253,7 +253,7 @@ pub(crate) fn mapped_table_read_program(
 pub(crate) fn like_machine_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, bound_values: Option<&[Value]>,
 ) -> Result<Option<Arc<Program>>> {
-    read_machine_program(inner, stmt, raw_sql, n_param, false, true, bound_values, None)
+    read_machine_program(inner, stmt, raw_sql, n_param, ReadMachineScope::Like, bound_values, None)
 }
 
 /// A read rejected by legacy validation despite C eliminating its table source.
@@ -263,7 +263,7 @@ pub(crate) fn like_machine_program(
 pub(crate) fn schema_free_read_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize,
 ) -> Result<Option<Arc<Program>>> {
-    read_machine_program(inner, stmt, raw_sql, n_param, true, false, None, None)
+    read_machine_program(inner, stmt, raw_sql, n_param, ReadMachineScope::SchemaFree, None, None)
 }
 
 /// The C planner orders explicit WHERE terms before implicit table-function
@@ -296,7 +296,7 @@ pub(crate) fn locking_mode_table_read_program(
     {
         return Ok(None);
     }
-    Ok(read_machine_program(inner, stmt, sql, n_param, false, false, None, None)?.filter(|program| {
+    Ok(read_machine_program(inner, stmt, sql, n_param, ReadMachineScope::Standard, None, None)?.filter(|program| {
         use sqliters_vdbe::opcodes::{OP_OpenRead, OP_ReopenIdx, OP_VOpen};
 
         !program.a_op.iter().any(|op| {
@@ -438,9 +438,57 @@ fn ordered_index_collation_mismatch(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadMachineScope {
+    Standard,
+    SchemaFree,
+    Like,
+    RowCase,
+}
+
+/// Legacy expressions do not prepare a row-valued subquery as a CASE operand.
+/// Its read program keeps the subquery's registers, collation and ResultRow
+/// boundaries together, including on UTF-16 databases.
+pub(crate) fn row_case_read_program(
+    inner: &ConnectionInner,
+    stmt: &Stmt,
+    sql: &str,
+    n_param: usize,
+    bound_values: Option<&[Value]>,
+) -> Result<Option<Arc<Program>>> {
+    use crate::dml_c::{Walk, walk_select};
+    use sqliters_syntax::Expr;
+
+    let Stmt::Select(select) = stmt else {
+        return Ok(None);
+    };
+    let mut has_row_case = false;
+    walk_select(select, &mut |expr| {
+        if let Expr::Case { operand: Some(operand), branches, .. } = expr {
+            match operand.as_ref() {
+                Expr::Subquery(_) => {
+                    has_row_case |= branches.iter().any(|(when, _)| {
+                        matches!(when, Expr::RowValue(_) | Expr::Subquery(_))
+                    });
+                }
+                Expr::RowValue(_) => {
+                    has_row_case |= branches.iter().any(|(when, _)| {
+                        matches!(when, Expr::Subquery(_))
+                    });
+                }
+                _ => {}
+            }
+        }
+        Walk::Deep
+    });
+    if !has_row_case {
+        return Ok(None);
+    }
+    read_machine_program(inner, Some(stmt), sql, n_param, ReadMachineScope::RowCase, bound_values, None)
+}
+
 fn read_machine_program(
-    inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, schema_free: bool, like_only: bool, bound_values: Option<&[Value]>,
+    inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, scope: ReadMachineScope, bound_values: Option<&[Value]>,
     precompiled: Option<Box<Program>>,
 ) -> Result<Option<Arc<Program>>> {
     if !matches!(stmt, Some(Stmt::Select(_))) {
@@ -464,7 +512,7 @@ fn read_machine_program(
         trace("fallback: schema with an application-defined collation", raw_sql);
         return Ok(None);
     }
-    let prepared = if schema_free {
+    let prepared = if scope == ReadMachineScope::SchemaFree {
         match crate::cgen::c_prepare(inner, raw_sql).0 {
             PrepareResult::Program(p) if p.n_var as usize == n_param && empty_program_path(&p) => {
                 trace("machine: empty schema-free path", raw_sql);
@@ -475,7 +523,9 @@ fn read_machine_program(
     } else {
         precompiled.map(PrepareResult::Program)
     };
-    if inner.effective_encoding() != TextEncoding::Utf8 && !like_only {
+    if inner.effective_encoding() != TextEncoding::Utf8
+        && !matches!(scope, ReadMachineScope::Like | ReadMachineScope::RowCase)
+    {
         trace("fallback: UTF-16 database", raw_sql);
         return Ok(None);
     }
@@ -484,8 +534,9 @@ fn read_machine_program(
         None => crate::cgen::c_prepare(inner, raw_sql).0,
     }) {
         PrepareResult::Program(mut p) => {
-            if like_only && !crate::cgen::program_has_like(&p) { return Ok(None); }
-            if schema_free && p.btree_mask != 0 { return Ok(None); }
+            if scope == ReadMachineScope::Like && !crate::cgen::program_has_like(&p) { return Ok(None); }
+            if scope == ReadMachineScope::SchemaFree && p.btree_mask != 0 { return Ok(None); }
+            if scope == ReadMachineScope::RowCase && !p.read_only { return Ok(None); }
             if p.explain != 0 {
                 return Ok(None);
             }

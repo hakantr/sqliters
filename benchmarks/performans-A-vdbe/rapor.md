@@ -2167,3 +2167,8 @@ REPLACE’in erken DELETE denetiminden sonra C’nin son tanı önceliği eşle�
 ## V6b.372 — UPDATE test paketinin etkinleştirilmesi
 
 C ve iki Rust kipinde 141 UPDATE kontrolü geçti. Pencere sorgusunun planı ve 72 C yeniden açılışı eş. OFF 1249/1/327, ON 1246/4/327. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_372.md).
+
+
+## V6b.373 — Alt sorgulu satır CASE adım davranışı
+
+İki Rust kipinde salt okunur satır CASE alt sorguları gerçek adım sınırlarında yürütülüyor. Altı disk profilinde 144 ifade sonucu C ile karşılaştırıldı. Önceki 60 fark kapandı. Odaklı C ve Rust adım kontrolleri geçti. Özgün rowvalue8 paketi workspace koşusuna alındı. OFF 1251/1/326, ON 1248/4/326. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,272 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_373.md).
