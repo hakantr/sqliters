@@ -713,8 +713,10 @@ fn read_machine_program(
                     if select.ctes.is_empty() && select.body.compounds.is_empty()
                         && matches!(&select.body.head, sqliters_syntax::SelectCore::Select { distinct: true, group_by, .. }
                             if group_by.is_empty()));
+                let builtin_collations = inner.collations.get_custom("NOCASE").is_none()
+                    && inner.collations.get_custom("RTRIM").is_none();
                 sqliters_vdbe::vdbe::unsupported_reason_row_case_read(
-                    &p, grouped_case, distinct_case, inner.effective_encoding() as u8,
+                    &p, grouped_case, distinct_case, builtin_collations, inner.effective_encoding() as u8,
                 )
             } else {
                 unsupported_reason(&p)

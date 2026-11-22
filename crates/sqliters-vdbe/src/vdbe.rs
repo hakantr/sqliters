@@ -967,9 +967,11 @@ pub fn unsupported_reason_mapped_read(prog: &Program) -> Option<String> {
 
 /// Keys a checked row CASE read can use in the database's encoding.
 pub fn unsupported_reason_row_case_read(
-    prog: &Program, grouped: bool, distinct: bool, encoding: u8,
+    prog: &Program, grouped: bool, distinct: bool, builtin_collations: bool, encoding: u8,
 ) -> Option<String> {
-    let key_scope = if grouped {
+    let key_scope = if grouped && builtin_collations {
+        ReadKeyScope::BuiltinGroup
+    } else if grouped {
         ReadKeyScope::BinaryGroup
     } else if distinct {
         ReadKeyScope::BinaryDistinct
@@ -1063,7 +1065,41 @@ enum ReadKeyScope {
     Utf8,
     BinarySorter,
     BinaryGroup,
+    BuiltinGroup,
     BinaryDistinct,
+}
+
+fn group_compare_width(prog: &Program, index: usize, op: &VdbeOp, key: &KeyInfo) -> Option<usize> {
+    let width = usize::try_from(op.p3).ok()?;
+    (op.opcode == OP_Compare
+        && op.p5 == 0
+        && (1..=usize::from(key.n_key_field)).contains(&width)
+        && prog.a_op.get(index + 1).is_some_and(|next| next.opcode == OP_Jump)
+        && key.a_sort_flags.get(..width).is_some()
+        && key.a_coll.get(..width).is_some())
+    .then_some(width)
+}
+
+/// GROUP BY shares one KeyInfo between its sorter and register comparison. Keep
+/// additional UTF-16 collation support tied to that pair.
+fn builtin_group_key(prog: &Program, key: &Arc<KeyInfo>) -> bool {
+    let supported = |coll: &CollSeq| {
+        (coll.name.eq_ignore_ascii_case("BINARY") && coll.enc == key.enc)
+            || ((coll.name.eq_ignore_ascii_case("NOCASE") || coll.name.eq_ignore_ascii_case("RTRIM"))
+                && coll.enc == crate::vdbeaux::SQLITE_UTF8)
+    };
+    if !key.a_coll.iter().flatten().all(|coll| supported(coll)) {
+        return false;
+    }
+    let shares_key = |op: &VdbeOp| {
+        matches!(&op.p4, P4::KeyInfo(other) if Arc::ptr_eq(key, other))
+    };
+    prog.a_op.iter().any(|op| op.opcode == OP_SorterOpen && shares_key(op))
+        && prog.a_op.iter().enumerate().any(|(index, op)| {
+            shares_key(op)
+                && group_compare_width(prog, index, op, key)
+                    .is_some_and(|width| key.a_coll[..width].iter().all(Option::is_some))
+        })
 }
 
 fn unsupported(
@@ -1072,7 +1108,7 @@ fn unsupported(
     if !prog.p_program.is_empty() && !write {
         return Some("sub-programs".to_owned());
     }
-    let has_group_sorter = key_scope == ReadKeyScope::BinaryGroup
+    let has_group_sorter = matches!(key_scope, ReadKeyScope::BinaryGroup | ReadKeyScope::BuiltinGroup)
         && prog.a_op.iter().any(|op| op.opcode == OP_SorterOpen);
     let subs = prog.p_program.iter().flat_map(|s| s.a_op.iter());
     for (index, op) in prog.a_op.iter().chain(subs).enumerate() {
@@ -1287,14 +1323,16 @@ fn unsupported(
                 && op.opcode == OP_SorterOpen
                 && k.a_coll.iter().flatten().all(|c| binary_in_key_encoding(c));
             let binary_group_compare = has_group_sorter
-                && op.opcode == OP_Compare
-                && op.p5 == 0
-                && (1..=i32::from(k.n_key_field)).contains(&op.p3)
-                && prog.a_op.get(index + 1).is_some_and(|next| next.opcode == OP_Jump)
-                && k.a_sort_flags.get(..op.p3 as usize).is_some()
-                && k.a_coll.get(..op.p3 as usize).is_some_and(|fields| {
-                    fields.iter().all(|c| c.as_deref().is_some_and(binary_in_key_encoding))
+                && group_compare_width(prog, index, op, k).is_some_and(|width| {
+                    k.a_coll[..width].iter().all(|c| c.as_deref().is_some_and(binary_in_key_encoding))
                 });
+            let builtin_group = key_scope == ReadKeyScope::BuiltinGroup
+                && row_case_encoding == Some(k.enc)
+                && (op.opcode == OP_SorterOpen
+                    || group_compare_width(prog, index, op, k).is_some_and(|width| {
+                        k.a_coll[..width].iter().all(Option::is_some)
+                    }))
+                && builtin_group_key(prog, k);
             let binary_distinct = key_scope == ReadKeyScope::BinaryDistinct
                 && matches!(k.enc, 2 | 3) && binary_distinct_key(prog, op, k);
             // Static BINARY fields (including implicit rowid tails) have no CollSeq.
@@ -1305,7 +1343,7 @@ fn unsupported(
                 && k.a_coll.iter().flatten().all(|c| binary_in_key_encoding(c));
             let binary_membership = row_case_encoding == Some(k.enc) && binary_in_key(prog, op, k);
             if k.enc != 1 && !prog.references_like
-                && !(binary_sort || binary_group_compare || binary_distinct || binary_physical_index || binary_membership)
+                && !(binary_sort || binary_group_compare || builtin_group || binary_distinct || binary_physical_index || binary_membership)
             {
                 return Some("UTF-16 key".to_owned());
             }

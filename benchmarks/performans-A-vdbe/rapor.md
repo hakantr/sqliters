@@ -2237,3 +2237,8 @@ VDBE toplama ve pencere metin sonuçlarını veritabanının kodlamasına getiri
 ## V6b.386 — UTF-16 BINARY CASE üyeliği
 
 Salt okunur CASE alt sorgusunda BINARY IN ve NOT IN anahtarları aynı kodlamayla karşılaştırılıyor. 558 gözlemde 32 fark kapandı. Altı C yeniden açılışı ve NULL, boş sonuç, satır üyeliği ve yeniden hazırlama kontrolleri geçti. OFF 1264/1/325, ON 1261/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,261 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_386.md).
+
+
+## V6b.387 — UTF-16 CASE gruplamasında yerleşik kolasyonlar
+
+Aynı gruplama anahtarını paylaşan sıralayıcı ve karşılaştırma adımlarında NOCASE ve RTRIM C kodlamasıyla yürütülüyor. 558 gözlemde 24 fark kapandı. Uygulamanın kayıtlı karşılaştırıcıları ve yetkilendirme kontrolleri korunuyor. OFF 1265/1/325, ON 1262/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_387.md).

@@ -964,3 +964,82 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_builtin_group_collations_and_steps() {
+    sqliters_tcltest::run_test_script(
+        "row_case_builtin_group_collations_and_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+proc observe_builtin_group {x} {
+    lappend ::group_calls $x
+    return [expr {int($x)}]
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    db function observe_builtin_group -argcount 1 observe_builtin_group
+    execsql {
+        CREATE TABLE points(id INTEGER PRIMARY KEY, token TEXT, pad TEXT, bucket INTEGER);
+        CREATE TABLE map(token TEXT,a INTEGER,b INTEGER,c INTEGER);
+        INSERT INTO points VALUES(1,'A','z ',1),(2,'a','z',1),(3,'B','z',1),(4,'b','z ',1);
+        INSERT INTO map VALUES('A',1,11,0),('B',2,22,0);
+    }
+    set sql {
+        SELECT p.token,
+               CASE (SELECT a,observe_builtin_group(b) FROM map m WHERE m.token=p.token)
+                   WHEN (1,11) THEN 'one' WHEN (2,22) THEN 'two' ELSE '-' END AS tag,
+               count(*) AS n
+          FROM points p
+         WHERE p.id>=?1
+         GROUP BY p.token COLLATE NOCASE
+    }
+    do_test builtin-group-$encoding.prepare {
+        set s [sqlite3_prepare_v2 db $sql -1]
+        sqlite3_bind_int $s 1 1
+        list [sqlite3_column_name $s 0] [sqlite3_column_name $s 1] [sqlite3_column_name $s 2]
+    } {token tag n}
+    foreach {key token tag calls} {1 A one 11 2 B two 22} {
+        do_test builtin-group-$encoding.step.$key {
+            set ::group_calls {}
+            list [sqlite3_step $s] [sqlite3_column_text $s 0] [sqlite3_column_text $s 1] [sqlite3_column_int $s 2] $::group_calls
+        } [list SQLITE_ROW $token $tag 2 $calls]
+    }
+    do_test builtin-group-$encoding.finish {
+        set ::group_calls {}
+        list [sqlite3_step $s] $::group_calls [sqlite3_finalize $s]
+    } {SQLITE_DONE {} SQLITE_OK}
+    do_test builtin-group-$encoding.reprepare {
+        set s [sqlite3_prepare_v2 db $sql -1]
+        sqlite3_bind_int $s 1 1
+        set ::group_calls {}
+        set before [list [sqlite3_step $s] [sqlite3_column_text $s 0] $::group_calls]
+        sqlite3_reset $s
+        execsql {CREATE TABLE unused(id INTEGER PRIMARY KEY);}
+        sqlite3_bind_int $s 1 3
+        set ::group_calls {}
+        set after [list [sqlite3_step $s] [sqlite3_column_text $s 0] $::group_calls]
+        list $before $after [sqlite3_finalize $s]
+    } {{SQLITE_ROW A 11} {SQLITE_ROW B 22} SQLITE_OK}
+    do_execsql_test builtin-group-$encoding.mixed {
+        SELECT min(id),count(*) FROM points
+         GROUP BY (CASE (SELECT 7,11) WHEN (7,11) THEN token ELSE '' END) COLLATE NOCASE,
+                  pad COLLATE RTRIM,bucket COLLATE BINARY
+         ORDER BY min(id);
+    } {1 2 3 2}
+    do_execsql_test builtin-group-$encoding.rtrim {
+        INSERT INTO points VALUES(5,'A ','z',1),(6,'A  ','z',1);
+        SELECT min(id),count(*) FROM points
+         GROUP BY (CASE (SELECT 7,11) WHEN (7,11) THEN token ELSE '' END) COLLATE RTRIM
+         ORDER BY min(id);
+    } {1 3 2 1 3 1 4 1}
+    do_catchsql_test builtin-group-$encoding.width {
+        SELECT count(*) FROM points
+         GROUP BY (CASE (SELECT a,b,c FROM map) WHEN (1,11) THEN token END) COLLATE NOCASE;
+    } {1 {row value misused}}
+}
+finish_test
+"#,
+    );
+}
