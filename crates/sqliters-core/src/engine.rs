@@ -2927,12 +2927,26 @@ pub(crate) fn schema_free_read_has_collation_override(
                     && explicit_comparison_collation(left, right)
                         .is_some_and(|name| registered_builtin_name_collation(name, collations));
             }
+            Expr::Binary { left, op: BinaryOp::Is | BinaryOp::IsNot, right }
+                if matches!(right.as_ref(), Expr::Integer(1))
+                    && normalized_scalar_truth_operand(left) => {}
             Expr::IsNull { expr, .. } if scalar_operand(expr) => {}
             _ if scalar_operand(expr) => {}
             _ => return false,
         }
     }
     uses_override
+}
+
+// truth_is lowers IS [NOT] TRUE/FALSE to one or two NOTs compared with 1.
+// The normalized operand cannot invoke a text comparator.
+fn normalized_scalar_truth_operand(expr: &Expr) -> bool {
+    let Expr::Unary { op: UnaryOp::Not, expr } = expr else { return false };
+    let operand = match expr.as_ref() {
+        Expr::Unary { op: UnaryOp::Not, expr } => expr.as_ref(),
+        other => other,
+    };
+    scalar_operand(operand)
 }
 
 fn scalar_operand(expr: &Expr) -> bool {

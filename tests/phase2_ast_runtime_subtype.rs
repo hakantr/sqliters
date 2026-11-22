@@ -1150,6 +1150,69 @@ fn group64_registered_builtin_name_collations_on_scalar_reads() {
 }
 
 #[test]
+fn group64_registered_builtin_collations_with_boolean_projections() {
+    use Value::{Integer, Null};
+
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!("PRAGMA encoding='{encoding}'; CREATE TABLE hold(x);"))
+            .unwrap();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for name in ["NOCASE", "RTRIM"] {
+            let seen = Arc::clone(&calls);
+            db.register_collation(name, move |left, right| {
+                seen.lock().unwrap().push(name);
+                right.cmp(left)
+            })
+            .unwrap();
+        }
+        let sql = "SELECT ?1 COLLATE NOCASE = ?2, ?3 COLLATE RTRIM IS TRUE,
+                          'x ' COLLATE RTRIM = 'x', ?3 IS FALSE COLLATE NOCASE,
+                          ?1 COLLATE NOCASE != ?2";
+        let mut statement = db.prepare(sql).unwrap();
+        statement.bind_text(1, "A").unwrap();
+        statement.bind_text(2, "a").unwrap();
+        for (value, is_true, is_false) in [
+            (Null, 0, 0),
+            (Integer(0), 0, 1),
+            (Value::Text(" -2 rest".into()), 1, 0),
+        ] {
+            statement.bind(3, value).unwrap();
+            assert!(calls.lock().unwrap().is_empty());
+            let StepResult::Row(row) = statement.step().unwrap() else {
+                panic!("missing scalar row in {encoding}");
+            };
+            assert_eq!(
+                row.values(),
+                &[Integer(0), Integer(is_true), Integer(0), Integer(is_false), Integer(1)],
+                "{encoding}"
+            );
+            assert_eq!(statement.step().unwrap(), StepResult::Done);
+            statement.reset().unwrap();
+            assert_eq!(
+                std::mem::take(&mut *calls.lock().unwrap()),
+                ["NOCASE", "RTRIM", "NOCASE"],
+                "{encoding}"
+            );
+        }
+
+        db.register_fallible_collation("RTRIM", |_, _| {
+            Err(SqliteError::new(ErrorCode::Error, "ordinary comparator error"))
+        })
+        .unwrap();
+        for _ in 0..2 {
+            let error = statement.step().unwrap_err();
+            assert_eq!(error.code, ErrorCode::Error);
+            assert_eq!(error.message, "ordinary comparator error", "{encoding}");
+            let error = statement.reset().unwrap_err();
+            assert_eq!(error.code, ErrorCode::Error);
+            assert_eq!(error.message, "ordinary comparator error", "{encoding}");
+            assert_eq!(std::mem::take(&mut *calls.lock().unwrap()), ["NOCASE"], "{encoding}");
+        }
+    }
+}
+
+#[test]
 fn numeric_blob_boolean_predicates_follow_database_encoding() {
     use Value::{Integer, Null};
 
