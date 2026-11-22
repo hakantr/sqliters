@@ -1793,3 +1793,98 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_physical_rtrim_steps() {
+    sqliters_tcltest::run_test_script(
+        "row_case_physical_rtrim_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE detail(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO detail VALUES(1,1,10),(2,2,20),(3,3,30);
+        CREATE TABLE items(id INTEGER PRIMARY KEY,tag TEXT COLLATE RTRIM,zone TEXT COLLATE NOCASE,
+                           ref INTEGER,label TEXT);
+        CREATE INDEX tag_rtrim ON items(tag);
+        CREATE INDEX tag_zone ON items(tag,zone DESC);
+        INSERT INTO items VALUES
+            (1,'A','west',1,'one'),(2,'A ','WEST',2,'two'),(3,'A  ','North',3,'three'),
+            (4,'a','west',1,'lower'),(5,'B','west',2,'five'),(6,char(256)||' ','east',1,'wide'),
+            (7,NULL,'west',1,'nil-w'),(8,'A'||char(160),'west',1,'nbsp'),
+            (9,'A'||char(0)||'x','west',1,'nul'),(10,'A',NULL,2,'nil-zone'),
+            (11,NULL,NULL,1,'nil-both'),(12,char(128512)||' ','east',3,'smile'),
+            (13,X'41','west',3,'blob'),(14,'B ','WEST',3,'fourteen'),(15,'A ','west',3,'repeat');
+        CREATE TABLE packed(tag TEXT COLLATE RTRIM,seq INTEGER,ref INTEGER,label TEXT,
+                            PRIMARY KEY(tag DESC,seq)) WITHOUT ROWID;
+        INSERT INTO packed VALUES ('A',1,1,'p-one'),('A ',2,2,'p-two'),
+            ('A'||char(160),3,1,'p-nbsp'),('a ',1,3,'p-lower'),(char(256)||' ',2,1,'p-wide'),('B',1,1,'p-b');
+    }
+    do_execsql_test physical-rtrim-row-case-$encoding.secondary {
+        SELECT id,CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+          WHEN (2,20) THEN 'changed' ELSE p.label END
+        FROM items p INDEXED BY tag_rtrim WHERE tag='A ' ORDER BY id;
+    } {1 one 2 changed 3 three 10 changed 15 repeat}
+    do_execsql_test physical-rtrim-row-case-$encoding.characters {
+        SELECT id,CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+          WHEN (2,20) THEN 'changed' ELSE p.label END
+        FROM items p INDEXED BY tag_rtrim WHERE tag='A'||char(0)||'x ';
+        SELECT id,CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+          WHEN (2,20) THEN 'changed' ELSE p.label END
+        FROM items p INDEXED BY tag_rtrim WHERE tag='A'||char(160);
+        SELECT id,CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+          WHEN (2,20) THEN 'changed' ELSE p.label END
+        FROM items p INDEXED BY tag_rtrim WHERE tag=char(128512);
+    } {9 nul 8 nbsp 12 smile}
+    do_execsql_test physical-rtrim-row-case-$encoding.nulls {
+        SELECT id,CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+          WHEN (2,20) THEN 'changed' ELSE p.label END
+        FROM items p INDEXED BY tag_rtrim WHERE tag IS NULL ORDER BY id;
+        SELECT id,CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+          WHEN (2,20) THEN 'changed' ELSE p.label END
+        FROM items p INDEXED BY tag_zone WHERE tag='A' AND zone IS NULL;
+    } {7 nil-w 11 nil-both 10 changed}
+    do_execsql_test physical-rtrim-row-case-$encoding.primary {
+        SELECT seq,CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+          WHEN (2,20) THEN 'changed' ELSE p.label END
+        FROM packed p WHERE tag='A ' ORDER BY seq DESC;
+    } {2 changed 1 p-one}
+    do_execsql_test physical-rtrim-row-case-$encoding.stream-group {
+        SELECT count(*),sum(CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+          WHEN (2,20) THEN 10 ELSE 1 END)
+        FROM items p INDEXED BY tag_zone WHERE tag='A' GROUP BY tag,zone;
+    } {3 12 1 1 1 10}
+    do_test physical-rtrim-row-case-$encoding.reprepare {
+        set s [sqlite3_prepare_v2 db {
+            SELECT id,CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+              WHEN (2,20) THEN 'changed' ELSE p.label END
+            FROM items p INDEXED BY tag_zone WHERE tag=?1 AND zone=?2 ORDER BY id
+        } -1]
+        sqlite3_bind_text $s 1 {A } -1
+        sqlite3_bind_text $s 2 WEST -1
+        set before {}
+        while {[set rc [sqlite3_step $s]] eq "SQLITE_ROW"} {
+            lappend before [sqlite3_column_int $s 0] [sqlite3_column_text $s 1]
+        }
+        lappend before $rc
+        sqlite3_reset $s
+        execsql {CREATE INDEX items_ref ON items(ref);}
+        sqlite3_bind_text $s 1 B -1
+        sqlite3_bind_text $s 2 west -1
+        set after {}
+        while {[set rc [sqlite3_step $s]] eq "SQLITE_ROW"} {
+            lappend after [sqlite3_column_int $s 0] [sqlite3_column_text $s 1]
+        }
+        lappend after $rc
+        list $before $after [sqlite3_finalize $s]
+    } {{1 one 2 changed 15 repeat SQLITE_DONE} {5 changed 14 fourteen SQLITE_DONE} SQLITE_OK}
+}
+finish_test
+
+"#,
+    );
+}

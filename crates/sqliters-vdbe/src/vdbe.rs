@@ -1909,8 +1909,7 @@ fn unsupported(
                 && k.n_key_field > 0 && k.n_key_field <= k.n_all_field
                 && k.a_coll.len() == usize::from(k.n_all_field)
                 && k.a_coll.iter().flatten().all(|c| {
-                    binary_in_key_encoding(c) || (builtin_collations
-                        && c.name.eq_ignore_ascii_case("NOCASE") && c.enc == crate::vdbeaux::SQLITE_UTF8)
+                    binary_in_key_encoding(c) || (builtin_collations && builtin_read_key_collation(c, k.enc))
                 });
             let membership = row_case_encoding == Some(k.enc)
                 && ordered_in_key(prog, op, k, |coll| {
