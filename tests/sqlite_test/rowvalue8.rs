@@ -189,3 +189,68 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_sorted_row_case_keeps_binary_keys_and_step_boundaries() {
+    sqliters_tcltest::run_test_script(
+        "sorted_row_case_keeps_binary_keys_and_step_boundaries",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+proc sorted_case_result {x} {
+    lappend ::sorted_calls $x
+    return [expr {int($x)}]
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    db function sorted_case_result -argcount 1 sorted_case_result
+    execsql {
+        CREATE TABLE words(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+        CREATE TABLE picks(id INTEGER PRIMARY KEY, ref INTEGER, token TEXT);
+        INSERT INTO words VALUES(1,1,10),(2,2,20),(3,3,30);
+        INSERT INTO picks VALUES
+            (1,3,'a'),(2,1,char(256)),(3,6,'a'||char(0)||'x'),
+            (4,2,char(128512)),(5,NULL,NULL),(6,1,'a'),(7,2,'A');
+    }
+    set sql {
+        SELECT p.id, CASE (SELECT a,sorted_case_result(b) FROM words WHERE id=p.ref)
+            WHEN (1,10) THEN 'one' WHEN (2,20) THEN 'two'
+            WHEN (3,30) THEN 'three' ELSE '-' END
+        FROM picks p ORDER BY p.token COLLATE BINARY DESC NULLS LAST, p.id
+    }
+    if {$encoding == "UTF-16le"} {
+        set expected {3 - 1 three 6 one 7 two 4 two 2 one 5 -}
+    } else {
+        set expected {4 two 2 one 3 - 1 three 6 one 7 two 5 -}
+    }
+    do_test sorted-row-case-$encoding.rows {
+        set s [sqlite3_prepare_v2 db $sql -1]
+        set ::sorted_calls {}
+        set rows {}
+        set schedule {}
+        while {[set code [sqlite3_step $s]] eq "SQLITE_ROW"} {
+            lappend rows [sqlite3_column_int $s 0] [sqlite3_column_text $s 1]
+            lappend schedule $::sorted_calls
+            set ::sorted_calls {}
+        }
+        list $rows $schedule $code $::sorted_calls [sqlite3_finalize $s]
+    } [list $expected [list {30 10 20 10 20} {} {} {} {} {} {}] SQLITE_DONE {} SQLITE_OK]
+    do_test sorted-row-case-$encoding.reprepare {
+        set s [sqlite3_prepare_v2 db $sql -1]
+        set ::sorted_calls {}
+        set code [sqlite3_step $s]
+        set before [list $code [sqlite3_column_int $s 0] [sqlite3_column_text $s 1] $::sorted_calls]
+        sqlite3_reset $s
+        execsql {CREATE INDEX picks_ref ON picks(ref);}
+        set ::sorted_calls {}
+        set code [sqlite3_step $s]
+        set after [list $code [sqlite3_column_int $s 0] [sqlite3_column_text $s 1] $::sorted_calls]
+        list $before $after [sqlite3_finalize $s]
+    } [list [concat SQLITE_ROW [lrange $expected 0 1] [list {30 10 20 10 20}]] \
+            [concat SQLITE_ROW [lrange $expected 0 1] [list {30 10 20 10 20}]] SQLITE_OK]
+}
+finish_test
+"#,
+    );
+}

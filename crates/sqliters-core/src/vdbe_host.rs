@@ -561,7 +561,12 @@ fn read_machine_program(
                 p = table_program;
                 table_scan = true;
             }
-            if let Some(why) = unsupported_reason(&p) {
+            let unsupported = if scope == ReadMachineScope::RowCase && inner.collations.get_custom("BINARY").is_none() {
+                sqliters_vdbe::vdbe::unsupported_reason_mapped_read(&p)
+            } else {
+                unsupported_reason(&p)
+            };
+            if let Some(why) = unsupported {
                 trace(&format!("fallback: {why}"), raw_sql);
                 return Ok(None);
             }

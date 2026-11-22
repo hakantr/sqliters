@@ -960,7 +960,7 @@ pub fn unsupported_reason_write(prog: &Program) -> Option<String> {
     unsupported(prog, true, false)
 }
 
-/// For the checked single-table mapped read, allow the sorter's BINARY UTF-16 keys.
+/// Allow BINARY UTF-16 sorter keys for the checked mapped and row CASE reads.
 pub fn unsupported_reason_mapped_read(prog: &Program) -> Option<String> {
     unsupported(prog, false, true)
 }
