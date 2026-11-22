@@ -33428,23 +33428,48 @@ fn view_dml_indexed_select(
         let full_index = |index: &IndexSchema| {
             index.where_clause.is_none() && simple_index(index, int_col)
         };
-        let matching_text_index = |index: &IndexSchema| {
-            let Some((part_col, BinaryOp::Gt, Expr::Integer(part_bound))) =
-                index.where_clause.as_ref().and_then(view_dml_index_term)
-            else {
-                return false;
-            };
-            simple_index(index, text_col)
-                && !part_col.double_quoted
-                && part_col.column.eq_ignore_ascii_case(&table.columns[text_col].name)
-                && matches!(text_bound, Expr::Integer(value) if value == part_bound)
-                && index.raw_sql.as_deref().is_some_and(|sql| has_plain_integer_tokens(sql, true))
+        let is_text_key = |reference: &ColumnRef| {
+            !reference.double_quoted
+                && reference.schema.is_none()
+                && reference.table.is_none()
+                && reference.column.eq_ignore_ascii_case(&table.columns[text_col].name)
         };
-        // For the proven pair, C gives the matching partial range priority.
+        let text_index_applies = |index: &IndexSchema| {
+            if !simple_index(index, text_col) {
+                return None;
+            }
+            let condition = index.where_clause.as_ref()?;
+            if let Some((reference, BinaryOp::Gt, Expr::Integer(value))) =
+                view_dml_index_term(condition)
+                && is_text_key(reference)
+                && index.raw_sql.as_deref().is_some_and(|sql| has_plain_integer_tokens(sql, true))
+            {
+                // C tests structural equality between the two literal predicates.
+                return Some(matches!(text_bound, Expr::Integer(query) if query == value));
+            }
+            if let Expr::IsNull { expr, negated: true } = condition
+                && let Expr::Column(reference) = expr.as_ref()
+                && is_text_key(reference)
+            {
+                return Some(expr_implies_partial_where(
+                    &make_selection(), condition, table, "main", alias,
+                ));
+            }
+            None
+        };
         let expected = match indexes.as_slice() {
-            [only] if full_index(only) || matching_text_index(only) => only,
-            [first, second] if full_index(first) && matching_text_index(second) => second,
-            [first, second] if full_index(second) && matching_text_index(first) => first,
+            [only] if full_index(only) || text_index_applies(only) == Some(true) => only,
+            [first, second] => {
+                let (full, partial) = if full_index(first) {
+                    (first, second)
+                } else if full_index(second) {
+                    (second, first)
+                } else {
+                    return None;
+                };
+                // C prices the applicable partial range below the full range.
+                if text_index_applies(partial)? { partial } else { full }
+            }
             _ => return None,
         };
         let indexed_by = IndexHint::IndexedBy(expected.name.clone());

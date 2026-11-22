@@ -2127,3 +2127,8 @@ Nitelikli INTEGER PRIMARY KEY eşitliğinde olağan INNER ve LEFT JOIN, reverse_
 ## V6b.364 — Rowid görünüm UPDATE karma aralığında tek indeks
 
 Tam INTEGER ve uygun kısmi TEXT indeksinin ayrı kullanıldığı 240 profilde 100 fark kapandı. OFF 1240/1/329, ON 1237/4/329. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,256 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_364.md).
+
+
+## V6b.365 — Rowid görünüm UPDATE kısmi indeks koşulu
+
+Literal koşul eşliği ve IS NOT NULL çıkarımı C ile eşleşti. 360 profil ve 250 kapanış doğrulandı. OFF 1241/1/329, ON 1238/4/329. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_365.md).

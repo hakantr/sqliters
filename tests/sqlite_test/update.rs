@@ -759,3 +759,44 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_rowid_view_update_mixed_range_partial_eligibility() {
+    sqliters_tcltest::run_test_script(
+        "rowid_view_update_mixed_range_partial_eligibility",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach {layout indexes limits returning order} {
+  stricter {CREATE INDEX full_a ON base(a DESC); CREATE INDEX partial_b ON base(b) WHERE b>5;} {b>4 AND a<6} {} {5 3 2 1 0}
+  weaker {CREATE INDEX partial_b ON base(b) WHERE b>3; CREATE INDEX full_a ON base(a DESC);} {a<6 AND b>4} {RETURNING a} {5 3 2 1 0}
+  notnull {CREATE INDEX full_a ON base(a DESC); CREATE INDEX partial_b ON base(b) WHERE b IS NOT NULL;} {b>4 AND a<6} {RETURNING a} {0 1 3 5 2}
+  notnull_desc {CREATE INDEX partial_b ON base(b DESC) WHERE b IS NOT NULL; CREATE INDEX full_a ON base(a);} {a<6 AND b>4} {} {2 5 3 1 0}
+  lone_ineligible {CREATE INDEX partial_b ON base(b) WHERE b>5;} {b>4 AND a<6} {} {3 1 5 2 0}
+} {
+  reset_db
+  execsql {
+    CREATE TABLE base(a INT NOT NULL, b TEXT, c NUM);
+    CREATE TABLE seen(seq INTEGER PRIMARY KEY, a INT);
+    INSERT INTO base VALUES (6,'6',60),(3,'8',30),(1,'7',10),(4,'2',40),(5,'9',50),(2,'text',20),(0,'5',0),(-1,NULL,-10);
+    CREATE VIEW projected AS SELECT a,b,c FROM base;
+    CREATE TRIGGER revise INSTEAD OF UPDATE ON projected BEGIN
+      INSERT INTO seen(a) VALUES(old.a);
+      UPDATE base SET c=new.c WHERE a=old.a;
+    END;
+  }
+  execsql $indexes
+  set returned {}
+  if {$returning ne {}} { set returned $order }
+  do_execsql_test mixed-rowid-partial-eligibility-$layout.1 "
+    UPDATE projected SET c=c+1 WHERE $limits $returning;
+    SELECT changes();
+    SELECT a FROM seen ORDER BY seq;
+    SELECT a,c FROM base ORDER BY a;
+    PRAGMA integrity_check;
+  " [concat $returned {0} $order {-1 -10 0 1 1 11 2 21 3 31 4 40 5 51 6 60 ok}]
+}
+finish_test
+"#,
+    );
+}
