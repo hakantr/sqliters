@@ -1423,3 +1423,92 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_builtin_membership_collations_and_steps() {
+    sqliters_tcltest::run_test_script(
+        "row_case_builtin_membership_collations_and_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE words(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO words VALUES(1,1,10),(2,2,20);
+        CREATE TABLE items(id INTEGER PRIMARY KEY,ref INTEGER,label,region TEXT);
+        INSERT INTO items VALUES(1,1,'Alpha','north '),(2,1,'ALPHA','south'),
+            (3,1,'trail ','north '),(4,1,'trail','north'),(5,1,NULL,'north '),
+            (6,2,'swap','west'),(7,1,'Beta','west'),(8,1,'trail'||char(160),'north'),
+            (9,1,'A'||char(0)||'Z','east'),(10,1,'a'||char(0)||'x','east'),
+            (11,9,NULL,NULL),(12,1,'A'||char(9),'east'),
+            (13,1,char(256),'east'),(14,1,char(257),'east'),(15,1,X'416C706861','east');
+        CREATE VIEW chosen AS
+          SELECT i.id,CASE (SELECT a,b FROM words w WHERE w.id=i.ref)
+             WHEN (2,20) THEN 'Beta  ' ELSE i.label END AS token,i.region
+          FROM items i;
+        CREATE TABLE probes(id INTEGER PRIMARY KEY,token TEXT,region TEXT);
+        INSERT INTO probes VALUES(1,'alpha','north'),(2,'ALPHA','south'),
+            (3,'alpha','NORTH'),(4,NULL,'north'),(5,'absent','north');
+    }
+    do_execsql_test builtin-row-case-in-$encoding.scalar {
+        SELECT 'alpha' COLLATE NOCASE IN (SELECT token FROM chosen WHERE id<=2),
+               'absent' COLLATE NOCASE NOT IN (SELECT token FROM chosen WHERE id<=2),
+               'Beta' COLLATE RTRIM IN (SELECT token FROM chosen WHERE id=6),
+               ('trail'||char(32)) COLLATE RTRIM IN (SELECT token FROM chosen WHERE id=4),
+               ('trail'||char(160)) COLLATE RTRIM IN (SELECT token FROM chosen WHERE id=4),
+               char(257) COLLATE NOCASE IN (SELECT token FROM chosen WHERE id=13),
+               ('A'||char(0)||'u') COLLATE NOCASE IN (SELECT token FROM chosen WHERE id=9),
+               X'416C706861' COLLATE NOCASE IN (SELECT token FROM chosen WHERE id<=2);
+    } {1 1 1 1 0 0 1 0}
+    do_execsql_test builtin-row-case-in-$encoding.row-mixed {
+        SELECT ('alpha' COLLATE NOCASE,'north' COLLATE RTRIM) IN
+                   (SELECT token,region FROM chosen WHERE id<=4),
+               ('ALPHA' COLLATE BINARY,'north' COLLATE RTRIM) IN
+                   (SELECT token,region FROM chosen WHERE id<=4),
+               ('Beta' COLLATE RTRIM,'WEST' COLLATE NOCASE) IN
+                   (SELECT token,region FROM chosen WHERE id BETWEEN 6 AND 7),
+               ('beta' COLLATE RTRIM,'west' COLLATE NOCASE) NOT IN
+                   (SELECT token,region FROM chosen WHERE id BETWEEN 6 AND 7);
+    } {1 0 1 1}
+    do_execsql_test builtin-row-case-in-$encoding.null {
+        SELECT 'missing' COLLATE NOCASE IN (SELECT token FROM chosen WHERE id<=5),
+               'missing' COLLATE RTRIM NOT IN (SELECT token FROM chosen WHERE id<=5),
+               ('missing' COLLATE NOCASE,'north' COLLATE RTRIM) IN
+                   (SELECT token,region FROM chosen WHERE id<=5),
+               ('missing' COLLATE NOCASE,'west' COLLATE RTRIM) NOT IN
+                   (SELECT token,region FROM chosen WHERE id<=5),
+               (NULL COLLATE NOCASE,'north' COLLATE RTRIM) IN
+                   (SELECT token,region FROM chosen WHERE id<0),
+               (NULL COLLATE NOCASE,'north' COLLATE RTRIM) NOT IN
+                   (SELECT token,region FROM chosen WHERE id<0);
+    } {{} {} {} 1 0 1}
+    do_test builtin-row-case-in-$encoding.cached {
+        set s [sqlite3_prepare_v2 db {
+            SELECT p.id,(p.token COLLATE NOCASE,p.region COLLATE RTRIM) IN
+              (SELECT token,region FROM chosen WHERE id<=?1) FROM probes p ORDER BY p.id
+        } -1]
+        sqlite3_bind_int $s 1 2
+        set before {}
+        while {[set rc [sqlite3_step $s]] eq "SQLITE_ROW"} {
+            lappend before [sqlite3_column_int $s 0] [sqlite3_column_text $s 1]
+        }
+        lappend before $rc
+        sqlite3_reset $s
+        execsql {CREATE INDEX items_ref ON items(ref);}
+        sqlite3_bind_int $s 1 1
+        set after {}
+        while {[set rc [sqlite3_step $s]] eq "SQLITE_ROW"} {
+            lappend after [sqlite3_column_int $s 0] [sqlite3_column_text $s 1]
+        }
+        lappend after $rc
+        list $before $after [sqlite3_finalize $s]
+    } {{1 1 2 1 3 0 4 {} 5 0 SQLITE_DONE} {1 1 2 0 3 0 4 {} 5 0 SQLITE_DONE} SQLITE_OK}
+}
+finish_test
+
+"#,
+    );
+}

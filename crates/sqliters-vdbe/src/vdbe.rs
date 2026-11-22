@@ -1013,15 +1013,15 @@ fn unordered_distinct_key(
 /// The ordered RHS set for IN is filled by SRT_Set and probed at the same
 /// width. Other ordered ephemeral keys, such as the LIMIT sorter, keep the
 /// ordinary key admission check.
-fn binary_in_key(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
+fn ordered_in_key(
+    prog: &Program, open: &VdbeOp, key: &KeyInfo, supports_collation: impl Fn(&CollSeq) -> bool,
+) -> bool {
     let width = i32::from(key.n_key_field);
     if open.opcode != OP_OpenEphemeral || open.p2 != width || open.p3 != 0
         || open.p5 != 0 || width == 0 || i32::from(key.n_all_field) != width + 1
         || !key.a_sort_flags.get(..width as usize).is_some_and(|flags| flags.iter().all(|&flag| flag == 0))
         || !key.a_coll.get(..width as usize).is_some_and(|fields| {
-            fields.iter().all(|field| field.as_deref().is_some_and(|collation| {
-                collation.name.eq_ignore_ascii_case("BINARY") && collation.enc == key.enc
-            }))
+            fields.iter().all(|field| field.as_deref().is_some_and(&supports_collation))
         })
     {
         return false;
@@ -1564,7 +1564,10 @@ fn unsupported(
                     binary_in_key_encoding(c) || (builtin_collations
                         && c.name.eq_ignore_ascii_case("NOCASE") && c.enc == crate::vdbeaux::SQLITE_UTF8)
                 });
-            let binary_membership = row_case_encoding == Some(k.enc) && binary_in_key(prog, op, k);
+            let membership = row_case_encoding == Some(k.enc)
+                && ordered_in_key(prog, op, k, |coll| {
+                    binary_in_key_encoding(coll) || (builtin_collations && builtin_read_key_collation(coll, k.enc))
+                });
             let builtin_sort = builtin_collations && row_case_encoding == Some(k.enc)
                 && builtin_order_sorter(prog, op, k);
             let limit_sort = row_case_encoding == Some(k.enc) && limit_sort_key(prog, op, k, builtin_collations);
@@ -1572,7 +1575,7 @@ fn unsupported(
             if k.enc != 1 && !prog.references_like
                 && !(binary_sort || binary_group_compare || builtin_group || streamed_group
                     || distinct || physical_index
-                    || binary_membership || builtin_sort || limit_sort || binary_fifo)
+                    || membership || builtin_sort || limit_sort || binary_fifo)
             {
                 return Some("UTF-16 key".to_owned());
             }
