@@ -2267,3 +2267,8 @@ Exact V6b.389 tabanıyla 684 gözlemde fiziksel NOCASE indeksinin beslediği 32 
 ## V6b.392 — Özyinelemeli FIFO UNION yerleşik kolasyonları
 
 300 gözlemde NOCASE/RTRIM ve karma büyük kayıtlarla 40 UTF-16 özyinelemeli FIFO sonucu C ile eşleşti. Önceki 558 gözlem ve bağlantı korumaları aynı. C fixture 13/13, Rust rowvalue8 24/24 ve delete2 1/1 iki kipte. OFF 1273/1/325, ON 1270/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,269 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_392.md).
+
+
+## V6b.393 — UTF-16 satır CASE kısmi sıralaması
+
+Kısmi ORDER BY ve LIMIT/OFFSET iki matriste 288 UTF-16 sonucunu C ile eşitledi. Önceki 558 gözlem, C planları ve koruma yolları aynı. C 13/13, Rust rowvalue8 25/25 ve delete2 1/1 iki kipte. OFF 1274/1/325, ON 1271/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,256 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_393.md).

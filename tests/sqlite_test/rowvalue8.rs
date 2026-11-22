@@ -1573,3 +1573,78 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_builtin_partial_order_steps_and_limit() {
+    sqliters_tcltest::run_test_script(
+        "row_case_builtin_partial_order_steps_and_limit",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+proc mark_partial {x} {
+    lappend ::partial_calls $x
+    return [expr {int($x)}]
+}
+proc collect_partial_steps {s} {
+    set rows {}
+    while {1} {
+        set ::partial_calls {}
+        set code [sqlite3_step $s]
+        if {$code ne "SQLITE_ROW"} {
+            lappend rows [list $code $::partial_calls]
+            return $rows
+        }
+        lappend rows [list [sqlite3_column_int $s 0] $::partial_calls]
+    }
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    db function mark_partial -argcount 1 mark_partial
+    execsql {
+        CREATE TABLE picks(id INTEGER PRIMARY KEY,prefix TEXT,label TEXT);
+        CREATE INDEX picks_prefix ON picks(prefix COLLATE NOCASE);
+        INSERT INTO picks VALUES(1,'A','alpha '),(2,'a','z'),(3,'a',NULL),
+            (4,'b','b  '),(5,'B','a'),(6,'b','b'),(7,'C','Y'),(8,'c','X'),(9,'C','Y  '),
+            (10,NULL,'c'),(11,NULL,NULL);
+    }
+    set sql {
+        SELECT i.id FROM picks i INDEXED BY picks_prefix
+        ORDER BY i.prefix COLLATE NOCASE,
+                 (CASE (SELECT 1,mark_partial(i.id)) WHEN (1,i.id) THEN i.label END) COLLATE RTRIM DESC NULLS FIRST,
+                 i.id
+    }
+    do_test row-case-partial-$encoding.full {
+        set s [sqlite3_prepare_v2 db $sql -1]
+        list [sqlite3_column_name $s 0] [collect_partial_steps $s] [sqlite3_finalize $s]
+    } {id {{11 {10 11 1}} {10 {}} {3 {2 3 4}} {2 {}} {1 {}} {4 {5 6 7}} {6 {}} {5 {}} {7 {8 9}} {9 {}} {8 {}} {SQLITE_DONE {}}} SQLITE_OK}
+    append sql " LIMIT ?1 OFFSET ?2"
+    do_test row-case-partial-$encoding.limit-reset-reprepare {
+        set s [sqlite3_prepare_v2 db $sql -1]
+        sqlite3_bind_int $s 1 3
+        sqlite3_bind_int $s 2 1
+        set first [collect_partial_steps $s]
+        set reset [sqlite3_reset $s]
+        execsql {CREATE TABLE reprepare(id INTEGER PRIMARY KEY);}
+        sqlite3_bind_int $s 1 2
+        sqlite3_bind_int $s 2 4
+        set second [collect_partial_steps $s]
+        list $first $reset $second [sqlite3_finalize $s]
+    } {{{10 {10 11 1}} {3 {2 3 4}} {2 {}} {SQLITE_DONE {}}} SQLITE_OK {{1 {10 11 1 2 3 4}} {4 {5 6 7}} {SQLITE_DONE {}}} SQLITE_OK}
+    do_test row-case-partial-$encoding.zero {
+        set s [sqlite3_prepare_v2 db $sql -1]
+        sqlite3_bind_int $s 1 0
+        sqlite3_bind_int $s 2 1
+        list [collect_partial_steps $s] [sqlite3_finalize $s]
+    } {{{SQLITE_DONE {}}} SQLITE_OK}
+    do_execsql_test row-case-partial-$encoding.payload {
+        SELECT i.id,i.label FROM picks i INDEXED BY picks_prefix
+        ORDER BY i.prefix COLLATE NOCASE,
+                 (CASE (SELECT 1,mark_partial(i.id)) WHEN (1,i.id) THEN i.label END) COLLATE RTRIM DESC NULLS FIRST,
+                 i.id LIMIT 4 OFFSET 2;
+    } {3 {} 2 z 1 {alpha } 4 {b  }}
+}
+finish_test
+"#,
+    );
+}

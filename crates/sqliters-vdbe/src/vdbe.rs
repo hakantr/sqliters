@@ -1255,6 +1255,130 @@ fn builtin_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
     })
 }
 
+/// A partial ORDER BY compares the satisfied prefix to detect a new block,
+/// then puts only the remaining fields into that block's sorter.
+fn partial_order_pairs(prog: &Program, encoding: u8) -> Vec<(usize, usize)> {
+    let ops = &prog.a_op;
+    ops.windows(6).enumerate().filter_map(|(start, window)| {
+        let [record, first, compare, jump, flush, reset] = window else { return None };
+        if record.opcode != OP_MakeRecord || record.p4 != P4::NotUsed || record.p5 != 0
+            || compare.opcode != OP_Compare || compare.p5 != 0 || jump.opcode != OP_Jump
+            || flush.opcode != OP_Gosub || reset.opcode != OP_ResetSorter
+            || compare.p3 <= 0 || compare.p2.checked_add(compare.p3) != Some(record.p1)
+            || usize::try_from(jump.p1).ok() != Some(start + 4) || jump.p1 != jump.p3
+        {
+            return None;
+        }
+        let cursor = reset.p1;
+        let (open_index, open) = ops[..start].iter().enumerate().find(|(_, op)| {
+            op.p1 == cursor && matches!(op.opcode, OP_SorterOpen | OP_OpenEphemeral)
+        })?;
+        let (P4::KeyInfo(prefix), P4::KeyInfo(suffix)) = (&compare.p4, &open.p4) else {
+            return None;
+        };
+        let prefix_width = compare.p3 as usize;
+        let suffix_width = usize::from(suffix.n_key_field);
+        let fields = usize::from(suffix.n_all_field);
+        let Ok(record_width) = usize::try_from(record.p2) else { return None };
+        if open.p2 != record.p2 || open.p3 != 0 || open.p5 != 0
+            || prefix.enc != encoding || suffix.enc != encoding
+            || !builtin_order_key(prefix) || !builtin_order_key(suffix)
+            || usize::from(prefix.n_key_field) != prefix_width + suffix_width
+            || usize::from(prefix.n_all_field) != prefix_width + fields
+            || prefix.a_sort_flags.iter().any(|&flag| flag != 0)
+            || prefix.a_coll[prefix_width..prefix_width + suffix_width] != suffix.a_coll[..suffix_width]
+            || record_width > fields
+        {
+            return None;
+        }
+
+        let (remember, insert, insert_index) = if open.opcode == OP_SorterOpen {
+            let [remember, insert] = ops.get(start + 6..start + 8)? else { return None };
+            if record_width < suffix_width || first.opcode != OP_SequenceTest || first.p1 != cursor
+                || usize::try_from(first.p2).ok() != Some(start + 6)
+                || usize::try_from(jump.p2).ok() != Some(start + 7)
+                || insert.opcode != OP_SorterInsert
+            {
+                return None;
+            }
+            (remember, insert, start + 7)
+        } else {
+            let sequence_register = record.p1.checked_add(i32::from(suffix.n_key_field))?;
+            let payload_end = record.p1.checked_add(record.p2)?;
+            // A deferred result column may be loaded after the sequence, but
+            // it must write only the record's non-key payload.
+            let seq = ops[..start].iter().rev().find(|op| {
+                !(op.opcode == OP_Column && op.p1 != cursor
+                    && op.p3 > sequence_register && op.p3 < payload_end)
+            })?;
+            let [done, remember, bound, last, skip, delete, insert] = ops.get(start + 6..start + 13)? else {
+                return None;
+            };
+            if record_width <= suffix_width || seq.opcode != OP_Sequence || seq.p1 != cursor
+                || seq.p2 != sequence_register
+                || first.opcode != OP_IfNot || first.p1 != seq.p2
+                || usize::try_from(first.p2).ok() != Some(start + 7)
+                || done.opcode != OP_IfNot || bound.opcode != OP_IfNotZero || done.p1 != bound.p1
+                || usize::try_from(jump.p2).ok() != Some(start + 8)
+                || usize::try_from(bound.p2).ok() != Some(start + 12)
+                || last.opcode != OP_Last || last.p1 != cursor || last.p2 != 0
+                || skip.opcode != OP_IdxLE || skip.p1 != cursor || skip.p3 != record.p1
+                || skip.p4 != P4::Int32(i32::from(suffix.n_key_field))
+                || delete.opcode != OP_Delete || delete.p1 != cursor || delete.p2 != 0 || delete.p5 != 0
+                || insert.opcode != OP_IdxInsert
+            {
+                return None;
+            }
+            (remember, insert, start + 12)
+        };
+        if remember.opcode != OP_Move || remember.p1 != compare.p2 || remember.p2 != compare.p1 || remember.p3 != compare.p3
+            || insert.p1 != cursor || insert.p2 != record.p3 || insert.p3 != record.p1
+            || insert.p4 != P4::Int32(record.p2) || insert.p5 != 0
+        {
+            return None;
+        }
+        let drain_start = usize::try_from(flush.p2).ok()?;
+        if drain_start <= insert_index
+            || !ops.get(insert_index + 1..drain_start)?.iter().any(|op| {
+                op.opcode == OP_Gosub && op.p1 == flush.p1 && op.p2 == flush.p2
+            })
+            || !partial_order_drain(ops, drain_start, flush.p1, open)
+        {
+            return None;
+        }
+        Some((open_index, start + 2))
+    }).collect()
+}
+
+fn partial_order_drain(ops: &[VdbeOp], start: usize, return_reg: i32, open: &VdbeOp) -> bool {
+    let cursor = open.p1;
+    let (loop_start, source, next_opcode) = if open.opcode == OP_SorterOpen {
+        let Some([once, pseudo, sort, data]) = ops.get(start..start + 4) else { return false };
+        if once.opcode != OP_Once || usize::try_from(once.p2).ok() != Some(start + 2)
+            || pseudo.opcode != OP_OpenPseudo || pseudo.p1 != data.p3 || pseudo.p2 != data.p2 || pseudo.p3 < open.p2
+            || sort.opcode != OP_SorterSort || sort.p1 != cursor || data.opcode != OP_SorterData || data.p1 != cursor
+        {
+            return false;
+        }
+        (start + 3, pseudo.p1, OP_SorterNext)
+    } else {
+        if !ops.get(start).is_some_and(|op| op.opcode == OP_Sort && op.p1 == cursor) {
+            return false;
+        }
+        (start + 1, cursor, OP_Next)
+    };
+    let Some(drain) = ops.get(loop_start..).and_then(|tail| {
+        tail.iter().position(|op| op.opcode == OP_Return && op.p1 == return_reg).map(|end| &tail[..end])
+    }) else {
+        return false;
+    };
+    drain.iter().any(|op| op.opcode == OP_Column && op.p1 == source && (0..open.p2).contains(&op.p2))
+        && drain.iter().any(|op| op.opcode == OP_ResultRow)
+        && drain.last().is_some_and(|next| {
+            next.opcode == next_opcode && next.p1 == cursor && usize::try_from(next.p2).ok() == Some(loop_start)
+        })
+}
+
 /// GROUP BY shares one KeyInfo between its sorter and register comparison. Keep
 /// additional UTF-16 collation support tied to that pair.
 fn builtin_group_key(prog: &Program, key: &Arc<KeyInfo>) -> bool {
@@ -1326,6 +1450,10 @@ fn unsupported(
     }
     let has_group_sorter = matches!(key_scope, ReadKeyScope::BinaryGroup | ReadKeyScope::BuiltinGroup)
         && prog.a_op.iter().any(|op| op.opcode == OP_SorterOpen);
+    let partial_order = match row_case_encoding {
+        Some(encoding) if builtin_collations && key_scope == ReadKeyScope::BinarySorter => partial_order_pairs(prog, encoding),
+        _ => Vec::new(),
+    };
     let subs = prog.p_program.iter().flat_map(|s| s.a_op.iter());
     for (index, op) in prog.a_op.iter().chain(subs).enumerate() {
         let ok = (op.opcode == OP_Expire && op.p1 != 0 && op.p2 == 1) || matches!(
@@ -1574,6 +1702,7 @@ fn unsupported(
             let builtin_sort = builtin_collations && row_case_encoding == Some(k.enc)
                 && builtin_order_sorter(prog, op, k);
             let limit_sort = row_case_encoding == Some(k.enc) && limit_sort_key(prog, op, k, builtin_collations);
+            let partial_sort = partial_order.iter().any(|&(open, compare)| index == open || index == compare);
             let recursive_fifo = row_case_encoding == Some(k.enc)
                 && recursive_fifo_key(prog, index, op, k, |coll| {
                     binary_in_key_encoding(coll) || (builtin_collations && builtin_read_key_collation(coll, k.enc))
@@ -1581,7 +1710,7 @@ fn unsupported(
             if k.enc != 1 && !prog.references_like
                 && !(binary_sort || binary_group_compare || builtin_group || streamed_group
                     || distinct || physical_index
-                    || membership || builtin_sort || limit_sort || recursive_fifo)
+                    || membership || builtin_sort || limit_sort || partial_sort || recursive_fifo)
             {
                 return Some("UTF-16 key".to_owned());
             }
