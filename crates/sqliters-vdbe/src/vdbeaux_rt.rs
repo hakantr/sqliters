@@ -5,6 +5,7 @@
 //!
 //! (The building half of `vdbeaux.c` — the program builder — is `vdbeaux.rs`.)
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use sqliters_btree::Btree;
@@ -13,7 +14,7 @@ use sqliters_types::{Result, SqliteError};
 
 use crate::vdbeaux::{KEYINFO_ORDER_BIGNULL, KEYINFO_ORDER_DESC};
 use crate::vdbemem::{
-    CollRt, MEM_BLOB, MEM_INT, MEM_INT_REAL, MEM_NULL, MEM_REAL, MEM_STR, MEM_ZERO, Mem, sqlite3_int_float_compare,
+    CollRt, MEM_BLOB, MEM_INT, MEM_INT_REAL, MEM_NULL, MEM_REAL, MEM_STR, MEM_ZERO, Mem, bin_coll_func, sqlite3_int_float_compare,
 };
 
 /// `struct KeyInfo` at run time: the collations are bound to their comparison functions.
@@ -257,6 +258,7 @@ impl<'a> UnpackedRecord<'a> {
                 return;
             }
             if flags & (MEM_REAL | MEM_INT_REAL | MEM_NULL | MEM_BLOB) == 0
+                && self.a_mem[0].enc == self.key_info.enc
                 && self.key_info.a_coll.first().is_none_or(|c| c.as_ref().is_none_or(|c| c.is_binary))
             {
                 self.x_compare = RecordCompare::String;
@@ -427,12 +429,12 @@ pub fn sqlite3_vdbe_record_compare_with_skip(a_key1: &[u8], p: &mut UnpackedReco
                 } else if let Some(coll) = key_info.a_coll.get(i).and_then(|c| c.as_ref()) {
                     rc = crate::vdbemem::compare_text_bytes(&a_key1[d..d + n as usize], key_info.enc, &rhs.z, rhs.enc, coll);
                 } else {
-                    let n_cmp = (n as usize).min(rhs.z.len());
-                    rc = match a_key1[d..d + n_cmp].cmp(&rhs.z[..n_cmp]) {
-                        std::cmp::Ordering::Less => -1,
-                        std::cmp::Ordering::Greater => 1,
-                        std::cmp::Ordering::Equal => n as i32 - rhs.z.len() as i32,
+                    let probe = if rhs.enc == key_info.enc {
+                        Cow::Borrowed(rhs.z.as_slice())
+                    } else {
+                        Cow::Owned(crate::utf::translate_bytes(&rhs.z, rhs.enc, key_info.enc))
                     };
+                    rc = bin_coll_func(&a_key1[d..d + n as usize], &probe);
                 }
             }
         } else if rhs.flags & MEM_BLOB != 0 {

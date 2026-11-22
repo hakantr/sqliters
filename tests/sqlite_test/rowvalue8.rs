@@ -607,3 +607,92 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_binary_physical_index_probe_encoding() {
+    sqliters_tcltest::run_test_script(
+        "row_case_binary_physical_index_probe_encoding",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+proc mark_index_lookup {x} {
+    lappend ::index_calls $x
+    return [expr {int($x)}]
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    db function mark_index_lookup -argcount 1 mark_index_lookup
+    execsql {
+        CREATE TABLE list(id INTEGER PRIMARY KEY, label TEXT COLLATE BINARY, slot, payload TEXT);
+        CREATE INDEX list_key ON list(label,slot DESC);
+        CREATE TABLE detail(label TEXT COLLATE BINARY, slot, payload TEXT, PRIMARY KEY(label,slot DESC)) WITHOUT ROWID;
+        CREATE TABLE marks(slot INTEGER PRIMARY KEY, a, b);
+        INSERT INTO list VALUES(1,'A',1,'first'),(2,'A',2,'second'),(3,char(256),1,'wide');
+        INSERT INTO detail SELECT label,slot,payload FROM list;
+        INSERT INTO marks VALUES(1,1,10),(2,2,20);
+    }
+    set selected {
+        SELECT i.payload,
+               CASE (SELECT a,mark_index_lookup(b) FROM marks WHERE slot=i.slot)
+                 WHEN (1,10) THEN 'one' WHEN (2,20) THEN 'two' ELSE '-' END AS tag
+          FROM list i INDEXED BY list_key
+         WHERE i.label=?1
+         ORDER BY i.slot DESC, i.id
+    }
+    do_test binary-index-case-$encoding.unbound {
+        set s [sqlite3_prepare_v2 db $selected -1]
+        set ::index_calls {}
+        list [sqlite3_column_name $s 0] [sqlite3_column_name $s 1] [sqlite3_step $s] $::index_calls
+    } {payload tag SQLITE_DONE {}}
+    do_test binary-index-case-$encoding.bind {
+        sqlite3_reset $s
+        sqlite3_bind_text $s 1 A 1
+        set ::index_calls {}
+        set code [sqlite3_step $s]
+        list $code [sqlite3_column_text $s 0] [sqlite3_column_text $s 1] $::index_calls
+    } {SQLITE_ROW second two 20}
+    do_test binary-index-case-$encoding.range-next {
+        set ::index_calls {}
+        set code [sqlite3_step $s]
+        list $code [sqlite3_column_text $s 0] [sqlite3_column_text $s 1] $::index_calls [sqlite3_step $s] [sqlite3_finalize $s]
+    } {SQLITE_ROW first one 10 SQLITE_DONE SQLITE_OK}
+    do_test binary-index-case-$encoding.without-rowid-reprepare {
+        set lookup [string map [list "list i INDEXED BY list_key" "detail i" "WHERE i.label=?1" "WHERE i.label=?1 AND i.slot=?2" "ORDER BY i.slot DESC, i.id" ""] $selected]
+        set s [sqlite3_prepare_v2 db $lookup -1]
+        sqlite3_bind_text $s 1 A 1
+        sqlite3_bind_int $s 2 1
+        set ::index_calls {}
+        set code [sqlite3_step $s]
+        set before [list $code [sqlite3_column_text $s 0] [sqlite3_column_text $s 1] $::index_calls]
+        sqlite3_reset $s
+        execsql {CREATE TABLE unrelated(k INTEGER);}
+        sqlite3_bind_text $s 1 A 1
+        sqlite3_bind_int $s 2 2
+        set ::index_calls {}
+        set code [sqlite3_step $s]
+        list $before $code [sqlite3_column_text $s 0] [sqlite3_column_text $s 1] $::index_calls [sqlite3_finalize $s]
+    } {{SQLITE_ROW first one 10} SQLITE_ROW second two 20 SQLITE_OK}
+    do_execsql_test binary-index-case-$encoding.mixed-probes {
+        CREATE TABLE stock(id INTEGER PRIMARY KEY);
+        INSERT INTO stock(id) VALUES(1),(2);
+        ALTER TABLE stock ADD COLUMN label TEXT DEFAULT 'old';
+        INSERT INTO stock VALUES(3,'old'),(4,'new'),(5,NULL);
+        CREATE TABLE details(prefix INTEGER, label TEXT, a, b, PRIMARY KEY(prefix,label)) WITHOUT ROWID;
+        INSERT INTO details VALUES(1,'old',1,10),(1,'new',2,20);
+        SELECT s.id,
+               CASE (SELECT a,b FROM details WHERE prefix=1 AND label=s.label)
+                 WHEN (1,10) THEN 'one' WHEN (2,20) THEN 'two' ELSE '-' END
+          FROM stock s ORDER BY s.id;
+        SELECT s.id,
+               CASE (SELECT a,b FROM details WHERE prefix=1 AND label=(
+                        SELECT group_concat(p.label,'') FROM stock p WHERE p.id=s.id
+                    ))
+                 WHEN (1,10) THEN 'one' WHEN (2,20) THEN 'two' ELSE '-' END
+          FROM stock s ORDER BY s.id;
+    } {1 one 2 one 3 one 4 two 5 - 1 one 2 one 3 one 4 two 5 -}
+}
+finish_test
+"#,
+    );
+}

@@ -951,28 +951,35 @@ fn sqlite3_log_est(mut x: u64) -> i16 {
 
 /// The reason why the machine does not run `prog` (`None`: every opcode is ported).
 pub fn unsupported_reason(prog: &Program) -> Option<String> {
-    unsupported(prog, false, ReadKeyScope::Utf8)
+    unsupported(prog, false, ReadKeyScope::Utf8, None)
 }
 
 /// [`unsupported_reason`] for a program that writes (`OP_Transaction` with `P2!=0`, the
 /// write opcodes).
 pub fn unsupported_reason_write(prog: &Program) -> Option<String> {
-    unsupported(prog, true, ReadKeyScope::Utf8)
+    unsupported(prog, true, ReadKeyScope::Utf8, None)
 }
 
 /// Allow BINARY UTF-16 sorter keys for the checked mapped and row CASE reads.
 pub fn unsupported_reason_mapped_read(prog: &Program) -> Option<String> {
-    unsupported(prog, false, ReadKeyScope::BinarySorter)
+    unsupported(prog, false, ReadKeyScope::BinarySorter, None)
 }
 
-/// For a sorter-backed row CASE group, also allow BINARY register comparisons in its encoding.
-pub fn unsupported_reason_binary_group_read(prog: &Program) -> Option<String> {
-    unsupported(prog, false, ReadKeyScope::BinaryGroup)
-}
-
-/// A row CASE DISTINCT can probe its BINARY ephemeral set in database encoding.
-pub fn unsupported_reason_binary_distinct_read(prog: &Program) -> Option<String> {
-    unsupported(prog, false, ReadKeyScope::BinaryDistinct)
+/// Keys a checked row CASE read can use in the database's encoding.
+pub fn unsupported_reason_row_case_read(
+    prog: &Program, grouped: bool, distinct: bool, encoding: u8,
+) -> Option<String> {
+    let key_scope = if grouped {
+        ReadKeyScope::BinaryGroup
+    } else if distinct {
+        ReadKeyScope::BinaryDistinct
+    } else {
+        ReadKeyScope::BinarySorter
+    };
+    let physical_encoding = (prog.read_only
+        && matches!(encoding, crate::vdbeaux::SQLITE_UTF16LE | crate::vdbeaux::SQLITE_UTF16BE))
+        .then_some(encoding);
+    unsupported(prog, false, key_scope, physical_encoding)
 }
 
 /// select.c's unordered DISTINCT probes its private index before storing the same key.
@@ -1007,7 +1014,9 @@ enum ReadKeyScope {
     BinaryDistinct,
 }
 
-fn unsupported(prog: &Program, write: bool, key_scope: ReadKeyScope) -> Option<String> {
+fn unsupported(
+    prog: &Program, write: bool, key_scope: ReadKeyScope, physical_encoding: Option<u8>,
+) -> Option<String> {
     if !prog.p_program.is_empty() && !write {
         return Some("sub-programs".to_owned());
     }
@@ -1236,8 +1245,14 @@ fn unsupported(prog: &Program, write: bool, key_scope: ReadKeyScope) -> Option<S
                 });
             let binary_distinct = key_scope == ReadKeyScope::BinaryDistinct
                 && matches!(k.enc, 2 | 3) && binary_distinct_key(prog, op, k);
+            // Static BINARY fields (including implicit rowid tails) have no CollSeq.
+            let binary_physical_index = physical_encoding == Some(k.enc)
+                && op.opcode == OP_OpenRead && op.p2 > 1 && op.p3 == 0
+                && k.n_key_field > 0 && k.n_key_field <= k.n_all_field
+                && k.a_coll.len() == usize::from(k.n_all_field)
+                && k.a_coll.iter().flatten().all(|c| binary_in_key_encoding(c));
             if k.enc != 1 && !prog.references_like
-                && !binary_sort && !binary_group_compare && !binary_distinct
+                && !(binary_sort || binary_group_compare || binary_distinct || binary_physical_index)
             {
                 return Some("UTF-16 key".to_owned());
             }

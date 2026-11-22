@@ -2212,3 +2212,8 @@ Sonradan eklenmiş TEXT DEFAULT sütununu eski fiziksel kayıttan okuyan VDBE, m
 ## V6b.381 — TEMP görünümünde satır CASE
 
 TEMP görünümü, ana ve bağlı şemalarla C ad çözümlemesini koruyor. 510 gözlemde 80 fark kapandı. 12 C açılışı, görünüm devre dışı bırakma ve yetkilendirme korumaları, bekleyen sorgunun ana görünüme yeniden hazırlanması geçti. OFF 1259/1/325, ON 1256/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_381.md).
+
+
+## V6b.382 — UTF-16 BINARY fiziksel indeks araması
+
+Ana veritabanında BINARY anahtarlı CASE okumalarında karma kodlamalı arama anahtarları C ile eşleşiyor. 756 fiziksel gözlemde 240 fark kapandı. 360 karma anahtar karşılaştırması, 60 olağan yazma ve 24 bayt eş C dosya imajı doğrulandı. OFF 1260/1/325, ON 1257/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,269 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_382.md).
