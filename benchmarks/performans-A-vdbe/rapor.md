@@ -2397,3 +2397,8 @@ Sabit C varsayılan PMA tabanı altında kalacağı kayıt baytlarından doğrul
 ## V6b.418 — IN listeli WITHOUT ROWID OR
 
 V6b.417 tabanındaki 21 hedef biçimde 336 UTF-16 farkı kapandı. 504 tam EXPLAIN planı, 24 deyim yaşam döngüsü kaydı ve 144 API davranışı kaydı doğrulandı. Birleşik ikilinin 528 eski kontrol planı C ve V6b.417 ile eşleşti. OFF 1298/1/325, ON 1296/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_418.md).
+
+
+## V6b.419 — Alt sorgu ve birden çok IN listeli WITHOUT ROWID OR
+
+İki sabitlenmiş alt sorgu biçimi, tam sayı aritmetiği ve bağımsız liste kollarında eski 64 UTF-16 farkı ile 48 komşu fark kapandı. 168 tam hedef planı C ile eşleşti. Önceki IN, filtre, yetkilendirici, kolasyon ve dosya denetimleri korundu. OFF 1299/1/325, ON 1297/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,278 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_419.md).

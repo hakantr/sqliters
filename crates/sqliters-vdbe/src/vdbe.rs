@@ -1923,7 +1923,7 @@ fn mixed_rowid_or_cursor(ops: &[VdbeOp], start: usize, encoding: u8) -> bool {
 struct WithoutRowidOrAdmission {
     seen: usize,
     reopens: Vec<usize>,
-    in_set: Option<usize>,
+    in_sets: Vec<usize>,
 }
 
 enum WithoutRowidOrPhase {
@@ -1958,7 +1958,7 @@ fn without_rowid_or_admissions(prog: &Program, encoding: u8) -> Vec<WithoutRowid
         {
             return None;
         }
-        let (reopens, seen_operations, secondary, in_set) =
+        let (reopens, seen_operations, secondary, in_sets) =
             without_rowid_or_arms(ops, first_pc..end, table, seen, ret, encoding)?;
         let cursors: Vec<_> = [table.p1, seen.p1].into_iter().chain(secondary).collect();
         if ops.iter().enumerate().any(|(pc, op)| {
@@ -1983,7 +1983,7 @@ fn without_rowid_or_admissions(prog: &Program, encoding: u8) -> Vec<WithoutRowid
         }) {
             return None;
         }
-        Some(WithoutRowidOrAdmission { seen: start + 1, reopens, in_set })
+        Some(WithoutRowidOrAdmission { seen: start + 1, reopens, in_sets })
     }).collect()
 }
 
@@ -2006,11 +2006,11 @@ impl WithoutRowidOrPhase {
 }
 
 /// An arm can advance a physical range directly, or advance it inside
-/// a scan of a private literal IN set.
+/// a scan of a private IN set.
 fn without_rowid_or_arms(
     ops: &[VdbeOp], arms: std::ops::Range<usize>, table: &VdbeOp,
     seen: &VdbeOp, ret: &VdbeOp, encoding: u8,
-) -> Option<(Vec<usize>, Vec<usize>, Option<i32>, Option<usize>)> {
+) -> Option<(Vec<usize>, Vec<usize>, Option<i32>, Vec<usize>)> {
     let P4::KeyInfo(key) = &table.p4 else { return None };
     let region = ops.get(arms.clone())?;
     if region.is_empty() {
@@ -2024,18 +2024,16 @@ fn without_rowid_or_arms(
     let mut reopens = Vec::new();
     let mut seen_operations = Vec::new();
     let mut root_keys = BTreeMap::new();
-    let mut in_set = None;
+    let mut in_sets = Vec::new();
     while start < arms.end {
         let open = &ops[start];
         let inner_index = open.opcode == OP_ReopenIdx;
         let physical = if inner_index { open } else { table };
-        let rhs = without_rowid_or_literal_in(
+        let rhs = without_rowid_or_in_driver(
             ops, start + usize::from(inner_index), arms.end, physical, seen.p1, ret.p2, encoding,
         );
         let (stop, arm_end, cursor, unique_bound) = if let Some(rhs) = rhs {
-            if in_set.replace(rhs.open).is_some() {
-                return None;
-            }
+            in_sets.push(rhs.open);
             let arm_end = rhs.step + 1;
             let stop = if rhs.unique_bound.is_some() { arm_end } else { rhs.step };
             (stop, arm_end, physical.p1, rhs.unique_bound)
@@ -2070,21 +2068,21 @@ fn without_rowid_or_arms(
     if start != arms.end || region.iter().filter(|op| op.opcode == OP_ReopenIdx).count() != reopens.len() {
         return None;
     }
-    Some((reopens, seen_operations, secondary, in_set))
+    Some((reopens, seen_operations, secondary, in_sets))
 }
 
-struct OrLiteralIn {
+struct WithoutRowidOrIn {
     open: usize,
     step: usize,
     unique_bound: Option<usize>,
 }
 
-/// The private set is built once from literals and bindings. Its complete
-/// key is loaded into the physical equality probe before each arm visit.
-fn without_rowid_or_literal_in(
+/// The private set is built once. Its complete key is loaded into the
+/// physical equality probe before each arm visit.
+fn without_rowid_or_in_driver(
     ops: &[VdbeOp], start: usize, end: usize, physical: &VdbeOp,
     seen: i32, return_reg: i32, encoding: u8,
-) -> Option<OrLiteralIn> {
+) -> Option<WithoutRowidOrIn> {
     let [begin, once, open] = ops.get(start..start + 3)? else { return None };
     let P4::KeyInfo(key) = &open.p4 else { return None };
     let P4::KeyInfo(physical_key) = &physical.p4 else { return None };
@@ -2128,10 +2126,16 @@ fn without_rowid_or_literal_in(
         return None;
     }
     let build = start + 3..ret_pc - 1;
-    let affinity = without_rowid_or_list_records(ops.get(build.clone())?, cursor, width, begin.p2, return_reg)?;
+    let entries = ops.get(build.clone())?;
+    let subquery = width == 1 && entries.first()?.opcode == OP_OpenRead;
+    let affinity = if subquery {
+        without_rowid_or_select_set(ops, build.clone(), cursor, &key.a_coll[0], begin.p2, return_reg, encoding)?
+    } else {
+        without_rowid_or_list_records(ops, entries, cursor, width, begin.p2, return_reg)?
+    };
     match &begin.p4 {
-        P4::NotUsed if !unique => {}
-        P4::SubrtnSig(sig) if unique && sig.b_complete && sig.i_table == cursor
+        P4::NotUsed if !unique && !subquery => {}
+        P4::SubrtnSig(sig) if (unique || subquery) && sig.b_complete && sig.i_table == cursor
             && sig.i_addr as usize == start + 1 && sig.reg_return == begin.p2
             && sig.z_aff.as_bytes() == affinity => {}
         _ => return None,
@@ -2147,7 +2151,7 @@ fn without_rowid_or_literal_in(
             return None;
         }
     }
-    let seek_pc = if unique {
+    let seek_pc = if unique || subquery {
         columns.end
     } else {
         let aff = ops.get(columns.end)?;
@@ -2168,16 +2172,19 @@ fn without_rowid_or_literal_in(
         } else {
             op.opcode == OP_Next && op.p1 == physical.p1 && op.p2 as usize == seek_pc + 1
         })
-        || !without_rowid_or_private_list(ops, cursor, start + 2, build, ret_pc, columns, step_pc)
+        || !without_rowid_or_owned_cursor(ops, cursor, |pc| {
+            pc == start + 2 || build.contains(&pc) || pc == ret_pc - 1 || pc == ret_pc + 1
+                || columns.contains(&pc) || pc == step_pc
+        })
     {
         return None;
     }
-    Some(OrLiteralIn { open: start + 2, step: step_pc, unique_bound: unique.then_some(seek_pc + 1) })
+    Some(WithoutRowidOrIn { open: start + 2, step: step_pc, unique_bound: unique.then_some(seek_pc + 1) })
 }
 
-fn without_rowid_or_list_records(
-    entries: &[VdbeOp], cursor: i32, width: usize, sub_return: i32, or_return: i32,
-) -> Option<&[u8]> {
+fn without_rowid_or_list_records<'a>(
+    ops: &[VdbeOp], entries: &'a [VdbeOp], cursor: i32, width: usize, sub_return: i32, or_return: i32,
+) -> Option<&'a [u8]> {
     let size = width + 2;
     let P4::Dynamic(affinity) = &entries.get(width)?.p4 else { return None };
     if entries.len() < size * 2 || entries.len() % size != 0
@@ -2195,8 +2202,13 @@ fn without_rowid_or_list_records(
             || insert.opcode != OP_IdxInsert || insert.p1 != cursor || insert.p2 != record.p3
             || insert.p3 != record.p1 || insert.p4 != P4::Int32(width as i32) || insert.p5 != 0
             || !values.iter().zip(input).all(|(op, reg)| {
-                matches!(op.opcode, OP_Integer | OP_Int64 | OP_Real | OP_String8 | OP_String | OP_Null | OP_Blob | OP_Variable)
-                    && op.p2 == reg && op.p5 == 0 && (op.opcode != OP_Null || op.p3 == 0 || op.p3 == reg)
+                in_list_value_output(op) == Some(reg) && op.p5 == 0 && match op.opcode {
+                    OP_Integer | OP_Int64 | OP_Real | OP_String8 | OP_String | OP_Blob | OP_Variable => true,
+                    OP_Null => op.p3 == 0 || op.p3 == reg,
+                    OP_Add | OP_Subtract | OP_Multiply | OP_Divide | OP_Remainder => width == 1
+                        && or_list_initial_integer(ops, op.p1) && or_list_initial_integer(ops, op.p2),
+                    _ => false,
+                }
             })
         {
             return None;
@@ -2205,10 +2217,63 @@ fn without_rowid_or_list_records(
     Some(affinity)
 }
 
-fn without_rowid_or_private_list(
-    ops: &[VdbeOp], cursor: i32, open: usize, build: std::ops::Range<usize>,
-    ret: usize, columns: std::ops::Range<usize>, step: usize,
-) -> bool {
+/// SQLite reserves the registers for factored integer literals in the
+/// initialization block, before execution jumps back to the SELECT body.
+fn or_list_initial_integer(ops: &[VdbeOp], reg: i32) -> bool {
+    let Some(init) = ops.first() else { return false };
+    let Some((end, code)) = ops.get(init.p2 as usize..).and_then(<[VdbeOp]>::split_last) else {
+        return false;
+    };
+    reg > 0 && init.opcode == OP_Init && end.opcode == OP_Goto && end.p2 == 1
+        && code.iter().filter(|op| op.p2 == reg
+            && matches!(op.opcode, OP_Integer | OP_Int64) && op.p5 == 0).count() == 1
+}
+
+/// A scalar SELECT supplies one column through an ordinary table scan or
+/// a single equality prefix of a persistent index, into the private set.
+fn without_rowid_or_select_set<'a>(
+    ops: &'a [VdbeOp], build: std::ops::Range<usize>, cursor: i32, collation: &Option<Arc<CollSeq>>,
+    sub_return: i32, or_return: i32, encoding: u8,
+) -> Option<&'a [u8]> {
+    let [open, probe @ .., column, record, insert, next] = ops.get(build.clone())? else { return None };
+    let from = open.p1;
+    let end = i32::try_from(build.end).ok()?;
+    if open.opcode != OP_OpenRead || open.p2 <= 1 || open.p3 != 0 || from == cursor
+        || column.opcode != OP_Column || column.p1 != from || column.p2 < 0
+        || column.p4 != P4::NotUsed || column.p5 != 0
+        || next.opcode != OP_Next || next.p1 != from
+        || ![column.p3, record.p3].iter().all(|reg| *reg > 0 && *reg != sub_return && *reg != or_return)
+        || column.p3 == record.p3 || record.opcode != OP_MakeRecord
+        || record.p1 != column.p3 || record.p2 != 1 || record.p5 != 0
+        || insert.opcode != OP_IdxInsert || insert.p1 != cursor || insert.p2 != record.p3
+        || insert.p3 != column.p3 || insert.p4 != P4::Int32(1) || insert.p5 != 0
+        || !without_rowid_or_owned_cursor(ops, from, |pc| build.contains(&pc))
+    {
+        return None;
+    }
+    let expected = match (&open.p4, probe) {
+        (P4::Int32(fields), [scan]) if open.p5 == 0 && column.p2 < *fields
+            && scan.opcode == OP_Rewind && scan.p1 == from && scan.p2 == end
+            && scan.p3 == 0 && scan.p5 == 0 && next.p2 as usize == build.start + 2
+            && next.p3 == 0 && next.p5 == 1 => SQLITE_AFF_NUMERIC,
+        (P4::KeyInfo(key), [value, seek, bound]) if open.p5 == OPFLAG_SEEKEQ
+            && without_rowid_or_key(key, encoding)
+            && key.a_coll.get(column.p2 as usize) == Some(collation)
+            && matches!(value.opcode, OP_Integer | OP_Int64) && value.p2 > 0
+            && value.p2 != sub_return && value.p2 != or_return && value.p5 == 0
+            && seek.opcode == OP_SeekGE && bound.opcode == OP_IdxGT
+            && [seek, bound].iter().all(|op| op.p1 == from && op.p2 == end
+                && op.p3 == value.p2 && op.p4 == P4::Int32(1) && op.p5 == 0)
+            && next.p2 as usize == build.start + 3 && next.p3 == 1 && next.p5 == 0 => SQLITE_AFF_BLOB,
+        _ => return None,
+    };
+    match &record.p4 {
+        P4::Dynamic(affinity) if affinity.as_slice() == [expected] => Some(affinity),
+        _ => None,
+    }
+}
+
+fn without_rowid_or_owned_cursor(ops: &[VdbeOp], cursor: i32, allowed: impl Fn(usize) -> bool) -> bool {
     ops.iter().enumerate().all(|(pc, op)| {
         if (op.opcode == OP_OpenDup && op.p2 == cursor)
             || (matches!(op.opcode, OP_DeferredSeek | OP_SorterData) && op.p3 == cursor)
@@ -2218,21 +2283,15 @@ fn without_rowid_or_private_list(
         if op.p1 != cursor {
             return true;
         }
-        match op.opcode {
-            OP_OpenEphemeral => pc == open,
-            OP_IdxInsert => build.contains(&pc),
-            OP_NullRow => pc == ret - 1,
-            OP_Rewind | OP_Last => pc == ret + 1,
-            OP_Column => columns.contains(&pc),
-            OP_Next | OP_Prev => pc == step,
-            OP_OpenRead | OP_OpenWrite | OP_ReopenIdx | OP_OpenDup | OP_OpenAutoindex
+        !matches!(op.opcode,
+            OP_OpenEphemeral | OP_IdxInsert | OP_NullRow | OP_Rewind | OP_Last | OP_Column
+            | OP_Next | OP_Prev | OP_OpenRead | OP_OpenWrite | OP_ReopenIdx | OP_OpenDup | OP_OpenAutoindex
             | OP_OpenPseudo | OP_SorterOpen | OP_VOpen | OP_Insert | OP_Delete | OP_IdxDelete
             | OP_NotFound | OP_Found | OP_NoConflict | OP_SeekLT | OP_SeekLE | OP_SeekGE
             | OP_SeekGT | OP_SeekRowid | OP_NotExists | OP_IfNoHope | OP_IdxLE | OP_IdxGT
             | OP_IdxLT | OP_IdxGE | OP_RowData | OP_Rowid | OP_IdxRowid | OP_DeferredSeek
-            | OP_Count | OP_Sort | OP_ResetSorter | OP_SorterInsert | OP_Close => false,
-            _ => true,
-        }
+            | OP_Count | OP_Sort | OP_ResetSorter | OP_SorterInsert | OP_Close
+        ) || allowed(pc)
     })
 }
 
@@ -2661,7 +2720,7 @@ fn unsupported(
                         || *reopen_or_checked.entry(op.p1)
                             .or_insert_with(|| rowid_or_index_cursor(prog, op.p1, k.enc)))));
             let without_rowid_or_set = row_case_encoding == Some(k.enc)
-                && without_rowid_or.iter().any(|group| index == group.seen || group.in_set == Some(index));
+                && without_rowid_or.iter().any(|group| index == group.seen || group.in_sets.contains(&index));
             let membership = row_case_encoding == Some(k.enc)
                 && ordered_in_key(prog, op, k, |coll| {
                     binary_in_key_encoding(coll) || (builtin_collations && builtin_read_key_collation(coll, k.enc))
