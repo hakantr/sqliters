@@ -2155,7 +2155,7 @@ fn without_rowid_or_in_driver(
     let affinity = if subquery {
         without_rowid_or_select_set(ops, build.clone(), cursor, &key.a_coll[0], begin.p2, return_reg, encoding)?
     } else {
-        without_rowid_or_list_records(ops, entries, cursor, width, begin.p2, return_reg)?
+        without_rowid_or_list_records(ops, build.clone(), cursor, width, begin.p2, return_reg)?
     };
     match &begin.p4 {
         P4::NotUsed if !unique && !subquery => {}
@@ -2206,26 +2206,38 @@ fn without_rowid_or_in_driver(
     Some(WithoutRowidOrIn { open: start + 2, step: step_pc, unique_bound: unique.then_some(seek_pc + 1) })
 }
 
-fn without_rowid_or_list_records<'a>(
-    ops: &[VdbeOp], entries: &'a [VdbeOp], cursor: i32, width: usize, sub_return: i32, or_return: i32,
-) -> Option<&'a [u8]> {
-    let size = width + 2;
-    let P4::Dynamic(affinity) = &entries.get(width)?.p4 else { return None };
-    if entries.len() < size * 2 || entries.len() % size != 0
-        || affinity.len() != width || !affinity.iter().all(|a| matches!(*a, SQLITE_AFF_INTEGER | SQLITE_AFF_TEXT))
-    {
-        return None;
-    }
-    for entry in entries.chunks_exact(size) {
-        let [values @ .., record, insert] = entry else { return None };
+fn without_rowid_or_list_records(
+    ops: &[VdbeOp], build: std::ops::Range<usize>, cursor: i32, width: usize, sub_return: i32, or_return: i32,
+) -> Option<&[u8]> {
+    let mut entries = ops.get(build.clone())?;
+    let mut affinity = None;
+    let mut count = 0;
+    while let Some(first) = entries.first() {
+        let function = width == 1 && first.opcode == OP_Once;
+        let size = if function { 6 } else { width + 2 };
+        let entry_pc = build.end - entries.len();
+        let [values @ .., record, insert] = entries.get(..size)? else { return None };
+        let P4::Dynamic(record_affinity) = &record.p4 else { return None };
         let input = record.p1..record.p1.checked_add(width as i32)?;
         if record.opcode != OP_MakeRecord || record.p1 <= 0 || record.p2 != width as i32
             || record.p3 <= 0 || record.p3 == or_return || record.p3 == sub_return
             || input.contains(&record.p3) || input.contains(&or_return) || input.contains(&sub_return)
-            || !matches!(&record.p4, P4::Dynamic(a) if a == affinity) || record.p5 != 0
+            || record_affinity.len() != width
+            || !record_affinity.iter().all(|a| matches!(*a, SQLITE_AFF_INTEGER | SQLITE_AFF_TEXT))
+            || *affinity.get_or_insert(record_affinity.as_slice()) != record_affinity.as_slice()
+            || record.p5 != 0
             || insert.opcode != OP_IdxInsert || insert.p1 != cursor || insert.p2 != record.p3
             || insert.p3 != record.p1 || insert.p4 != P4::Int32(width as i32) || insert.p5 != 0
-            || !values.iter().zip(input).all(|(op, reg)| {
+        {
+            return None;
+        }
+        if function {
+            if record_affinity.as_slice() != [SQLITE_AFF_INTEGER]
+                || !or_list_builtin_abs(values, entry_pc, record.p1, sub_return, or_return)
+            {
+                return None;
+            }
+        } else if !values.iter().zip(input).all(|(op, reg)| {
                 in_list_value_output(op) == Some(reg) && op.p5 == 0 && match op.opcode {
                     OP_Integer | OP_Int64 | OP_Real | OP_String8 | OP_String | OP_Blob | OP_Variable => true,
                     OP_Null => op.p3 == 0 || op.p3 == reg,
@@ -2237,8 +2249,29 @@ fn without_rowid_or_list_records<'a>(
         {
             return None;
         }
+        count += 1;
+        entries = &entries[size..];
     }
-    Some(affinity)
+    (count >= 2).then_some(affinity?)
+}
+
+/// Only SQLite's registered built-in abs() has the verified constant
+/// argument and error behavior for this list producer.
+fn or_list_builtin_abs(values: &[VdbeOp], pc: usize, output: i32, sub_return: i32, or_return: i32) -> bool {
+    const SQLITE_FUNC_CONSTANT: u32 = 0x0000_0800;
+    let [once, arg, call, copy] = values else { return false };
+    let P4::FuncCtx(ctx) = &call.p4 else { return false };
+    let builtin = SQLITE_FUNC_BUILTIN | SQLITE_FUNC_CONSTANT;
+    once.opcode == OP_Once && once.p2 as usize == pc + 3 && once.p3 == 0 && once.p5 == 0
+        && matches!(arg.opcode, OP_Integer | OP_Int64 | OP_Null)
+        && (arg.opcode != OP_Null || arg.p3 == 0 || arg.p3 == arg.p2) && arg.p5 == 0
+        && call.opcode == OP_Function && call.p1 == 1 && call.p2 == arg.p2 && call.p5 == 0
+        && ctx.argc == 1 && ctx.i_op as usize == pc + 2 && ctx.p_func.n_arg == 1
+        && ctx.p_func.func_flags & builtin == builtin && ctx.p_func.user_data == 0
+        && !ctx.p_func.x_finalize && !ctx.p_func.x_value && ctx.p_func.name.eq_ignore_ascii_case("abs")
+        && [arg.p2, call.p3].iter().all(|&reg| reg > 0 && reg != sub_return && reg != or_return)
+        && call.p3 != arg.p2 && copy.opcode == OP_SCopy && copy.p1 == call.p3 && copy.p2 == output
+        && copy.p3 == 0 && copy.p4 == P4::NotUsed && copy.p5 == 0
 }
 
 /// SQLite reserves the registers for factored integer literals in the
@@ -2276,10 +2309,12 @@ fn without_rowid_or_select_set<'a>(
         return None;
     }
     let expected = match (&open.p4, probe) {
-        (P4::Int32(fields), [scan]) if open.p5 == 0 && column.p2 < *fields
+        (P4::Int32(fields), [scan, filter @ ..]) if open.p5 == 0 && column.p2 < *fields
             && scan.opcode == OP_Rewind && scan.p1 == from && scan.p2 == end
             && scan.p3 == 0 && scan.p5 == 0 && next.p2 as usize == build.start + 2
-            && next.p3 == 0 && next.p5 == 1 => SQLITE_AFF_NUMERIC,
+            && next.p3 == 0 && next.p5 == 1
+            && or_list_table_filter(ops, filter, from, *fields, end - 1, [sub_return, or_return], encoding)
+            => SQLITE_AFF_NUMERIC,
         (P4::KeyInfo(key), [value, seek, bound]) if open.p5 == OPFLAG_SEEKEQ
             && without_rowid_or_key(key, encoding)
             && key.a_coll.get(column.p2 as usize) == Some(collation)
@@ -2289,12 +2324,41 @@ fn without_rowid_or_select_set<'a>(
             && [seek, bound].iter().all(|op| op.p1 == from && op.p2 == end
                 && op.p3 == value.p2 && op.p4 == P4::Int32(1) && op.p5 == 0)
             && next.p2 as usize == build.start + 3 && next.p3 == 1 && next.p5 == 0 => SQLITE_AFF_BLOB,
+        (P4::KeyInfo(key), [lower, seek, upper, bound]) if open.p5 == 0
+            && without_rowid_or_key(key, encoding)
+            && key.a_coll.get(column.p2 as usize) == Some(collation)
+            && matches!(seek.opcode, OP_SeekGE | OP_SeekGT) && matches!(bound.opcode, OP_IdxGE | OP_IdxGT)
+            && [(lower, seek), (upper, bound)].iter().all(|(value, op)| {
+                matches!(value.opcode, OP_Integer | OP_Int64) && value.p2 > 0
+                    && value.p2 != sub_return && value.p2 != or_return && value.p5 == 0
+                    && op.p1 == from && op.p2 == end && op.p3 == value.p2
+                    && op.p4 == P4::Int32(1) && op.p5 == 0
+            })
+            && next.p2 as usize == build.start + 4 && next.p3 == 0 && next.p5 == 0 => SQLITE_AFF_BLOB,
         _ => return None,
     };
     match &record.p4 {
         P4::Dynamic(affinity) if affinity.as_slice() == [expected] => Some(affinity),
         _ => None,
     }
+}
+
+fn or_list_table_filter(
+    ops: &[VdbeOp], filter: &[VdbeOp], cursor: i32, fields: i32, next: i32,
+    returns: [i32; 2], encoding: u8,
+) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    let [column, compare] = filter else { return false };
+    column.opcode == OP_Column && column.p1 == cursor && (0..fields).contains(&column.p2)
+        && column.p3 > 0 && !returns.contains(&column.p3) && column.p4 == P4::NotUsed && column.p5 == 0
+        && matches!(compare.opcode, OP_Eq | OP_Ne | OP_Lt | OP_Le | OP_Gt | OP_Ge)
+        && compare.p2 == next && compare.p3 == column.p3 && compare.p1 != column.p3
+        && !returns.contains(&compare.p1) && or_list_initial_integer(ops, compare.p1)
+        && compare.p5 == (u16::from(SQLITE_AFF_INTEGER) | SQLITE_JUMPIFNULL)
+        && matches!(&compare.p4, P4::CollSeq(coll)
+            if coll.enc == encoding && coll.name.eq_ignore_ascii_case("BINARY"))
 }
 
 fn without_rowid_or_owned_cursor(ops: &[VdbeOp], cursor: i32, allowed: impl Fn(usize) -> bool) -> bool {

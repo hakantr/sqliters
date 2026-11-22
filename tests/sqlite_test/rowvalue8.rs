@@ -2773,3 +2773,49 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_without_rowid_or_bounded_in_producers_steps() {
+    sqliters_tcltest::run_test_script(
+        "row_case_without_rowid_or_bounded_in_producers_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE detail(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO detail VALUES(1,1,10),(2,2,20),(3,3,30);
+        CREATE TABLE packed(tag TEXT COLLATE RTRIM,seq INTEGER,ref INTEGER,label TEXT,
+                            PRIMARY KEY(tag DESC,seq)) WITHOUT ROWID;
+        INSERT INTO packed VALUES ('A',1,1,'p-one'),('A ',2,2,'p-two'),
+            ('B',1,1,'p-b'),(char(256)||' ',2,1,'p-wide'),('C',3,3,'p-other');
+        CREATE INDEX packed_by_seq ON packed(seq);
+        CREATE INDEX packed_by_label ON packed(label);
+    }
+    set expression {CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+                     WHEN (2,20) THEN 'changed' ELSE p.label END}
+    foreach {suffix condition expected} {
+        filtered {tag='A' OR seq IN (SELECT a FROM detail WHERE b>10) OR label='p-two'}
+            {1 p-one 2 changed 2 p-wide 3 p-other}
+        index-range {tag IN (SELECT tag FROM packed WHERE seq BETWEEN 1 AND 2) OR seq=2}
+            {1 p-one 1 p-b 2 changed 2 p-wide}
+        built-in {tag='A' OR seq IN (abs(-1),abs(3),abs(NULL),5) OR label='p-two'}
+            {1 p-one 1 p-b 2 changed 3 p-other}
+    } {
+        do_test or-bounded-rhs-$encoding.$suffix {
+            execsql "SELECT seq,$expression FROM packed p WHERE $condition ORDER BY seq,tag;"
+        } $expected
+    }
+    do_test or-bounded-rhs-$encoding.abs-overflow {
+        catchsql "SELECT seq,$expression FROM packed p
+                  WHERE tag='A' OR seq IN (abs(-9223372036854775808),abs(3)) OR label='p-two'
+                  ORDER BY seq,tag;"
+    } {1 {integer overflow}}
+    do_execsql_test or-bounded-rhs-$encoding.changes {SELECT changes(),total_changes();} {5 8}
+}
+finish_test
+"#,
+    );
+}
