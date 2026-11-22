@@ -1943,3 +1943,70 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_integer_set_probe_steps() {
+    sqliters_tcltest::run_test_script(
+        "row_case_integer_set_probe_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE words(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO words VALUES (1,1,10),(2,2,20),(3,3,30),(4,4,40);
+        CREATE TABLE picks(id INTEGER PRIMARY KEY,ref INTEGER,label TEXT);
+        INSERT INTO picks VALUES (2,1,'two'),(3,2,'unused'),(4,1,'four'),
+            (7,3,'seven'),(8,1,'eight'),(9,4,'nine'),(11,NULL,'null');
+        CREATE INDEX picks_ref ON picks(ref);
+        CREATE VIEW chosen AS SELECT p.id,p.ref,
+          CASE (SELECT a,b FROM words w WHERE w.id=p.ref)
+           WHEN (2,20) THEN 'Three ' ELSE p.label END AS token FROM picks p;
+    }
+    do_execsql_test row-case-integer-set-$encoding.rowid-compound {
+        SELECT id,token FROM chosen WHERE id IN
+          (SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 3 UNION ALL SELECT NULL)
+          ORDER BY id DESC;
+    } {4 four 3 {Three }}
+    do_execsql_test row-case-integer-set-$encoding.nested {
+        SELECT 'THREE ' COLLATE NOCASE IN
+          (SELECT token FROM chosen WHERE id IN (SELECT 3 UNION ALL SELECT 2));
+    } {1}
+    do_execsql_test row-case-integer-set-$encoding.secondary-forward {
+       SELECT p.id,CASE (SELECT a,b FROM words WHERE id=p.ref)
+                    WHEN (3,30) THEN 'third' ELSE p.label END
+       FROM picks p INDEXED BY picks_ref WHERE p.ref IN (1,3,3.0,'03',4,NULL,'none')
+       ORDER BY p.ref,p.id;
+    } {2 two 4 four 8 eight 7 third 9 nine}
+    do_test row-case-integer-set-$encoding.secondary-reset {
+        set stmt [sqlite3_prepare_v2 db {
+            SELECT p.id,CASE (SELECT a,b FROM words WHERE id=p.ref)
+                     WHEN (3,30) THEN 'third' ELSE p.label END
+            FROM picks p INDEXED BY picks_ref WHERE p.ref IN (?1,?2,4,NULL)
+            ORDER BY p.ref DESC,p.id DESC;
+        } -1]
+        sqlite3_bind_int $stmt 1 1
+        sqlite3_bind_int $stmt 2 3
+        set first {}
+        while {[set rc [sqlite3_step $stmt]] eq "SQLITE_ROW"} {
+            lappend first [sqlite3_column_int $stmt 0] [sqlite3_column_text $stmt 1]
+        }
+        lappend first $rc
+        sqlite3_reset $stmt
+        execsql {CREATE TABLE reset_control(id INTEGER);}
+        sqlite3_bind_null $stmt 1
+        sqlite3_bind_int $stmt 2 3
+        set second {}
+        while {[set rc [sqlite3_step $stmt]] eq "SQLITE_ROW"} {
+            lappend second [sqlite3_column_int $stmt 0] [sqlite3_column_text $stmt 1]
+        }
+        lappend second $rc
+        list $first $second [sqlite3_finalize $stmt]
+    } {{9 nine 7 third 8 eight 4 four 2 two SQLITE_DONE} {9 nine 7 third SQLITE_DONE} SQLITE_OK}
+}
+finish_test
+"#,
+    );
+}

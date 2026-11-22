@@ -2302,3 +2302,8 @@ Kısmi ORDER BY ve LIMIT/OFFSET iki matriste 288 UTF-16 sonucunu C ile eşitledi
 ## V6b.399 — UTF-16 hesaplanan rowid listeleri
 
 390 gözlemde aritmetik ve yerleşik kolasyonlu rowid listesi için 64 UTF-16 farkı kapandı. Önceki 558 gözlem aynı. C fixture 10/10, Rust rowvalue8 29/29 ve delete2 1/1 iki kipte. OFF 1279/1/325, ON 1277/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,277 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_399.md).
+
+
+## V6b.400 — UTF-16 satır CASE tamsayı kümesi aramaları
+
+390 gözlemde sabit SELECT kümesi ve ikincil indeks aramaları için 56 sonuç C ile eşleşti. Önceki 558 gözlem aynı. C fixture 13/13, Rust rowvalue8 30/30 ve delete2 1/1 iki kipte. OFF 1280/1/325, ON 1278/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,277 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_400.md).

@@ -1062,9 +1062,9 @@ fn ordered_in_key(
     written && probed
 }
 
-/// An IN list driving a rowid lookup is a private one-column set. Its
+/// An IN list driving an integer lookup is a private one-column set. Its
 /// records use integer affinity and database encoding before index insertion.
-fn rowid_expression_list_key(
+fn integer_probe_list_key(
     prog: &Program, open_index: usize, open: &VdbeOp, key: &KeyInfo,
     supports_collation: impl Fn(&CollSeq) -> bool,
 ) -> bool {
@@ -1081,18 +1081,45 @@ fn rowid_expression_list_key(
     let Some([begin, once]) = open_index.checked_sub(2).and_then(|start| ops.get(start..open_index)) else {
         return false;
     };
-    if begin.opcode != OP_BeginSubrtn || begin.p1 != 0 || begin.p4 != P4::NotUsed
+    let reusable = matches!(&begin.p4, P4::SubrtnSig(signature)
+        if signature.b_complete && signature.i_table == cursor
+            && signature.z_aff.as_bytes() == [SQLITE_AFF_INTEGER]);
+    if begin.opcode != OP_BeginSubrtn || begin.p1 != 0
+        || (begin.p4 != P4::NotUsed && !reusable)
         || once.opcode != OP_Once || once.p3 != 0
     {
         return false;
     }
     let ret = once.p2 as usize;
-    let Some([null_row, return_op, scan, column, skip_null, seek]) = ret.checked_sub(1)
+    let Some([null_row, return_op, scan, column, skip_null, probe]) = ret.checked_sub(1)
         .and_then(|start| start.checked_add(6).and_then(|end| ops.get(start..end))) else {
         return false;
     };
     let step_index = skip_null.p2 as usize;
     let Some(step) = ops.get(step_index) else { return false };
+    let secondary = probe.opcode != OP_SeekRowid;
+    let seek = if secondary {
+        let Some([seek, stop]) = ops.get(ret + 5..ret + 7) else { return false };
+        if probe.opcode != OP_Affinity || probe.p1 != column.p3 || probe.p2 != 1 || probe.p5 != 0
+            || !matches!(&probe.p4, P4::Dynamic(affinity)
+                if matches!(affinity.as_slice(), [SQLITE_AFF_INTEGER | SQLITE_AFF_NUMERIC]))
+            || !matches!((seek.opcode, stop.opcode), (OP_SeekGE, OP_IdxGT) | (OP_SeekLE, OP_IdxLT))
+            || seek.p4 != P4::Int32(1) || stop.p1 != seek.p1 || stop.p2 != seek.p2
+            || stop.p3 != seek.p3 || stop.p4 != P4::Int32(1) || stop.p5 != 0
+            || !ops.get(ret + 7..step_index).is_some_and(|body| body.iter().any(|next| {
+                matches!((seek.opcode, next.opcode), (OP_SeekGE, OP_Next) | (OP_SeekLE, OP_Prev))
+                    && next.p1 == seek.p1 && next.p2 as usize == ret + 6
+            }))
+        {
+            return false;
+        }
+        seek
+    } else {
+        if probe.p4 != P4::NotUsed {
+            return false;
+        }
+        probe
+    };
     if null_row.opcode != OP_NullRow || null_row.p1 != cursor
         || return_op.opcode != OP_Return || return_op.p1 != begin.p2
         || return_op.p2 as usize != open_index - 1 || return_op.p3 != 1
@@ -1101,8 +1128,8 @@ fn rowid_expression_list_key(
         || column.opcode != OP_Column || column.p1 != cursor || column.p2 != 0
         || column.p4 != P4::NotUsed || column.p5 != 0
         || skip_null.opcode != OP_IsNull || skip_null.p1 != column.p3
-        || seek.opcode != OP_SeekRowid || seek.p1 == cursor || seek.p3 != column.p3
-        || seek.p2 != skip_null.p2 || seek.p4 != P4::NotUsed || seek.p5 != 0
+        || seek.p1 == cursor || seek.p3 != column.p3
+        || seek.p2 != skip_null.p2 || seek.p5 != 0
         || step_index < ret + 5 || step.p1 != cursor || step.p2 as usize != ret + 2
         || step.p3 != 0 || step.p5 != 0
     {
@@ -1137,8 +1164,16 @@ fn rowid_expression_list_key(
         let opens = matches!(op.opcode, OP_OpenRead | OP_OpenWrite | OP_ReopenIdx | OP_OpenDup
             | OP_OpenAutoindex | OP_OpenEphemeral | OP_SorterOpen | OP_OpenPseudo | OP_VOpen);
         if opens && op.p1 == seek.p1 {
+            let compatible = if secondary {
+                op.p5 == OPFLAG_SEEKEQ
+                    && matches!(&op.p4, P4::KeyInfo(index_key)
+                        if index_key.enc == key.enc && index_key.n_key_field > 0
+                            && matches!(index_key.a_coll.first(), Some(None)))
+            } else {
+                op.p5 == 0 && matches!(op.p4, P4::Int32(n) if n > 0)
+            };
             if physical_read || index >= ret || op.opcode != OP_OpenRead || op.p2 <= 1
-                || op.p3 != 0 || op.p5 != 0 || !matches!(op.p4, P4::Int32(n) if n > 0)
+                || op.p3 != 0 || !compatible
             {
                 return false;
             }
@@ -1934,7 +1969,7 @@ fn unsupported(
                     binary_in_key_encoding(coll) || (builtin_collations && builtin_read_key_collation(coll, k.enc))
                 });
             let rowid_list = row_case_encoding == Some(k.enc)
-                && rowid_expression_list_key(prog, index, op, k, |coll| {
+                && integer_probe_list_key(prog, index, op, k, |coll| {
                     binary_in_key_encoding(coll) || (builtin_collations && builtin_read_key_collation(coll, k.enc))
                 });
             let recursive_priority = row_case_encoding == Some(k.enc)
