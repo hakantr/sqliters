@@ -2162,3 +2162,8 @@ Yabancı anahtar eylem önceliği üç ek çatışma kipinde C ile eşleşti. 88
 ## V6b.371 — REPLACE UPDATE hazırlama tanısı
 
 REPLACE’in erken DELETE denetiminden sonra C’nin son tanı önceliği eşleşti. 1.134 salt okunur kontrolde 40 fark kapandı. OFF 1248/1/328, ON 1245/4/328. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,300 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_371.md).
+
+
+## V6b.372 — UPDATE test paketinin etkinleştirilmesi
+
+C ve iki Rust kipinde 141 UPDATE kontrolü geçti. Pencere sorgusunun planı ve 72 C yeniden açılışı eş. OFF 1249/1/327, ON 1246/4/327. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_372.md).
