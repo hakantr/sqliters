@@ -1727,3 +1727,69 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_recursive_priority_queue() {
+    sqliters_tcltest::run_test_script(
+        "row_case_recursive_priority_queue",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE pairings(id INTEGER PRIMARY KEY,a,b);
+        INSERT INTO pairings VALUES (1,1,10),(2,2,20);
+        CREATE TABLE items(id INTEGER PRIMARY KEY,ref INTEGER,token TEXT);
+        INSERT INTO items VALUES (1,1,'A'),(2,1,'a'),(3,1,'A  '),(4,1,'b'),
+          (5,1,'b '),(6,1,NULL),(7,1,'Ā'),(8,1,'ā'),(9,2,'unused');
+        CREATE VIEW rendered AS SELECT i.id,CASE
+           (SELECT a,b FROM pairings WHERE id=i.ref) WHEN (2,20) THEN 'A' ELSE i.token END AS token
+           FROM items i;
+    }
+    do_execsql_test row-case-recursive-priority-$encoding.all {
+        WITH RECURSIVE visits(id,token) AS (
+            SELECT id,token FROM rendered WHERE id BETWEEN 1 AND 2
+            UNION ALL SELECT id+2,token FROM visits WHERE id<4
+            ORDER BY 1 DESC
+        ) SELECT id,quote(token) FROM visits;
+    } {2 'a' 4 'a' 1 'A' 3 'A' 5 'A'}
+    do_execsql_test row-case-recursive-priority-$encoding.distinct {
+        WITH RECURSIVE visits(token,depth) AS (
+            SELECT token COLLATE NOCASE,1 FROM rendered WHERE id<=5
+            UNION SELECT token,depth+1 FROM visits WHERE depth<2
+            ORDER BY 1 COLLATE NOCASE DESC NULLS FIRST,2 DESC
+        ) SELECT quote(token),depth FROM visits;
+    } {{'b '} 1 {'b '} 2 'b' 1 'b' 2 {'A  '} 1 {'A  '} 2 'A' 1 'A' 2}
+    do_execsql_test row-case-recursive-priority-$encoding.limits {
+        WITH RECURSIVE visits(token,depth) AS (
+            SELECT token COLLATE RTRIM,1 FROM rendered WHERE id>=3
+            UNION SELECT token,depth+1 FROM visits WHERE depth<2
+            ORDER BY 1 COLLATE RTRIM DESC NULLS LAST,2 ASC LIMIT 7 OFFSET 2
+        ) SELECT quote(token),depth FROM visits;
+    } {'Ā' 1 'Ā' 2 'b' 1 'b' 2 {'A  '} 1 {'A  '} 2 NULL 1}
+    do_test row-case-recursive-priority-$encoding.reset {
+        set stmt [sqlite3_prepare_v2 db {
+            WITH RECURSIVE visits(id,token) AS (
+                SELECT id,token FROM rendered WHERE id BETWEEN 1 AND 2
+                UNION SELECT id+2,token FROM visits WHERE id<4
+                ORDER BY 1 DESC LIMIT ?1 OFFSET ?2
+            ) SELECT id,quote(token) FROM visits;
+        } -1]
+        sqlite3_bind_int $stmt 1 2
+        sqlite3_bind_int $stmt 2 1
+        set first [list [sqlite3_step $stmt] [sqlite3_column_int $stmt 0] [sqlite3_column_text $stmt 1]]
+        set second [list [sqlite3_step $stmt] [sqlite3_column_int $stmt 0] [sqlite3_column_text $stmt 1]]
+        set done [sqlite3_step $stmt]
+        sqlite3_reset $stmt
+        sqlite3_bind_int $stmt 1 1
+        sqlite3_bind_int $stmt 2 3
+        set again [list [sqlite3_step $stmt] [sqlite3_column_int $stmt 0] [sqlite3_column_text $stmt 1]]
+        list $first $second $done $again [sqlite3_step $stmt] [sqlite3_finalize $stmt]
+    } {{SQLITE_ROW 4 'a'} {SQLITE_ROW 1 'A'} SQLITE_DONE {SQLITE_ROW 3 'A'} SQLITE_DONE SQLITE_OK}
+}
+finish_test
+"#,
+    );
+}

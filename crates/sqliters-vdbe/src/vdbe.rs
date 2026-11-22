@@ -1239,6 +1239,126 @@ fn fifo_duplicate_producer(ops: &[VdbeOp], probe: usize, width: i32, queue: i32)
         && insert.p3 == rowid.p2 && insert.p4 == P4::NotUsed && insert.p5 == OPFLAG_APPEND
 }
 
+/// An ordered recursive CTE dequeues from an index keyed by its ORDER BY
+/// columns and a sequence number. UNION also tracks all admitted result rows.
+fn recursive_priority_key(
+    prog: &Program, index: usize, supports_collation: impl Fn(&CollSeq) -> bool,
+) -> bool {
+    let ops = &prog.a_op;
+    let Some(previous) = index.checked_sub(1).and_then(|i| ops.get(i)) else {
+        return false;
+    };
+    let queue_index = if previous.opcode == OP_OpenPseudo { index } else { index - 1 };
+    let Some(current) = queue_index.checked_sub(1).and_then(|i| ops.get(i)) else {
+        return false;
+    };
+    let queue = &ops[queue_index];
+    let P4::KeyInfo(key) = &queue.p4 else {
+        return false;
+    };
+    let columns = current.p3;
+    let order = usize::from(key.n_key_field).saturating_sub(1);
+    if current.opcode != OP_OpenPseudo || current.p5 != 0 || columns <= 0
+        || queue.opcode != OP_OpenEphemeral || queue.p3 != 0 || queue.p5 != 0
+        || order == 0 || queue.p2 as usize != order + 2 || usize::from(key.n_all_field) != order + 2
+        || key.a_coll.len() != order + 2 || key.a_sort_flags.len() != order + 2
+        || !key.a_coll[..order].iter().all(|coll| coll.as_deref().is_some_and(&supports_collation))
+        || key.a_coll[order..].iter().any(Option::is_some)
+        || key.a_sort_flags[..order].iter().any(|flags| flags & !(KEYINFO_ORDER_DESC | KEYINFO_ORDER_BIGNULL) != 0)
+        || key.a_sort_flags[order..].iter().any(|&flags| flags != 0)
+    {
+        return false;
+    }
+    let distinct = ops.get(queue_index + 1).filter(|op|
+        op.opcode == OP_OpenEphemeral && queue.p1.checked_add(1) == Some(op.p1));
+    if let Some(seen) = distinct {
+        let P4::KeyInfo(seen_key) = &seen.p4 else {
+            return false;
+        };
+        if seen.p2 != columns || seen.p3 != 0 || seen.p5 != 0 || seen_key.enc != key.enc
+            || i32::from(seen_key.n_key_field) != columns || i32::from(seen_key.n_all_field) != columns + 1
+            || seen_key.a_sort_flags.len() != columns as usize + 1
+            || seen_key.a_sort_flags.iter().any(|&flags| flags != 0)
+            || !matches!(seen_key.a_coll.split_last(), Some((None, fields)) if fields.len() == columns as usize
+                && fields.iter().all(|coll| coll.as_deref().is_some_and(&supports_collation)))
+        {
+            return false;
+        }
+    } else if index != queue_index {
+        return false;
+    }
+    if ops.iter().any(|op| op.opcode == OP_OpenDup
+        && (op.p2 == queue.p1 || distinct.is_some_and(|seen| op.p2 == seen.p1)))
+    {
+        return false;
+    }
+    let has_dequeue = ops.windows(4).any(|part| {
+        let [rewind, null_row, payload, delete] = part else { return false };
+        rewind.opcode == OP_Rewind && rewind.p1 == queue.p1
+            && null_row.opcode == OP_NullRow && null_row.p1 == current.p1
+            && payload.opcode == OP_Column && payload.p1 == queue.p1
+            && payload.p2 == order as i32 + 1 && payload.p3 == current.p2
+            && delete.opcode == OP_Delete && delete.p1 == queue.p1 && delete.p5 == 0
+    });
+    if !has_dequeue {
+        return false;
+    }
+    let mut producers = 0;
+    for (i, insert) in ops.iter().enumerate().filter(|(_, op)| op.opcode == OP_IdxInsert && op.p1 == queue.p1) {
+        if !priority_queue_producer(ops, i, insert, order, columns, distinct) {
+            return false;
+        }
+        producers += 1;
+    }
+    producers >= 2 && distinct.is_none_or(|seen| {
+        ops.iter().filter(|op| op.p1 == seen.p1 && op.opcode == OP_IdxInsert).count() == producers
+            && ops.iter().filter(|op| op.p1 == seen.p1 && op.opcode == OP_Found).count() == producers
+    })
+}
+
+fn priority_queue_producer(
+    ops: &[VdbeOp], index: usize, insert: &VdbeOp, order: usize,
+    columns: i32, distinct: Option<&VdbeOp>,
+) -> bool {
+    let Some(prefix) = index.checked_sub(order + 3 + usize::from(distinct.is_some()))
+        .and_then(|start| ops.get(start..index)) else {
+        return false;
+    };
+    let [start @ .., sequence, packed] = prefix else {
+        return false;
+    };
+    let offset = usize::from(distinct.is_some());
+    let row = &start[0];
+    let sort_base = packed.p1;
+    let width = order as i32 + 2;
+    if row.opcode != OP_MakeRecord || row.p2 != columns || row.p4 != P4::NotUsed
+        || row.p3 != sort_base + width - 1 || row.p5 != 0
+        || sequence.opcode != OP_Sequence || sequence.p1 != insert.p1 || sequence.p2 != sort_base + width - 2
+        || packed.opcode != OP_MakeRecord || packed.p2 != width || packed.p4 != P4::NotUsed || packed.p5 != 0
+        || insert.p2 != packed.p3 || insert.p3 != sort_base || insert.p4 != P4::Int32(width) || insert.p5 != 0
+    {
+        return false;
+    }
+    if let Some(seen) = distinct {
+        let Some(found) = index.checked_sub(prefix.len() + 1).and_then(|i| ops.get(i)) else {
+            return false;
+        };
+        let remember = &start[1];
+        if found.opcode != OP_Found || found.p1 != seen.p1 || found.p3 != row.p1
+            || found.p4 != P4::Int32(columns) || found.p5 != 0
+            || usize::try_from(found.p2).ok() != Some(index + 1)
+            || remember.opcode != OP_IdxInsert || remember.p1 != seen.p1 || remember.p2 != row.p3
+            || remember.p3 != 0 || remember.p4 != P4::NotUsed || remember.p5 != OPFLAG_USESEEKRESULT
+        {
+            return false;
+        }
+    }
+    start[1 + offset..].iter().enumerate().all(|(i, copy)| {
+        copy.opcode == OP_SCopy && (row.p1..row.p1 + columns).contains(&copy.p1)
+            && copy.p2 == sort_base + i as i32
+    })
+}
+
 /// ORDER BY LIMIT keeps an ordered private index with a sequence field
 /// and evicts the last entry before appending a better candidate.
 fn limit_sort_key(prog: &Program, open: &VdbeOp, key: &KeyInfo, builtin_collations: bool) -> bool {
@@ -1805,10 +1925,14 @@ fn unsupported(
                     binary_in_key_encoding(coll) || (builtin_collations && builtin_read_key_collation(coll, k.enc))
                 });
             let rowid_list = row_case_encoding == Some(k.enc) && literal_rowid_list_key(prog, index, op, k);
+            let recursive_priority = row_case_encoding == Some(k.enc)
+                && recursive_priority_key(prog, index, |coll| {
+                    binary_in_key_encoding(coll) || (builtin_collations && builtin_read_key_collation(coll, k.enc))
+                });
             if k.enc != 1 && !prog.references_like
                 && !(binary_sort || binary_group_compare || builtin_group || streamed_group
                     || distinct || physical_index
-                    || membership || builtin_sort || limit_sort || partial_sort || recursive_fifo || rowid_list)
+                    || membership || builtin_sort || limit_sort || partial_sort || recursive_fifo || rowid_list || recursive_priority)
             {
                 return Some("UTF-16 key".to_owned());
             }
