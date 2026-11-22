@@ -2471,3 +2471,81 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_many_secondary_or_steps() {
+    sqliters_tcltest::run_test_script(
+        "row_case_many_secondary_or_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+proc many_or_rows {stmt} {
+    set rows {}
+    while {[set rc [sqlite3_step $stmt]] eq "SQLITE_ROW"} {
+        lappend rows [sqlite3_column_int $stmt 0] [sqlite3_column_text $stmt 1]
+    }
+    lappend rows $rc
+    return $rows
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE detail(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO detail VALUES(1,1,10),(2,2,20),(3,3,30);
+        CREATE TABLE packed(tag TEXT COLLATE RTRIM,zone TEXT COLLATE NOCASE,
+                            seq INTEGER,ref INTEGER,label TEXT,stamp INTEGER,rack INTEGER,site INTEGER,
+                            PRIMARY KEY(tag DESC,zone,seq)) WITHOUT ROWID;
+        INSERT INTO packed VALUES
+            ('A','west',1,1,'p-one',2,2,4),('A ','WEST',2,2,'p-two',3,2,2),
+            ('B','north',1,1,'p-b',2,3,4),(char(256)||' ','east',2,1,'p-wide',3,3,4),
+            ('C','south',3,3,'p-other',4,5,5),('D','other',4,3,'p-fourth',8,8,8);
+        CREATE INDEX packed_by_seq ON packed(seq);
+        CREATE INDEX packed_by_ref ON packed(ref);
+        CREATE INDEX packed_by_label ON packed(label);
+        CREATE INDEX packed_by_stamp ON packed(stamp);
+        CREATE INDEX packed_by_rack ON packed(rack);
+        CREATE INDEX packed_by_site ON packed(site);
+    }
+    set result_expr {CASE (SELECT a,b FROM detail d WHERE d.id=p.ref)
+                     WHEN (2,20) THEN 'changed' ELSE p.label END}
+    do_test many-or-$encoding.four {
+        execsql "SELECT seq,$result_expr FROM packed p
+                 WHERE stamp=4 OR ref=1 OR seq=2 OR label='p-two' ORDER BY seq,tag,zone;"
+    } {1 p-one 1 p-b 2 changed 2 p-wide 3 p-other}
+    do_test many-or-$encoding.reopened-range {
+        execsql "SELECT seq,$result_expr FROM packed p
+                 WHERE seq=2 OR label='p-two' OR ref=1 OR (seq>=1 AND seq<3) OR stamp=4
+                 ORDER BY seq,tag,zone;"
+    } {1 p-one 1 p-b 2 changed 2 p-wide 3 p-other}
+    do_test many-or-$encoding.six-rebind-reprepare {
+        set s [sqlite3_prepare_v2 db "SELECT seq,$result_expr FROM packed p
+                                    WHERE site=?6 OR rack=?5 OR ref=?3 OR seq=?1 OR label=?2 OR stamp=?4
+                                    ORDER BY seq,tag,zone;" -1]
+        foreach {arg value} {1 2 3 1 4 4 5 2 6 8} {
+            sqlite3_bind_int $s $arg $value
+        }
+        sqlite3_bind_text $s 2 p-two -1
+        set all [many_or_rows $s]
+        sqlite3_reset $s
+        foreach arg {1 3 4 5 6} {sqlite3_bind_null $s $arg}
+        set one [many_or_rows $s]
+        sqlite3_reset $s
+        sqlite3_bind_null $s 2
+        set empty [many_or_rows $s]
+        sqlite3_reset $s
+        execsql {CREATE INDEX packed_by_label_ref ON packed(label,ref);}
+        sqlite3_bind_int $s 4 4
+        sqlite3_bind_int $s 6 8
+        set reprepare [many_or_rows $s]
+        list $all $one $empty $reprepare [sqlite3_finalize $s]
+    } {{1 p-one 1 p-b 2 changed 2 p-wide 3 p-other 4 p-fourth SQLITE_DONE} {2 changed SQLITE_DONE} SQLITE_DONE {3 p-other 4 p-fourth SQLITE_DONE} SQLITE_OK}
+    do_execsql_test many-or-$encoding.changes {
+        SELECT changes(),total_changes();
+    } {6 9}
+}
+finish_test
+"#,
+    );
+}

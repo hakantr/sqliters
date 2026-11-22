@@ -1965,12 +1965,12 @@ fn without_rowid_or_admissions(prog: &Program, encoding: u8) -> Vec<WithoutRowid
         }
         let reopens: Vec<_> = ops.iter().enumerate().filter_map(|(pc, op)| {
             (op.opcode == OP_ReopenIdx && op.p1 == secondary.p1).then_some(pc)
-        }).take(4).collect();
+        }).collect();
         let seen_operations = if let [open] = reopens.as_slice() {
             without_rowid_primary_or_branches(ops, first_pc..end, *open, table, seen, ret, encoding)?
         } else {
             let [first_reopen, .., last_reopen] = reopens.as_slice() else { return None };
-            if !matches!(reopens.len(), 2 | 3) || *first_reopen != first_pc || *last_reopen >= end {
+            if *first_reopen != first_pc || *last_reopen >= end {
                 return None;
             }
             let mut root_keys = BTreeMap::new();

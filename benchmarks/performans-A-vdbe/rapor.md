@@ -2357,3 +2357,8 @@ Açık NOCASE ve RTRIM ile tam bellek sıralamasında uygulama karşılaştırı
 ## V6b.410 — Birincil ve ikincil WITHOUT ROWID OR kolları
 
 Birincil B-tree kolu bileşik anahtarı tablo imlecinden alıyor. İkincil kol aynı anahtar alanlarıyla tabloda konumu doğruluyor. 160 UTF-16 sonucu ve 240 tam EXPLAIN planı C ile eşleşti. İki kolun sırası, aralık genişlikleri, NULL bağlama ve C yeniden açma denetlendi. OFF 1290/1/325, ON 1288/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,261 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_410.md).
+
+
+## V6b.411 — Çok kollu ikincil indeks OR
+
+Tüm ikincil kollar aynı tam bileşik anahtarı ve ilk, orta, son akışını kullanıyor. Dört, beş, altı ve sekiz kollu C biçimlerinde 208 UTF-16 sonucu ve 312 tam EXPLAIN planı eşleşti. Önceki iki ve üç kollu sonuçlar ile birincil ve ikincil iki kollu kontrol korundu. OFF 1291/1/325, ON 1289/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_411.md).
