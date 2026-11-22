@@ -919,3 +919,41 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_returning_rowid_view_mixed_text_integer_ranges() {
+    sqliters_tcltest::run_test_script(
+        "returning_rowid_view_mixed_text_integer_ranges",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach {layout indexes limits expected order} {
+  text_first {CREATE INDEX full_a ON base(a DESC); CREATE INDEX partial_b ON base(b) WHERE b>4;} {b>4 AND a<6} {1 11 3 31 5 51 2 21} {1 3 5 2}
+  integer_first {CREATE INDEX partial_b ON base(b) WHERE b>4; CREATE INDEX full_a ON base(a DESC);} {a<6 AND b>4} {1 11 3 31 5 51 2 21} {1 3 5 2}
+  descending {CREATE INDEX full_a ON base(a); CREATE INDEX partial_b ON base(b DESC) WHERE b>4;} {b>4 AND a<6} {2 21 5 51 3 31 1 11} {2 5 3 1}
+  table_control {} {b>4 AND a<6} {3 31 1 11 5 51 2 21} {3 1 5 2}
+} {
+  reset_db
+  execsql {
+    CREATE TABLE base(a INT NOT NULL, b TEXT, c NUM);
+    CREATE TABLE seen(seq INTEGER PRIMARY KEY, a INT, previous NUM);
+    INSERT INTO base VALUES (6,'6',60),(3,'8',30),(1,'7',10),(4,'2',40),(5,'9',50),(2,'text',20);
+    CREATE VIEW projected AS SELECT a,b,c FROM base;
+    CREATE TRIGGER revise INSTEAD OF UPDATE ON projected BEGIN
+      INSERT INTO seen(a,previous) VALUES(old.a,old.c);
+      UPDATE base SET c=new.c WHERE a=old.a;
+    END;
+  }
+  execsql $indexes
+  do_execsql_test returning-mixed-rowid-range-$layout.1 "
+    UPDATE projected SET c=c+1 WHERE $limits RETURNING a,c;
+    SELECT changes();
+    SELECT a FROM seen ORDER BY seq;
+    SELECT a,c FROM base ORDER BY a;
+    PRAGMA integrity_check;
+  " [concat $expected {0} $order {1 11 2 21 3 31 4 40 5 51 6 60 ok}]
+}
+finish_test
+"#,
+    );
+}

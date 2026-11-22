@@ -33073,6 +33073,39 @@ pub(crate) fn view_update_range_tokens(stmt: &Stmt, db_set: &DatabaseSet, sql: &
         && has_plain_integer_tokens(sql, literal_equality)
 }
 
+pub(crate) fn rowid_view_text_range_tokens(stmt: &Stmt, db_set: &DatabaseSet, sql: &str) -> bool {
+    let Stmt::Update(update) = stmt else {
+        return false;
+    };
+    if update.returning.is_empty()
+        || !update.returning.iter().all(|item| view_dml_named_column(item).is_some())
+    {
+        return false;
+    }
+    let Some(Expr::Binary { left, op: BinaryOp::And, right }) = update.selection.as_ref() else {
+        return false;
+    };
+    let (Some((left_col, left_op, left_bound)), Some((right_col, right_op, right_bound))) =
+        (view_dml_index_term(left), view_dml_index_term(right))
+    else {
+        return false;
+    };
+    let integer_bound = |bound: &Expr| {
+        matches!(bound, Expr::Integer(value) if (0..=i64::from(i32::MAX)).contains(value))
+    };
+    !left_col.double_quoted && !right_col.double_quoted
+        && !left_col.column.eq_ignore_ascii_case(&right_col.column)
+        && integer_bound(left_bound)
+        && integer_bound(right_bound)
+        && matches!((left_op, right_op), (BinaryOp::Gt, BinaryOp::Lt) | (BinaryOp::Lt, BinaryOp::Gt))
+        && main_direct_view_update_source(update, db_set).is_some_and(|(_, table, projection, alias)| {
+            !table.without_rowid
+                && alias.is_none()
+                && projection.iter().all(|item| view_dml_named_column(item).is_some())
+        })
+        && has_plain_integer_tokens(sql, true)
+}
+
 // sqlite3MaterializeView copies the UPDATE or DELETE predicate into the
 // ephemeral SELECT. Its scan order becomes the INSTEAD OF trigger input order.
 // Push only a proven index term over a directly projected column. For a
@@ -33142,10 +33175,10 @@ fn view_dml_indexed_select(
         !target_col.column.eq_ignore_ascii_case(&other.column)
     });
     if returning_range
-        && (distinct_columns || second_term.is_some_and(|(_, _, bound)| {
+        && second_term.is_some_and(|(_, _, bound)| {
             !matches!(bound, Expr::Integer(_))
                 && !matches!(bound, Expr::Float(value) if value.is_finite())
-        }))
+        })
     {
         return None;
     }
@@ -33195,9 +33228,17 @@ fn view_dml_indexed_select(
 
     let schema = &ctx.db_set.main_slot().schema;
     let table = schema.find_user_table(&name.name)?;
+    let rowid_text_range = returning_range
+        && !table.without_rowid
+        && distinct_columns
+        && ctx.stmt_tx.view_update_range_tokens;
+    if returning_range && distinct_columns && !rowid_text_range {
+        return None;
+    }
     if (max_eq && !table.without_rowid)
         || (returning_range
-            && (!table.without_rowid || ctx.collations.get_custom("BINARY").is_some()))
+            && ((!table.without_rowid && !rowid_text_range)
+                || ctx.collations.get_custom("BINARY").is_some()))
         || (table.without_rowid && predicate == ViewDmlIndexPredicate::DeleteRange)
         || (quoted_bound.is_some()
             && ((!returning_range && table.without_rowid)
@@ -33287,6 +33328,12 @@ fn view_dml_indexed_select(
             }
         };
         let compatible = match (column.affinity, other_column.affinity) {
+            (TypeAffinity::Text, TypeAffinity::Integer) if rowid_text_range => {
+                op == BinaryOp::Gt && other_op == BinaryOp::Lt
+            }
+            (TypeAffinity::Integer, TypeAffinity::Text) if rowid_text_range => {
+                op == BinaryOp::Lt && other_op == BinaryOp::Gt
+            }
             (TypeAffinity::Numeric, TypeAffinity::Integer) => compatible_ops(op, other_op),
             (TypeAffinity::Integer, TypeAffinity::Numeric) => compatible_ops(other_op, op),
             _ => false,
@@ -33332,7 +33379,9 @@ fn view_dml_indexed_select(
             first
         }
     };
-    let compatible_affinity = if let Some(literal) = quoted_bound {
+    let compatible_affinity = if rowid_text_range {
+        true
+    } else if let Some(literal) = quoted_bound {
         match column.affinity {
             TypeAffinity::Text => !returning_range,
             TypeAffinity::Integer | TypeAffinity::Numeric | TypeAffinity::Real if returning_range => {
@@ -33364,6 +33413,69 @@ fn view_dml_indexed_select(
     let has_partial = indexes.iter().any(|index| index.where_clause.is_some());
     if view_filter.is_some() && has_partial {
         return None;
+    }
+    let rowid_text_root = if rowid_text_range {
+        let [first, second] = indexes.as_slice() else {
+            return None;
+        };
+        let (full, partial) = match (&first.where_clause, &second.where_clause) {
+            (None, Some(_)) => (first, second),
+            (Some(_), None) => (second, first),
+            _ => return None,
+        };
+        let (text_col, text_bound, int_col) = if column.affinity == TypeAffinity::Text {
+            (column_index, bound, other_index)
+        } else {
+            (other_index, second_term?.2, column_index)
+        };
+        let (part_col, BinaryOp::Gt, Expr::Integer(part_bound)) =
+            view_dml_index_term(partial.where_clause.as_ref()?)?
+        else {
+            return None;
+        };
+        let simple_index = |index: &IndexSchema, column| {
+            !index.is_autoindex
+                && !index.unique
+                && index.stat1.is_none()
+                && matches!(index.columns.as_slice(), [key] if key.col_idx == Some(column)
+                    && key.sort_order.collation == Collation::Binary
+                    && key.sort_order.custom_collation.is_none())
+        };
+        if !simple_index(full, int_col)
+            || !simple_index(partial, text_col)
+            || part_col.double_quoted
+            || !part_col.column.eq_ignore_ascii_case(&table.columns[text_col].name)
+            || !matches!(text_bound, Expr::Integer(value) if value == part_bound)
+            || !has_plain_integer_tokens(partial.raw_sql.as_deref()?, true)
+        {
+            return None;
+        }
+        let indexed_by = IndexHint::IndexedBy(partial.name.clone());
+        let AccessPlan::IndexRangeScan { index, range_col_idx: Some(0), skip_scan_cols: 0, .. } =
+            choose_access_plan_with_context(
+                table,
+                "main",
+                alias,
+                Some(&make_selection()),
+                schema,
+                QueryPlanContext {
+                    projection: Some(projection),
+                    indexed_by: Some(&indexed_by),
+                    ..Default::default()
+                },
+            )
+        else {
+            return None;
+        };
+        if index.root_pgno != partial.root_pgno {
+            return None;
+        }
+        Some(index.root_pgno)
+    } else {
+        None
+    };
+    if let Some(root) = rowid_text_root {
+        indexes.retain(|index| index.root_pgno == root);
     }
     let two_index_range = indexes.len() == 2
         && predicate == ViewDmlIndexPredicate::UpdateRange
@@ -33599,6 +33711,7 @@ fn view_dml_indexed_select(
     if (same_range_direction || distinct_columns)
         && !partial_range
         && !(same_returning_range && !has_partial)
+        && rowid_text_root.is_none()
     {
         return None;
     }
@@ -33773,7 +33886,8 @@ fn view_dml_indexed_select(
     let key = index.columns.first()?;
     let without_rowid_range = table.without_rowid && !max_eq;
     let expected_keys = if max_eq { 2 } else { 1 };
-    if (index.where_clause.is_some() && !partial_range && wr_mixed_root.is_none())
+    if (index.where_clause.is_some() && !partial_range && wr_mixed_root.is_none()
+        && rowid_text_root.is_none())
         || index.is_unordered()
         || index.columns.len() != expected_keys
         || !matches_key(key.col_idx)
@@ -33802,7 +33916,7 @@ fn view_dml_indexed_select(
         ..
     } = &mut narrowed.select.body.head
     {
-        if (tied_range || wr_forced_range_plan)
+        if (tied_range || wr_forced_range_plan || rowid_text_root.is_some())
             && let TableOrSubquery::Table { indexed_by, .. } = &mut from.head
         {
             *indexed_by = Some(IndexHint::IndexedBy(index.name.clone()));

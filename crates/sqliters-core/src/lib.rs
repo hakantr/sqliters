@@ -11789,12 +11789,13 @@ impl Statement {
                     prepared_defer_fks: Some(self.compiled_defer_fks),
                     prepared_ignore_checks: Some(self.compiled_ignore_checks),
                     prepared_reverse_order: self.compiled_reverse_order,
-                    view_update_range_tokens: inner.explicit_tx
-                        && inner.db_set.main_btree().transaction_state() == TransactionState::Write
-                        && !inner.authorizer.is_some()
+                    view_update_range_tokens: !inner.authorizer.is_some()
                         && self.c_machine_write.is_none()
                         && self.stmt.as_ref().is_some_and(|stmt| {
-                            engine::view_update_range_tokens(stmt, &inner.db_set, &self.raw_sql)
+                            (inner.explicit_tx
+                                && inner.db_set.main_btree().transaction_state() == TransactionState::Write
+                                && engine::view_update_range_tokens(stmt, &inner.db_set, &self.raw_sql))
+                                || engine::rowid_view_text_range_tokens(stmt, &inner.db_set, &self.raw_sql)
                         }),
                     prepared_recursive_triggers: Some(self.compiled_recursive_triggers),
                     prepared_count_changes: Some(self.compiled_count_changes),
