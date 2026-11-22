@@ -52576,6 +52576,13 @@ fn validate_update_static_inner(
                 )?;
             }
 
+            let ordered_fk_actions = db_id == DatabaseId::MAIN
+                && tbl.without_rowid
+                && tbl.foreign_keys.is_empty()
+                && trig_depth == 0
+                && upd.ctes.is_empty()
+                && upd.from.is_none()
+                && upd.returning.is_empty();
             if !is_catalog {
                 let cspecs: Vec<(String, Collation, Option<TypeAffinity>)> = tbl
                     .columns
@@ -52620,7 +52627,26 @@ fn validate_update_static_inner(
                             effective_or_conflict,
                         )
                     {
-                        validate_fk_check_static(db_set, db_id, &tbl, foreign_keys, None, false)?;
+                        let check =
+                            validate_fk_check_static(db_set, db_id, &tbl, foreign_keys, None, false);
+                        if check.is_err()
+                            && ordered_fk_actions
+                            && effective_or_conflict == Some(ConflictAction::Replace)
+                            && find_referencing_fks(slot_schema, &tbl.name).iter()
+                                .all(|(_, fk)| fk.on_delete == FkAction::NoAction)
+                        {
+                            // C continues to compile the UPDATE actions after the
+                            // REPLACE delete's failed parent-key check.
+                            let mut modified = vec![false; tbl.columns.len()];
+                            for name in &mod_col_names {
+                                if let Some((i, _)) = tbl.find_column(name) {
+                                    modified[i] = true;
+                                }
+                            }
+                            let modified = modified_cols_with_generated(&tbl, &modified);
+                            validate_fk_update_action_keys_static(db_set, db_id, &tbl, &modified)?;
+                        }
+                        check?;
                     }
                     if recursive_triggers {
                         for tm in [TriggerTiming::Before, TriggerTiming::After] {
@@ -52697,24 +52723,7 @@ fn validate_update_static_inner(
                     Some((&modified, chng_rowid)),
                     false,
                 );
-                if fk_check.is_err()
-                    && db_id == DatabaseId::MAIN
-                    && tbl.without_rowid
-                    && tbl.foreign_keys.is_empty()
-                    && trig_depth == 0
-                    && upd.ctes.is_empty()
-                    && upd.from.is_none()
-                    && upd.returning.is_empty()
-                    && matches!(
-                        effective_or_conflict,
-                        None | Some(
-                            ConflictAction::Abort
-                                | ConflictAction::Fail
-                                | ConflictAction::Ignore
-                                | ConflictAction::Rollback
-                        )
-                    )
-                {
+                if fk_check.is_err() && ordered_fk_actions {
                     validate_fk_update_action_keys_static(db_set, db_id, &tbl, &modified)?;
                 }
                 fk_check?;
