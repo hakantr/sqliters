@@ -7404,6 +7404,18 @@ pub(crate) fn custom_limit_order_collation<'a>(
         .filter(|(name, _)| Collation::from_name(name).is_none() && collations.get_custom(name).is_some())
 }
 
+pub(crate) fn custom_file_order_collation<'a>(
+    select: &'a SelectStmt,
+    db_set: &'a DatabaseSet,
+    collations: &CollationRegistry,
+) -> Option<(&'a str, u32)> {
+    if select.limit.is_some() || !select.ctes.is_empty() || !select.body.compounds.is_empty() {
+        return None;
+    }
+    main_rowid_order_collation(db_set, &select.body.head, &select.order_by)
+        .filter(|(name, _)| Collation::from_name(name).is_none() && collations.get_custom(name).is_some())
+}
+
 fn registered_memory_sort_builtin(
     name: &str,
     encoding: TextEncoding,

@@ -32,7 +32,7 @@ use sqliters_vdbe::vdbeaux::{P4, P4Vtab};
 
 use crate::ConnectionInner;
 use crate::engine::ExecContext;
-use crate::db_set::DatabaseSet;
+use crate::db_set::{DatabaseSet, TempStoreMode};
 use crate::execution_context::{CollationRegistry, ExecutionContext, FunctionRegistry, ProgressTracker};
 
 /// True if the environment variable `SQLITERS_VDBE_EXEC` is set: statements the generator and
@@ -129,9 +129,34 @@ pub(crate) fn machine_program_with_prepare(
     read_machine_program(inner, stmt, raw_sql, n_param, ReadMachineScope::Standard, None, prepared)
 }
 
+pub(crate) fn custom_sort_policy_matches(inner: &ConnectionInner, program: &Program) -> bool {
+    if program.fallible_limit_sort_open.is_some() {
+        !inner.authorizer.is_some() && inner.db_set.temp_store().is_memory()
+    } else if program.fallible_file_sort_open.is_some() {
+        file_sort_policy(inner)
+    } else {
+        true
+    }
+}
+
+fn file_sort_policy(inner: &ConnectionInner) -> bool {
+    !inner.authorizer.is_some() && inner.db_set.temp_store() == TempStoreMode::File
+        && inner.db_set.worker_threads_limit == 0
+}
+
+pub(crate) fn custom_sort_read_program(
+    inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
+) -> Option<Arc<Program>> {
+    if file_sort_policy(inner) {
+        custom_file_sort_read_program(inner, stmt, sql, n_param)
+    } else {
+        custom_limit_sort_read_program(inner, stmt, sql, n_param)
+    }
+}
+
 /// A plain ORDER BY with LIMIT uses a private index rather than the full sorter.
 #[allow(non_upper_case_globals)]
-pub(crate) fn custom_limit_sort_read_program(
+fn custom_limit_sort_read_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
 ) -> Option<Arc<Program>> {
     use sqliters_vdbe::opcodes::*;
@@ -174,6 +199,53 @@ pub(crate) fn custom_limit_sort_read_program(
     }
     program.fallible_limit_sort_open = Some(open);
     trace("machine: custom LIMIT sorter", sql);
+    Some(Arc::new(*program))
+}
+
+#[allow(non_upper_case_globals)]
+fn custom_file_sort_read_program(
+    inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
+) -> Option<Arc<Program>> {
+    use sqliters_vdbe::opcodes::*;
+    let Some(Stmt::Select(select)) = stmt else { return None };
+    let (name, root) = crate::engine::custom_file_order_collation(select, &inner.db_set, &inner.collations)?;
+    let PrepareResult::Program(mut program) = crate::cgen::c_prepare(inner, sql).0 else {
+        return None;
+    };
+    if !program.read_only || program.explain != 0 || program.btree_mask != 1
+        || !program.p_program.is_empty() || program.n_var as usize != n_param
+    {
+        return None;
+    }
+    let open = sqliters_vdbe::vdbe::custom_file_sort_open(
+        &program, name, inner.effective_encoding() as u8,
+    )?;
+    let mut reads = program.a_op.iter().filter(|op| op.opcode == OP_OpenRead);
+    let mut pseudos = program.a_op.iter().filter(|op| op.opcode == OP_OpenPseudo);
+    let read = reads.next()?;
+    let pseudo = pseudos.next()?;
+    let sort = &program.a_op[open];
+    if reads.next().is_some() || pseudos.next().is_some()
+        || read.p1 == sort.p1 || pseudo.p1 == read.p1 || pseudo.p1 == sort.p1
+        || read.p2 != root as i32 || read.p3 != 0 || !matches!(read.p4, P4::Int32(_))
+    {
+        return None;
+    }
+    if !program.a_op.iter().enumerate().all(|(pc, op)| match op.opcode {
+        OP_Init | OP_MakeRecord | OP_ResultRow | OP_Goto | OP_Halt
+        | OP_OpenRead | OP_OpenPseudo => true,
+        OP_Transaction => op.p1 == 0 && op.p2 == 0,
+        OP_Rewind | OP_Rowid | OP_Next => op.p1 == read.p1,
+        OP_Column => op.p1 == read.p1 || op.p1 == pseudo.p1,
+        OP_SorterOpen => pc == open,
+        OP_SorterInsert | OP_SorterSort | OP_SorterNext => op.p1 == sort.p1,
+        OP_SorterData => op.p1 == sort.p1 && op.p3 == pseudo.p1,
+        _ => false,
+    }) {
+        return None;
+    }
+    program.fallible_file_sort_open = Some(open);
+    trace("machine: custom FILE sorter", sql);
     Some(Arc::new(*program))
 }
 
@@ -2171,7 +2243,7 @@ pub(crate) fn step(
     if let Err(e) = &res
         && e.code == ErrorCode::Corrupt
         && e.extended_code == ErrorCode::Corrupt as i32
-        && !vm.has_limit_sort_callback_error()
+        && !vm.has_sort_callback_error()
         && !inner.is_autocommit()
     {
         inner.db_set.set_corrupt_rdonly(true);

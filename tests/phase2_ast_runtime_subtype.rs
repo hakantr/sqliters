@@ -1674,6 +1674,72 @@ fn group64_memory_limit_sort_preserves_custom_callbacks_and_error() {
 }
 
 #[test]
+fn group64_file_sort_delivers_pma_comparisons_between_steps() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        let padding = if encoding == "UTF-8" { 29999 } else { 14999 };
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}';
+             PRAGMA temp_store=FILE; PRAGMA cache_size=1; PRAGMA threads=0;
+             CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);
+             WITH RECURSIVE seq(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM seq WHERE i<11)
+             INSERT INTO items SELECT i,substr('kzbgaqocsdy',i,1)||printf('%0*d',{padding},0) FROM seq;"
+        ))
+        .unwrap();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        db.register_collation("app_order", move |left, right| {
+            seen.lock().unwrap().push((left.as_bytes()[0], right.as_bytes()[0]));
+            right.cmp(left)
+        })
+        .unwrap();
+        let sql = "SELECT id FROM items ORDER BY v COLLATE app_order NULLS LAST,id";
+        let mut statement = db.prepare(sql).unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+        let StepResult::Row(first) = statement.step().unwrap() else {
+            panic!("missing first PMA result in {encoding}");
+        };
+        assert_eq!(first.get_i64(0), Some(2));
+        let before_first = [
+            (b'b', b'g'), (b'k', b'z'), (b'z', b'g'), (b'k', b'g'),
+            (b'o', b'c'), (b'a', b'q'), (b'q', b'o'), (b'a', b'o'),
+            (b'a', b'c'), (b'd', b'y'), (b's', b'y'), (b's', b'd'),
+            (b'z', b'q'), (b'z', b'y'),
+        ];
+        assert_eq!(std::mem::take(&mut *calls.lock().unwrap()), before_first);
+        let StepResult::Row(second) = statement.step().unwrap() else {
+            panic!("missing second PMA result in {encoding}");
+        };
+        assert_eq!(second.get_i64(0), Some(11));
+        assert_eq!(std::mem::take(&mut *calls.lock().unwrap()), [(b'k', b'q'), (b'y', b'q')]);
+        statement.reset().unwrap();
+
+        let seen = Arc::clone(&calls);
+        let failure = SqliteError::with_extended(
+            sqliters_types::extended::SQLITE_BUSY_SNAPSHOT, "ordinary PMA comparator error",
+        )
+        .with_offset(23);
+        let injected = failure.clone();
+        db.register_fallible_collation("app_order", move |left, right| {
+            let mut seen = seen.lock().unwrap();
+            seen.push((left.as_bytes()[0], right.as_bytes()[0]));
+            if seen.len() == 15 {
+                Err(injected.clone())
+            } else {
+                Ok(right.cmp(left))
+            }
+        })
+        .unwrap();
+        assert!(matches!(statement.step().unwrap(), StepResult::Row(_)));
+        assert_eq!(statement.step().unwrap_err(), failure);
+        assert_eq!(statement.reset().unwrap_err(), failure);
+        let seen = std::mem::take(&mut *calls.lock().unwrap());
+        assert_eq!(seen[..14], before_first);
+        assert_eq!(seen[14..], [(b'k', b'q')]);
+    }
+}
+
+#[test]
 fn numeric_blob_boolean_predicates_follow_database_encoding() {
     use Value::{Integer, Null};
 

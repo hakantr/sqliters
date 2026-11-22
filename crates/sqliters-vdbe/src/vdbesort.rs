@@ -270,6 +270,31 @@ impl PmaDiskReader {
     }
 }
 
+pub(crate) type SortCallbackError = Arc<std::sync::Mutex<Option<SqliteError>>>;
+
+#[derive(Clone)]
+struct SorterComparator {
+    key: Arc<KeyInfoRt>,
+    error: Option<SortCallbackError>,
+}
+
+impl SorterComparator {
+    fn unpack(&self, record: &[u8]) -> Vec<Mem> {
+        sqlite3_vdbe_record_unpack(&self.key, record, usize::from(self.key.n_key_field))
+    }
+
+    fn compare(&self, lhs: &[u8], rhs: &[Mem]) -> SqlResult<i32> {
+        let mut record = UnpackedRecord::new(&self.key, rhs, rhs.len() as u16, 0);
+        let result = sqlite3_vdbe_record_compare_with_skip(lhs, &mut record, false);
+        if let Some(error) = &self.error
+            && let Some(error) = error.lock().unwrap().as_ref()
+        {
+            return Err(error.clone());
+        }
+        Ok(result)
+    }
+}
+
 /// `SORTER_MAX_MERGE_COUNT`
 const PMA_FANOUT: usize = 16;
 
@@ -288,7 +313,7 @@ impl PmaReader {
         Ok(())
     }
 
-    fn refill(&mut self, key: &KeyInfoRt, refill_bytes: usize) -> SqlResult<()> {
+    fn refill(&mut self, key: &SorterComparator, refill_bytes: usize) -> SqlResult<()> {
         let Some(child) = &mut self.child else { return self.refill_disk() };
         let mut remaining = refill_bytes;
         // vdbeIncrPopulate writes each record then advances the input, even
@@ -342,7 +367,7 @@ impl PmaMerge {
         Self::new(readers, PMA_FANOUT)
     }
 
-    fn initialize(&mut self, key: &KeyInfoRt, refill_bytes: usize) -> SqlResult<()> {
+    fn initialize(&mut self, key: &SorterComparator, refill_bytes: usize) -> SqlResult<()> {
         for reader in &mut self.readers {
             if let Some(child) = &mut reader.child {
                 child.initialize(key, refill_bytes)?;
@@ -358,28 +383,28 @@ impl PmaMerge {
             } else {
                 (left_child - width, left_child + 1 - width)
             };
-            self.winners[node] = self.choose(key, left, right);
+            self.winners[node] = self.choose(key, left, right)?;
         }
         Ok(())
     }
 
-    fn choose(&self, key: &KeyInfoRt, left: usize, right: usize) -> usize {
-        match (self.readers[left].records.front(), self.readers[right].records.front()) {
+    fn choose(&self, key: &SorterComparator, left: usize, right: usize) -> SqlResult<usize> {
+        Ok(match (self.readers[left].records.front(), self.readers[right].records.front()) {
             (None, _) => right,
             (Some(_), None) => left,
             (Some(a), Some(b)) => {
-                let rhs = sqlite3_vdbe_record_unpack(key, b, usize::from(key.n_key_field));
-                let cmp = VdbeSorter::compare(key, a, &rhs);
+                let rhs = key.unpack(b);
+                let cmp = key.compare(a, &rhs)?;
                 if cmp < 0 || (cmp == 0 && left < right) { left } else { right }
             }
-        }
+        })
     }
 
     fn current(&self) -> Option<&[u8]> {
         self.readers[self.winners[1]].records.front().map(Vec::as_slice)
     }
 
-    fn pop(&mut self, key: &KeyInfoRt, refill_bytes: usize) -> SqlResult<Option<Vec<u8>>> {
+    fn pop(&mut self, key: &SorterComparator, refill_bytes: usize) -> SqlResult<Option<Vec<u8>>> {
         let previous = self.winners[1];
         let reader = &mut self.readers[previous];
         let Some(result) = reader.records.pop_front() else { return Ok(None) };
@@ -393,7 +418,7 @@ impl PmaMerge {
         let mut right = previous | 1;
         let mut node = (self.winners.len() + previous) / 2;
         loop {
-            let winner = self.choose(key, left, right);
+            let winner = self.choose(key, left, right)?;
             self.winners[node] = winner;
             if node == 1 {
                 break;
@@ -413,7 +438,7 @@ impl PmaMerge {
 /// `struct VdbeSorter`.
 pub struct VdbeSorter {
     /// `pKeyInfo`: a copy whose `nKeyField` is the number of sort columns
-    key_info: Arc<KeyInfoRt>,
+    comparator: SorterComparator,
     /// `mnPmaSize`, `mxPmaSize`
     mn_pma_size: i64,
     mx_pma_size: i64,
@@ -455,6 +480,10 @@ impl VdbeSorter {
         self.vfs = vfs;
     }
 
+    pub(crate) fn set_sort_callback_error(&mut self, error: Option<SortCallbackError>) {
+        self.comparator.error = error;
+    }
+
     /// `sqlite3VdbeSorterInit(db, nField, pCsr)`. `pgsz` is the page size of the main
     /// database, `cache_size` is `db->aDb[0].pSchema->cache_size`, `temp_in_memory` is
     /// `sqlite3TempInMemory(db)`.
@@ -464,7 +493,7 @@ impl VdbeSorter {
             ki.n_key_field = n_field as u16;
         }
         let mut s = VdbeSorter {
-            key_info: Arc::new(ki),
+            comparator: SorterComparator { key: Arc::new(ki), error: None },
             mn_pma_size: 0,
             mx_pma_size: 0,
             use_a_memory: false,
@@ -500,18 +529,9 @@ impl VdbeSorter {
         s
     }
 
-    /// `vdbeSorterCompare(pTask, &bCached, pKey1, nKey1, pKey2, nKey2)` with `r2` = the
-    /// unpacked `pKey2`.
-    #[inline]
-    fn compare(key_info: &KeyInfoRt, key1: &[u8], r2: &[Mem]) -> i32 {
-        let mut r = UnpackedRecord::new(key_info, r2, r2.len() as u16, 0);
-        sqlite3_vdbe_record_compare_with_skip(key1, &mut r, false)
-    }
-
     /// `vdbeSorterMerge(pTask, p1, p2)`: merges two sorted lists; on a tie the record of
     /// `p1` comes first.
-    fn merge(key_info: &KeyInfoRt, p1: Vec<Vec<u8>>, p2: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-        let n_field = usize::from(key_info.n_key_field);
+    fn merge(key: &SorterComparator, p1: Vec<Vec<u8>>, p2: Vec<Vec<u8>>) -> SqlResult<Vec<Vec<u8>>> {
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(p1.len() + p2.len());
         let mut i1 = p1.into_iter().peekable();
         let mut i2 = p2.into_iter().peekable();
@@ -521,9 +541,9 @@ impl VdbeSorter {
                 break;
             };
             if cached.is_none() {
-                cached = Some(sqlite3_vdbe_record_unpack(key_info, b, n_field));
+                cached = Some(key.unpack(b));
             }
-            let res = Self::compare(key_info, a, cached.as_deref().unwrap_or(&[]));
+            let res = key.compare(a, cached.as_deref().unwrap_or(&[]))?;
             if res <= 0 {
                 out.push(i1.next().unwrap_or_default());
             } else {
@@ -533,15 +553,13 @@ impl VdbeSorter {
         }
         out.extend(i1);
         out.extend(i2);
-        out
+        Ok(out)
     }
 
     /// `vdbeSorterSort(pTask, pList)`: sorts the record list.
-    fn sort_list(&mut self) -> Vec<Vec<u8>> {
-        let key_info = Arc::clone(&self.key_info);
-        sort_memory_runs(std::mem::take(&mut self.list), |p, s| {
-            Ok::<_, std::convert::Infallible>(Self::merge(&key_info, p, s))
-        }).unwrap_or_else(|never| match never {})
+    fn sort_list(&mut self) -> SqlResult<Vec<Vec<u8>>> {
+        let comparator = &self.comparator;
+        sort_memory_runs(std::mem::take(&mut self.list), |p, s| Self::merge(comparator, p, s))
     }
 
     /// `vdbeSorterFlushPMA`
@@ -553,7 +571,7 @@ impl VdbeSorter {
         if self.pma_file.is_none() && let Some(vfs) = &self.vfs {
             self.pma_file = Some(PmaFile::open(vfs.as_ref(), self.page_size)?);
         }
-        let run = self.sort_list();
+        let run = self.sort_list()?;
         if let Some(file) = &mut self.pma_file {
             file.write_run(self.sz_pma as u64, run)?;
         } else {
@@ -607,7 +625,7 @@ impl VdbeSorter {
                 self.out = Vec::new();
                 return Ok(true);
             }
-            self.out = self.sort_list();
+            self.out = self.sort_list()?;
             return Ok(false);
         }
         self.flush_pma()?;
@@ -621,7 +639,7 @@ impl VdbeSorter {
             }).collect()
         };
         let mut merge = PmaMerge::from_readers(readers);
-        merge.initialize(&self.key_info, self.refill_bytes)?;
+        merge.initialize(&self.comparator, self.refill_bytes)?;
         let empty = merge.current().is_none();
         self.pma_merge = Some(merge);
         self.out.clear();
@@ -636,7 +654,7 @@ impl VdbeSorter {
 
     pub(crate) fn next_checked(&mut self) -> SqlResult<bool> {
         if let Some(merge) = &mut self.pma_merge {
-            merge.pop(&self.key_info, self.refill_bytes)?;
+            merge.pop(&self.comparator, self.refill_bytes)?;
             return Ok(merge.current().is_some());
         }
         // (the record is released as C frees it)

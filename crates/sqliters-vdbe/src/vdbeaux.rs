@@ -760,6 +760,7 @@ impl Vdbe {
             references_like: self.references_like,
             group_sorter_owns_rows: self.group_sorter_owns_rows,
             fallible_limit_sort_open: None,
+            fallible_file_sort_open: None,
         }
     }
 }
@@ -818,6 +819,8 @@ pub struct Program {
     pub group_sorter_owns_rows: bool,
     /// Address of the checked ORDER BY LIMIT private index's OpenEphemeral.
     pub fallible_limit_sort_open: Option<usize>,
+    /// Address of a checked complete FILE ORDER BY SorterOpen.
+    pub fallible_file_sort_open: Option<usize>,
     /// `usesStmtJournal`
     pub uses_stmt_journal: bool,
     /// `explain`: 0 normal, 1 EXPLAIN, 2 EXPLAIN QUERY PLAN
@@ -849,6 +852,11 @@ pub const EXPLAIN_COLUMN_NAMES: [&str; 12] = [
 ];
 
 impl Program {
+    #[doc(hidden)]
+    pub fn fallible_sort_open(&self) -> Option<usize> {
+        self.fallible_limit_sort_open.or(self.fallible_file_sort_open)
+    }
+
     /// The program opens a virtual-table cursor (`OP_VOpen`).
     pub fn uses_vtab(&self) -> bool {
         self.a_op.iter().any(|op| op.opcode == crate::opcodes::OP_VOpen)
