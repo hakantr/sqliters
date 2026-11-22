@@ -906,3 +906,61 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_binary_membership_and_null_semantics() {
+    sqliters_tcltest::run_test_script(
+        "row_case_binary_membership_and_null_semantics",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE facts(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+        INSERT INTO facts VALUES(1,1,10),(2,2,20),(3,3,30);
+        CREATE TABLE items(id INTEGER PRIMARY KEY, ref INTEGER, label TEXT);
+        INSERT INTO items VALUES(1,1,'A'),(2,2,'a'),(3,3,NULL),
+            (4,9,'tail'),(5,1,char(256)),(6,1,'A'||char(0)||'B');
+        CREATE VIEW selected AS
+            SELECT i.id, CASE (SELECT a,b FROM facts WHERE id=i.ref)
+              WHEN (2,20) THEN 'new' ELSE i.label END AS token
+            FROM items i;
+    }
+    do_execsql_test row-case-in-$encoding.1 {
+        SELECT 2 IN (SELECT id FROM selected WHERE token='new'),
+               'A' COLLATE BINARY IN (SELECT token FROM selected),
+               'a' COLLATE BINARY IN (SELECT token FROM selected),
+               char(256) IN (SELECT token FROM selected),
+               ('A'||char(0)||'B') IN (SELECT token FROM selected);
+    } {1 1 {} 1 1}
+    do_execsql_test row-case-in-$encoding.2 {
+        SELECT (2,'new') IN (SELECT id,token FROM selected),
+               (2,'a') IN (SELECT id,token FROM selected),
+               (3,'x') NOT IN (SELECT id,token FROM selected),
+               (99,NULL) NOT IN (SELECT id,token FROM selected);
+    } {1 0 {} 1}
+    do_execsql_test row-case-in-$encoding.3 {
+        SELECT 'absent' NOT IN (SELECT token FROM selected),
+               'absent' NOT IN (SELECT token FROM selected WHERE token IS NOT NULL),
+               NULL IN (SELECT token FROM selected WHERE id < 0),
+               NULL NOT IN (SELECT token FROM selected WHERE id < 0);
+    } {{} 1 0 1}
+    do_test row-case-in-$encoding.reprepare {
+        set s [sqlite3_prepare_v2 db {
+            SELECT ?1 COLLATE BINARY IN (SELECT token FROM selected WHERE id<>3)
+        } -1]
+        sqlite3_bind_text $s 1 new -1
+        set before [list [sqlite3_step $s] [sqlite3_column_int $s 0]]
+        sqlite3_reset $s
+        execsql {CREATE INDEX item_ref ON items(ref);}
+        sqlite3_bind_text $s 1 missing -1
+        set after [list [sqlite3_step $s] [sqlite3_column_int $s 0]]
+        list $before $after [sqlite3_step $s] [sqlite3_finalize $s]
+    } {{SQLITE_ROW 1} {SQLITE_ROW 0} SQLITE_DONE SQLITE_OK}
+}
+finish_test
+"#,
+    );
+}

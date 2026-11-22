@@ -976,10 +976,10 @@ pub fn unsupported_reason_row_case_read(
     } else {
         ReadKeyScope::BinarySorter
     };
-    let physical_encoding = (prog.read_only
+    let row_case_encoding = (prog.read_only
         && matches!(encoding, crate::vdbeaux::SQLITE_UTF16LE | crate::vdbeaux::SQLITE_UTF16BE))
         .then_some(encoding);
-    unsupported(prog, false, key_scope, physical_encoding)
+    unsupported(prog, false, key_scope, row_case_encoding)
 }
 
 /// select.c's unordered DISTINCT probes its private index before storing the same key.
@@ -1006,6 +1006,58 @@ fn binary_distinct_key(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
     })
 }
 
+/// The ordered RHS set for IN is filled by SRT_Set and probed at the same
+/// width. Other ordered ephemeral keys, such as the LIMIT sorter, keep the
+/// ordinary key admission check.
+fn binary_in_key(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
+    let width = i32::from(key.n_key_field);
+    if open.opcode != OP_OpenEphemeral || open.p2 != width || open.p3 != 0
+        || open.p5 != 0 || width == 0 || i32::from(key.n_all_field) != width + 1
+        || !key.a_sort_flags.get(..width as usize).is_some_and(|flags| flags.iter().all(|&flag| flag == 0))
+        || !key.a_coll.get(..width as usize).is_some_and(|fields| {
+            fields.iter().all(|field| field.as_deref().is_some_and(|collation| {
+                collation.name.eq_ignore_ascii_case("BINARY") && collation.enc == key.enc
+            }))
+        })
+    {
+        return false;
+    }
+
+    let mut written = false;
+    let mut probed = false;
+    for (index, op) in prog.a_op.iter().enumerate() {
+        if op.opcode == OP_OpenDup && op.p2 == open.p1 {
+            return false;
+        }
+        if op.p1 != open.p1 {
+            continue;
+        }
+        match op.opcode {
+            OP_IdxInsert => {
+                let Some(record) = index.checked_sub(1).and_then(|i| prog.a_op.get(i)) else {
+                    return false;
+                };
+                if op.p4 != P4::Int32(width) || op.p5 != 0 || record.opcode != OP_MakeRecord
+                    || record.p1 != op.p3 || record.p2 != width || record.p3 != op.p2
+                    || !matches!(&record.p4, P4::Dynamic(affinity) if affinity.len() == width as usize)
+                {
+                    return false;
+                }
+                written = true;
+            }
+            OP_Found | OP_NotFound => {
+                if op.p4 != P4::Int32(width) {
+                    return false;
+                }
+                probed = true;
+            }
+            OP_IdxDelete => return false,
+            _ => {}
+        }
+    }
+    written && probed
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReadKeyScope {
     Utf8,
@@ -1015,7 +1067,7 @@ enum ReadKeyScope {
 }
 
 fn unsupported(
-    prog: &Program, write: bool, key_scope: ReadKeyScope, physical_encoding: Option<u8>,
+    prog: &Program, write: bool, key_scope: ReadKeyScope, row_case_encoding: Option<u8>,
 ) -> Option<String> {
     if !prog.p_program.is_empty() && !write {
         return Some("sub-programs".to_owned());
@@ -1246,13 +1298,14 @@ fn unsupported(
             let binary_distinct = key_scope == ReadKeyScope::BinaryDistinct
                 && matches!(k.enc, 2 | 3) && binary_distinct_key(prog, op, k);
             // Static BINARY fields (including implicit rowid tails) have no CollSeq.
-            let binary_physical_index = physical_encoding == Some(k.enc)
+            let binary_physical_index = row_case_encoding == Some(k.enc)
                 && op.opcode == OP_OpenRead && op.p2 > 1 && op.p3 == 0
                 && k.n_key_field > 0 && k.n_key_field <= k.n_all_field
                 && k.a_coll.len() == usize::from(k.n_all_field)
                 && k.a_coll.iter().flatten().all(|c| binary_in_key_encoding(c));
+            let binary_membership = row_case_encoding == Some(k.enc) && binary_in_key(prog, op, k);
             if k.enc != 1 && !prog.references_like
-                && !(binary_sort || binary_group_compare || binary_distinct || binary_physical_index)
+                && !(binary_sort || binary_group_compare || binary_distinct || binary_physical_index || binary_membership)
             {
                 return Some("UTF-16 key".to_owned());
             }
