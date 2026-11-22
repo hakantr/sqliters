@@ -10067,7 +10067,9 @@ impl Statement {
                 let result = if let Err(e) = inner.ensure_usable() {
                     Some(Err(e))
                 } else if inner.trace_hook.is_some() || inner.authorizer.is_some()
-                    || engine::registered_builtin_memory_sort(stmt.as_ref(), &inner.db_set, &inner.collations)
+                    || engine::registered_builtin_memory_sort(
+                        stmt.as_ref(), &inner.db_set, &inner.collations, inner.effective_encoding(),
+                    )
                     || inner.db_set.main_slot().btree.as_ref().is_some_and(|bt| bt.pager().uses_fetch())
                 {
                     None
@@ -10450,7 +10452,9 @@ impl Statement {
     fn uses_registered_builtin_memory_sort(&self, inner: &ConnectionInner) -> bool {
         self.category == Some(StmtCategory::Read)
             && !self.c_machine_fixed
-            && engine::registered_builtin_memory_sort(self.stmt.as_ref(), &inner.db_set, &inner.collations)
+            && engine::registered_builtin_memory_sort(
+                self.stmt.as_ref(), &inner.db_set, &inner.collations, inner.effective_encoding(),
+            )
     }
 
     fn mapped_read_program(&self, inner: &ConnectionInner) -> Option<Arc<sqliters_vdbe::vdbeaux::Program>> {

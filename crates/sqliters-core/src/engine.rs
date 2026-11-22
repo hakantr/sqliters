@@ -7371,11 +7371,25 @@ fn complete_memory_sort_collation<'a>(
     (Some(key_index) != table.rowid_alias_col && rowid_tail).then_some(collation)
 }
 
+fn registered_memory_sort_builtin(
+    name: &str,
+    encoding: TextEncoding,
+    collations: &CollationRegistry,
+) -> bool {
+    // C has independent BINARY entries for UTF-8, UTF-16le and UTF-16be.
+    // Rust registrations take UTF-8 text and replace only the UTF-8 sort key here.
+    if encoding == TextEncoding::Utf8 && name.eq_ignore_ascii_case("BINARY") {
+        return collations.get_custom(name).is_some();
+    }
+    registered_builtin_name_collation(name, collations)
+}
+
 /// Prefer the checked relational comparator only for the current memory sort.
 pub(crate) fn registered_builtin_memory_sort(
     stmt: Option<&Stmt>,
     db_set: &DatabaseSet,
     collations: &CollationRegistry,
+    encoding: TextEncoding,
 ) -> bool {
     let Some(Stmt::Select(select)) = stmt else { return false };
     let Some(OrderByTerm { expr: Expr::Collate { collation, .. }, .. }) = select.order_by.first() else {
@@ -7383,7 +7397,7 @@ pub(crate) fn registered_builtin_memory_sort(
     };
     select.ctes.is_empty()
         && select.body.compounds.is_empty()
-        && registered_builtin_name_collation(collation, collations)
+        && registered_memory_sort_builtin(collation, encoding, collations)
         && complete_memory_sort_collation(
             db_set, &select.body.head, &select.order_by, select.limit.as_ref(),
         ).is_some()
@@ -8394,7 +8408,7 @@ fn exec_single_select_core_inner(
                             if Collation::from_name(name).is_none() {
                                 ctx.collations.get_custom(name).is_some()
                             } else {
-                                registered_builtin_name_collation(name, ctx.collations)
+                                registered_memory_sort_builtin(name, enc, ctx.collations)
                             }
                         })
                 } else {

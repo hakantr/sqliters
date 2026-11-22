@@ -2367,3 +2367,8 @@ Tüm ikincil kollar aynı tam bileşik anahtarı ve ilk, orta, son akışını k
 ## V6b.412 — Çok kollu birincil ve karışık OR
 
 Birincil ve ikincil kollar C planındaki adım sınırlarıyla aynı geçici anahtar kümesini kullanıyor. Dokuz biçim 144 UTF-16 sonucu ve 216 tam EXPLAIN planını eşledi. Bağımsız birincil artı üç ikincil tanığı ek 16 sonucu ve 24 planı kapattı. Önceki 312 geniş ikincil plan korunuyor. OFF 1292/1/325, ON 1290/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_412.md).
+
+
+## V6b.413 — Açık UTF-8 BINARY bellek sıralaması
+
+Kayıtlı UTF-8 BINARY karşılaştırıcısı C ile her Rust kipinde 4.236 adım ve 36 Unicode/NUL gözleminde eş. Native UTF-16 sıraları C ile karşılaştırıcısız eşleşti. Karşılaştırma hatasının özgün kodu ve ofseti, aynı deyim FILE/MEMORY geçişi ve altı dosyanın baytları doğrulandı. OFF 1293/1/325, ON 1291/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,269 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_413.md).
