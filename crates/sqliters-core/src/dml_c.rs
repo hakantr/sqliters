@@ -418,6 +418,16 @@ pub(crate) fn walk_select(sel: &SelectStmt, f: &mut dyn FnMut(&Expr) -> Walk) {
     for cte in &sel.ctes {
         walk_select(&cte.query, f);
     }
+    walk_select_body(sel, f, true);
+}
+
+/// Walk this SELECT's expressions without entering CTE or FROM sub-selects.
+/// Return `Walk::Shallow` to handle sub-selects inside expressions explicitly.
+pub(crate) fn walk_select_level(sel: &SelectStmt, f: &mut dyn FnMut(&Expr) -> Walk) {
+    walk_select_body(sel, f, false);
+}
+
+fn walk_select_body(sel: &SelectStmt, f: &mut dyn FnMut(&Expr) -> Walk, walk_from_subqueries: bool) {
     let core = |c: &SelectCore, f: &mut dyn FnMut(&Expr) -> Walk| match c {
         SelectCore::Values(rows) => {
             for r in rows {
@@ -441,7 +451,7 @@ pub(crate) fn walk_select(sel: &SelectStmt, f: &mut dyn FnMut(&Expr) -> Walk) {
                 }
             }
             if let Some(fc) = from {
-                walk_from(fc, f);
+                walk_from(fc, walk_from_subqueries, f);
             }
             if let Some(x) = selection {
                 walk_expr(x, f);
@@ -472,7 +482,7 @@ pub(crate) fn walk_select(sel: &SelectStmt, f: &mut dyn FnMut(&Expr) -> Walk) {
     }
 }
 
-fn walk_from(fc: &FromClause, f: &mut dyn FnMut(&Expr) -> Walk) {
+fn walk_from(fc: &FromClause, walk_subqueries: bool, f: &mut dyn FnMut(&Expr) -> Walk) {
     let tos = |t: &TableOrSubquery, f: &mut dyn FnMut(&Expr) -> Walk| match t {
         TableOrSubquery::Table { table_args, .. } => {
             if let Some(es) = table_args {
@@ -486,7 +496,11 @@ fn walk_from(fc: &FromClause, f: &mut dyn FnMut(&Expr) -> Walk) {
                 walk_expr(x, f);
             }
         }
-        TableOrSubquery::Subquery { query, .. } => walk_select(query, f),
+        TableOrSubquery::Subquery { query, .. } => {
+            if walk_subqueries {
+                walk_select(query, f);
+            }
+        }
     };
     tos(&fc.head, f);
     for j in &fc.joins {
@@ -1661,7 +1675,7 @@ impl Analyzer<'_> {
 
     fn from_clause(&mut self, fc: &FromClause) {
         let mut abort = false;
-        walk_from(fc, &mut |x| {
+        walk_from(fc, true, &mut |x| {
             collect_node(x, &mut abort);
             Walk::Deep
         });

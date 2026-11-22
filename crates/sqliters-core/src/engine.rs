@@ -9779,74 +9779,113 @@ fn disambiguate_view_column_names(raw_names: &[String]) -> Vec<String> {
 }
 
 /// Tests SELECTs of referenced persistent views using the same lookup, schema binding
-/// and view-depth rules as preparation.
-pub(crate) fn any_persisted_view_select<'a>(
+/// and depth rules as preparation.
+pub(crate) fn any_persisted_view_select(
     select: &SelectStmt,
-    db_set: &'a DatabaseSet,
+    db_set: &DatabaseSet,
     predicate: impl Fn(&SelectStmt) -> bool,
 ) -> bool {
-    fn visit<'a>(
-        select: &SelectStmt,
+    struct Search<'a, F> {
         db_set: &'a DatabaseSet,
-        parent_ctes: &CteStore,
-        seen_depth: &mut HashMap<(DatabaseId, &'a str), usize>,
-        predicate: &impl Fn(&SelectStmt) -> bool,
-    ) -> bool {
-        let ctes = parent_ctes.with_scope(&select.ctes);
-        let depth_limit = db_set.expr_depth_limit();
-        let cores = std::iter::once(&select.body.head)
-            .chain(select.body.compounds.iter().map(|(_, core)| core));
-        for core in cores {
-            let SelectCore::Select { from: Some(from), .. } = core else {
-                continue;
-            };
-            let sources = std::iter::once(&from.head).chain(from.joins.iter().map(|join| &join.right));
-            for source in sources {
-                match source {
-                    TableOrSubquery::Table { name, table_args: None, .. } => {
-                        if name.schema.is_none() && ctes.locate(&name.name).is_some() {
-                            continue;
-                        }
-                        let Some((db_id, view)) = db_set.find_view_in_set(name) else {
-                            continue;
-                        };
-                        if db_id == DatabaseId::TEMP {
-                            continue;
-                        }
-                        let Ok(view_ctes) = ctes.enter_view(db_id, &view.name, depth_limit) else {
-                            continue;
-                        };
-                        let key = (db_id, view.name.as_str());
-                        if seen_depth.get(&key).is_some_and(|depth| *depth <= view_ctes.nest_depth) {
-                            continue;
-                        }
-                        seen_depth.insert(key, view_ctes.nest_depth);
-                        let Some(slot) = db_set.slot(db_id) else {
-                            continue;
-                        };
-                        let Ok(fixed) = prepare_fixed_view_select(db_id, &slot.name, view) else {
-                            continue;
-                        };
-                        if predicate(&fixed) || visit(&fixed, db_set, &view_ctes, seen_depth, predicate) {
-                            return true;
-                        }
+        predicate: F,
+        seen_depth: HashMap<(DatabaseId, &'a str), usize>,
+        active_ctes: Vec<(CteScopeCache, usize)>,
+    }
+
+    impl<'a, F: Fn(&SelectStmt) -> bool> Search<'a, F> {
+        fn visit(&mut self, select: &SelectStmt, parent_ctes: &CteStore) -> bool {
+            let ctes = parent_ctes.with_scope(&select.ctes);
+            let cores = std::iter::once(&select.body.head)
+                .chain(select.body.compounds.iter().map(|(_, core)| core));
+            for core in cores {
+                let SelectCore::Select { from: Some(from), .. } = core else {
+                    continue;
+                };
+                let sources = std::iter::once(&from.head).chain(from.joins.iter().map(|join| &join.right));
+                for source in sources {
+                    ctes.record_expanded_tab();
+                    let found = match source {
+                        TableOrSubquery::Table { name, table_args: None, .. } => self.relation(name, &ctes),
+                        TableOrSubquery::Subquery { query, .. } => self.nested(query, &ctes),
+                        _ => false,
+                    };
+                    if found {
+                        return true;
                     }
-                    TableOrSubquery::Subquery { query, .. } => {
-                        if let Ok(nested_ctes) = ctes.enter_nested_select(depth_limit)
-                            && visit(query, db_set, &nested_ctes, seen_depth, predicate)
-                        {
-                            return true;
-                        }
-                    }
-                    _ => {}
                 }
             }
+
+            let mut found = false;
+            crate::dml_c::walk_select_level(select, &mut |expr| {
+                if !found {
+                    let subquery = match expr {
+                        Expr::Subquery(query)
+                        | Expr::Exists { subquery: query, .. }
+                        | Expr::InSubquery { subquery: query, .. } => Some(query),
+                        _ => None,
+                    };
+                    if let Some(query) = subquery {
+                        found = self.nested(query, &ctes);
+                    }
+                }
+                crate::dml_c::Walk::Shallow
+            });
+            found
         }
-        false
+
+        fn nested(&mut self, query: &SelectStmt, ctes: &CteStore) -> bool {
+            ctes.enter_nested_select(self.db_set.expr_depth_limit())
+                .is_ok_and(|nested| self.visit(query, &nested))
+        }
+
+        fn relation(&mut self, name: &QualifiedName, ctes: &CteStore) -> bool {
+            if name.schema.is_none()
+                && let Some((scope, index)) = ctes.locate(&name.name)
+            {
+                // WITH entries shadow catalog names, including when their body is recursive.
+                let cte = &ctes.scopes[scope][index];
+                let scope_cache = &ctes.scope_caches[scope];
+                if self.active_ctes.iter().any(|(seen, entry)| {
+                    *entry == index && Rc::ptr_eq(seen, scope_cache)
+                }) || !matches!(classify_cte_recursion(cte), CteRecursionKind::NonRecursive) {
+                    return false;
+                }
+                let Ok(nested) = ctes.enter_cte_select(self.db_set.expr_depth_limit()) else {
+                    return false;
+                };
+                self.active_ctes.push((Rc::clone(scope_cache), index));
+                let found = self.visit(&cte.query, &nested.slice_to_scope(scope));
+                self.active_ctes.pop();
+                return found;
+            }
+
+            let Some((db_id, view)) = self.db_set.find_view_in_set(name) else {
+                return false;
+            };
+            if db_id == DatabaseId::TEMP {
+                return false;
+            }
+            let Ok(view_ctes) = ctes.enter_view(db_id, &view.name, self.db_set.expr_depth_limit()) else {
+                return false;
+            };
+            let key = (db_id, view.name.as_str());
+            if self.seen_depth.get(&key).is_some_and(|depth| *depth <= view_ctes.nest_depth) {
+                return false;
+            }
+            self.seen_depth.insert(key, view_ctes.nest_depth);
+            let Some(slot) = self.db_set.slot(db_id) else {
+                return false;
+            };
+            let Ok(fixed) = prepare_fixed_view_select(db_id, &slot.name, view) else {
+                return false;
+            };
+            (self.predicate)(&fixed) || self.visit(&fixed, &view_ctes)
+        }
     }
 
     db_set.enable_view()
-        && visit(select, db_set, &CteStore::default(), &mut HashMap::new(), &predicate)
+        && Search { db_set, predicate, seen_depth: HashMap::new(), active_ctes: Vec::new() }
+            .visit(select, &CteStore::default())
 }
 
 fn prepare_fixed_view_select(

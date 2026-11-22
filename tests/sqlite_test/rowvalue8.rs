@@ -445,3 +445,68 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_view_cte_expression_steps() {
+    sqliters_tcltest::run_test_script(
+        "row_case_view_cte_expression_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+proc note_case {x} {
+    lappend ::calls $x
+    return [expr {int($x)}]
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding'; PRAGMA trusted_schema=ON;"
+    db function note_case -argcount 1 note_case
+    execsql {
+        CREATE TABLE words(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        CREATE TABLE picks(id INTEGER PRIMARY KEY,ref INTEGER);
+        INSERT INTO words VALUES(1,1,10),(2,2,20),(3,3,30);
+        INSERT INTO picks VALUES(1,3),(2,1),(3,6),(4,2);
+        CREATE VIEW chosen AS SELECT p.id,
+          CASE (SELECT a,note_case(b) FROM words w WHERE w.id=p.ref)
+          WHEN (1,10) THEN 'one' WHEN (2,20) THEN 'two' WHEN (3,30) THEN 'three'
+          ELSE '-' END AS label FROM picks p;
+    }
+    set sql {
+        WITH source AS (SELECT id,label FROM chosen),
+             consumer AS (SELECT id,label FROM source)
+        SELECT p.id,
+            (WITH source AS (VALUES(99,'wrong'))
+             SELECT label FROM consumer WHERE id=p.id)
+        FROM picks p WHERE p.id >= ?1 ORDER BY p.id
+    }
+    set s [sqlite3_prepare_v2 db $sql -1]
+    sqlite3_bind_int $s 1 1
+    foreach {step int value calls} {1 1 three {30} 2 2 one {10} 3 3 - {} 4 4 two {20}} {
+        do_test view-reference-$encoding.step.$step {
+            set ::calls {}
+            set code [sqlite3_step $s]
+            list $code [sqlite3_column_int $s 0] [sqlite3_column_text $s 1] $::calls
+        } [list SQLITE_ROW $int $value $calls]
+    }
+    do_test view-reference-$encoding.reprepare {
+        set ::calls {}
+        set before [list [sqlite3_step $s] $::calls]
+        sqlite3_reset $s
+        execsql {CREATE INDEX picks_ref ON picks(ref);}
+        sqlite3_bind_int $s 1 2
+        set code [sqlite3_step $s]
+        set after [list $code [sqlite3_column_int $s 0] [sqlite3_column_text $s 1] $::calls]
+        list $before $after [sqlite3_finalize $s]
+    } {{SQLITE_DONE {}} {SQLITE_ROW 2 one 10} SQLITE_OK}
+    do_execsql_test view-reference-$encoding.unused {
+        WITH unused AS (SELECT * FROM chosen) SELECT 99;
+    } {99}
+    do_execsql_test view-reference-$encoding.shadow {
+        WITH chosen(id,label) AS (VALUES(99,'local'))
+        SELECT (SELECT label FROM chosen);
+    } {local}
+}
+finish_test
+"#,
+    );
+}
