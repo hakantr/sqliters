@@ -461,7 +461,7 @@ pub(crate) fn row_case_read_program(
         return Ok(None);
     };
     if !select_has_row_case(select)
-        && !crate::engine::any_persisted_view_select(select, &inner.db_set, select_has_row_case)
+        && !crate::engine::any_referenced_view_select(select, &inner.db_set, select_has_row_case)
     {
         return Ok(None);
     }

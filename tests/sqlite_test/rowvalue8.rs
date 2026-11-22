@@ -540,3 +540,70 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_temp_row_case_view_shadowing_and_reprepare() {
+    sqliters_tcltest::run_test_script(
+        "temp_row_case_view_shadowing_and_reprepare",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+proc temp_case_note {x} {
+    lappend ::calls $x
+    return [expr {int($x)}]
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding'; PRAGMA trusted_schema=ON;"
+    db function temp_case_note -argcount 1 temp_case_note
+    execsql {
+        CREATE TABLE words(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        CREATE TABLE picks(id INTEGER PRIMARY KEY,ref INTEGER);
+        INSERT INTO words VALUES(1,1,10),(2,2,20);
+        INSERT INTO picks VALUES(1,1),(2,2),(3,9);
+        CREATE VIEW labels AS
+          SELECT p.id,CASE (SELECT a,b FROM words w WHERE w.id=p.ref)
+             WHEN (1,10) THEN 'permanent' ELSE '-' END AS label
+          FROM picks p;
+        CREATE TEMP VIEW labels AS
+          SELECT p.id,CASE (SELECT a,temp_case_note(b) FROM words w WHERE w.id=p.ref)
+             WHEN (1,10) THEN 'temporary' ELSE '-' END AS label
+          FROM picks p;
+    }
+    db config enable_view off
+    set sql {SELECT id,label FROM labels WHERE id>=?1 ORDER BY id}
+    do_test temp-row-case-$encoding.prepare {
+        set s [sqlite3_prepare_v2 db $sql -1]
+        sqlite3_bind_int $s 1 1
+        set ::calls {}
+        set rc [sqlite3_step $s]
+        list $rc [sqlite3_column_int $s 0] [sqlite3_column_text $s 1] $::calls
+    } {SQLITE_ROW 1 temporary 10}
+    do_test temp-row-case-$encoding.next {
+        set ::calls {}
+        set rc [sqlite3_step $s]
+        list $rc [sqlite3_column_int $s 0] [sqlite3_column_text $s 1] $::calls
+    } {SQLITE_ROW 2 - 20}
+    do_catchsql_test temp-row-case-$encoding.main-blocked {
+        SELECT label FROM main.labels WHERE id=1
+    } {1 {access to view "labels" prohibited}}
+    do_test temp-row-case-$encoding.reprepare {
+        sqlite3_reset $s
+        db config enable_view on
+        execsql {DROP VIEW temp.labels}
+        sqlite3_bind_int $s 1 1
+        set ::calls {}
+        set rc [sqlite3_step $s]
+        list $rc [sqlite3_column_int $s 0] [sqlite3_column_text $s 1] $::calls [sqlite3_finalize $s]
+    } {SQLITE_ROW 1 permanent {} SQLITE_OK}
+    db config enable_view off
+    do_catchsql_test temp-row-case-$encoding.temp-relay-blocked {
+        CREATE TEMP VIEW relay AS SELECT * FROM main.labels;
+        SELECT label FROM relay WHERE id=1
+    } {1 {access to view "labels" prohibited}}
+    db config enable_view on
+}
+finish_test
+"#,
+    );
+}

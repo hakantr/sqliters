@@ -9778,9 +9778,9 @@ fn disambiguate_view_column_names(raw_names: &[String]) -> Vec<String> {
     out
 }
 
-/// Tests SELECTs of referenced persistent views using the same lookup, schema binding
+/// Tests SELECTs of referenced views using the same lookup, schema binding
 /// and depth rules as preparation.
-pub(crate) fn any_persisted_view_select(
+pub(crate) fn any_referenced_view_select(
     select: &SelectStmt,
     db_set: &DatabaseSet,
     predicate: impl Fn(&SelectStmt) -> bool,
@@ -9862,7 +9862,8 @@ pub(crate) fn any_persisted_view_select(
             let Some((db_id, view)) = self.db_set.find_view_in_set(name) else {
                 return false;
             };
-            if db_id == DatabaseId::TEMP {
+            // SQLite's ENABLE_VIEW setting applies to permanent views only.
+            if !self.db_set.enable_view() && db_id != DatabaseId::TEMP {
                 return false;
             }
             let Ok(view_ctes) = ctes.enter_view(db_id, &view.name, self.db_set.expr_depth_limit()) else {
@@ -9883,9 +9884,8 @@ pub(crate) fn any_persisted_view_select(
         }
     }
 
-    db_set.enable_view()
-        && Search { db_set, predicate, seen_depth: HashMap::new(), active_ctes: Vec::new() }
-            .visit(select, &CteStore::default())
+    Search { db_set, predicate, seen_depth: HashMap::new(), active_ctes: Vec::new() }
+        .visit(select, &CteStore::default())
 }
 
 fn prepare_fixed_view_select(

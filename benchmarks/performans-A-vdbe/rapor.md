@@ -2207,3 +2207,8 @@ Gerçekten başvurulan özyinelemesiz CTE ve ifade alt sorgularında kalıcı g�
 ## V6b.380 — Eski satırda sütun varsayılanının metin kodlaması
 
 Sonradan eklenmiş TEXT DEFAULT sütununu eski fiziksel kayıttan okuyan VDBE, metni bağlantının veritabanı kodlamasına getiriyor. 324 gözlemde 16 C farkı kapandı. Önceki DISTINCT geçişinin 24 Rust sonucu korundu. OFF 1258/1/325, ON 1255/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,267 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_380.md).
+
+
+## V6b.381 — TEMP görünümünde satır CASE
+
+TEMP görünümü, ana ve bağlı şemalarla C ad çözümlemesini koruyor. 510 gözlemde 80 fark kapandı. 12 C açılışı, görünüm devre dışı bırakma ve yetkilendirme korumaları, bekleyen sorgunun ana görünüme yeniden hazırlanması geçti. OFF 1259/1/325, ON 1256/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_381.md).
