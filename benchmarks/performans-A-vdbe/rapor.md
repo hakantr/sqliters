@@ -2337,3 +2337,8 @@ Karma IS TRUE projeksiyonlarında önceki altı fark kapandı. Her Rust kipinde 
 ## V6b.406 — UTF-16 WITHOUT ROWID iki dallı OR
 
 İki fiziksel OR dalı ve bileşik PK için ölçülen 144 UTF-16 sonuç C ile eş. Exact OFF ve ON rowvalue8 34/34, C fixture 16/16. 216 tam C planı ve önceki 558 gözlem eş. OFF 1286/1/325, ON 1284/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_406.md).
+
+
+## V6b.407 — Özel adlı kolasyonun tam bellek sırası
+
+Her Rust kipinde 180 dar bellek sıralama profili ve 12.708 callback/adım optimize C ile eş. İlk callback hatası özgün kodla döndü. Group64 7/7, altı DELETE/WAL imajı ve C yeniden açılışları korundu. OFF 1287/1/325, ON 1285/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,264 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_407.md).

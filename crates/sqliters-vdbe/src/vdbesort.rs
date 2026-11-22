@@ -24,6 +24,55 @@ use crate::vdbeaux_rt::{
 };
 use crate::vdbemem::{MEM_NULL, Mem};
 
+/// The in-memory `vdbeSorterSort` schedule, shared by packed records and
+/// materialized rows. C's list head is the newest record.
+fn sort_memory_runs<T, E>(
+    rows: Vec<T>,
+    mut merge: impl FnMut(Vec<T>, Vec<T>) -> Result<Vec<T>, E>,
+) -> Result<Vec<T>, E> {
+    let mut slots: Vec<Option<Vec<T>>> = (0..64).map(|_| None).collect();
+    for record in rows.into_iter().rev() {
+        let mut run = vec![record];
+        let mut index = 0;
+        while let Some(other) = slots[index].take() {
+            run = merge(run, other)?;
+            index += 1;
+        }
+        slots[index] = Some(run);
+    }
+    let mut ordered = None;
+    for run in slots.into_iter().flatten() {
+        ordered = Some(match ordered {
+            Some(earlier) => merge(earlier, run)?,
+            None => run,
+        });
+    }
+    Ok(ordered.unwrap_or_default())
+}
+
+/// In-memory `vdbeSorterSort` for projected rows whose comparison can fail.
+#[doc(hidden)]
+pub fn sort_memory_rows<T>(
+    rows: Vec<T>,
+    mut compare: impl FnMut(&T, &T) -> sqliters_types::Result<std::cmp::Ordering>,
+) -> sqliters_types::Result<Vec<T>> {
+    sort_memory_runs(rows, |left, right| {
+        let mut merged = Vec::with_capacity(left.len() + right.len());
+        let mut left = left.into_iter().peekable();
+        let mut right = right.into_iter().peekable();
+        while let (Some(a), Some(b)) = (left.peek(), right.peek()) {
+            if compare(a, b)? != std::cmp::Ordering::Greater {
+                merged.extend(left.next());
+            } else {
+                merged.extend(right.next());
+            }
+        }
+        merged.extend(left);
+        merged.extend(right);
+        Ok(merged)
+    })
+}
+
 /// `SQLITE_MAX_PMASZ`
 const SQLITE_MAX_PMASZ: i64 = 1 << 29;
 /// `sqlite3GlobalConfig.szPma` (`SQLITE_SORTER_PMASZ`)
@@ -137,29 +186,9 @@ impl VdbeSorter {
     /// `vdbeSorterSort(pTask, pList)`: sorts the record list.
     fn sort_list(&mut self) -> Vec<Vec<u8>> {
         let key_info = Arc::clone(&self.key_info);
-        let mut a_slot: Vec<Option<Vec<Vec<u8>>>> = (0..64).map(|_| None).collect();
-        // C walks the list from its head: the newest record first.
-        let list = std::mem::take(&mut self.list);
-        for rec in list.into_iter().rev() {
-            let mut p = vec![rec];
-            let mut i = 0;
-            while let Some(s) = a_slot[i].take() {
-                p = Self::merge(&key_info, p, s);
-                i += 1;
-            }
-            a_slot[i] = Some(p);
-        }
-        let mut p: Option<Vec<Vec<u8>>> = None;
-        for slot in &mut a_slot {
-            let Some(s) = slot.take() else {
-                continue;
-            };
-            p = Some(match p {
-                Some(p) => Self::merge(&key_info, p, s),
-                None => s,
-            });
-        }
-        p.unwrap_or_default()
+        sort_memory_runs(std::mem::take(&mut self.list), |p, s| {
+            Ok::<_, std::convert::Infallible>(Self::merge(&key_info, p, s))
+        }).unwrap_or_else(|never| match never {})
     }
 
     /// `vdbeSorterFlushPMA`

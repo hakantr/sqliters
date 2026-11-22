@@ -7314,6 +7314,66 @@ fn exec_single_select_core(
     res
 }
 
+/// The relational executor already owns explicitly named application
+/// collations. With a single rowid scan, the full memory sorter receives the
+/// same records in the same order as SQLite's complete OP_SorterOpen path.
+fn use_complete_memory_sort(
+    ctx: &ExecContext<'_>,
+    core: &SelectCore,
+    order_by: &[OrderByTerm],
+    limit: Option<&LimitClause>,
+) -> bool {
+    if !ctx.db_set.temp_store().is_memory() || limit.is_some()
+        || ctx.stmt_tx.top_core != core as *const SelectCore as usize
+        || ctx.db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0
+    {
+        return false;
+    }
+    let SelectCore::Select {
+        distinct: false, projection, from: Some(from), selection: None,
+        group_by, having: None, windows,
+    } = core else { return false };
+    let TableOrSubquery::Table {
+        name, table_args: None, alias: None, indexed_by: None,
+    } = &from.head else { return false };
+    if !from.joins.is_empty() || !group_by.is_empty() || !windows.is_empty() {
+        return false;
+    }
+    let Some((DatabaseId::MAIN, table)) = ctx.db_set.find_user_table_in_set(name) else {
+        return false;
+    };
+    if table.without_rowid || table.root_pgno <= 1
+        || table.columns.iter().any(|column| column.generated.is_some())
+        || ctx.db_set.slots()[DatabaseId::MAIN.index()].schema.indexes.iter()
+            .any(|index| index.table_name.eq_ignore_ascii_case(&table.name))
+    {
+        return false;
+    }
+    let column_index = |expr: &Expr| {
+        let Expr::Column(column) = expr else { return None };
+        if column.schema.is_some() || column.table.is_some() {
+            return None;
+        }
+        table.find_column(&column.column).map(|(index, _)| index)
+    };
+    if !projection.iter().all(|column| matches!(column,
+        ResultColumn::Expr { expr, alias: None, .. } if column_index(expr).is_some()))
+    {
+        return false;
+    }
+    let Some((first, trailing)) = order_by.split_first() else { return false };
+    let Expr::Collate { expr, collation } = &first.expr else { return false };
+    let Some(key_index) = column_index(expr) else { return false };
+    key_index != table.rowid_alias_col.unwrap_or(usize::MAX)
+        && Collation::from_name(collation).is_none()
+        && ctx.collations.get_custom(collation).is_some()
+        && match trailing {
+            [] => true,
+            [last] => column_index(&last.expr).is_some_and(|index| Some(index) == table.rowid_alias_col),
+            _ => false,
+        }
+}
+
 fn exec_single_select_core_inner(
     ctx: &mut ExecContext<'_>,
     core: &SelectCore,
@@ -8338,6 +8398,11 @@ fn exec_single_select_core_inner(
                     result_rows_with_sort.sort_by(|(_, sa), (_, sb)| {
                         compare_value_slices_infallible(sa, sb, &specs, enc)
                     });
+                } else if use_complete_memory_sort(ctx, core, order_by, limit) {
+                    result_rows_with_sort = sqliters_vdbe::vdbesort::sort_memory_rows(
+                        result_rows_with_sort,
+                        |(_, sa), (_, sb)| compare_value_slices(sa, sb, &specs, enc),
+                    )?;
                 } else {
                     fallible_sort_by(&mut result_rows_with_sort, |(_, sa), (_, sb)| {
                         compare_value_slices(sa, sb, &specs, enc)
