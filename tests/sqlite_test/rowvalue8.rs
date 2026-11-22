@@ -1382,3 +1382,44 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_row_case_streaming_index_groups() {
+    sqliters_tcltest::run_test_script(
+        "row_case_streaming_index_groups",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    execsql {
+        CREATE TABLE words(id INTEGER PRIMARY KEY,k TEXT COLLATE NOCASE,bucket INTEGER,route INTEGER);
+        CREATE INDEX words_key ON words(k,bucket DESC);
+        INSERT INTO words VALUES (1,'a',1,1),(2,'A',1,2),(3,'B',2,2),
+            (4,'b',1,1),(5,NULL,1,2),(6,NULL,1,1),(7,'Ā',2,1),(8,'Ā',2,2),
+            (9,'ā',2,1),(10,'a',2,2);
+        CREATE TABLE kinds(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER);
+        INSERT INTO kinds VALUES (1,1,10),(2,2,20);
+    }
+    do_execsql_test row-case-index-group-$encoding.prefix {
+        SELECT quote(k),count(*),min(id),
+            max(CASE (SELECT a,b FROM kinds d WHERE d.id=i.route) WHEN (2,20) THEN 2 ELSE 1 END)
+        FROM words i INDEXED BY words_key GROUP BY k;
+    } {NULL 2 5 2 'a' 3 1 2 'B' 2 3 2 'Ā' 2 7 2 'ā' 1 9 1}
+    do_execsql_test row-case-index-group-$encoding.composite {
+        SELECT quote(k),bucket,count(*),min(id),
+            max(CASE (SELECT a,b FROM kinds d WHERE d.id=i.route) WHEN (2,20) THEN 2 ELSE 1 END)
+        FROM words i INDEXED BY words_key GROUP BY k,bucket;
+    } {NULL 1 2 5 2 'a' 2 1 10 2 'A' 1 2 1 2 'B' 2 1 3 2 'b' 1 1 4 1 'Ā' 2 2 7 2 'ā' 2 1 9 1}
+    do_execsql_test row-case-index-group-$encoding.reverse {
+        SELECT quote(k),bucket,count(*),min(id),
+            max(CASE (SELECT a,b FROM kinds d WHERE d.id=i.route) WHEN (2,20) THEN 2 ELSE 1 END)
+        FROM words i INDEXED BY words_key WHERE bucket>=1
+            GROUP BY k,bucket ORDER BY k DESC,bucket ASC;
+    } {'ā' 2 1 9 1 'Ā' 2 2 7 2 'b' 1 1 4 1 'B' 2 1 3 2 'A' 1 2 1 2 'a' 2 1 10 2 NULL 1 2 5 2}
+}
+finish_test
+"#,
+    );
+}

@@ -1269,6 +1269,51 @@ fn builtin_group_key(prog: &Program, key: &Arc<KeyInfo>) -> bool {
         })
 }
 
+/// GROUP BY can consume consecutive rows from a physical index instead of a
+/// sorter. The comparison must use the same collations as the scanned fields.
+fn streamed_group_key(prog: &Program, index: usize, op: &VdbeOp, key: &KeyInfo) -> bool {
+    let Some(width) = group_compare_width(prog, index, op, key) else {
+        return false;
+    };
+    let Some(start) = index.checked_sub(width) else {
+        return false;
+    };
+    let columns = &prog.a_op[start..index];
+    let cursor = columns[0].p1;
+    let jump = &prog.a_op[index + 1];
+    if jump.p1 != jump.p3 || !columns.iter().enumerate().all(|(field, column)| {
+        column.opcode == OP_Column && column.p1 == cursor
+            && column.p2 == field as i32 && column.p3 == op.p2 + field as i32
+    }) {
+        return false;
+    }
+    let source_key = prog.a_op[..start].iter().rev().find_map(|open| {
+        match &open.p4 {
+            P4::KeyInfo(source) if open.opcode == OP_OpenRead && open.p1 == cursor
+                && open.p2 > 1 && open.p3 == 0 => Some(source),
+            _ => None,
+        }
+    });
+    source_key.is_some_and(|source| {
+        source.enc == key.enc && width <= usize::from(source.n_key_field)
+            && source.a_coll.get(..width).is_some_and(|collations| {
+                collations.iter().zip(&key.a_coll[..width]).all(|(physical, group)| {
+                    group.as_deref().is_some_and(|group| {
+                        builtin_read_key_collation(group, key.enc)
+                            && physical.as_deref().map_or_else(
+                                || group.name.eq_ignore_ascii_case("BINARY"),
+                                |physical| physical.enc == group.enc
+                                    && physical.name.eq_ignore_ascii_case(&group.name),
+                            )
+                    })
+                })
+            })
+    }) && prog.a_op[index + 2..].iter().any(|next| {
+        matches!(next.opcode, OP_Next | OP_Prev) && next.p1 == cursor
+            && usize::try_from(next.p2).is_ok_and(|target| target <= start)
+    })
+}
+
 fn unsupported(
     prog: &Program, write: bool, key_scope: ReadKeyScope, row_case_encoding: Option<u8>,
     builtin_collations: bool,
@@ -1501,6 +1546,8 @@ fn unsupported(
                         k.a_coll[..width].iter().all(Option::is_some)
                     }))
                 && builtin_group_key(prog, k);
+            let streamed_group = key_scope == ReadKeyScope::BuiltinGroup
+                && row_case_encoding == Some(k.enc) && streamed_group_key(prog, index, op, k);
             let distinct = matches!(key_scope, ReadKeyScope::BinaryDistinct | ReadKeyScope::BuiltinDistinct)
                 && matches!(k.enc, 2 | 3)
                 && unordered_distinct_key(prog, op, k, |coll| {
@@ -1523,7 +1570,8 @@ fn unsupported(
             let limit_sort = row_case_encoding == Some(k.enc) && limit_sort_key(prog, op, k, builtin_collations);
             let binary_fifo = row_case_encoding == Some(k.enc) && binary_recursive_fifo_key(prog, index, op, k);
             if k.enc != 1 && !prog.references_like
-                && !(binary_sort || binary_group_compare || builtin_group || distinct || physical_index
+                && !(binary_sort || binary_group_compare || builtin_group || streamed_group
+                    || distinct || physical_index
                     || binary_membership || builtin_sort || limit_sort || binary_fifo)
             {
                 return Some("UTF-16 key".to_owned());

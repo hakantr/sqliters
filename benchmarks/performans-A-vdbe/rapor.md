@@ -2252,3 +2252,8 @@ Aynı gruplama anahtarını paylaşan sıralayıcı ve karşılaştırma adımla
 ## V6b.389 — UTF-16 yerleşik satır CASE sıralaması
 
 Tam ORDER BY ve LIMIT/OFFSET NOCASE/RTRIM sonuçları C ile eş. 756, 576 ve 612 gözlemli üç matris 320 farkı kapattı. Eşit anahtarların sıralama kontrolünde 384 Rust sonucu C ile eş ve 256 ek fark kapandı. Önceki 558 sonuç ve yol izi aynı. Pinned C 28/28, iki Rust kipi rowvalue8 21/21 ve delete2 1/1. OFF 1270/1/325, ON 1267/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_389.md).
+
+
+## V6b.390 — Fiziksel indeks üzerinden satır CASE gruplaması
+
+Exact V6b.389 tabanıyla 684 gözlemde fiziksel NOCASE indeksinin beslediği 32 gruplanmış sonuç C ile eşleşti. Önceki 558 CASE kaydı ve bağlantı kolasyonu korumaları eş. C fixture 10/10, Rust rowvalue8 22/22 ve delete2 1/1 iki kipte. OFF 1271/1/325, ON 1268/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,264 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_390.md).
