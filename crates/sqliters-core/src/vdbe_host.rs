@@ -644,7 +644,15 @@ fn read_machine_program(
                 table_scan = true;
             }
             let unsupported = if scope == ReadMachineScope::RowCase && inner.collations.get_custom("BINARY").is_none() {
-                sqliters_vdbe::vdbe::unsupported_reason_mapped_read(&p)
+                let grouped_case = matches!(stmt, Some(Stmt::Select(select))
+                    if select.ctes.is_empty() && select.body.compounds.is_empty()
+                        && matches!(&select.body.head, sqliters_syntax::SelectCore::Select { group_by, .. }
+                            if !group_by.is_empty()));
+                if grouped_case {
+                    sqliters_vdbe::vdbe::unsupported_reason_binary_group_read(&p)
+                } else {
+                    sqliters_vdbe::vdbe::unsupported_reason_mapped_read(&p)
+                }
             } else {
                 unsupported_reason(&p)
             };

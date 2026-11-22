@@ -951,26 +951,40 @@ fn sqlite3_log_est(mut x: u64) -> i16 {
 
 /// The reason why the machine does not run `prog` (`None`: every opcode is ported).
 pub fn unsupported_reason(prog: &Program) -> Option<String> {
-    unsupported(prog, false, false)
+    unsupported(prog, false, ReadKeyScope::Utf8)
 }
 
 /// [`unsupported_reason`] for a program that writes (`OP_Transaction` with `P2!=0`, the
 /// write opcodes).
 pub fn unsupported_reason_write(prog: &Program) -> Option<String> {
-    unsupported(prog, true, false)
+    unsupported(prog, true, ReadKeyScope::Utf8)
 }
 
 /// Allow BINARY UTF-16 sorter keys for the checked mapped and row CASE reads.
 pub fn unsupported_reason_mapped_read(prog: &Program) -> Option<String> {
-    unsupported(prog, false, true)
+    unsupported(prog, false, ReadKeyScope::BinarySorter)
 }
 
-fn unsupported(prog: &Program, write: bool, mapped_read: bool) -> Option<String> {
+/// For a sorter-backed row CASE group, also allow BINARY register comparisons in its encoding.
+pub fn unsupported_reason_binary_group_read(prog: &Program) -> Option<String> {
+    unsupported(prog, false, ReadKeyScope::BinaryGroup)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadKeyScope {
+    Utf8,
+    BinarySorter,
+    BinaryGroup,
+}
+
+fn unsupported(prog: &Program, write: bool, key_scope: ReadKeyScope) -> Option<String> {
     if !prog.p_program.is_empty() && !write {
         return Some("sub-programs".to_owned());
     }
+    let has_group_sorter = key_scope == ReadKeyScope::BinaryGroup
+        && prog.a_op.iter().any(|op| op.opcode == OP_SorterOpen);
     let subs = prog.p_program.iter().flat_map(|s| s.a_op.iter());
-    for op in prog.a_op.iter().chain(subs) {
+    for (index, op) in prog.a_op.iter().chain(subs).enumerate() {
         let ok = (op.opcode == OP_Expire && op.p1 != 0 && op.p2 == 1) || matches!(
             op.opcode,
             OP_Init
@@ -1176,11 +1190,21 @@ fn unsupported(prog: &Program, write: bool, mapped_read: bool) -> Option<String>
             _ => {}
         }
         if let P4::KeyInfo(k) = &op.p4 {
-            let binary_sort = mapped_read && op.opcode == OP_SorterOpen
-                && k.a_coll.iter().flatten().all(|c| {
-                    c.name.eq_ignore_ascii_case("BINARY") && c.enc == k.enc
+            let binary_in_key_encoding =
+                |c: &CollSeq| c.name.eq_ignore_ascii_case("BINARY") && c.enc == k.enc;
+            let binary_sort = key_scope != ReadKeyScope::Utf8
+                && op.opcode == OP_SorterOpen
+                && k.a_coll.iter().flatten().all(|c| binary_in_key_encoding(c));
+            let binary_group_compare = has_group_sorter
+                && op.opcode == OP_Compare
+                && op.p5 == 0
+                && (1..=i32::from(k.n_key_field)).contains(&op.p3)
+                && prog.a_op.get(index + 1).is_some_and(|next| next.opcode == OP_Jump)
+                && k.a_sort_flags.get(..op.p3 as usize).is_some()
+                && k.a_coll.get(..op.p3 as usize).is_some_and(|fields| {
+                    fields.iter().all(|c| c.as_deref().is_some_and(binary_in_key_encoding))
                 });
-            if k.enc != 1 && !prog.references_like && !binary_sort {
+            if k.enc != 1 && !prog.references_like && !binary_sort && !binary_group_compare {
                 return Some("UTF-16 key".to_owned());
             }
             // An application-defined collation can fail in this engine (its callback returns a

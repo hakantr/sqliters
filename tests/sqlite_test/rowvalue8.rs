@@ -310,3 +310,70 @@ finish_test
 "#,
     );
 }
+
+#[test]
+fn test_binary_grouped_row_case_steps() {
+    sqliters_tcltest::run_test_script(
+        "binary_grouped_row_case_steps",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+proc mark_group {x} {
+    lappend ::group_calls $x
+    return [expr {int($x)}]
+}
+foreach encoding {UTF-8 UTF-16le UTF-16be} {
+    reset_db
+    execsql "PRAGMA encoding='$encoding';"
+    db function mark_group -argcount 1 mark_group
+    execsql {
+        CREATE TABLE points(id INTEGER PRIMARY KEY, token TEXT, amount INTEGER);
+        CREATE TABLE map(token TEXT, a INTEGER, b INTEGER);
+        INSERT INTO points VALUES(1,'b',3),(2,'a',2),(3,'a',1),(4,'b',5);
+        INSERT INTO map VALUES('a',1,11),('b',2,22);
+    }
+    set sql {
+        SELECT p.token,
+               CASE (SELECT a,b FROM map m WHERE m.token=p.token)
+                 WHEN (1,11) THEN mark_group(10*min(p.amount)+1)
+                 WHEN (2,22) THEN mark_group(10*min(p.amount)+2)
+                 ELSE -1 END AS label,
+               count(*) AS amount
+          FROM points p
+         WHERE p.amount >= ?1
+         GROUP BY p.token COLLATE BINARY
+    }
+    do_test group-case-$encoding.prepare {
+        set s [sqlite3_prepare_v2 db $sql -1]
+        sqlite3_bind_int $s 1 0
+        list [sqlite3_column_name $s 0] [sqlite3_column_name $s 1] [sqlite3_column_name $s 2]
+    } {token label amount}
+    foreach {part token label amount} {1 a 11 2 2 b 32 2} {
+        do_test group-case-$encoding.step.$part {
+            set ::group_calls {}
+            set rc [sqlite3_step $s]
+            list $rc [sqlite3_column_text $s 0] [sqlite3_column_int $s 1] [sqlite3_column_int $s 2] $::group_calls
+        } [list SQLITE_ROW $token $label $amount $label]
+    }
+    do_test group-case-$encoding.finish {
+        set ::group_calls {}
+        list [sqlite3_step $s] $::group_calls [sqlite3_finalize $s]
+    } {SQLITE_DONE {} SQLITE_OK}
+    do_test group-case-$encoding.reprepare {
+        set s [sqlite3_prepare_v2 db $sql -1]
+        sqlite3_bind_int $s 1 0
+        set ::group_calls {}
+        set before [sqlite3_step $s]
+        set first [list $before [sqlite3_column_text $s 0] $::group_calls]
+        sqlite3_reset $s
+        execsql {CREATE TABLE unrelated(id INTEGER PRIMARY KEY);}
+        sqlite3_bind_int $s 1 3
+        set ::group_calls {}
+        set after [sqlite3_step $s]
+        list $first $after [sqlite3_column_text $s 0] [sqlite3_column_int $s 2] $::group_calls [sqlite3_finalize $s]
+    } {{SQLITE_ROW a 11} SQLITE_ROW b 2 32 SQLITE_OK}
+}
+finish_test
+"#,
+    );
+}

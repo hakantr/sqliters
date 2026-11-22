@@ -2187,3 +2187,8 @@ Aynı bağlantıda olağan UPDATE veya DELETE sonrası doğrudan iki rowid tablo
 ## V6b.376 — Kalıcı görünümde satır CASE
 
 Kalıcı görünümden gelen alt sorgulu satır CASE adım davranışı iki Rust kipinde C ile eşleşiyor. Exact 600 gözlemde 110 fark kapandı. 12 C yeniden açılışı ve görünüm, derinlik, yetkilendirme ve kolasyon korumaları doğrulandı. OFF 1254/1/325, ON 1251/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,272 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_376.md).
+
+
+## V6b.377 — UTF-16 BINARY satır CASE gruplaması
+
+Salt okunur satır CASE sorgularında BINARY grup karşılaştırmaları kendi UTF-16 kodlamasında yürütülüyor. 12 profilde 432 gözlem ve 80 kapanan fark doğrulandı. Diğer sonuçlar ve dosya özetleri aynı. İki Rust kipi ve C odak testleri geçti. OFF 1255/1/325, ON 1252/4/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,254 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_377.md).
