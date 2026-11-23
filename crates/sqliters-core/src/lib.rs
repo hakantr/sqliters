@@ -9141,6 +9141,7 @@ impl Statement {
             && (self.is_journal_mode_pragma()
                 || self.c_v1_write_constraint_diagnostic
                 || self.c_legacy_read_mismatch(last_error.as_ref())
+                || last_error.as_ref().is_some_and(|error| self.is_readonly_application_header_error(error))
                 || self.expired
                     && last_error.as_ref().is_some_and(|error| error.code == ErrorCode::Schema))
     }
@@ -9540,7 +9541,8 @@ impl Statement {
     ) {
         if ran
             && let Err(error) = result
-            && (self.c_v1_write_constraint_diagnostic || self.c_legacy_read_mismatch(Some(error)))
+            && (self.c_v1_write_constraint_diagnostic || self.c_legacy_read_mismatch(Some(error))
+                || self.is_readonly_application_header_error(error))
         {
             inner.transfer_c_read_error(Some(error));
             return;
@@ -10442,6 +10444,15 @@ impl Statement {
                 // A successful pragma.c HEADER_VALUE setter is run-only-once.
                 self.expired = true;
             }
+            if let Err(error) = &result && self.is_readonly_application_header_error(error) {
+                // pragma.c emits OP_Expire before OP_Transaction rejects this write.
+                self.expired = true;
+                if self.mode == PrepareMode::V1 {
+                    inner.c_connection_diagnostic_code = ErrorCode::Error;
+                    return Err(inner.legacy_c_step_error().with_conflict_effect(error.conflict_effect));
+                }
+                inner.transfer_c_read_error(Some(error));
+            }
             self.c_v1_write_constraint_diagnostic = self.mode == PrepareMode::V1
                 && result.as_ref().is_err_and(|error| error.code == ErrorCode::Constraint);
             return result.map_err(|error| Self::write_step_error(inner, self.mode, error));
@@ -10470,6 +10481,14 @@ impl Statement {
     fn is_application_header_write(&self) -> bool {
         matches!(self.stmt.as_ref(), Some(Stmt::Pragma { name, value: Some(_), .. })
             if name.eq_ignore_ascii_case("user_version") || name.eq_ignore_ascii_case("application_id"))
+    }
+
+    fn is_readonly_application_header_error(&self, error: &SqliteError) -> bool {
+        error.extended_code == ErrorCode::ReadOnly as i32
+            && self.shared.is_readonly
+            && self.is_application_header_write()
+            && matches!(self.stmt.as_ref(), Some(Stmt::Pragma { schema, .. })
+                if schema.as_deref().is_none_or(|name| name.eq_ignore_ascii_case("main")))
     }
 
     fn is_journal_mode_pragma(&self) -> bool {
@@ -10522,7 +10541,10 @@ impl Statement {
 
         // Autoreset a completed execution while retaining its bindings.
         if let StatementLifecycle::Halted { last_error } = &self.lifecycle {
-            if self.c_v1_write_constraint_diagnostic || self.c_legacy_read_mismatch(last_error.as_ref()) {
+            if self.c_v1_write_constraint_diagnostic || self.c_legacy_read_mismatch(last_error.as_ref())
+                || self.mode == PrepareMode::V1 && last_error.as_ref()
+                    .is_some_and(|error| self.is_readonly_application_header_error(error))
+            {
                 inner.transfer_c_read_error(last_error.as_ref());
             }
             self.lifecycle = StatementLifecycle::Ready;

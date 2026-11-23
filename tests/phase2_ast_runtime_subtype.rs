@@ -4718,3 +4718,52 @@ fn group64_small_direct_file_sort_keeps_registered_collation_on_caller() {
         }
     }
 }
+
+#[test]
+fn group65_readonly_application_header_setters_expire_on_write_rejection() {
+    let path = std::env::temp_dir().join(format!("sqliters-readonly-header-{}.db", std::process::id()));
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(
+        "PRAGMA foreign_keys=ON;
+         CREATE TABLE parent(id INTEGER PRIMARY KEY);
+         CREATE TABLE child(id INTEGER PRIMARY KEY, p INTEGER REFERENCES parent);
+         INSERT INTO parent VALUES(1);
+         INSERT INTO child VALUES(1,1);
+         PRAGMA user_version=7;
+         PRAGMA application_id=23;",
+    ).unwrap();
+    db.try_close().unwrap();
+    let seed = fs::read(&path).unwrap();
+
+    let db = Connection::open_with_flags(&path, sqliters::vfs::OpenFlags::READONLY).unwrap();
+    db.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+    for name in ["user_version", "application_id"] {
+        let sql = format!("PRAGMA main.{name}=65");
+        let mut legacy = db.prepare_v1(&sql).unwrap();
+        let step = legacy.step().unwrap_err();
+        assert_eq!((step.code, step.message.as_str()), (ErrorCode::Error, "SQL logic error"));
+        assert!(!legacy.c_v1_expired_before_run());
+        let reset = legacy.reset().unwrap_err();
+        assert_eq!((reset.code, reset.message.as_str()), (ErrorCode::ReadOnly, "attempt to write a readonly database"));
+        let expired = legacy.step().unwrap_err();
+        assert_eq!((expired.code, expired.message.as_str()), (ErrorCode::Error, reset.message.as_str()));
+        assert!(legacy.c_v1_expired_before_run());
+        let finalized = legacy.finalize().unwrap_err();
+        assert_eq!((finalized.code, finalized.message.as_str()), (ErrorCode::Schema, reset.message.as_str()));
+
+        let mut current = db.prepare(&sql).unwrap();
+        for reprepares in [0, 1] {
+            assert_eq!(current.step().unwrap_err().code, ErrorCode::ReadOnly);
+            assert_eq!(current.c_reprepare_status().0, reprepares);
+            assert_eq!(current.reset().unwrap_err().code, ErrorCode::ReadOnly);
+        }
+        current.finalize().unwrap();
+    }
+    assert_eq!(db.query("PRAGMA user_version", &[]).unwrap().rows[0].get_i64(0), Some(7));
+    assert_eq!(db.query("PRAGMA application_id", &[]).unwrap().rows[0].get_i64(0), Some(23));
+    assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+    assert_eq!(db.query("PRAGMA integrity_check", &[]).unwrap().rows[0].get_str(0), Some("ok"));
+    db.try_close().unwrap();
+    assert_eq!(fs::read(&path).unwrap(), seed);
+    fs::remove_file(path).unwrap();
+}

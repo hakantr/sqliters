@@ -2832,3 +2832,8 @@ Dört COLLATE yerleşimi, iki journal ve üç kodlamada ilk adım, reset, callba
 ## V6b.505 — Küçük FILE ve DEFAULT sıralamasında kayıtlı NOCASE ve RTRIM
 
 Kip başına 96 C eş hedef, 384 taban kontrolü ve dokuz snapshot profili. Küçük MAIN görüntüsünde C ve Rust çağıran iş parçacığını kullanır. Program değişiminde ifadeye ait sayaçlar korunur. Group64 36/36, Group65 39/39. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v505-registered-file-sort-exact/sonuc.md) OFF 1375/0/324, ON 1375/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,293 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_505.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.506 — Salt okunur uygulama başlığı yazıcısında ilk adım ve reset
+
+64 native karşılaştırma, 96 C ve 192 Rust açılışı eş. V1 ilk adım 1, ilk reset 8 ve sonraki reset 17 ile önceki tanıyı korur. V2 yeniden hazırlama eş. Group64 36/36, Group65 40/40 ve V505 sıralama kontrolü 978/978. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v506-readonly-header-rebase/sonuc.md) OFF 1376/0/324, ON 1376/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,283 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_506.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
