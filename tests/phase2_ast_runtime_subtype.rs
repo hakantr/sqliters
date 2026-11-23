@@ -3338,6 +3338,13 @@ fn group64_file_sorter_late_mmap_opt_in_with_two_workers() {
     check_file_sorter_late_mmap_opt_in(2);
 }
 
+#[test]
+fn group64_file_sorter_late_mmap_opt_in_with_many_workers() {
+    for workers in 3..=8 {
+        check_file_sorter_late_mmap_opt_in(workers);
+    }
+}
+
 fn check_file_sorter_late_mmap_opt_in(workers: u8) {
     let db = Connection::open_in_memory().unwrap();
     db.execute_batch(&format!(

@@ -5684,9 +5684,7 @@ impl Vdbe {
                         && k.a_coll.iter().flatten().all(|coll| coll.is_binary && coll.custom.is_none())
                     {
                         sorter.enable_workers(worker_count as usize);
-                        // Larger worker sets share the limit when mapping is
-                        // already enabled at sorter open.
-                        if worker_count <= 2 || (worker_count <= 8 && host.sorter_mmap_limit() > 0) {
+                        if worker_count <= 8 {
                             sorter.set_worker_mmap_limit(host.share_sorter_mmap_limit());
                         }
                     }
