@@ -4082,3 +4082,38 @@ fn group65_unistr_hex_observes_text_bytes_across_prepared_reset() {
         }
     }
 }
+
+#[test]
+fn group64_file_sorter_worker_uses_stock_collation_and_rowid() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}';
+             PRAGMA temp_store=FILE; PRAGMA cache_size=1; PRAGMA threads=2;
+             CREATE TABLE items(id INTEGER PRIMARY KEY, v);
+             INSERT INTO items VALUES (1,printf('Alpha%70000s','x')),
+                 (2,printf('aLPHA%70000s','x')), (3,printf('trim%70000s','x')),
+                 (4,printf('trim%70000s ','x')), (5,NULL), (6,13), (7,x'006100');"
+        )).unwrap();
+        for (order, expected) in [
+            ("v COLLATE NOCASE NULLS LAST,id DESC", [6, 2, 1, 3, 4, 7, 5]),
+            ("v COLLATE RTRIM DESC NULLS FIRST,id", [5, 7, 3, 4, 2, 1, 6]),
+        ] {
+            let mut statement = db.prepare(&format!("SELECT id FROM items ORDER BY {order}")).unwrap();
+            let StepResult::Row(first) = statement.step().unwrap() else {
+                panic!("expected first row in {encoding} for {order}");
+            };
+            assert_eq!(first.get_i64(0), Some(expected[0]));
+            assert!(statement.machine_stmt_status(4, false) > 0, "{encoding} {order}");
+            statement.reset().unwrap();
+            for id in expected {
+                let StepResult::Row(row) = statement.step().unwrap() else {
+                    panic!("expected row {id} in {encoding} for {order}");
+                };
+                assert_eq!(row.get_i64(0), Some(id));
+            }
+            assert!(matches!(statement.step().unwrap(), StepResult::Done));
+            statement.reset().unwrap();
+        }
+    }
+}

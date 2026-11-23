@@ -2742,3 +2742,8 @@ Kip başına 536 C API profili, 17.970.434 kontrollü VFS olayı ve 968.632 koru
 ## V6b.487 — Hazır `unistr` ve `hex` metin baytları
 
 Üç kodlama ve iki journal biçiminde kip başına 12 C API profili, Group65 26/26 ve yeniden etkin func9 15/15. Geçerli FK yazımlarından sonra 12 C/Rust dosya görüntüsü byte eş. [Bağımsız ölçüm](/github/sqliters/target/perf-work/builtin-unistr-mem-candidate/sonuc.md) OFF 1356/0/324, ON 1356/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,259 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_487.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.488 — Yerleşik NOCASE ve RTRIM ile toplam rowid sıralamasında işçi PMA
+
+Kip başına 180 C API profili, 673.332 kontrollü VFS olayı, 72 gerçek işçi profili. Group64 32/32, 18 FK ve bütünlük kontrolü geçti. Uygulama kolasyonu guard kayıtları korundu. [Bağımsız ölçüm](/github/sqliters/target/perf-work/worker-stock-collation-rowid-v486-preflight/sonuc.md) OFF 1357/0/324, ON 1357/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,265 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_488.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)

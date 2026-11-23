@@ -158,6 +158,11 @@ pub trait VdbeHost {
         matches!(read.p4, P4::Int32(_))
             && u32::try_from(read.p2).ok().is_some_and(|root| self.sorter_has_declared_unique_key(root, keys))
     }
+    /// Whether the connection still has the original built-in UTF-8 comparison slot.
+    #[doc(hidden)]
+    fn sorter_has_stock_collation(&self, _name: &str) -> bool {
+        false
+    }
     /// Maximum mapping size for sorter PMAs. Zero disables sorter xFetch.
     fn sorter_mmap_limit(&mut self) -> i32 {
         0
@@ -1642,19 +1647,33 @@ fn complete_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
     })
 }
 
-/// One main table scan with a total BINARY order.
+/// One main table scan with a total order and infallible stock comparators.
 fn worker_order_sorter(
     prog: &Program,
     open: &VdbeOp,
     key: &KeyInfo,
+    encoding: u8,
     has_table_key: impl FnOnce(&VdbeOp, &[VdbeOp]) -> bool,
+    has_stock_collation: impl FnOnce(&str) -> bool,
 ) -> bool {
     if !prog.read_only || prog.btree_mask != 1 || !prog.p_program.is_empty()
         || !builtin_order_sorter(prog, open, key)
         || !matches!(key.enc, 1..=3)
-        || key.a_coll.iter().flatten().any(|coll| !coll.name.eq_ignore_ascii_case("BINARY"))
     {
         return false;
+    }
+    let binary_order = key.a_coll.iter().flatten().all(|coll| coll.name.eq_ignore_ascii_case("BINARY"));
+    if !binary_order {
+        // The stock NOCASE/RTRIM term must compare in its UTF-8 slot,
+        // with a native BINARY rowid as the final tie breaker.
+        let [Some(first), Some(last)] = &key.a_coll[..usize::from(key.n_key_field)] else {
+            return false;
+        };
+        if key.enc != encoding || first.name.eq_ignore_ascii_case("BINARY")
+            || !last.name.eq_ignore_ascii_case("BINARY") || !has_stock_collation(&first.name)
+        {
+            return false;
+        }
     }
     let mut table_reads = prog.a_op.iter().filter(|op| op.opcode == OP_OpenRead);
     let Some(table) = table_reads.next() else { return false };
@@ -1711,10 +1730,10 @@ fn worker_order_sorter(
             }
         })
         && prog.a_op.iter().filter(|op| op.opcode == OP_SorterOpen).count() == 1
-        && if rowid_index.is_some() {
-            width >= 2 && matches!(table.p4, P4::Int32(_))
+        && if let Some(index) = rowid_index {
+            width >= 2 && matches!(table.p4, P4::Int32(_)) && (binary_order || index == width - 1)
         } else {
-            verified_schema && record.p5 == 0 && keys.iter().all(|op| op.p5 == 0)
+            binary_order && verified_schema && record.p5 == 0 && keys.iter().all(|op| op.p5 == 0)
                 && has_table_key(table, keys)
         }
 }
@@ -1743,9 +1762,20 @@ pub fn is_worker_sort_with_table_key(
     encoding: TextEncoding,
     has_table_key: impl Fn(&VdbeOp, &[VdbeOp]) -> bool,
 ) -> bool {
+    is_worker_sort_with_collations(prog, encoding, has_table_key, |_| false)
+}
+
+#[doc(hidden)]
+pub fn is_worker_sort_with_collations(
+    prog: &Program,
+    encoding: TextEncoding,
+    has_table_key: impl Fn(&VdbeOp, &[VdbeOp]) -> bool,
+    has_stock_collation: impl Fn(&str) -> bool,
+) -> bool {
     prog.a_op.iter().any(|op| {
         matches!(&op.p4, P4::KeyInfo(key)
-            if key.enc == encoding as u8 && worker_order_sorter(prog, op, key, &has_table_key))
+            if key.enc == encoding as u8 && worker_order_sorter(
+                prog, op, key, encoding as u8, &has_table_key, &has_stock_collation))
     })
 }
 
@@ -5676,12 +5706,14 @@ impl Vdbe {
                     let mut sorter = VdbeSorter::init(k, op.p3, pgsz, cache_size, temp_in_memory);
                     sorter.set_vfs(host.sorter_vfs());
                     let worker_count = host.sorter_worker_threads();
+                    let encoding = host.text_encoding() as u8;
                     if !temp_in_memory && self.prog.fallible_sort_open().is_none()
-                        && (k.enc == 1 || k.enc == host.text_encoding() as u8)
+                        && (k.enc == 1 || k.enc == encoding)
                         && worker_count > 0 && (worker_count <= 8 || host.sorter_mmap_limit() <= 0)
                         && matches!(&op.p4, P4::KeyInfo(key) if worker_order_sorter(&self.prog, op, key,
-                            |read, keys| host.sorter_has_worker_table_key(read, keys)))
-                        && k.a_coll.iter().flatten().all(|coll| coll.is_binary && coll.custom.is_none())
+                            encoding, |read, keys| host.sorter_has_worker_table_key(read, keys),
+                            |name| host.sorter_has_stock_collation(name)))
+                        && k.a_coll.iter().flatten().all(|coll| coll.custom.is_none())
                     {
                         sorter.enable_workers(worker_count as usize);
                         if worker_count <= 8 {

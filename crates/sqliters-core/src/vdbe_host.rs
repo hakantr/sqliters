@@ -315,7 +315,11 @@ fn has_worker_sort_table_key(db_set: &DatabaseSet, encoding: TextEncoding, read:
     })
 }
 
-/// Admit only native BINARY table scans with a total ORDER BY key.
+fn has_stock_sorter_collation(collations: &CollationRegistry, name: &str) -> bool {
+    collations.has_registration_comparator(name) && collations.get_custom(name).is_none()
+}
+
+/// Admit only native table scans with a total ORDER BY key and stock collations.
 pub(crate) fn worker_sort_read_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
 ) -> Option<Arc<Program>> {
@@ -335,9 +339,11 @@ pub(crate) fn worker_sort_read_program(
         return None;
     };
     if program.explain != 0 || program.n_var as usize != n_param
-        || !sqliters_vdbe::vdbe::is_worker_sort_with_table_key(&program, encoding, |read, keys| {
-            has_worker_sort_table_key(&inner.db_set, encoding, read, keys)
-        })
+        || !sqliters_vdbe::vdbe::is_worker_sort_with_collations(
+            &program, encoding,
+            |read, keys| has_worker_sort_table_key(&inner.db_set, encoding, read, keys),
+            |name| has_stock_sorter_collation(&inner.collations, name),
+        )
     {
         return None;
     }
@@ -1518,6 +1524,10 @@ macro_rules! host_common {
                 return 0;
             }
             self.dbs().worker_threads_limit
+        }
+
+        fn sorter_has_stock_collation(&self, name: &str) -> bool {
+            has_stock_sorter_collation(self.colls(), name)
         }
 
         fn sorter_mmap_limit(&mut self) -> i32 {
