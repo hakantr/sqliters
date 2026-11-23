@@ -106,8 +106,8 @@ pub(crate) fn func_flags(flags: FunctionFlags) -> u32 {
     1 /* SQLITE_UTF8 */ | (extra ^ SQLITE_FUNC_UNSAFE)
 }
 
-/// The public scalar registration API supplies SQLITE_UTF8 to sqlite3CreateFunc.
-pub(crate) fn scalar_registration_replaces_definition(
+/// The public function registration APIs supply SQLITE_UTF8 to sqlite3CreateFunc.
+pub(crate) fn registration_replaces_definition(
     functions: &FunctionRegistry,
     name: &str,
     arity: Option<usize>,

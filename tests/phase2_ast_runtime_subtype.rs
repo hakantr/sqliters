@@ -2764,3 +2764,59 @@ fn group65_scalar_removal_masks_exact_arity_until_registration() {
         assert_eq!(db.query("SELECT app_count(1)", &[]).unwrap().rows[0].get_i64(0), Some(303));
     }
 }
+
+#[test]
+fn group65_function_kind_replacement_keeps_one_active_definition() {
+    struct Total(i64);
+
+    impl sqliters::WindowAggregateInstance for Total {
+        fn step(&mut self, args: &[RuntimeValue]) -> Result<()> {
+            if let Value::Integer(value) = args[0].value {
+                self.0 += value;
+            }
+            Ok(())
+        }
+
+        fn finalize(&mut self) -> Result<RuntimeValue> {
+            Ok(RuntimeValue::plain(Value::Integer(self.0)))
+        }
+    }
+
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch("CREATE TABLE data(id INTEGER PRIMARY KEY); INSERT INTO data VALUES(1),(2);")
+        .unwrap();
+    let register_scalar = || {
+        db.register_scalar_function("app_kind", 1, FunctionFlags::NONE, |_| {
+            Ok(RuntimeValue::plain(Value::Integer(41)))
+        })
+    };
+    let register_aggregate = |name| {
+        db.create_aggregate_function(name, 1, FunctionFlags::NONE, || Box::new(Total(0)))
+    };
+    let query = "SELECT app_kind(id) FROM data";
+    let kinds = "SELECT type FROM pragma_function_list WHERE name='app_kind' AND narg=1";
+
+    register_scalar().unwrap();
+    let mut first = db.prepare(query).unwrap();
+    assert!(matches!(first.step().unwrap(), StepResult::Row(_)));
+    for name in ["app_kind", "sum"] {
+        assert_eq!(register_aggregate(name).unwrap_err().code, ErrorCode::Busy);
+    }
+    first.finalize().unwrap();
+
+    register_aggregate("app_kind").unwrap();
+    let results = db.query(query, &[]).unwrap();
+    assert_eq!(results.rows.len(), 1);
+    assert_eq!(results.rows[0].get_i64(0), Some(3));
+    let listed = db.query(kinds, &[]).unwrap();
+    assert_eq!(listed.rows.len(), 1);
+    assert_eq!(listed.rows[0].get_str(0), Some("a"));
+
+    register_scalar().unwrap();
+    let results = db.query(query, &[]).unwrap();
+    assert_eq!(results.rows.len(), 2);
+    assert!(results.rows.iter().all(|row| row.get_i64(0) == Some(41)));
+    let listed = db.query(kinds, &[]).unwrap();
+    assert_eq!(listed.rows.len(), 1);
+    assert_eq!(listed.rows[0].get_str(0), Some("s"));
+}

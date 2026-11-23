@@ -2507,3 +2507,8 @@ Kararlı filtresiz Linux üzerinde adlandırılıp silinen sorter dosyasının e
 ## V6b.440 — Kaldırılan fonksiyon aritesi ve yeniden kayıt
 
 Üç kodlama, V1/V2 ve OFF/ON üzerinde 36 akış ve 468 API kaydı eş. 24 önceki fark kapandı. Kaldırılan arite maskesi ve diğer ariteler, gömülü liste satırı, yeniden kayıt, reset ve Rust bool dönüşü doğrulandı. LIKE operatörünün iki aritesi ve PRAGMA sonrası geri kayıt iki yürütme kipinde pinli C ile doğrulandı. OFF 1319/1/325, ON 1317/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,276 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_440.md).
+
+
+## V6b.441 — Scalar ve aggregate tanımı değiştirme
+
+Etkin ifadede aynı fonksiyon tanımı üzerine kayıt SQLITE_BUSY verir. Boştayken uygulama callback türü tek liste girdisi bırakacak şekilde değişir. 36 akış, 540 kayıt ve 252 kapsam dışı kontrol doğrulandı. OFF 1320/1/325, ON 1318/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,272 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_441.md).

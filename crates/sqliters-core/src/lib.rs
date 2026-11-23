@@ -1731,7 +1731,7 @@ impl ConnectionInner {
         }
     }
 
-    fn prepare_scalar_change(&mut self, replacing: bool) -> Result<()> {
+    fn prepare_function_change(&mut self, replacing: bool) -> Result<()> {
         // sqlite3CreateFunc expires prepared statements when replacing an existing overload.
         if replacing {
             if !self.activity.leases.is_empty() {
@@ -4694,8 +4694,8 @@ impl Connection {
         let mut session = self.shared.enter()?;
         let inner = session.inner_mut();
         inner.ensure_usable()?;
-        let replacing = cgen::scalar_registration_replaces_definition(&inner.functions, name, arity);
-        inner.prepare_scalar_change(replacing)?;
+        let replacing = cgen::registration_replaces_definition(&inner.functions, name, arity);
+        inner.prepare_function_change(replacing)?;
         inner.functions.register_scalar(name, arity, flags, func);
         if replacing {
             inner.schema_generation += 1;
@@ -4730,11 +4730,11 @@ impl Connection {
         let mut session = self.shared.enter()?;
         let inner = session.inner_mut();
         inner.ensure_usable()?;
-        let removing = cgen::scalar_registration_replaces_definition(&inner.functions, name, arity);
+        let removing = cgen::registration_replaces_definition(&inner.functions, name, arity);
         if !removing {
             return Ok(false);
         }
-        inner.prepare_scalar_change(true)?;
+        inner.prepare_function_change(true)?;
         let removed = inner.functions.unregister_scalar(name, arity);
         inner.functions.mask_scalar_definition(name, arity);
         inner.schema_generation += 1;
@@ -4785,6 +4785,8 @@ impl Connection {
         let mut session = self.shared.enter()?;
         let inner = session.inner_mut();
         inner.ensure_usable()?;
+        let replacing = cgen::registration_replaces_definition(&inner.functions, name, arity);
+        inner.prepare_function_change(replacing)?;
         inner.functions.register_window_aggregate(
             name,
             arity,

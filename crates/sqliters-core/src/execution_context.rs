@@ -225,6 +225,7 @@ impl FunctionRegistry {
         let registered_name = if key == "LIKE" { "like".to_owned() } else { name.to_owned() };
         self.clear_c_like_metadata(&key, arity);
         self.clear_scalar_mask(&key, arity);
+        self.remove_aggregate_overload(&key, arity);
         let def = ScalarFunctionDef {
             name: registered_name,
             arity,
@@ -297,11 +298,15 @@ impl FunctionRegistry {
     /// sqlite3CreateFunc keeps a callback-free FuncDef at the selected UTF-8 arity.
     pub(crate) fn mask_scalar_definition(&mut self, name: &str, arity: Option<usize>) {
         let key = name.to_ascii_uppercase();
-        self.deleted_scalar_arities.entry(key.clone()).or_default().push(arity);
-        if let Some(overloads) = self.aggregates.get_mut(&key) {
+        self.remove_aggregate_overload(&key, arity);
+        self.deleted_scalar_arities.entry(key).or_default().push(arity);
+    }
+
+    fn remove_aggregate_overload(&mut self, key: &str, arity: Option<usize>) {
+        if let Some(overloads) = self.aggregates.get_mut(key) {
             overloads.retain(|definition| definition.arity != arity);
             if overloads.is_empty() {
-                self.aggregates.remove(&key);
+                self.aggregates.remove(key);
             }
         }
     }
@@ -495,11 +500,8 @@ impl FunctionRegistry {
         let name = name.into();
         let key = name.to_ascii_uppercase();
         self.clear_scalar_mask(&key, arity);
+        self.unregister_scalar(&name, arity);
         let name = if key == "LIKE" { "like".to_owned() } else { name };
-        if key == "LIKE" {
-            self.clear_c_like_metadata(&key, arity);
-            if let Some(v) = self.scalars.get_mut("LIKE") { v.retain(|entry| entry.definition.arity != arity); }
-        }
         let def = WindowFunctionDef {
             name,
             arity,
