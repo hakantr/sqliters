@@ -3590,3 +3590,38 @@ fn group65_v1_machine_retains_application_aggregate_callback_error() {
         }
     }
 }
+
+#[test]
+fn group65_function_list_table_authorizes_named_columns() {
+    use sqliters::{AuthorizerAction, AuthorizerResult};
+
+    for (decision, sql, label) in [
+        (AuthorizerResult::Deny, "SELECT NAME FROM PRAGMA_FUNCTION_LIST", "PRAGMA_FUNCTION_LIST"),
+        (AuthorizerResult::Ignore, "SELECT name, builtin FROM pragma_function_list() LIMIT 1",
+            "pragma_function_list"),
+    ] {
+        let db = Connection::open_in_memory().unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let events = reads.clone();
+        db.set_authorizer(Some(Box::new(move |action, table, column, schema, context| {
+            if action == AuthorizerAction::Read && column == Some("name") {
+                assert_eq!((table, schema, context), (Some(label), Some("main"), None));
+                events.fetch_add(1, AtomicOrdering::Relaxed);
+                return decision;
+            }
+            AuthorizerResult::Ok
+        }))).unwrap();
+
+        if decision == AuthorizerResult::Deny {
+            let Err(err) = db.prepare(sql) else {
+                panic!("denied function list column prepared");
+            };
+            assert_eq!(err.code, ErrorCode::Auth);
+            assert_eq!(err.message, "access to PRAGMA_FUNCTION_LIST.name is prohibited");
+        } else {
+            let row = db.query_row(sql, &[]).unwrap().unwrap();
+            assert_eq!(row.values(), &[Value::Null, Value::Integer(1)]);
+        }
+        assert_eq!(reads.load(AtomicOrdering::Relaxed), 1);
+    }
+}

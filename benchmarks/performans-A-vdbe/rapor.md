@@ -2612,3 +2612,8 @@ Pinli C ile 84 ON profili eşleşti. xStep, xInverse, xValue ve xFinal hatasın�
 ## V6b.461 — VACUUM DELETE journal silme hatasından sonra kurtarma
 
 İlk 2570 hatası ve işlem durumu korunurken sonraki erişim C gibi olağan sıcak journal kurtarmasına giriyor. Yinelenen silme hatası ve daha sonraki başarılı okuma eşleşti. Yeniden açılan 30 dosyada FK ve bütünlük kontrolü geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v461-vacuum-journal-delete-candidate/sonuc.md) OFF 1337/0/325, ON 1337/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,279 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_461.md).
+
+
+## V6b.462 — pragma_function_list adlandırılmış sütun yetkilendirmesi
+
+Adlandırılmış sütunların izin, yoksayma ve ret kararları 480 doğrudan C profili ve 4.068 kayıtta eşleşti. 192 ret satır döndürmedi. Ad yazımı, şema ve tanı doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v462-function-list-named-authorization-candidate/sonuc.md) OFF 1338/0/325, ON 1338/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,277 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_462.md).

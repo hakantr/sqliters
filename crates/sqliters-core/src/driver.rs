@@ -499,6 +499,33 @@ impl<'a> AuthWalkCtx<'a> {
             }
         }
 
+        let registry = self.db_set.vtab_registry();
+        if qn.name.eq_ignore_ascii_case("pragma_function_list")
+            && qn.schema.as_deref().is_none_or(|schema| self.db_set.find_db_id(schema).is_some())
+            && self.db_set.find_virtual_table_in_set(qn).is_none()
+            && (registry.has_automatic_pragma_module(&qn.name) || registry.get_module(&qn.name).is_none())
+            && let Some(module) = crate::vtab::PragmaVTabModule::try_for_module_name(&qn.name)
+        {
+            // SQLite's automatic eponymous table is declared in the main schema.
+            let table = module.declared_table()?;
+            return Ok((
+                AuthSourceTable {
+                    db_id: Some(DatabaseId::MAIN),
+                    db_name: Some(self.slot_name(DatabaseId::MAIN)),
+                    table_name: registry.registered_module_name(&qn.name)
+                        .unwrap_or(&qn.name)
+                        .to_owned(),
+                    alias: alias.map(str::to_owned),
+                    columns: table.columns.into_iter().map(|column| column.name).collect(),
+                    has_rowid: !table.without_rowid,
+                    ipk_column: None,
+                    fires_read: true,
+                    qualified_only: false,
+                },
+                None,
+            ));
+        }
+
         let db_id = qn
             .schema
             .as_deref()

@@ -3493,6 +3493,10 @@ pub struct PragmaVTabModule {
 }
 
 impl PragmaVTabModule {
+    pub(crate) fn declared_table(&self) -> Result<TableSchema> {
+        parse_declare_vtab_sql(&self.module_name, self.declare_sql).map(|(table, _)| table)
+    }
+
     /// Checks if `name` is an eponymous `pragma_<name>` module and returns its descriptor.
     pub fn try_for_module_name(name: &str) -> Option<Self> {
         let lower = name.to_ascii_lowercase();
