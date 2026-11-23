@@ -19,14 +19,14 @@ use sqliters_pager::{JournalMode, LockingMode, PagerOpenOptions, TransactionStat
 use sqliters_types::DatabaseKind;
 use sqliters_syntax::Stmt;
 use sqliters_types::{
-    AggregateStepId, DatabaseId, ErrorCode, ExecutionServices, Result, RuntimeValue, SqliteError, TextEncoding, Value,
+    AggregateStepId, Collation, DatabaseId, ErrorCode, ExecutionServices, Result, RuntimeValue, SqliteError, TextEncoding, Value,
 };
 use sqliters_vdbe::functions::VmRuntimeContext;
 use sqliters_vdbe::vdbe::{
     COLTYPE_ANY, COLTYPE_BLOB, COLTYPE_CUSTOM, COLTYPE_INT, COLTYPE_INTEGER, COLTYPE_REAL, COLTYPE_TEXT, TableColRt, TableRt, Vdbe,
     VdbeHost, unsupported_reason,
 };
-use sqliters_vdbe::vdbeaux::{COLNAME_NAME, FuncDef, Program};
+use sqliters_vdbe::vdbeaux::{COLNAME_NAME, FuncDef, Program, VdbeOp};
 use sqliters_vdbe::vdbemem::{CollRt, Mem};
 use sqliters_vdbe::vdbeaux::{P4, P4Vtab};
 
@@ -251,7 +251,34 @@ fn custom_file_sort_read_program(
     Some(Arc::new(*program))
 }
 
-/// The worker sorter admits only the complete native BINARY rowid order.
+fn has_declared_unique_sort_key(db_set: &DatabaseSet, root: u32, keys: &[VdbeOp]) -> bool {
+    let schema = &db_set.main_slot().schema;
+    if !schema.loaded || db_set.writable_schema_effective() {
+        return false;
+    }
+    let Some(table) = schema.tables.iter().find(|table| table.root_pgno == root) else {
+        return false;
+    };
+    // Generated columns can change the mapping from OP_Column to the declaration.
+    if table.without_rowid || table.columns.iter().any(|column| column.generated.is_some()) {
+        return false;
+    }
+    schema.indexes.iter().any(|index| {
+        index.unique && index.root_pgno > 1 && index.where_clause.is_none()
+            && index.table_name.eq_ignore_ascii_case(&table.name)
+            && !index.columns.is_empty()
+            && index.columns.iter().all(|part| {
+                part.expr.is_none() && part.sort_order.collation == Collation::Binary
+                    && part.sort_order.custom_collation.is_none()
+                    && part.col_idx.is_some_and(|column| {
+                        table.columns.get(column).is_some_and(|column| column.not_null.is_some())
+                            && keys.iter().any(|key| usize::try_from(key.p2).ok() == Some(column))
+                    })
+            })
+    })
+}
+
+/// Admit only native BINARY table scans with a total ORDER BY key.
 pub(crate) fn worker_sort_read_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
 ) -> Option<Arc<Program>> {
@@ -261,7 +288,7 @@ pub(crate) fn worker_sort_read_program(
     if (encoding == TextEncoding::Utf8 && exec_switch_on())
         || inner.db_set.worker_threads_limit <= 0 || inner.db_set.temp_store().is_memory()
         || inner.db_set.sorter_mmap_limit() > 0 || inner.collations.get_custom("BINARY").is_some()
-        || select.order_by.len() < 2 || select.limit.is_some() || read_codegen_blocker(inner).is_some()
+        || select.order_by.is_empty() || select.limit.is_some() || read_codegen_blocker(inner).is_some()
     {
         return None;
     }
@@ -269,7 +296,9 @@ pub(crate) fn worker_sort_read_program(
         return None;
     };
     if program.explain != 0 || program.n_var as usize != n_param
-        || !sqliters_vdbe::vdbe::is_worker_sort(&program, encoding)
+        || !sqliters_vdbe::vdbe::is_worker_sort_with_declared_unique_key(&program, encoding, |root, keys| {
+            has_declared_unique_sort_key(&inner.db_set, root, keys)
+        })
     {
         return None;
     }
@@ -1457,6 +1486,12 @@ macro_rules! host_common {
 }
 
 impl VdbeHost for MachineHost<'_> {
+    fn sorter_has_declared_unique_key(&self, root: u32, keys: &[VdbeOp]) -> bool {
+        self.db_set.main_slot().btree.as_ref()
+            .is_some_and(|btree| btree.transaction_state() != TransactionState::Open)
+            && has_declared_unique_sort_key(self.db_set, root, keys)
+    }
+
     fn open_limit_sort_index(&mut self) -> Result<Btree> {
         if self.db_set.temp_store().is_memory() {
             return self.open_ephemeral();

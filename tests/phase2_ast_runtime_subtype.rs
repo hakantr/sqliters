@@ -3881,3 +3881,39 @@ fn group64_file_sorter_worker_rowid_can_precede_other_keys() {
         }
     }
 }
+
+#[test]
+fn group64_file_sorter_worker_uses_a_declared_not_null_unique_key() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}';
+             PRAGMA temp_store=FILE; PRAGMA cache_size=1; PRAGMA threads=2;
+             CREATE TABLE items(id INTEGER PRIMARY KEY,k TEXT NOT NULL,n INTEGER NOT NULL,p TEXT,
+                                UNIQUE(k,n));
+             WITH RECURSIVE r(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM r WHERE i<12)
+             INSERT INTO items SELECT i,'key',i,printf('x%23000s','z') FROM r;"
+        )).unwrap();
+        let sql = "SELECT id,p FROM items NOT INDEXED ORDER BY k COLLATE BINARY,n DESC";
+        let mut statement = db.prepare(sql).unwrap();
+        let StepResult::Row(first) = statement.step().unwrap() else {
+            panic!("expected first row for {encoding}");
+        };
+        assert_eq!(first.get_i64(0), Some(12));
+        assert!(statement.machine_stmt_status(4, false) > 0, "{encoding}");
+        statement.reset().unwrap();
+
+        for id in (1..=12).rev() {
+            let StepResult::Row(row) = statement.step().unwrap() else {
+                panic!("expected row {id} for {encoding}");
+            };
+            assert_eq!(row.get_i64(0), Some(id));
+        }
+        assert!(matches!(statement.step().unwrap(), StepResult::Done));
+        statement.reset().unwrap();
+
+        let result = db.query(sql, &[]).unwrap();
+        let ids: Vec<i64> = result.rows.iter().map(|row| row.get_i64(0).unwrap()).collect();
+        assert_eq!(ids, (1..=12).rev().collect::<Vec<_>>());
+    }
+}

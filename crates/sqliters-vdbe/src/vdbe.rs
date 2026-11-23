@@ -146,6 +146,12 @@ pub trait VdbeHost {
     fn sorter_worker_threads(&mut self) -> i32 {
         0
     }
+    /// Whether these direct main-table columns contain a complete binary UNIQUE key.
+    /// The VM calls this after checking the read snapshot's schema cookie.
+    #[doc(hidden)]
+    fn sorter_has_declared_unique_key(&self, _root: u32, _keys: &[VdbeOp]) -> bool {
+        false
+    }
     /// Maximum mapping size for sorter PMAs. Zero disables sorter xFetch.
     fn sorter_mmap_limit(&mut self) -> i32 {
         0
@@ -1630,12 +1636,16 @@ fn complete_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
     })
 }
 
-/// One index-free main rowid scan with a total BINARY order. One comparator
-/// field is the table's unique rowid, independently of the result columns.
-fn worker_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
+/// One index-free main rowid scan with a total BINARY order.
+fn worker_order_sorter(
+    prog: &Program,
+    open: &VdbeOp,
+    key: &KeyInfo,
+    has_declared_unique_key: impl FnOnce(u32, &[VdbeOp]) -> bool,
+) -> bool {
     if !prog.read_only || prog.btree_mask != 1 || !prog.p_program.is_empty()
         || !builtin_order_sorter(prog, open, key)
-        || !matches!(key.enc, 1..=3) || key.n_key_field < 2
+        || !matches!(key.enc, 1..=3)
         || key.a_coll.iter().flatten().any(|coll| !coll.name.eq_ignore_ascii_case("BINARY"))
     {
         return false;
@@ -1670,7 +1680,10 @@ fn worker_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
     let mut inserts = prog.a_op.windows(width + 2)
         .filter(|ops| ops[width + 1].opcode == OP_SorterInsert);
     let Some([keys @ .., record, _]) = inserts.next() else { return false };
-    let Some(rowid_index) = keys.iter().position(|source| source.opcode == OP_Rowid) else { return false };
+    let rowid_index = keys.iter().position(|source| source.opcode == OP_Rowid);
+    let verified_schema = prog.a_op.first().filter(|op| op.opcode == OP_Init)
+        .and_then(|op| prog.a_op.get(op.p2 as usize))
+        .is_some_and(|op| op.opcode == OP_Transaction && op.p1 == 0 && op.p2 == 0 && op.p5 == 1);
     inserts.next().is_none()
         && record.opcode == OP_MakeRecord
         && keys.iter().enumerate().all(|(index, source)| {
@@ -1679,7 +1692,7 @@ fn worker_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
             }
             let Some(register) = record.p1.checked_add(index as i32) else { return false };
             match source.opcode {
-                OP_Rowid => index == rowid_index && source.p2 == register,
+                OP_Rowid => Some(index) == rowid_index && source.p2 == register,
                 OP_Column => source.p3 == register && keys[..index].iter().all(|prior| {
                     prior.opcode != OP_Column || prior.p2 != source.p2
                 }),
@@ -1687,14 +1700,29 @@ fn worker_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
             }
         })
         && prog.a_op.iter().filter(|op| op.opcode == OP_SorterOpen).count() == 1
+        && if rowid_index.is_some() {
+            width >= 2
+        } else {
+            verified_schema && record.p5 == 0 && keys.iter().all(|op| op.p5 == 0)
+                && u32::try_from(table.p2).ok().is_some_and(|root| has_declared_unique_key(root, keys))
+        }
 }
 
 /// Check the same worker-sort shape before admitting statement execution.
 #[doc(hidden)]
 pub fn is_worker_sort(prog: &Program, encoding: TextEncoding) -> bool {
+    is_worker_sort_with_declared_unique_key(prog, encoding, |_, _| false)
+}
+
+#[doc(hidden)]
+pub fn is_worker_sort_with_declared_unique_key(
+    prog: &Program,
+    encoding: TextEncoding,
+    has_declared_unique_key: impl Fn(u32, &[VdbeOp]) -> bool,
+) -> bool {
     prog.a_op.iter().any(|op| {
         matches!(&op.p4, P4::KeyInfo(key)
-            if key.enc == encoding as u8 && worker_order_sorter(prog, op, key))
+            if key.enc == encoding as u8 && worker_order_sorter(prog, op, key, &has_declared_unique_key))
     })
 }
 
@@ -5628,7 +5656,8 @@ impl Vdbe {
                     if !temp_in_memory && self.prog.fallible_sort_open().is_none()
                         && (k.enc == 1 || k.enc == host.text_encoding() as u8)
                         && worker_count > 0 && host.sorter_mmap_limit() <= 0
-                        && matches!(&op.p4, P4::KeyInfo(key) if worker_order_sorter(&self.prog, op, key))
+                        && matches!(&op.p4, P4::KeyInfo(key) if worker_order_sorter(&self.prog, op, key,
+                            |root, keys| host.sorter_has_declared_unique_key(root, keys)))
                         && k.a_coll.iter().flatten().all(|coll| coll.is_binary && coll.custom.is_none())
                     {
                         sorter.enable_workers(worker_count as usize);

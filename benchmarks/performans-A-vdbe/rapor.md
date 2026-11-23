@@ -2687,3 +2687,8 @@ Kip başına 12 sonuç/reset profili, 50.642 VFS kaydı ve altı kopya EIO geri 
 ## V6b.476 — DROP TABLE içinde ertelenmiş FK borcunun sahibini koruma
 
 196 profil iki kipte C ile eş. Önceki 24 ON hatalı reddi giderildi. Başka tablo ve şema örneğinin borcu 787 kaldı. ROLLBACK TO, ardından tekrar DROP ve 588 temiz C yeniden açılışı doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v469-fk-drop-counter-provenance-experiment/sonuc.md) OFF 1346/0/325, ON 1346/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,268 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_476.md).
+
+
+## V6b.477 — UNIQUE ve NOT NULL toplam anahtarıyla işçi PMA
+
+Tam BINARY UNIQUE ve NOT NULL bileşenleri parse ve etkin okuma şemasında doğrulandı. Her kipte 144 profil, 73.944 C adımı ve 72 reset/reuse eş. Kısmi, ifade, NULL ve özel kolasyon guard’ları ile FK bütünlüğü korundu. [Bağımsız ölçüm](/github/sqliters/target/perf-work/worker-declared-unique-key-preflight/sonuc.md) OFF 1347/0/325, ON 1347/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,213 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_477.md).
