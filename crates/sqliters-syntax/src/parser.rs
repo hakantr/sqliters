@@ -2113,12 +2113,10 @@ impl<'a> Parser<'a> {
     fn parse_pragma(&mut self) -> Result<Stmt> {
         self.expect(TokenKind::Pragma)?;
         let qn = self.parse_qualified_name()?;
-        // MaxPgcnt decodes the signed token text, rather than an integer expression.
-        let keep_token_text = qn.name.eq_ignore_ascii_case("max_page_count");
         let value = if self.eat(TokenKind::Eq) {
-            Some(self.parse_pragma_value(keep_token_text)?)
+            Some(self.parse_pragma_value(&qn.name)?)
         } else if self.eat(TokenKind::Lp) {
-            let v = self.parse_pragma_value(keep_token_text)?;
+            let v = self.parse_pragma_value(&qn.name)?;
             self.expect(TokenKind::Rp)?;
             Some(v)
         } else {
@@ -2131,7 +2129,10 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_pragma_value(&mut self, keep_token_text: bool) -> Result<PragmaValue> {
+    fn parse_pragma_value(&mut self, name: &str) -> Result<PragmaValue> {
+        let header_cookie = name.eq_ignore_ascii_case("user_version")
+            || name.eq_ignore_ascii_case("application_id");
+        let keep_token_text = header_cookie || name.eq_ignore_ascii_case("max_page_count");
         let sign = if self.eat(TokenKind::Minus) {
             Some(-1i64)
         } else if self.eat(TokenKind::Plus) {
@@ -2147,6 +2148,12 @@ impl<'a> Parser<'a> {
             return Err(self.syntax_err_at(tok, "invalid PRAGMA value"));
         }
         if tok.kind == TokenKind::Nothing {
+            return Err(self.syntax_err_at(tok, "invalid PRAGMA value"));
+        }
+        // SQLite's PRAGMA grammar accepts numeric tokens, but excludes QNUMBER.
+        if header_cookie && matches!(tok.kind, TokenKind::Integer | TokenKind::Float)
+            && tok.text.as_bytes().contains(&b'_')
+        {
             return Err(self.syntax_err_at(tok, "invalid PRAGMA value"));
         }
         match tok.kind {

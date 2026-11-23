@@ -320,3 +320,47 @@ fn pragma_programs_match_c_for_schema_headers_and_flags() {
         }
     }
 }
+
+#[test]
+fn application_header_pragmas_follow_sqlite_numeric_token_rules() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys=ON;
+         CREATE TABLE parent(id INTEGER PRIMARY KEY);
+         CREATE TABLE child(id INTEGER PRIMARY KEY, p INTEGER REFERENCES parent);
+         INSERT INTO parent VALUES(1);
+         INSERT INTO child VALUES(1,1);",
+    )
+    .unwrap();
+    for pragma in ["user_version", "application_id"] {
+        let query = format!("PRAGMA {pragma}");
+        for (input, expected) in [
+            ("2147483647", 2147483647),
+            ("-2147483648", -2147483648),
+            ("2147483648", 0),
+            ("-2147483649", 0),
+            ("'0x00000412'", 1042),
+            ("-0x00000412", 0),
+            ("+0x00000412", 1042),
+            ("14.75", 14),
+            ("' 12'", 0),
+            ("'19suffix'", 19),
+            ("TRUE", 0),
+        ] {
+            let mut setter = conn.prepare(&format!("{query}={input}")).unwrap();
+            assert!(matches!(setter.step().unwrap(), StepResult::Done));
+            assert_eq!(integer(&conn, &query), expected, "{pragma}={input}");
+            setter.reset().unwrap();
+
+            conn.execute_batch("BEGIN").unwrap();
+            conn.execute(&format!("{query}='1_042'")).unwrap();
+            assert_eq!(integer(&conn, &query), 1);
+            conn.execute_batch("ROLLBACK").unwrap();
+            assert_eq!(integer(&conn, &query), expected);
+        }
+
+        assert!(conn.prepare(&format!("{query}=1_042")).is_err());
+        assert_eq!(integer(&conn, &query), 0);
+    }
+    assert!(conn.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+}

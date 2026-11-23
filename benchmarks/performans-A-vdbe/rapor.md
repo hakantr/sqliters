@@ -2812,3 +2812,8 @@ Dört COLLATE yerleşimi, iki journal ve üç kodlamada ilk adım, reset, callba
 ## V6b.501 — Hazırlanmış TRIM, LTRIM, RTRIM, LOWER ve UPPER
 
 Üç kodlama, iki journal ve V1/V2 ile kip başına 12 API profili C ile eş. Kip başına 120 olağan ve 12 odaklı sonuç eş. Group65 her kipte 37/37. [Bağımsız ölçüm](/github/sqliters/target/perf-work/builtin-trim-case-text-register-candidate/sonuc.md) OFF 1371/0/324, ON 1371/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,290 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_501.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.502 — user_version ve application_id sayısal değerleri
+
+512/4096 sayfa, DELETE/PERSIST/WAL ve 17 sayı profili. 204/204 commit, rollback, C yeniden açılışı ve ana dosya baytları eş. FK boş ve integrity_check ok. Sayısal literal hazırlama ve reset testi her iki kipte geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/header-metadata-lifecycle-candidate/sonuc.md) OFF 1372/0/324, ON 1372/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,288 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_502.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)

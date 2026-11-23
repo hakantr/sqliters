@@ -4293,7 +4293,7 @@ fn execute_write_body_inner(
             match name.to_ascii_uppercase().as_str() {
                 "USER_VERSION" => {
                     ctx.ensure_write_db(db_id, false)?;
-                    let v = pragma_to_i64(pv) as i32;
+                    let v = pragma_header_cookie(pv);
                     if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree {
                         bt.pager_mut().header_mut()?.user_version = v;
                     }
@@ -4301,7 +4301,7 @@ fn execute_write_body_inner(
                 }
                 "APPLICATION_ID" => {
                     ctx.ensure_write_db(db_id, false)?;
-                    let v = pragma_to_i64(pv) as i32;
+                    let v = pragma_header_cookie(pv);
                     if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree {
                         bt.pager_mut().header_mut()?.application_id = v;
                     }
@@ -49391,7 +49391,7 @@ fn exec_pragma(
         }
         "USER_VERSION" => {
             if let Some(pv) = value {
-                let v = pragma_to_i64(pv) as i32;
+                let v = pragma_header_cookie(pv);
                 ctx.ensure_write_db(db_id, false)?;
                 if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree {
                     bt.pager_mut().header_mut()?.user_version = v;
@@ -49409,7 +49409,7 @@ fn exec_pragma(
         }
         "APPLICATION_ID" => {
             if let Some(pv) = value {
-                let v = pragma_to_i64(pv) as i32;
+                let v = pragma_header_cookie(pv);
                 ctx.ensure_write_db(db_id, false)?;
                 if let Some(ref mut bt) = ctx.db_set.slot_mut(db_id).unwrap().btree {
                     bt.pager_mut().header_mut()?.application_id = v;
@@ -49883,6 +49883,16 @@ fn pragma_atoi(s: &str) -> i32 {
         v = v * 10 + i64::from(c - b'0');
     }
     if v > i64::from(i32::MAX) { 0 } else { v as i32 }
+}
+
+// pragma.c sets application_id and user_version with sqlite3Atoi.
+fn pragma_header_cookie(pv: &PragmaValue) -> i32 {
+    match pv {
+        PragmaValue::Integer(value) => i32::try_from(*value).unwrap_or(0),
+        PragmaValue::Ident(text) | PragmaValue::String(text) => {
+            sqliters_codegen::util::sqlite3_get_int32(text).unwrap_or(0)
+        }
+    }
 }
 
 fn pragma_to_i64(pv: &PragmaValue) -> i64 {
