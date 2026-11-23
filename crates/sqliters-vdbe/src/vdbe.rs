@@ -101,6 +101,9 @@ pub trait VdbeHost {
     /// The collating sequence `name` of the connection (the three built-ins are bound by the
     /// machine itself).
     fn find_collation(&mut self, name: &str) -> Option<CollRt>;
+    fn find_worker_sort_collation(&mut self, name: &str) -> Option<CollRt> {
+        self.find_collation(name)
+    }
     /// `pFunc->xSFunc(pCtx, argc, argv)` of a scalar function.
     fn call_function(&mut self, func: &FuncDef, args: &[RuntimeValue]) -> Result<RuntimeValue>;
     /// Preserves the call context of OP_PureFunc when the host supports it.
@@ -3446,7 +3449,8 @@ impl Vdbe {
     fn make_rt<H: VdbeHost>(&mut self, host: &mut H) -> Result<()> {
         let prog = Arc::clone(&self.prog);
         self.rt = Self::bind_ops(&prog.a_op, host,
-            prog.fallible_sort_open().zip(self.sort_callback_error.as_ref()))?;
+            prog.fallible_sort_open().zip(self.sort_callback_error.as_ref())
+                .map(|(pc, error)| (pc, error, prog.worker_file_sort)))?;
         self.rt_ready = true;
         Ok(())
     }
@@ -3455,11 +3459,12 @@ impl Vdbe {
     fn bind_ops<H: VdbeHost>(
         a_op: &[VdbeOp],
         host: &mut H,
-        scoped_sort: Option<(usize, &SortCallbackError)>,
+        scoped_sort: Option<(usize, &SortCallbackError, bool)>,
     ) -> Result<Vec<OpRt>> {
         let mut rt = vec![OpRt::None; a_op.len()];
-        let find_registered = |name: &str, host: &mut H| {
-            host.find_collation(name).map(Arc::new).ok_or_else(|| {
+        let find_registered = |name: &str, host: &mut H, workers: bool| {
+            let collation = if workers { host.find_worker_sort_collation(name) } else { host.find_collation(name) };
+            collation.map(Arc::new).ok_or_else(|| {
                 SqliteError::new(ErrorCode::Error, format!("no such collation sequence: {name}"))
             })
         };
@@ -3468,7 +3473,7 @@ impl Vdbe {
                 b.enc = c.enc;
                 return Ok(Arc::new(b));
             }
-            find_registered(&c.name, host)
+            find_registered(&c.name, host, false)
         };
         for (i, op) in a_op.iter().enumerate() {
             match &op.p4 {
@@ -3478,9 +3483,10 @@ impl Vdbe {
                     let mut a_coll = Vec::with_capacity(k.a_coll.len());
                     for (field, c) in k.a_coll.iter().enumerate() {
                         a_coll.push(match c {
-                            Some(c) if field == 0 && scoped_sort.is_some_and(|(pc, _)| i == pc) => {
-                                let (_, error) = scoped_sort.expect("checked sort address");
-                                Some(Arc::new(fallible_sort_collation(find_registered(&c.name, host)?, error)?))
+                            Some(c) if field == 0 && scoped_sort.is_some_and(|(pc, _, _)| i == pc) => {
+                                let (_, error, workers) = scoped_sort.expect("checked sort address");
+                                let registered = find_registered(&c.name, host, workers)?;
+                                Some(Arc::new(fallible_sort_collation(registered, error)?))
                             }
                             Some(c) => Some(find(c, host)?),
                             None => None,
@@ -5718,13 +5724,17 @@ impl Vdbe {
                     sorter.set_vfs(host.sorter_vfs());
                     let worker_count = host.sorter_worker_threads();
                     let encoding = host.text_encoding() as u8;
-                    if !temp_in_memory && self.prog.fallible_sort_open().is_none()
-                        && (k.enc == 1 || k.enc == encoding)
-                        && worker_count > 0 && (worker_count <= 8 || host.sorter_mmap_limit() <= 0)
-                        && matches!(&op.p4, P4::KeyInfo(key) if worker_order_sorter(&self.prog, op, key,
-                            encoding, |read, keys| host.sorter_has_worker_table_key(read, keys),
-                            |name| host.sorter_has_stock_collation(name)))
-                        && k.a_coll.iter().flatten().all(|coll| coll.custom.is_none())
+                    let registered_workers = self.prog.worker_file_sort
+                        && self.prog.fallible_file_sort_open == Some(pc)
+                        && matches!(worker_count, 1 | 2) && k.enc == encoding;
+                    if !temp_in_memory && worker_count > 0
+                        && (registered_workers || (self.prog.fallible_sort_open().is_none()
+                            && (k.enc == 1 || k.enc == encoding)
+                            && (worker_count <= 8 || host.sorter_mmap_limit() <= 0)
+                            && matches!(&op.p4, P4::KeyInfo(key) if worker_order_sorter(&self.prog, op, key,
+                                encoding, |read, keys| host.sorter_has_worker_table_key(read, keys),
+                                |name| host.sorter_has_stock_collation(name)))
+                            && k.a_coll.iter().flatten().all(|coll| coll.custom.is_none())))
                     {
                         sorter.enable_workers(worker_count as usize);
                         if worker_count <= 8 {
@@ -7431,7 +7441,7 @@ fn fallible_sort_collation(
         match compare(&a, &b) {
             Ok(order) => order as i32,
             Err(error) => {
-                *failure.lock().unwrap() = Some(error);
+                failure.lock().unwrap().get_or_insert(error);
                 0
             }
         }

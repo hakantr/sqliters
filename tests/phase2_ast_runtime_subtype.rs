@@ -4979,3 +4979,102 @@ fn group65_foreign_key_actions_use_child_text_affinity_for_old_parent_parameters
         }
     }
 }
+
+#[test]
+fn group64_registered_builtin_file_sort_calls_comparator_on_worker() {
+    for (encoding, width) in [("UTF-8", 3100), ("UTF-16le", 1550), ("UTF-16be", 1550)] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}'; PRAGMA temp_store=FILE;
+             PRAGMA cache_size=1; PRAGMA foreign_keys=ON;
+             CREATE TABLE parents(id INTEGER PRIMARY KEY);
+             INSERT INTO parents VALUES(1),(2);
+             CREATE TABLE items(id INTEGER PRIMARY KEY,v TEXT,p INTEGER REFERENCES parents(id));
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<52)
+             INSERT INTO items SELECT x,printf('%02d',x%9)||substr(hex(zeroblob(1600)),1,{width}-2),1+x%2 FROM n;"
+        )).unwrap();
+        let mut expected: Vec<i64> = (1..=52).collect();
+        expected.sort_by_key(|id| std::cmp::Reverse((id % 9, *id)));
+        for workers in [1, 2] {
+            db.execute_batch(&format!("PRAGMA threads={workers}")).unwrap();
+            for name in ["NOCASE", "RTRIM"] {
+                let worker_calls = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&worker_calls);
+                let caller = std::thread::current().id();
+                db.register_collation(name, move |left, right| {
+                    if std::thread::current().id() != caller {
+                        observed.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    right.cmp(left)
+                }).unwrap();
+                let sql = format!("SELECT id FROM items ORDER BY v COLLATE {name} NULLS LAST,id DESC");
+                let mut statement = db.prepare(&sql).unwrap();
+                let StepResult::Row(first) = statement.step().unwrap() else { panic!("missing first row"); };
+                assert_eq!(first.get_i64(0), Some(expected[0]));
+                assert!(worker_calls.load(AtomicOrdering::Relaxed) > 0, "{encoding}/{workers}/{name}");
+                statement.reset().unwrap();
+                for &id in &expected {
+                    let StepResult::Row(row) = statement.step().unwrap() else { panic!("missing row {id}"); };
+                    assert_eq!(row.get_i64(0), Some(id));
+                }
+                assert!(matches!(statement.step().unwrap(), StepResult::Done));
+                assert_eq!(statement.machine_stmt_status(sqliters_vdbe::vdbe::SQLITE_STMTSTATUS_SORT, false), 2);
+            }
+        }
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+        assert_eq!(db.query("PRAGMA integrity_check", &[]).unwrap().rows[0].get_str(0), Some("ok"));
+    }
+}
+
+#[test]
+fn group64_registered_builtin_worker_sort_preserves_tied_key_groups() {
+    for (encoding, width) in [("UTF-8", 3100), ("UTF-16le", 1550), ("UTF-16be", 1550)] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}'; PRAGMA cache_size=1;
+             PRAGMA foreign_keys=ON;
+             CREATE TABLE parents(id INTEGER PRIMARY KEY);
+             INSERT INTO parents VALUES(1),(2);
+             CREATE TABLE items(id INTEGER PRIMARY KEY,v TEXT,p INTEGER REFERENCES parents(id));
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<52)
+             INSERT INTO items SELECT x,printf('%02d',x%9)||substr(hex(zeroblob(1600)),1,{width}-2),1+x%2 FROM n;"
+        )).unwrap();
+        for store in ["FILE", "DEFAULT"] {
+            db.execute_batch(&format!("PRAGMA temp_store={store}")).unwrap();
+            for workers in [1, 2] {
+                db.execute_batch(&format!("PRAGMA threads={workers}")).unwrap();
+                for name in ["NOCASE", "RTRIM"] {
+                    let worker_calls = Arc::new(AtomicUsize::new(0));
+                    let observed = Arc::clone(&worker_calls);
+                    let caller = std::thread::current().id();
+                    db.register_collation(name, move |left, right| {
+                        if std::thread::current().id() != caller {
+                            observed.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        right.cmp(left)
+                    }).unwrap();
+                    let query = format!("SELECT id FROM items ORDER BY v COLLATE {name} NULLS LAST");
+                    let mut statement = db.prepare(&query).unwrap();
+                    let StepResult::Row(first) = statement.step().unwrap() else { panic!("missing first key group"); };
+                    assert_eq!(first.get_i64(0).unwrap() % 9, 8);
+                    assert!(worker_calls.load(AtomicOrdering::Relaxed) > 0);
+                    statement.reset().unwrap();
+                    let mut seen = [false; 52];
+                    let mut previous_group = 9;
+                    while let StepResult::Row(row) = statement.step().unwrap() {
+                        let rowid = row.get_i64(0).unwrap();
+                        let group = rowid % 9;
+                        assert!(group <= previous_group);
+                        previous_group = group;
+                        let index = (rowid - 1) as usize;
+                        assert!(!std::mem::replace(&mut seen[index], true));
+                    }
+                    assert!(seen.into_iter().all(|present| present));
+                    assert_eq!(statement.machine_stmt_status(sqliters_vdbe::vdbe::SQLITE_STMTSTATUS_SORT, false), 2);
+                }
+            }
+        }
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+        assert_eq!(db.query("PRAGMA integrity_check", &[]).unwrap().rows[0].get_str(0), Some("ok"));
+    }
+}

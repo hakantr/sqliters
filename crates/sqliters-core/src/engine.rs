@@ -7556,7 +7556,7 @@ pub(crate) fn custom_file_order_collation<'a>(
 }
 
 /// A direct registered FILE sort can defer its route until MAIN is pinned.
-pub(crate) fn bounded_worker_file_sort(
+pub(crate) fn registered_worker_file_sort(
     stmt: Option<&Stmt>, db_set: &DatabaseSet, collations: &CollationRegistry,
     require_snapshot: bool,
 ) -> bool {
@@ -7582,9 +7582,7 @@ pub(crate) fn bounded_worker_file_sort(
     if !require_snapshot {
         return true;
     }
-    let bt = db_set.main_btree();
-    bt.transaction_state() != TransactionState::Open
-        && sqliters_vdbe::vdbesort::table_sort_fits_default_pma(bt.pager().page_count(), fields)
+    db_set.main_btree().transaction_state() != TransactionState::Open
 }
 
 fn registered_order_collation(name: &str, collations: &CollationRegistry) -> bool {

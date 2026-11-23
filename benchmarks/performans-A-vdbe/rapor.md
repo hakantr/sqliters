@@ -2852,3 +2852,8 @@ UTF-8, UTF-16LE/BE, iki slot ve limitli/varsayılan yürütmede 116 native C eş
 ## V6b.509 — Yabancı anahtar action için TEXT karşılaştırması
 
 DELETE ve UPDATE için CASCADE, SET NULL ve SET DEFAULT. 288 action profili ve 192 önceki profil C ile eş. Reddedilen yazmalarda dosya başlangıçla aynı. Tüm FK ve bütünlük kontrolleri temiz. [Bağımsız ölçüm](/github/sqliters/target/perf-work/fk-parent-action-text-affinity-v506-candidate/sonuc.md) OFF 1382/0/324, ON 1382/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,284 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_509.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.510 — FILE ve DEFAULT sıralamasında gerçek işçide kayıtlı karşılaştırıcı
+
+Tek ve toplam anahtar iki-PMA profillerinde her kipte 240 C callback dağılımı eş. Geniş sonuç sırası, tekillik ve reset eş. Aynı PMA ataması ölçülen 111/111 Rust koşusunda callback izi eş. Group64 38/38 ve Group65 46/46. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v510-registered-worker-sort-exact/sonuc.md) OFF 1384/0/324, ON 1384/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,298 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_510.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)

@@ -763,6 +763,7 @@ impl Vdbe {
             group_sorter_owns_rows: self.group_sorter_owns_rows,
             fallible_limit_sort_open: None,
             fallible_file_sort_open: None,
+            worker_file_sort: false,
         }
     }
 }
@@ -823,6 +824,8 @@ pub struct Program {
     pub fallible_limit_sort_open: Option<usize>,
     /// Address of a checked complete FILE ORDER BY SorterOpen.
     pub fallible_file_sort_open: Option<usize>,
+    /// The validated private full sorter may use PMA workers.
+    pub worker_file_sort: bool,
     /// `usesStmtJournal`
     pub uses_stmt_journal: bool,
     /// `explain`: 0 normal, 1 EXPLAIN, 2 EXPLAIN QUERY PLAN

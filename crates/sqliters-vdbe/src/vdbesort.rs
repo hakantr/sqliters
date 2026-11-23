@@ -117,20 +117,6 @@ pub fn file_sort_fits_default_pma<'a>(
     true
 }
 
-/// Prove that a direct full table sort cannot flush a PMA before its first row.
-#[doc(hidden)]
-pub fn table_sort_fits_default_pma(page_count: u32, fields: usize) -> bool {
-    // The complete main image bounds all stored payload bytes, once for each
-    // packed field. At least four bytes per row are used for the table page
-    // cell pointer, the payload length varint and the rowid varint.
-    // Allow a full integer body, a serial type varint for each field, a
-    // header length varint, the SorterRecord header and its round-up.
-    let per_row = fields as u64 * (8 + 9) + 9 + SZ_SORTER_RECORD as u64 + 7;
-    let file_multiplier = fields as u64 + per_row.div_ceil(4);
-    page_count > 0
-        && u64::from(page_count).saturating_mul(file_multiplier) <= SQLITE_SORTER_PMASZ as u64
-}
-
 /// The level-0 PMA file contains a length prefix for the run and then the
 /// length-prefixed records. Each writer starts at the preceding run's end.
 struct PmaFile {

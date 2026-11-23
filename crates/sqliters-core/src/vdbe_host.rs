@@ -143,7 +143,7 @@ pub(crate) fn custom_sort_policy_matches(
         file_sort_policy(inner, collation)
             || (op.p3 == 0
                 && matches!(collation.and_then(Collation::from_name), Some(Collation::NoCase | Collation::RTrim))
-                && bounded_worker_file_sort(inner, stmt, require_snapshot))
+                && registered_worker_file_sort(inner, stmt, require_snapshot))
     } else {
         true
     }
@@ -159,11 +159,11 @@ fn file_sort_policy(inner: &ConnectionInner, collation: Option<&str>) -> bool {
         }
 }
 
-pub(crate) fn bounded_worker_file_sort(
+pub(crate) fn registered_worker_file_sort(
     inner: &ConnectionInner, stmt: Option<&Stmt>, require_snapshot: bool,
 ) -> bool {
     !inner.authorizer.is_some()
-        && crate::engine::bounded_worker_file_sort(
+        && crate::engine::registered_worker_file_sort(
             stmt, &inner.db_set, &inner.collations, require_snapshot,
         )
 }
@@ -229,7 +229,7 @@ pub(crate) fn custom_file_sort_read_program(
     file_sort_read_program(inner, stmt, sql, n_param, false)
 }
 
-pub(crate) fn bounded_worker_file_sort_read_program(
+pub(crate) fn registered_worker_file_sort_read_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
 ) -> Option<Arc<Program>> {
     file_sort_read_program(inner, stmt, sql, n_param, true)
@@ -240,7 +240,7 @@ fn file_sort_read_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize, with_workers: bool,
 ) -> Option<Arc<Program>> {
     use sqliters_vdbe::opcodes::*;
-    if with_workers && !bounded_worker_file_sort(inner, stmt, true) {
+    if with_workers && !registered_worker_file_sort(inner, stmt, true) {
         return None;
     }
     let Some(Stmt::Select(select)) = stmt else { return None };
@@ -284,6 +284,20 @@ fn file_sort_read_program(
     }) {
         return None;
     }
+    if with_workers {
+        if !matches!(&sort.p4, P4::KeyInfo(key)
+            if usize::from(key.n_key_field) == select.order_by.len())
+        {
+            return None;
+        }
+        if select.order_by.len() == 2 && !sqliters_vdbe::vdbe::is_worker_sort_with_collations(
+            &program, inner.effective_encoding(), |_, _| false,
+            |collation| collation.eq_ignore_ascii_case(name),
+        ) {
+            return None;
+        }
+    }
+    program.worker_file_sort = with_workers;
     program.fallible_file_sort_open = Some(open);
     trace("machine: custom FILE sorter", sql);
     Some(Arc::new(*program))
@@ -1356,6 +1370,7 @@ pub(crate) struct MachineHost<'a> {
     pub progress: &'a mut ProgressTracker,
     pub runtime: &'a VmRuntimeContext,
     pub interrupt_flag: &'a std::sync::atomic::AtomicBool,
+    sort_worker_conn_id: Option<u64>,
     pub strict_subtype: bool,
     pub encoding: TextEncoding,
 }
@@ -1370,6 +1385,7 @@ impl<'a> MachineHost<'a> {
             progress: &mut inner.progress,
             runtime: &inner.runtime,
             interrupt_flag: &inner.active_interrupt_flag,
+            sort_worker_conn_id: None,
             strict_subtype: inner.strict_subtype,
             encoding,
         }
@@ -1659,6 +1675,19 @@ macro_rules! host_common {
 }
 
 impl VdbeHost for MachineHost<'_> {
+    fn find_worker_sort_collation(&mut self, name: &str) -> Option<CollRt> {
+        let conn_id = self.sort_worker_conn_id?;
+        let mut collation = self.collations.get_custom(name)?;
+        let compare = Arc::clone(&collation.comparator);
+        collation.comparator = Arc::new(move |left, right| {
+            // Keep the connection gate's callback rules on a PMA thread too.
+            let _active = (!crate::is_conn_active_on_current_thread(conn_id))
+                .then(|| crate::ActiveConnStackGuard::push(conn_id));
+            compare(left, right)
+        });
+        Some(CollRt::from_custom(collation))
+    }
+
     fn limit_length(&self) -> i32 {
         self.runtime.effective_length_limit()
     }
@@ -2596,6 +2625,7 @@ pub(crate) fn step(
         let steps_before = vm.n_vm_step;
         let prepared_functions = inner.functions.function_registry_at(function_generation);
         let mut host = MachineHost::new(inner);
+        host.sort_worker_conn_id = vm.prog.worker_file_sort.then_some(shared.conn_id);
         if let Some(registry) = &prepared_functions {
             host.functions = registry;
         }

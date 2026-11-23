@@ -8287,7 +8287,7 @@ impl Statement {
         };
         let mut vm = match self.c_machine_vm.take() {
             Some(vm) if Arc::ptr_eq(&vm.prog, &prog) => vm,
-            Some(previous) if vdbe_host::bounded_worker_file_sort(inner, self.stmt.as_ref(), false)
+            Some(previous) if vdbe_host::registered_worker_file_sort(inner, self.stmt.as_ref(), false)
                 && (previous.prog.fallible_file_sort_open.is_some() || prog.fallible_file_sort_open.is_some()) =>
             {
                 // Both programs execute this prepared statement on successive snapshots.
@@ -10426,7 +10426,7 @@ impl Statement {
                     || engine::registered_builtin_memory_sort(
                         stmt.as_ref(), &inner.db_set, &inner.collations, inner.effective_encoding(),
                     )
-                    || vdbe_host::bounded_worker_file_sort(inner, stmt.as_ref(), false)
+                    || vdbe_host::registered_worker_file_sort(inner, stmt.as_ref(), false)
                     || inner.db_set.main_slot().btree.as_ref().is_some_and(|bt| bt.pager().uses_fetch())
                 {
                     None
@@ -10888,7 +10888,7 @@ impl Statement {
         {
             return None;
         }
-        if let Some(program) = self.bounded_worker_file_sort_program(inner) {
+        if let Some(program) = self.registered_worker_file_sort_program(inner) {
             return Some(program);
         }
         if let Some(program) = &self.c_machine {
@@ -10915,18 +10915,17 @@ impl Statement {
             })
     }
 
-    fn bounded_worker_file_sort_program(
+    fn registered_worker_file_sort_program(
         &self, inner: &ConnectionInner,
     ) -> Option<Arc<sqliters_vdbe::vdbeaux::Program>> {
-        if self.c_machine_fixed || !vdbe_host::bounded_worker_file_sort(inner, self.stmt.as_ref(), true) {
+        if self.c_machine_fixed || !vdbe_host::registered_worker_file_sort(inner, self.stmt.as_ref(), true) {
             return None;
         }
         self.c_machine_vm.as_ref()
-            .filter(|vm| vm.prog.fallible_file_sort_open.is_some() && vdbe_host::custom_sort_policy_matches(
-                inner, &vm.prog, self.stmt.as_ref(), true,
-            ))
+            .filter(|vm| vm.prog.fallible_file_sort_open.is_some() && vm.prog.worker_file_sort
+                && vdbe_host::custom_sort_policy_matches(inner, &vm.prog, self.stmt.as_ref(), true))
             .map(|vm| Arc::clone(&vm.prog))
-            .or_else(|| vdbe_host::bounded_worker_file_sort_read_program(
+            .or_else(|| vdbe_host::registered_worker_file_sort_read_program(
                 inner, self.stmt.as_ref(), &self.raw_sql, self.params.len(),
             ))
     }
@@ -10949,7 +10948,7 @@ impl Statement {
         }
         let mut mapped_program = self.mapped_read_program(inner);
         if mapped_program.is_none() && !self.uses_registered_builtin_memory_sort(inner)
-            && (self.c_machine_fixed || !vdbe_host::bounded_worker_file_sort(inner, self.stmt.as_ref(), false))
+            && (self.c_machine_fixed || !vdbe_host::registered_worker_file_sort(inner, self.stmt.as_ref(), false))
         {
             if let Some(fast_res) = self.try_fast_read_plan(hid, shared, inner) {
                 return fast_res;
@@ -11543,7 +11542,7 @@ impl Statement {
                         }
                     }
 
-                    mapped_program = self.bounded_worker_file_sort_program(inner);
+                    mapped_program = self.registered_worker_file_sort_program(inner);
                     if let Some(ref prog_final) = self.compiled_vdbe
                         && mapped_program.is_none() && !self.uses_registered_builtin_memory_sort(inner)
                     {
@@ -11837,7 +11836,7 @@ impl Statement {
                 // Diagnostic switch SQLITERS_VDBE_EXEC: the statement runs on the port of C's
                 // virtual machine, one row per step.
                 if !point_read && mapped_program.is_none() {
-                    mapped_program = self.bounded_worker_file_sort_program(inner);
+                    mapped_program = self.registered_worker_file_sort_program(inner);
                 }
                 if !point_read
                     && (self.c_machine.as_ref().is_some_and(|prog| vdbe_host::custom_sort_policy_matches(
