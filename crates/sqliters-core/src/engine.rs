@@ -19925,6 +19925,10 @@ fn eval_expr_rt(
                     }))),
                 });
             }
+            if ctx.functions.scalar_mask_matches(fname, Some(argc)) {
+                ctx.functions
+                    .validate_call(fname, false, argc, false, false, false)?;
+            }
             let tv = eval_expr(ctx, txt_e, params, scopes, ctes, agg_group)?;
             let pv = eval_expr(ctx, pattern, params, scopes, ctes, agg_group)?;
             if tv.is_null() || pv.is_null() {
@@ -57023,6 +57027,7 @@ fn validate_expr_static_with_win_stage(
                 && expr_is_vtab_column_in_scopes(txt_e, scopes);
             if !is_vtab_match
                 && (matches!(op, LikeOp::Regexp | LikeOp::Match)
+                    || functions.scalar_mask_matches(fname, Some(argc))
                     || functions.find_scalar(fname, argc).is_some()
                     || (matches!(op, LikeOp::Like | LikeOp::Glob)
                         && functions.has_scalar_name(fname)))

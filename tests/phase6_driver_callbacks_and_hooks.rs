@@ -155,8 +155,23 @@ fn test_group54_regexp_match_unregistered_and_custom_registration() {
     let custom_like = query_vals(&conn, "SELECT id FROM words WHERE w LIKE 'CUSTOM_PAT';");
     assert_eq!(custom_like, vec![vec![Value::Integer(2)]]);
 
-    // Unregistering custom `like` restores built-in `LIKE`
+    // SQLite leaves a callback-free two-argument definition after removal.
     assert!(conn.remove_scalar_function("like", 2).unwrap());
+    for op in ["LIKE", "LiKe"] {
+        let sql = format!("SELECT 'alpha' {op} 'ALP%'");
+        let Err(err) = conn.prepare(&sql) else {
+            panic!("removed two-argument {op} prepared");
+        };
+        assert_eq!(err.code, ErrorCode::Error);
+        assert_eq!(err.message, format!("wrong number of arguments to function {op}()"));
+        assert_eq!(err.c_offset(), 15);
+    }
+    assert_eq!(
+        query_vals(&conn, "SELECT 'alpha' LIKE 'ALP%' ESCAPE '!'"),
+        vec![vec![Value::Integer(1)]]
+    );
+
+    conn.execute("PRAGMA case_sensitive_like=OFF").unwrap();
     let builtin_like = query_vals(
         &conn,
         "SELECT id FROM words WHERE w LIKE 'ALP%' ORDER BY id;",

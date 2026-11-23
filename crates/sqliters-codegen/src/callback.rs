@@ -157,7 +157,18 @@ pub fn sqlite3_find_function(p: &mut Parse, z_name: &str, n_arg: i32, _create_fl
     if let Some(b) = best_conn {
         best = Some(intern_func(p, b));
     }
-    if best.is_none() || (p.db.m_db_flags & DBFLAG_PreferBuiltin as u32) != 0 {
+    let mut masked = false;
+    if n_arg != -2 {
+        for arity in p.db.host.deleted_user_arities(z_name) {
+            let score = match_quality(i32::from(arity), 1, n_arg, enc);
+            if score > 0 && score >= best_score {
+                best_score = score;
+                masked = true;
+                best = None;
+            }
+        }
+    }
+    if (!masked && best.is_none()) || (p.db.m_db_flags & DBFLAG_PreferBuiltin as u32) != 0 {
         best_score = 0;
         let mut best_b: Option<&BuiltinFunc> = None;
         for b in BUILTIN_FUNCS.iter().filter(|b| b.0.eq_ignore_ascii_case(z_name)) {

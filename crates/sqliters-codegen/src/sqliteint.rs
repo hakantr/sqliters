@@ -1220,6 +1220,8 @@ pub trait Host {
     /// Application-defined functions named `name` (`db->aFunc`), any arity. Built-in functions
     /// are known to the code generator itself.
     fn user_functions(&self, name: &str) -> Vec<Arc<FuncDef>>;
+    /// Callback-free UTF-8 entries retained by sqlite3CreateFunc on removal.
+    fn deleted_user_arities(&self, _name: &str) -> Vec<i16> { Vec::new() }
     /// The registered name of the application-defined collating sequence `name`
     /// (`sqlite3FindCollSeq`; the lookup ignores ASCII case). BINARY, NOCASE and RTRIM are
     /// known to the code generator itself.

@@ -112,6 +112,9 @@ pub(crate) fn scalar_registration_replaces_definition(
     name: &str,
     arity: Option<usize>,
 ) -> bool {
+    if functions.scalar_mask_matches(name, arity) {
+        return false;
+    }
     let scalar = arity.map_or_else(
         || functions.has_scalar_overload(name, None).then_some(None),
         |argc| functions.find_scalar(name, argc).map(|definition| definition.arity),
@@ -236,6 +239,12 @@ impl Host for EngineHost<'_> {
 
     fn note_temp_opened(&self) {
         C_TEMP_OPENED.with(|c| c.set(true));
+    }
+
+    fn deleted_user_arities(&self, name: &str) -> Vec<i16> {
+        self.functions.deleted_scalar_arities(name).iter()
+            .map(|arity| arity.map_or(-1, |argc| argc as i16))
+            .collect()
     }
 
     fn user_functions(&self, name: &str) -> Vec<Arc<FuncDef>> {

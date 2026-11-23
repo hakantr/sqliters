@@ -2723,3 +2723,44 @@ fn group64_file_sorter_worker_adopts_utf16_encoding_at_step() {
         }
     }
 }
+
+#[test]
+fn group65_scalar_removal_masks_exact_arity_until_registration() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!("PRAGMA encoding='{encoding}';")).unwrap();
+        for (arity, value) in [(-1, 101), (1, 202)] {
+            db.register_scalar_function("app_count", arity, FunctionFlags::NONE, move |_| {
+                Ok(RuntimeValue::plain(Value::Integer(value)))
+            }).unwrap();
+        }
+        assert!(db.unregister_scalar_function("app_count", 1).unwrap());
+        assert!(!db.unregister_scalar_function("app_count", 1).unwrap());
+        assert!(!db.unregister_scalar_function("length", 1).unwrap());
+        for (sql, name) in [("SELECT app_count(1)", "app_count"), ("SELECT length('cat')", "length")] {
+            for result in [db.prepare_v1(sql), db.prepare(sql)] {
+                let Err(error) = result else { panic!("deleted function accepted") };
+                assert_eq!(error.code, ErrorCode::Error);
+                assert_eq!(error.message, format!("wrong number of arguments to function {name}()"));
+            }
+        }
+        assert_eq!(db.query("SELECT app_count(1,2)", &[]).unwrap().rows[0].get_i64(0), Some(101));
+        let listed = db.query(
+            "SELECT builtin,narg FROM pragma_function_list
+             WHERE name IN ('app_count','length') ORDER BY builtin,narg", &[]
+        ).unwrap();
+        assert_eq!(listed.rows.len(), 2);
+        assert_eq!(listed.rows[0].values(), &[Value::Integer(0), Value::Integer(-1)]);
+        assert_eq!(listed.rows[1].values(), &[Value::Integer(1), Value::Integer(1)]);
+
+        let mut held = db.prepare_v1("SELECT app_count(1,2)").unwrap();
+        db.register_scalar_function("app_count", 1, FunctionFlags::NONE, |_| {
+            Ok(RuntimeValue::plain(Value::Integer(303)))
+        }).unwrap();
+        let StepResult::Row(row) = held.step().unwrap() else { panic!("expected held row") };
+        assert_eq!(row.get_i64(0), Some(101));
+        assert!(matches!(held.step().unwrap(), StepResult::Done));
+        assert_eq!(held.c_reprepare_status().0, 0);
+        assert_eq!(db.query("SELECT app_count(1)", &[]).unwrap().rows[0].get_i64(0), Some(303));
+    }
+}

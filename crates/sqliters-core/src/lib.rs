@@ -4716,7 +4716,9 @@ impl Connection {
     }
 
     /// Unregisters a connection-local scalar SQL function overload (`sqlite3_create_function_v2`
-    /// with `xFunc == NULL`).
+    /// with `xFunc == NULL`). The boolean reports removal of a connection-local
+    /// scalar callback. Removing an exact built-in signature masks calls at
+    /// that arity on this connection.
     pub fn unregister_scalar_function(&self, name: &str, num_args: i32) -> Result<bool> {
         let arity = if num_args == -1 {
             None
@@ -4728,13 +4730,15 @@ impl Connection {
         let mut session = self.shared.enter()?;
         let inner = session.inner_mut();
         inner.ensure_usable()?;
-        let removing = inner.functions.has_scalar_overload(name, arity);
-        inner.prepare_scalar_change(removing)?;
-        let removed = inner.functions.unregister_scalar(name, arity);
-        if removed {
-            inner.schema_generation += 1;
-            inner.v1_expire_generation += 1;
+        let removing = cgen::scalar_registration_replaces_definition(&inner.functions, name, arity);
+        if !removing {
+            return Ok(false);
         }
+        inner.prepare_scalar_change(true)?;
+        let removed = inner.functions.unregister_scalar(name, arity);
+        inner.functions.mask_scalar_definition(name, arity);
+        inner.schema_generation += 1;
+        inner.v1_expire_generation += 1;
         Ok(removed)
     }
 

@@ -181,6 +181,7 @@ struct RegisteredScalar {
 pub struct FunctionRegistry {
     scalars: BTreeMap<String, Vec<RegisteredScalar>>,
     scalar_generation: u64,
+    deleted_scalar_arities: BTreeMap<String, Vec<Option<usize>>>,
     aggregates: BTreeMap<String, Vec<WindowFunctionDef>>,
     user_modified: bool,
     c_like_flags: BTreeMap<Option<usize>, u32>,
@@ -223,6 +224,7 @@ impl FunctionRegistry {
         let key = name.to_ascii_uppercase();
         let registered_name = if key == "LIKE" { "like".to_owned() } else { name.to_owned() };
         self.clear_c_like_metadata(&key, arity);
+        self.clear_scalar_mask(&key, arity);
         let def = ScalarFunctionDef {
             name: registered_name,
             arity,
@@ -290,6 +292,64 @@ impl FunctionRegistry {
             self.scalars.remove(&key);
         }
         removed
+    }
+
+    /// sqlite3CreateFunc keeps a callback-free FuncDef at the selected UTF-8 arity.
+    pub(crate) fn mask_scalar_definition(&mut self, name: &str, arity: Option<usize>) {
+        let key = name.to_ascii_uppercase();
+        self.deleted_scalar_arities.entry(key.clone()).or_default().push(arity);
+        if let Some(overloads) = self.aggregates.get_mut(&key) {
+            overloads.retain(|definition| definition.arity != arity);
+            if overloads.is_empty() {
+                self.aggregates.remove(&key);
+            }
+        }
+    }
+
+    pub(crate) fn deleted_scalar_arities(&self, name: &str) -> &[Option<usize>] {
+        if self.deleted_scalar_arities.is_empty() {
+            return &[];
+        }
+        with_ascii_upper_key(name, |key| self.deleted_scalar_arities.get(key))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    fn clear_scalar_mask(&mut self, key: &str, arity: Option<usize>) {
+        if let Some(deleted) = self.deleted_scalar_arities.get_mut(key) {
+            deleted.retain(|entry| *entry != arity);
+            if deleted.is_empty() {
+                self.deleted_scalar_arities.remove(key);
+            }
+        }
+    }
+
+    pub(crate) fn scalar_mask_matches(&self, name: &str, arity: Option<usize>) -> bool {
+        let deleted = self.deleted_scalar_arities(name);
+        deleted.contains(&arity)
+            || arity.is_some_and(|argc| {
+                deleted.contains(&None)
+                    && !self.has_scalar_overload(name, arity)
+                    && !self.find_aggregate(name, argc).is_some_and(|definition| definition.arity == arity)
+            })
+    }
+
+    fn masked_scalar_error(&self, name: &str, argc: usize) -> Option<SqliteError> {
+        if !self.scalar_mask_matches(name, Some(argc)) {
+            return None;
+        }
+        use sqliters_codegen::builtin_funcs::{BUILTIN_FUNCS, CONNECTION_FUNCS};
+        let has_connection_function = CONNECTION_FUNCS.iter().any(|entry| {
+            entry.0.eq_ignore_ascii_case(name)
+                && !self.deleted_scalar_arities(name).contains(&usize::try_from(entry.1).ok())
+        });
+        let has_live_name = self.has_scalar_name(name) || self.has_aggregate_name(name)
+            || has_connection_function || BUILTIN_FUNCS.iter().any(|entry| entry.0.eq_ignore_ascii_case(name));
+        let message = if has_live_name {
+            format!("wrong number of arguments to function {name}()")
+        } else {
+            format!("no such function: {name}")
+        };
+        Some(SqliteError::new(ErrorCode::Error, message))
     }
 
     /// Finds a registration by its declared arity, including a variadic declaration.
@@ -434,6 +494,7 @@ impl FunctionRegistry {
         self.user_modified = true;
         let name = name.into();
         let key = name.to_ascii_uppercase();
+        self.clear_scalar_mask(&key, arity);
         let name = if key == "LIKE" { "like".to_owned() } else { name };
         if key == "LIKE" {
             self.clear_c_like_metadata(&key, arity);
@@ -490,6 +551,9 @@ impl FunctionRegistry {
         has_filter: bool,
         allow_aggregates: bool,
     ) -> Result<()> {
+        if let Some(error) = self.masked_scalar_error(name, if star_args { 0 } else { arg_count }) {
+            return Err(error);
+        }
         if !star_args && self.find_scalar(name, arg_count).is_some() {
             if has_filter {
                 return Err(SqliteError::new(
@@ -559,6 +623,9 @@ impl FunctionRegistry {
         runtime_ctx: &VmRuntimeContext,
         strict_subtype: bool,
     ) -> Result<RuntimeValue> {
+        if let Some(error) = self.masked_scalar_error(name, args.len()) {
+            return Err(error);
+        }
         if let Some(def) = self.find_scalar(name, args.len()) {
             return self.call_scalar_definition(def, args, runtime_ctx, strict_subtype);
         }

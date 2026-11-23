@@ -1882,7 +1882,8 @@ impl FastCompileScope<'_> {
     }
 
     fn builtin_not_overridden(&self, name_lower: &str, argc: usize) -> bool {
-        self.functions.find_scalar(name_lower, argc).is_none()
+        !self.functions.scalar_mask_matches(name_lower, Some(argc))
+            && self.functions.find_scalar(name_lower, argc).is_none()
             && self.functions.find_aggregate(name_lower, argc).is_none()
     }
 
