@@ -9102,6 +9102,7 @@ impl Statement {
         self.mode == PrepareMode::V1
             && !self.c_v1_expired_before_run
             && (self.is_journal_mode_pragma()
+                || self.c_v1_write_constraint_diagnostic
                 || self.c_legacy_read_mismatch(last_error.as_ref())
                 || self.expired
                     && last_error.as_ref().is_some_and(|error| error.code == ErrorCode::Schema))
@@ -10221,6 +10222,7 @@ impl Statement {
             && self.category == Some(StmtCategory::Write)
             && !self.expired
             && self.compiled_vdbe.is_some()
+            && !self.c_v1_write_constraint_diagnostic
         {
             let fast_write = {
                 let mode = self.mode;
@@ -10236,6 +10238,7 @@ impl Statement {
                     ref params,
                     ref mut lifecycle,
                     ref mut write_vm_scratch,
+                    ref mut c_v1_write_constraint_diagnostic,
                     ..
                 } = *self;
                 let mut session = shared.enter()?;
@@ -10262,6 +10265,8 @@ impl Statement {
                 };
                 result.map(|result| {
                     inner.note_c_step_result(&result, false);
+                    *c_v1_write_constraint_diagnostic = mode == PrepareMode::V1
+                        && result.as_ref().is_err_and(|error| error.code == ErrorCode::Constraint);
                     result.map_err(|error| Self::write_step_error(inner, mode, error))
                 })
             };
@@ -10470,7 +10475,7 @@ impl Statement {
 
         // Autoreset a completed execution while retaining its bindings.
         if let StatementLifecycle::Halted { last_error } = &self.lifecycle {
-            if self.c_legacy_read_mismatch(last_error.as_ref()) {
+            if self.c_v1_write_constraint_diagnostic || self.c_legacy_read_mismatch(last_error.as_ref()) {
                 inner.transfer_c_read_error(last_error.as_ref());
             }
             self.lifecycle = StatementLifecycle::Ready;

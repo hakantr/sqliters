@@ -2717,3 +2717,8 @@ V1 hata adımı genel kodu, reset/finalize özgün 20 ve tanıyı veriyor. Açı
 ## V6b.482 — İlk adımdan önce etkin iki işçili PMA mmap
 
 Kip başına 156 API profili, 60 kontrollü iz ve 2.494.892 VFS olayı C ile eş. 24 gerçek iki işçi, 14/778/266, reset ve FK dosya kontrolleri geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/two-worker-initial-mmap-rebased-candidate/sonuc.md) OFF 1351/0/325, ON 1351/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_482.md).
+
+
+## V6b.483 — Hazır V1 olağan yazmada otomatik reset tanısı
+
+Otomatik reset önceki gerçek kısıt mesajını koruyor. Her kipte 42 C profili ve 21 önceki tanı farkı, sayaç, satır, işlem ve beş Group65 testi doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/plain-write-autoreset-candidate/sonuc.md) OFF 1352/0/325, ON 1352/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,267 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_483.md).

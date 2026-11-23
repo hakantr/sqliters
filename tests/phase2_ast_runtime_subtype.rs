@@ -4014,3 +4014,24 @@ fn group65_legacy_limit_mismatch_transfers_diagnostic_on_reset() {
     assert_eq!(row.get_i64(0), Some(2));
     stmt.finalize().unwrap();
 }
+
+#[test]
+fn group65_legacy_plain_write_autoreset_keeps_constraint_diagnostic() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT UNIQUE);
+         INSERT INTO items VALUES(1,'used');",
+    ).unwrap();
+
+    let sql = "INSERT INTO items VALUES(2,'used')";
+    let mut stmt = db.prepare_v1(sql).unwrap();
+    let first = stmt.step().unwrap_err();
+    assert_eq!((first.extended_code, first.message.as_str()), (1, "SQL logic error"));
+
+    let next = stmt.step().unwrap_err();
+    assert_eq!((next.extended_code, next.message.as_str()), (1, "UNIQUE constraint failed: items.value"));
+    let finished = stmt.finalize().unwrap_err();
+    assert_eq!((finished.extended_code, finished.message.as_str()), (2067, next.message.as_str()));
+    assert_eq!(db.total_changes(), 1);
+    assert_eq!(db.query_row("SELECT count(*) FROM items", &[]).unwrap().unwrap().get_i64(0), Some(1));
+}
