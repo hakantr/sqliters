@@ -8389,7 +8389,7 @@ impl Statement {
         artifacts: &mut CompiledArtifacts,
         raw_sql: &str,
         is_explain: bool,
-        has_like: bool,
+        schema_use: Option<&cgen::SelectSchemaUse>,
         bound_values: Option<&[Value]>,
         prepared_vtab: Option<Box<sqliters_vdbe::vdbeaux::Program>>,
     ) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
@@ -8405,7 +8405,13 @@ impl Statement {
             inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param,
         ) {
             Ok(Some(point_read))
-        } else if has_like {
+        } else if schema_use.is_some_and(|usage| usage.has_unistr_register_read)
+            && let Some(program) = vdbe_host::unistr_register_read_program(
+                inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param,
+            )
+        {
+            Ok(Some(program))
+        } else if schema_use.is_some_and(|usage| usage.has_like) {
             vdbe_host::like_machine_program(inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param, bound_values)
         } else if vdbe_host::exec_switch_on() {
             vdbe_host::machine_program_with_prepare(
@@ -8978,7 +8984,7 @@ impl Statement {
         } else if let Some(program) = row_case_fallback.into_inner() {
             Some(program)
         } else {
-            Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some(), select_schema_use.as_ref().is_some_and(|u| u.has_like), None, prepared_vtab)?
+            Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some(), select_schema_use.as_ref(), None, prepared_vtab)?
                 .or_else(|| schema_free_fallback.into_inner())
         };
         apply_prepared_pragma(&mut artifacts, &mut c_prepared_pragma, authorized_pragma.as_ref());
@@ -9898,7 +9904,7 @@ impl Statement {
             } else if let Some(program) = row_case_fallback {
                 Some(program)
             } else {
-                Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some(), select_schema_use.as_ref().is_some_and(|u| u.has_like), Some(&self.params), prepared_vtab)?
+                Self::c_machine_of(inner, &mut artifacts, &self.raw_sql, c_explain.is_some(), select_schema_use.as_ref(), Some(&self.params), prepared_vtab)?
                     .or(schema_free_fallback)
             };
             if let Some(prog) = &c_write

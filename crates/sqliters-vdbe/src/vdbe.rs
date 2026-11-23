@@ -7033,6 +7033,12 @@ impl Vdbe {
                         let mut m = Mem::null();
                         m.set_zero_blob(n as i32);
                         out = m;
+                    } else if func.func_flags & SQLITE_FUNC_BUILTIN != 0 && argc == 1
+                        && let Some(value) = crate::func_c::eval_text_register(
+                            &func.name, &self.a_mem[p2], host.text_encoding(), limit_length,
+                        )
+                    {
+                        out = value?;
                     } else {
                         let args: Vec<RuntimeValue> = self.a_mem[p2..p2 + argc].iter().map(Mem::to_runtime_value).collect();
                         let rv = if op.opcode == OP_PureFunc {

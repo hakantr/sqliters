@@ -106,6 +106,128 @@ fn append_utf8(out: &mut Vec<u8>, c: u32) {
     }
 }
 
+/// unistrFunc, with the AST String boundary retaining its existing lossy conversion.
+fn unistr_bytes(zin: &[u8], preserve_non_scalars: bool) -> Result<Vec<u8>> {
+    let n_in = zin.len();
+    let at = |i: usize| -> u8 { if i < n_in { zin[i] } else { 0 } };
+    let n_hex = |i: usize, n: usize| -> Option<u32> {
+        let mut v = 0u32;
+        for k in 0..n {
+            let d = (at(i + k) as char).to_digit(16)?;
+            v = (v << 4) + d;
+        }
+        Some(v)
+    };
+    let err = || SqliteError::new(ErrorCode::Error, "invalid Unicode escape");
+    let mut out = Vec::with_capacity(n_in);
+    let mut i = 0usize;
+    while i < n_in {
+        // strchr(): the search for a backslash ends at a NUL.
+        let seg_end = zin[i..]
+            .iter()
+            .position(|&c| c == b'\\' || c == 0)
+            .map(|p| i + p);
+        let bs = match seg_end {
+            Some(p) if zin[p] == b'\\' => p,
+            _ => {
+                out.extend_from_slice(&zin[i..]);
+                break;
+            }
+        };
+        out.extend_from_slice(&zin[i..bs]);
+        i = bs;
+        let c1 = at(i + 1);
+        let (v, adv) = if c1 == b'\\' {
+            out.push(b'\\');
+            i += 2;
+            continue;
+        } else if c1.is_ascii_hexdigit() {
+            (n_hex(i + 1, 4), 5)
+        } else if c1 == b'+' {
+            (n_hex(i + 2, 6), 8)
+        } else if c1 == b'u' {
+            (n_hex(i + 2, 4), 6)
+        } else if c1 == b'U' {
+            (n_hex(i + 2, 8), 10)
+        } else {
+            (None, 0)
+        };
+        let Some(v) = v else {
+            return Err(err());
+        };
+        i += adv;
+        // sqlite3AppendOneUtf8Character
+        if !preserve_non_scalars && ((0xd800..0xe000).contains(&v) || v > 0x10_ffff) {
+            append_utf8(&mut out, 0xfffd);
+        } else {
+            append_utf8(&mut out, v);
+        }
+    }
+    Ok(out)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Evaluate built-ins which observe or produce the raw bytes of a TEXT register.
+pub(crate) fn eval_text_register(
+    name: &str,
+    arg: &crate::vdbemem::Mem,
+    encoding: TextEncoding,
+    limit_length: i32,
+) -> Option<Result<crate::vdbemem::Mem>> {
+    use crate::vdbemem::{MEM_BLOB, MEM_NULL, MEM_STR, MEM_ZERO, Mem};
+
+    let mut out = Mem::null();
+    if name.eq_ignore_ascii_case("unistr") {
+        if arg.flags & MEM_NULL != 0 {
+            return Some(Ok(out));
+        }
+        let mut input = arg.clone();
+        if input.flags & (MEM_BLOB | MEM_STR) != 0 {
+            input.expand_blob();
+            input.flags |= MEM_STR;
+            input.change_encoding(TextEncoding::Utf8 as u8);
+        } else {
+            input.stringify(false);
+        }
+        match unistr_bytes(&input.z, true) {
+            Ok(bytes) => {
+                out.z = bytes;
+                out.flags = MEM_STR;
+            }
+            Err(error) => return Some(Err(error)),
+        }
+    } else if name.eq_ignore_ascii_case("hex") {
+        let mut input = arg.clone();
+        let count = if input.flags & MEM_NULL != 0 {
+            0
+        } else if input.flags & (MEM_BLOB | MEM_STR) != 0 {
+            input.z.len() + if input.flags & MEM_ZERO != 0 { input.n_zero.max(0) as usize } else { 0 }
+        } else {
+            input.stringify(false);
+            input.z.len()
+        };
+        if count.saturating_mul(2).saturating_add(1) > limit_length.max(0) as usize {
+            return Some(Err(too_big()));
+        }
+        input.expand_blob();
+        out.z = hex_bytes(&input.z[..count]).into_bytes();
+        out.flags = MEM_STR;
+    } else {
+        return None;
+    }
+    out.change_encoding(encoding as u8);
+    Some(Ok(out))
+}
+
 /// `sqlite3_value_numeric_type()` followed by `sqlite3_value_double()`: `None` unless the
 /// value is (or, for text, entirely converts to) a number.
 fn numeric_double(v: &Value) -> Option<f64> {
@@ -325,13 +447,7 @@ pub(crate) fn eval(upper: &str, args: &[Value], ctx: &VmRuntimeContext) -> Optio
                     }
                 }
             };
-            const HEX: &[u8; 16] = b"0123456789ABCDEF";
-            let mut out = String::with_capacity(bytes.len() * 2);
-            for &b in bytes.iter() {
-                out.push(HEX[(b >> 4) as usize] as char);
-                out.push(HEX[(b & 0x0f) as usize] as char);
-            }
-            Ok(Value::Text(out))
+            Ok(Value::Text(hex_bytes(&bytes)))
         }
         "UNHEX" if args.len() == 1 || args.len() == 2 => {
             let Some(hex_full) = value_text(&args[0], enc) else {
@@ -771,63 +887,7 @@ pub(crate) fn eval(upper: &str, args: &[Value], ctx: &VmRuntimeContext) -> Optio
             let Some(full) = value_text(&args[0], enc) else {
                 return Some(Ok(Value::Null));
             };
-            let zin: &[u8] = &full;
-            let n_in = zin.len();
-            let at = |i: usize| -> u8 { if i < n_in { zin[i] } else { 0 } };
-            let n_hex = |i: usize, n: usize| -> Option<u32> {
-                let mut v = 0u32;
-                for k in 0..n {
-                    let d = (at(i + k) as char).to_digit(16)?;
-                    v = (v << 4) + d;
-                }
-                Some(v)
-            };
-            let err = || SqliteError::new(ErrorCode::Error, "invalid Unicode escape");
-            let mut out = Vec::with_capacity(n_in);
-            let mut i = 0usize;
-            while i < n_in {
-                // strchr(): the search for a backslash ends at a NUL.
-                let seg_end = zin[i..]
-                    .iter()
-                    .position(|&c| c == b'\\' || c == 0)
-                    .map(|p| i + p);
-                let bs = match seg_end {
-                    Some(p) if zin[p] == b'\\' => p,
-                    _ => {
-                        out.extend_from_slice(&zin[i..]);
-                        break;
-                    }
-                };
-                out.extend_from_slice(&zin[i..bs]);
-                i = bs;
-                let c1 = at(i + 1);
-                let (v, adv) = if c1 == b'\\' {
-                    out.push(b'\\');
-                    i += 2;
-                    continue;
-                } else if c1.is_ascii_hexdigit() {
-                    (n_hex(i + 1, 4), 5)
-                } else if c1 == b'+' {
-                    (n_hex(i + 2, 6), 8)
-                } else if c1 == b'u' {
-                    (n_hex(i + 2, 4), 6)
-                } else if c1 == b'U' {
-                    (n_hex(i + 2, 8), 10)
-                } else {
-                    (None, 0)
-                };
-                let Some(v) = v else {
-                    return Some(Err(err()));
-                };
-                i += adv;
-                // sqlite3AppendOneUtf8Character
-                if (0xd800..0xe000).contains(&v) || v > 0x10_ffff {
-                    append_utf8(&mut out, 0xfffd);
-                } else {
-                    append_utf8(&mut out, v);
-                }
-            }
-            Ok(text_value(out))
+            unistr_bytes(&full, false).map(text_value)
         }
         "QUOTE" | "UNISTR_QUOTE" if args.len() == 1 => {
             quote_value(&args[0], upper == "UNISTR_QUOTE", enc).map(text_value)

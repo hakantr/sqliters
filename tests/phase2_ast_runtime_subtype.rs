@@ -4053,3 +4053,32 @@ fn group65_legacy_plain_write_autoreset_keeps_constraint_diagnostic() {
     assert_eq!(db.total_changes(), 1);
     assert_eq!(db.query_row("SELECT count(*) FROM items", &[]).unwrap().unwrap().get_i64(0), Some(1));
 }
+
+
+#[test]
+fn group65_unistr_hex_observes_text_bytes_across_prepared_reset() {
+    for (encoding, initial, after_reset) in [
+        ("UTF-8", "410042", "F7BFBFBF"),
+        ("UTF-16le", "410000004200", "BFDBFFDF"),
+        ("UTF-16be", "004100000042", "DBBFDFFF"),
+    ] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!("PRAGMA encoding='{encoding}'; CREATE TABLE t(i);"))
+            .unwrap();
+        let query = "SELECT hex(unistr(?1))";
+        for mut stmt in [db.prepare_v1(query).unwrap(), db.prepare(query).unwrap()] {
+            stmt.bind_text(1, r"A\u0000B").unwrap();
+            let StepResult::Row(first) = stmt.step().unwrap() else {
+                panic!("expected first row for {encoding}");
+            };
+            assert_eq!(first.get_str(0), Some(initial));
+            stmt.reset().unwrap();
+            stmt.bind_text(1, r"\UFFFFFFFF").unwrap();
+            let StepResult::Row(reused) = stmt.step().unwrap() else {
+                panic!("expected row after reset for {encoding}");
+            };
+            assert_eq!(reused.get_str(0), Some(after_reset));
+            assert!(matches!(stmt.step().unwrap(), StepResult::Done));
+        }
+    }
+}

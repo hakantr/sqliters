@@ -533,6 +533,13 @@ pub(crate) fn like_machine_program(
 }
 
 /// A read rejected by legacy validation despite C eliminating its table source.
+pub(crate) fn unistr_register_read_program(
+    inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
+) -> Option<Arc<Program>> {
+    read_machine_program(inner, stmt, sql, n_param, ReadMachineScope::UnistrRegister, None, None)
+        .ok().flatten()
+}
+
 /// This entry also works with the diagnostic switch off; it accepts only a
 /// checked program with no Btree use. An empty path containing only control
 /// flow and integer initialization also works in UTF-16 without text operations.
@@ -718,6 +725,7 @@ fn ordered_index_collation_mismatch(
 enum ReadMachineScope {
     Standard,
     SchemaFree,
+    UnistrRegister,
     Like,
     RowCase,
     LiveTableJoin,
@@ -941,7 +949,7 @@ fn read_machine_program(
     if inner.effective_encoding() != TextEncoding::Utf8
         && !matches!(scope, ReadMachineScope::Like
                 | ReadMachineScope::RowCase
-                | ReadMachineScope::LiveTableJoin)
+                | ReadMachineScope::LiveTableJoin | ReadMachineScope::UnistrRegister)
     {
         trace("fallback: UTF-16 database", raw_sql);
         return Ok(None);
@@ -953,6 +961,9 @@ fn read_machine_program(
         PrepareResult::Program(mut p) => {
             if scope == ReadMachineScope::Like && !crate::cgen::program_has_like(&p) { return Ok(None); }
             if scope == ReadMachineScope::SchemaFree && p.btree_mask != 0 { return Ok(None); }
+            if scope == ReadMachineScope::UnistrRegister && !crate::cgen::unistr_register_read(&p) {
+                return Ok(None);
+            }
             if matches!(scope, ReadMachineScope::RowCase | ReadMachineScope::LiveTableJoin)
                 && !p.read_only
             {
