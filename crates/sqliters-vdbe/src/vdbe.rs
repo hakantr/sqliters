@@ -5586,13 +5586,14 @@ impl Vdbe {
                     let (pgsz, cache_size, temp_in_memory) = host.sorter_config();
                     let mut sorter = VdbeSorter::init(k, op.p3, pgsz, cache_size, temp_in_memory);
                     sorter.set_vfs(host.sorter_vfs());
+                    let worker_count = host.sorter_worker_threads();
                     if !temp_in_memory && self.prog.fallible_sort_open().is_none()
                         && (k.enc == 1 || k.enc == host.text_encoding() as u8)
-                        && host.sorter_worker_threads() == 1 && host.sorter_mmap_limit() <= 0
+                        && matches!(worker_count, 1 | 2) && host.sorter_mmap_limit() <= 0
                         && matches!(&op.p4, P4::KeyInfo(key) if worker_order_sorter(&self.prog, op, key))
                         && k.a_coll.iter().flatten().all(|coll| coll.is_binary && coll.custom.is_none())
                     {
-                        sorter.enable_worker();
+                        sorter.enable_workers(worker_count as usize);
                     }
                     if self.prog.fallible_file_sort_open == Some(pc) {
                         sorter.set_sort_callback_error(self.sort_callback_error.clone());

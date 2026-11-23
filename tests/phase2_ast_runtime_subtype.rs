@@ -3065,3 +3065,41 @@ fn group65_prepared_aggregate_keeps_selected_definition_on_reset() {
         assert_eq!(db.query(sql, &[]).unwrap().rows[0].get_i64(0), Some(81));
     }
 }
+
+#[test]
+fn group64_file_sorter_two_worker_order_and_reset() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}';
+             PRAGMA temp_store=FILE; PRAGMA cache_size=1;
+             CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);
+             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<24)
+             INSERT INTO items SELECT i, CASE WHEN i%3=0 THEN NULL
+               ELSE printf('%02d%22000s',i%3,'x') END FROM n;"
+        )).unwrap();
+        let mut statement = db.prepare(
+            "SELECT id FROM items ORDER BY v COLLATE BINARY NULLS LAST,id"
+        ).unwrap();
+        let expected: Vec<_> = [1, 2, 0].into_iter()
+            .flat_map(|group| (1..=24).filter(move |id| id % 3 == group)).collect();
+
+        for (threads, take) in [(0, 24), (2, 1), (1, 24), (2, 24)] {
+            db.execute_batch(&format!("PRAGMA threads={threads}")).unwrap();
+            statement.machine_stmt_status(4, true);
+            for &id in expected.iter().take(take) {
+                let StepResult::Row(row) = statement.step().unwrap() else {
+                    panic!("expected row in {encoding}, threads={threads}");
+                };
+                assert_eq!(row.get_i64(0), Some(id));
+            }
+            if take == expected.len() {
+                assert!(matches!(statement.step().unwrap(), StepResult::Done));
+            }
+            if threads == 2 {
+                assert!(statement.machine_stmt_status(4, false) > 0, "{encoding}");
+            }
+            statement.reset().unwrap();
+        }
+    }
+}

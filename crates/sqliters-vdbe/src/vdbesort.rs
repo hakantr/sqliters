@@ -1,6 +1,6 @@
 //! `vdbesort.c`: the sorter of `OP_SorterOpen` … `OP_SorterNext` (and `rowset.c`: `RowSet`).
 //!
-//! Port of SQLite 3.54.1 as the reference build runs it (no worker threads). What is ported
+//! Port of the SQLite 3.54.1 memory and PMA sorting paths. What is ported
 //! one to one: the record list (new records at the head), the flush decision of
 //! `sqlite3VdbeSorterWrite` (`mxPmaSize` / `mnPmaSize` from the page size and the cache size
 //! of the main database, `list.aMemory` accounting with `sizeof(SorterRecord)`), the list
@@ -606,12 +606,13 @@ impl PmaReader {
         if let Some(parallel) = &mut self.parallel {
             let next = parallel.read_next_file();
             self.disk = None;
-            if let Some(disk) = next? {
+            if let Ok(Some(disk)) = next {
                 self.disk = Some(disk);
                 return self.refill_disk();
             }
+            // A failed buffer swap clears this reader before its siblings.
             self.parallel = None;
-            return Ok(());
+            return next.map(|_| ());
         }
         let Some(child) = &mut self.child else {
             self.disk = None;
@@ -698,7 +699,7 @@ impl PmaMerge {
     }
 
     fn join_workers(&mut self) {
-        for reader in &mut self.readers {
+        for reader in self.readers.iter_mut().rev() {
             if let Some(parallel) = &mut reader.parallel {
                 parallel.join_tree();
             }
@@ -790,7 +791,8 @@ pub struct VdbeSorter {
     // Drop readers, then level-0 and intermediate file handles in VDBE order.
     worker_rows: Option<PmaReader>,
     pma_merge: Option<PmaMerge>,
-    worker_run: Option<Box<RunWriter>>,
+    auxiliary_tasks: Vec<RunWriter>,
+    next_worker: usize,
     pma_file: Option<PmaFile>,
     intermediate_file: Option<Arc<dyn VfsFile>>,
     vfs: Option<Arc<dyn Vfs>>,
@@ -820,13 +822,13 @@ impl VdbeSorter {
         self.vfs = vfs;
     }
 
-    pub(crate) fn enable_worker(&mut self) {
+    pub(crate) fn enable_workers(&mut self, count: usize) {
         if self.use_a_memory && self.vfs.is_some() {
-            self.worker_run = Some(Box::new(RunWriter {
+            self.auxiliary_tasks.resize_with(count, || RunWriter {
                 file: None,
                 intermediate: Arc::new(std::sync::Mutex::new(None)),
                 job: None,
-            }));
+            });
         }
     }
 
@@ -856,7 +858,8 @@ impl VdbeSorter {
             list: Vec::new(),
             pmas: Vec::new(),
             worker_rows: None,
-            worker_run: None,
+            auxiliary_tasks: Vec::new(),
+            next_worker: 0,
             pma_file: None,
             intermediate_file: None,
             vfs: None,
@@ -926,10 +929,16 @@ impl VdbeSorter {
         if self.list.is_empty() {
             return Ok(());
         }
-        if let Some(worker) = &mut self.worker_run
-            && worker.job.as_ref().is_none_or(SorterJob::is_finished)
-        {
+        let worker_count = self.auxiliary_tasks.len();
+        // C starts with task 0 and skips busy tasks in round-robin order.
+        for offset in 0..worker_count {
+            let index = (self.next_worker + offset) % worker_count;
+            let worker = &mut self.auxiliary_tasks[index];
+            if worker.job.as_ref().is_some_and(|job| !job.is_finished()) {
+                continue;
+            }
             worker.join()?;
+            self.next_worker = (index + 1) % worker_count;
             let vfs = Arc::clone(self.vfs.as_ref().expect("worker has VFS"));
             let key = self.comparator.clone();
             let page_size = self.page_size;
@@ -1016,11 +1025,9 @@ impl VdbeSorter {
         }
         let flush = self.flush_pma();
         self.refill_bytes = (self.mx_pma_size as usize / 2).max(self.largest_pma_record + 9);
-        if let Some(worker) = &mut self.worker_run {
-            let joined = worker.join();
-            flush?;
-            joined?;
-            return self.rewind_worker();
+        if !self.auxiliary_tasks.is_empty() {
+            self.join_run_writers(flush)?;
+            return self.rewind_workers();
         }
         flush?;
         let readers = if let Some(file) = &self.pma_file {
@@ -1047,25 +1054,31 @@ impl VdbeSorter {
         Ok(empty)
     }
 
-    fn rewind_worker(&mut self) -> SqlResult<bool> {
+    fn rewind_workers(&mut self) -> SqlResult<bool> {
         let vfs = Arc::clone(self.vfs.as_ref().expect("worker has VFS"));
         let page_size = self.page_size;
         let capacity = self.refill_bytes;
         let key = &self.comparator;
-        let worker = self.worker_run.as_ref().expect("worker enabled");
-        let make_merge = |file: &PmaFile| file.readers(0).map(PmaMerge::from_readers);
-        let background = worker.file.as_ref().map(make_merge).transpose()?;
-        let foreground = self.pma_file.as_ref().map(make_merge).transpose()?;
+        let files = self.auxiliary_tasks.iter().map(|task| task.file.as_ref())
+            .chain(std::iter::once(self.pma_file.as_ref()));
+        // Load the level-zero trees in task order before starting any reader.
+        let readers: Vec<PmaReader> = files.map(|file| {
+            let child = file.map(|file| file.readers(0).map(PmaMerge::from_readers).map(Box::new))
+                .transpose()?;
+            Ok(PmaReader { child, ..PmaReader::default() })
+        }).collect::<SqlResult<_>>()?;
+        let width = readers.len().next_power_of_two();
+        let mut root = PmaMerge::new(readers, width);
 
-        let mut left = PmaReader::default();
-        if let Some(merge) = background {
+        for (reader, task) in root.readers.iter_mut().zip(&self.auxiliary_tasks) {
+            let Some(merge) = reader.child.take() else { continue };
             let vfs = Arc::clone(&vfs);
-            let retained = Arc::clone(&worker.intermediate);
+            let retained = Arc::clone(&task.intermediate);
             let mut buffer = DoubleBuffer {
                 files: [None, None],
-                work: MergeWork { merge, key: key.clone(), page_size, capacity },
+                work: MergeWork { merge: *merge, key: key.clone(), page_size, capacity },
             };
-            left.parallel = Some(Box::new(ParallelReader {
+            reader.parallel = Some(Box::new(ParallelReader {
                 active: Some(SorterJob::start(move || {
                     let result = buffer.work.initialize(vfs.as_ref(), &retained)
                         .and_then(|_| buffer.initialize(vfs.as_ref()));
@@ -1074,35 +1087,44 @@ impl VdbeSorter {
                 finished: None,
             }));
         }
-        let mut right = PmaReader::default();
-        if let Some(mut merge) = foreground {
-            let mut intermediate = PmaIntermediate {
-                vfs: vfs.as_ref(), file: None, next_offset: 0, page_size,
-                allocation: 0, mmap_limit: 0,
-            };
-            let init = merge.initialize(key, capacity, 0, Some(&mut intermediate))
-                .and_then(|_| intermediate.reserve(capacity));
-            self.intermediate_file = intermediate.file;
-            right.chunk = Some(init?);
-            right.child = Some(Box::new(merge));
-        }
-        let mut root = PmaMerge::new(vec![left, right], 2);
-        for reader in root.readers.iter_mut().rev() {
-            reader.refill(key, capacity, 0)?;
-        }
-        root.choose_initial(key)?;
 
         let mut buffer = DoubleBuffer {
             files: [None, None],
             work: MergeWork { merge: root, key: key.clone(), page_size, capacity },
         };
-        let initial = buffer.initialize(vfs.as_ref());
+        let initial = (|| {
+            let root = &mut buffer.work.merge;
+            let foreground = &mut root.readers[self.auxiliary_tasks.len()];
+            if let Some(merge) = &mut foreground.child {
+                let mut intermediate = PmaIntermediate {
+                    vfs: vfs.as_ref(), file: None, next_offset: 0, page_size,
+                    allocation: 0, mmap_limit: 0,
+                };
+                let init = merge.initialize(key, capacity, 0, Some(&mut intermediate))
+                    .and_then(|_| intermediate.reserve(capacity));
+                self.intermediate_file = intermediate.file;
+                foreground.chunk = Some(init?);
+            }
+            // C warms the foreground reader before joining the reader tasks.
+            for reader in root.readers.iter_mut().rev() {
+                reader.refill(key, capacity, 0)?;
+            }
+            root.choose_initial(key)?;
+            buffer.initialize(vfs.as_ref())
+        })();
+
+        let (end, error) = match initial {
+            Ok(end) => (end, None),
+            Err(error) => (None, Some(error)),
+        };
         let mut output = PmaReader {
-            parallel: Some(Box::new(ParallelReader { active: None, finished: Some((buffer, initial)) })),
+            parallel: Some(Box::new(ParallelReader { active: None, finished: Some((buffer, Ok(end))) })),
             ..PmaReader::default()
         };
-        let first = output.refill(key, capacity, 0);
+        let first = error.map_or_else(|| output.refill(key, capacity, 0), Err);
         let empty = output.records.is_empty();
+        // Keep every still-live reader for the root-first cleanup path,
+        // including when initial merge setup failed.
         self.worker_rows = Some(output);
         first?;
         Ok(empty)
@@ -1158,24 +1180,30 @@ impl VdbeSorter {
         sqlite3_vdbe_record_compare_with_skip(val, &mut r, false)
     }
 
+    fn join_run_writers(&mut self, mut result: SqlResult<()>) -> SqlResult<()> {
+        for task in self.auxiliary_tasks.iter_mut().rev() {
+            let joined = task.join();
+            result = result.and(joined);
+        }
+        result
+    }
+
     fn join_workers(&mut self) {
         if let Some(reader) = &mut self.worker_rows
             && let Some(parallel) = &mut reader.parallel
         {
             parallel.join_tree();
         }
-        if let Some(worker) = &mut self.worker_run {
-            let _ = worker.join();
-        }
+        let _ = self.join_run_writers(Ok(()));
     }
 
     /// `sqlite3VdbeSorterReset`
     pub fn reset(&mut self) {
         self.join_workers();
         self.worker_rows = None;
-        if let Some(worker) = &mut self.worker_run {
-            worker.file = None;
-            worker.intermediate.lock().unwrap().take();
+        for task in &mut self.auxiliary_tasks {
+            task.file = None;
+            task.intermediate.lock().unwrap().take();
         }
         self.list.clear();
         self.pmas.clear();
@@ -1457,7 +1485,7 @@ fn worker_pma_reset_joins_reader_jobs_and_restarts() {
     let vfs = Arc::new(MemoryVfs::new());
     let mut sorter = VdbeSorter::init(&key, 0, 512, 1, false);
     sorter.set_vfs(Some(vfs.clone()));
-    sorter.enable_worker();
+    sorter.enable_workers(1);
     let payload = "x".repeat(45_000);
     for _ in 0..2 {
         for id in (1..=55).rev() {
@@ -1467,7 +1495,7 @@ fn worker_pma_reset_joins_reader_jobs_and_restarts() {
             ])).unwrap();
         }
         assert!(!sorter.rewind_checked().unwrap());
-        assert!(sorter.worker_run.as_ref().unwrap().file.is_some());
+        assert!(sorter.auxiliary_tasks[0].file.is_some());
         assert!(sorter.worker_rows.as_ref().unwrap().parallel.is_some());
         assert_eq!(decode_record(sorter.rowkey()).unwrap()[1], Value::Integer(1));
         assert!(sorter.next_checked().unwrap());

@@ -2537,3 +2537,8 @@ Yetkilendirici kurulu olmayan doğrudan kullanımda 24 C ve EXPLAIN izi, 156 ad�
 ## V6b.446 — Hazırlanmış aggregate ilk adımı ve reset
 
 Yeni uygulama aggregate aritesi eski hazırlanmış seçimi değiştirmez. Taze sorgu yeni tanımı kullanır. 12 C akışı ve 132 kayıt eş. 288 kapsam dışı kontrol ve her kipte odak testi doğrulandı. OFF 1326/1/325, ON 1324/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,257 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_446.md).
+
+
+## V6b.447 — İki yardımcı işçiyle PMA
+
+İki kipte 468 zorlanmış koşu ve 3.438.644 VFS kaydı eş. 54 bariyerli koşu çağıran iş parçacığının PMA üretmesini, ters hata önceliğini ve bütün işçilerin birleştirilmesini doğruladı. 18 okuyucu kilidi, 180 olağan FK ve son dosya görüntüleri eş. OFF 1327/1/325, ON 1325/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_447.md).
