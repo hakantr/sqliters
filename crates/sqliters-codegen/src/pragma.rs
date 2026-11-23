@@ -294,6 +294,28 @@ pub fn sqlite3_pragma(
         None
     };
     match pragma.typ {
+        17 => {
+            // pragmaFunclistLine emits sqlite3VdbeMultiLoad(v, 1, "sissii", ...).
+            let Some(functions) = p.db.host.pragma_function_list() else {
+                p.not_supported("PRAGMA function_list registry (V6b)");
+                return;
+            };
+            p.n_mem = 6;
+            for function in functions {
+                let cells = function.into_iter().map(|value| match value {
+                    sqliters_types::Value::Text(text) if !text.as_bytes().contains(&0) => {
+                        Some(PragmaCell::Text(text))
+                    }
+                    sqliters_types::Value::Integer(n) => i32::try_from(n).ok().map(PragmaCell::Int),
+                    _ => None,
+                }).collect::<Option<Vec<_>>>();
+                let Some(cells) = cells.filter(|cells| cells.len() == 6) else {
+                    p.not_supported("PRAGMA function_list row (V6b)");
+                    return;
+                };
+                row(p, cells);
+            }
+        }
         29 => {
             // pragma.c:1489–1497, Hash iteration order at prepare time.
             let Some(names) = p.db.host.pragma_module_names() else {

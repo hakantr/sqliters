@@ -168,6 +168,9 @@ impl Host for EngineHost<'_> {
     fn pragma_module_names(&self) -> Option<Vec<String>> {
         Some(self.db_set.vtab_registry().module_names_in_hash_order())
     }
+    fn pragma_function_list(&self) -> Option<Vec<Vec<Value>>> {
+        Some(crate::engine::pragma_function_list(self.functions).rows)
+    }
     fn pragma_mmap_size(&self, i_db: usize, request: Option<i64>) -> Option<sqliters_types::Result<Option<i64>>> {
         let slot = self.db_set.slots().get(i_db)?;
         if i_db == 1 && slot.btree.is_none() { return Some(Ok(None)); }

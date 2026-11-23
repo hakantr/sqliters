@@ -6726,7 +6726,10 @@ fn prepare_row_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &st
 {
     let defer_query = matches!(stmt, Some(Stmt::Pragma { name, value: None, .. })
         if name.eq_ignore_ascii_case("defer_foreign_keys"));
-    if !defer_query && !matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("database_list") || name.eq_ignore_ascii_case("collation_list") || name.eq_ignore_ascii_case("module_list") || name.eq_ignore_ascii_case("compile_options") || name.eq_ignore_ascii_case("case_sensitive_like") || name.eq_ignore_ascii_case("mmap_size")) {
+    let function_list_query = !inner.authorizer.is_some()
+        && matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("function_list"));
+    if !defer_query && !function_list_query
+        && !matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("database_list") || name.eq_ignore_ascii_case("collation_list") || name.eq_ignore_ascii_case("module_list") || name.eq_ignore_ascii_case("compile_options") || name.eq_ignore_ascii_case("case_sensitive_like") || name.eq_ignore_ascii_case("mmap_size")) {
         return Ok(None);
     }
     let Some(program) = prepare_pragma_program(inner, sql)? else { return Ok(None); };
@@ -6783,10 +6786,15 @@ fn prepare_auto_vacuum_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, 
 }
 
 #[allow(non_upper_case_globals)]
-fn prepare_constant_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str) -> Result<Option<Box<QueryOutput>>> {
+fn prepare_constant_pragma(
+    inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str, row_program: bool,
+) -> Result<Option<Box<QueryOutput>>> {
     use sqliters_vdbe::opcodes::{OP_Int64, OP_Integer, OP_String8};
     let Some(Stmt::Pragma { schema, name, value }) = stmt else { return Ok(None); };
     if name.eq_ignore_ascii_case("function_list") {
+        if row_program {
+            return Ok(None);
+        }
         if schema.is_some() {
             // Resolve the qualifier before authorization and preserve its SQL error offset.
             let _ = prepare_pragma_program(inner, sql)?;
@@ -8633,13 +8641,15 @@ impl Statement {
                 result?
             }
         };
-        let mut c_prepared_pragma = prepare_constant_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
+        let c_row_pragma = prepare_row_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
+        let mut c_prepared_pragma = prepare_constant_pragma(
+            inner, stmt_opt.as_ref(), &raw_sql, c_row_pragma.is_some(),
+        )?;
         let authorized_pragma = if inner.authorizer.is_some() && c_prepared_pragma.is_some() {
             stmt_opt.clone()
         } else {
             None
         };
-        let c_row_pragma = prepare_row_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
         let c_integer_collation = prepare_integer_collation_select(inner, stmt_opt.as_ref(), select_schema_use.as_ref(), &raw_sql)?;
         let c_prepared_default_cache = prepare_default_cache_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
         let c_prepared_auto_vacuum = prepare_auto_vacuum_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
@@ -9639,8 +9649,10 @@ impl Statement {
                 }
             };
             apply_codegen_pragma_effects(inner)?;
-            let mut c_prepared_pragma = prepare_constant_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
             let c_row_pragma = prepare_row_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
+            let mut c_prepared_pragma = prepare_constant_pragma(
+                inner, parsed_stmt.as_ref(), &self.raw_sql, c_row_pragma.is_some(),
+            )?;
             let c_integer_collation = prepare_integer_collation_select(inner, parsed_stmt.as_ref(), select_schema_use.as_ref(), &self.raw_sql)?;
             self.c_prepared_default_cache = prepare_default_cache_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
             let c_prepared_auto_vacuum = prepare_auto_vacuum_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
@@ -10630,7 +10642,7 @@ impl Statement {
                 self.lifecycle = StatementLifecycle::Halted {
                     last_error: Some(err.clone()),
                 };
-                let prepared_function_list = self.c_prepared_pragma.is_some()
+                let prepared_function_list = (self.c_prepared_pragma.is_some() || self.c_machine.is_some())
                     && matches!(self.stmt.as_ref(), Some(Stmt::Pragma { name, .. })
                         if name.eq_ignore_ascii_case("function_list"));
                 let flag_pragma_expired = matches!(self.category, Some(StmtCategory::Read | StmtCategory::Write))

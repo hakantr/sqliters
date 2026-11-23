@@ -2527,3 +2527,8 @@ Etkin ifadede aynı fonksiyon tanımı üzerine kayıt SQLITE_BUSY verir. Boşta
 ## V6b.444 — Doğrudan function_list yetkilendirme ve şema tanısı
 
 Altı şema biçimi, dört yetkilendirme seçimi, üç kodlama ve V1/V2 üzerinden 288 akış ve 1.248 API kaydı C ile eş. Geçersiz şema, callback öncesi SQL ofsetiyle reddedilir. IGNORE sıfır satır ve sütunla reset yaşam döngüsünü korur. OFF 1323/1/325, ON 1321/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,272 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_444.md).
+
+
+## V6b.445 — Doğrudan function_list EXPLAIN ve ilerleme
+
+Yetkilendirici kurulu olmayan doğrudan kullanımda 24 C ve EXPLAIN izi, 156 adım zamanlaması ve 52.740 API kaydı eş. İptal, reset ve farklı ilerleme periyotları ölçüldü. Hazırlanabilir olmayan Rust-only adlar önceki satır yaşam döngüsünü korur. OFF 1325/1/325, ON 1323/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,281 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_445.md).

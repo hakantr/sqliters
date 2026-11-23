@@ -2954,3 +2954,72 @@ fn group65_direct_function_list_honors_prepare_authorizer_and_reset() {
         assert_eq!(calls.load(AtomicOrdering::Relaxed), 2);
     }
 }
+
+#[test]
+fn group65_direct_function_list_machine_program_and_progress() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}'; CREATE TABLE encoding_anchor(x);"
+        )).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let record = calls.clone();
+        db.progress_handler(1, Some(Box::new(move || {
+            record.fetch_add(1, AtomicOrdering::Relaxed);
+            false
+        }))).unwrap();
+
+        let mut explain = db.prepare("EXPLAIN PRAGMA function_list").unwrap();
+        let mut opcodes = Vec::new();
+        while let StepResult::Row(row) = explain.step().unwrap() {
+            assert_eq!(row.get_i64(0), Some(opcodes.len() as i64));
+            opcodes.push(row.get_str(1).unwrap().to_owned());
+        }
+        assert_eq!(opcodes.len(), 1215);
+        assert_eq!(opcodes[..4], ["Init", "Expire", "String8", "Integer"]);
+        assert_eq!(opcodes[1212..], ["ResultRow", "Halt", "Goto"]);
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 0);
+
+        let mut statement = db.prepare("PRAGMA function_list").unwrap();
+        for attempt in 0..2 {
+            let mut rows = 0;
+            while let StepResult::Row(_) = statement.step().unwrap() {
+                rows += 1;
+                let steps = attempt * 1215 + 3 + 7 * rows;
+                assert_eq!(statement.machine_stmt_status(4, false), steps);
+                assert_eq!(calls.load(AtomicOrdering::Relaxed), steps as usize);
+            }
+            assert_eq!(rows, 173);
+            let steps = (attempt + 1) * 1215;
+            assert_eq!(statement.machine_stmt_status(4, false), steps);
+            assert_eq!(calls.load(AtomicOrdering::Relaxed), steps as usize);
+            assert_eq!(statement.c_reprepare_status().0, attempt);
+            statement.reset().unwrap();
+        }
+    }
+}
+
+#[test]
+fn group65_direct_function_list_preserves_rust_name_with_embedded_nul() {
+    const NAME: &str = "embedded\0name";
+    let db = Connection::open_in_memory().unwrap();
+    let mut statement = db.prepare("PRAGMA function_list").unwrap();
+    db.register_scalar_function(NAME, 1, FunctionFlags::DETERMINISTIC, |_| {
+        Ok(RuntimeValue::plain(Value::Integer(1)))
+    }).unwrap();
+
+    for expected in [0, 1] {
+        let mut found = 0;
+        while let StepResult::Row(row) = statement.step().unwrap() {
+            let name = row.get_str(0).unwrap();
+            assert_ne!(name, "embedded");
+            if name == NAME {
+                assert_eq!(row.get_i64(1), Some(0));
+                assert_eq!(row.get_i64(4), Some(1));
+                found += 1;
+            }
+        }
+        assert_eq!(found, expected);
+        statement.reset().unwrap();
+    }
+}

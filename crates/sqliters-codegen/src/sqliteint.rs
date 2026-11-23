@@ -1186,6 +1186,8 @@ pub trait Host {
     fn pragma_text(&self, _i_db: usize, _name: &str) -> Option<String> { None }
     /// C's live aCollSeq hash order, including entries whose comparator was removed.
     fn pragma_module_names(&self) -> Option<Vec<String>> { None }
+    /// Visible six-column rows of the connection's function registry at prepare.
+    fn pragma_function_list(&self) -> Option<Vec<Vec<sqliters_types::Value>>> { None }
     fn pragma_collations(&self) -> Option<Vec<String>> { None }
     /// A read-only prediction of the MMAP_SIZE file-control result. The outer
     /// None leaves the handler unsupported; inner None is SQLITE_NOTFOUND.
