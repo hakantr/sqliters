@@ -2207,6 +2207,7 @@ pub(crate) fn step(
     params: &[Value],
     start: bool,
     sql: &str,
+    scalar_generation: u64,
 ) -> (Result<Option<Vec<Value>>>, Option<usize>) {
     if start {
         vm.rewind();
@@ -2246,7 +2247,15 @@ pub(crate) fn step(
         result
     } else {
         let steps_before = vm.n_vm_step;
+        let scalar_registry = if start {
+            None
+        } else {
+            inner.functions.scalar_registry_at(scalar_generation)
+        };
         let mut host = MachineHost::new(inner);
+        if let Some(registry) = &scalar_registry {
+            host.functions = registry;
+        }
         let r = vm.exec(&mut host);
         // (the engine's tick counter, `Connection::progress_op_count`)
         host.progress.add_ops(vm.n_vm_step - steps_before);

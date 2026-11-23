@@ -2449,3 +2449,56 @@ fn group46_65_inline_shortcircuit_star_arg_and_custom_collation_regressions() {
         );
     }
 }
+
+#[test]
+fn group65_active_read_retains_preexisting_scalar_overload() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    fn next_integer(stmt: &mut sqliters::Statement) -> Option<i64> {
+        match stmt.step().unwrap() {
+            sqliters::StepResult::Row(row) => Some(row.get_i64(0).unwrap()),
+            sqliters::StepResult::Done => None,
+        }
+    }
+
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for use_builtin in [true, false] {
+            let db = sqliters::Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}';
+                CREATE TABLE records(id INTEGER PRIMARY KEY, v TEXT);
+                INSERT INTO records VALUES(1,'x'),(2,'yy'),(3,'zzz');"
+            )).unwrap();
+            let (name, arity, sql, expected) = if use_builtin {
+                ("length", -1, "SELECT length(v) FROM records ORDER BY id", [1_i64, 2, 3])
+            } else {
+                db.register_scalar_function("app_measure", -1, FunctionFlags::NONE, |_| {
+                    Ok(RuntimeValue::plain(Value::Integer(101)))
+                }).unwrap();
+                ("app_measure", 1, "SELECT app_measure(id) FROM records ORDER BY id", [101; 3])
+            };
+            let mut held = db.prepare(sql).unwrap();
+            assert_eq!(next_integer(&mut held), Some(expected[0]));
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&calls);
+            db.register_scalar_function(name, arity, FunctionFlags::NONE, move |_| {
+                count.fetch_add(1, Ordering::Relaxed);
+                Ok(RuntimeValue::plain(Value::Integer(202)))
+            }).unwrap();
+            let result = db.query(sql, &[]).unwrap();
+            assert_eq!(result.rows.len(), 3);
+            assert!(result.rows.iter().all(|row| row.get_i64(0) == Some(202)));
+            assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+            assert_eq!(next_integer(&mut held), Some(expected[1]));
+            assert_eq!(next_integer(&mut held), Some(expected[2]));
+            assert_eq!(next_integer(&mut held), None);
+            assert_eq!(held.c_reprepare_status().0, 0);
+            assert_eq!(calls.load(Ordering::Relaxed), 3);
+        }
+    }
+}

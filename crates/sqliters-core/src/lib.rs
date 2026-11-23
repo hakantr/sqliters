@@ -921,6 +921,7 @@ pub(crate) enum RunningExec {
     Vdbe {
         vm: VdbeVm,
         read_instances: SmallInstVec,
+        scalar_generation: u64,
     },
     PointSelectRowYielded {
         read_instances: SmallInstVec,
@@ -936,6 +937,7 @@ pub(crate) enum RunningExec {
         vm: Box<sqliters_vdbe::vdbe::Vdbe>,
         lease_cursors: Vec<(SchemaInstanceId, CursorId)>,
         read_instances: SmallInstVec,
+        scalar_generation: u64,
     },
     FastSingleTextArena {
         arena: String,
@@ -3089,6 +3091,7 @@ impl ConnectionInner {
             RunningExec::Vdbe {
                 mut vm,
                 read_instances,
+                ..
             } => {
                 vm.close_cursors(&mut self.db_set);
                 self.finish_activity(
@@ -3104,6 +3107,7 @@ impl ConnectionInner {
                 mut vm,
                 lease_cursors,
                 read_instances,
+                ..
             } => {
                 vdbe_host::halt(self, &mut vm);
                 self.finish_activity(
@@ -8063,8 +8067,9 @@ impl Statement {
             None => Box::new(sqliters_vdbe::vdbe::Vdbe::new(prog)),
         };
 
+        let scalar_generation = inner.functions.scalar_generation();
         let (result, pragma_schema_error_offset) =
-            vdbe_host::step(inner, shared, hid, &mut vm, &self.params, true, &self.raw_sql);
+            vdbe_host::step(inner, shared, hid, &mut vm, &self.params, true, &self.raw_sql, scalar_generation);
         if vm.expired_on_reset { self.expired = true; }
         match result {
             Ok(Some(row)) => {
@@ -8076,6 +8081,7 @@ impl Statement {
                     vm,
                     lease_cursors,
                     read_instances,
+                    scalar_generation,
                 });
                 MachineStart::Stepped(Ok(StepResult::Row(Row::new(row))))
             }
@@ -8164,11 +8170,13 @@ impl Statement {
         shared: &Arc<ConnectionShared>,
         inner: &mut ConnectionInner,
     ) -> Result<StepResult> {
-        let StatementLifecycle::Running(RunningExec::Machine { vm, .. }) = &mut self.lifecycle else {
+        let StatementLifecycle::Running(RunningExec::Machine { vm, scalar_generation, .. }) =
+            &mut self.lifecycle
+        else {
             unreachable!("machine_advance requires a statement suspended on the machine");
         };
         let (res, pragma_schema_error_offset) =
-            vdbe_host::step(inner, shared, hid, vm, &self.params, false, &self.raw_sql);
+            vdbe_host::step(inner, shared, hid, vm, &self.params, false, &self.raw_sql, *scalar_generation);
         if vm.expired_on_reset { self.expired = true; }
         if let Ok(Some(row)) = res {
             if vm.prog.uses_vtab() {
@@ -8182,6 +8190,7 @@ impl Statement {
             vm,
             lease_cursors,
             read_instances,
+            ..
         }) = prev
         else {
             unreachable!("checked above");
@@ -9381,6 +9390,7 @@ impl Statement {
             StatementLifecycle::Running(RunningExec::Vdbe {
                 mut vm,
                 read_instances,
+                ..
             }) => {
                 vm.close_cursors(&mut inner.db_set);
                 self.cached_read_vm = Some(vm);
@@ -9397,6 +9407,7 @@ impl Statement {
                 mut vm,
                 lease_cursors,
                 read_instances,
+                ..
             }) => {
                 // sqlite3_reset in the middle of a result: sqlite3VdbeHalt, the Vdbe is kept
                 vdbe_host::halt(inner, &mut vm);
@@ -10426,7 +10437,9 @@ impl Statement {
         } else {
             VdbeVm::from_shared(Arc::clone(prog), &self.params, vm_rt)
         };
-        self.lifecycle = StatementLifecycle::Running(RunningExec::Vdbe { vm, read_instances });
+        self.lifecycle = StatementLifecycle::Running(RunningExec::Vdbe {
+            vm, read_instances, scalar_generation: inner.functions.scalar_generation(),
+        });
         Some(self.advance_running_in_session(hid, shared, inner))
     }
 
@@ -11120,8 +11133,9 @@ impl Statement {
                         } else {
                             VdbeVm::from_shared(Arc::clone(prog_final), &self.params, vm_rt)
                         };
-                        self.lifecycle =
-                            StatementLifecycle::Running(RunningExec::Vdbe { vm, read_instances });
+                        self.lifecycle = StatementLifecycle::Running(RunningExec::Vdbe {
+                            vm, read_instances, scalar_generation: inner.functions.scalar_generation(),
+                        });
                         return self.advance_running_in_session(hid, shared, inner);
                     }
                 }
@@ -12247,7 +12261,7 @@ impl Statement {
                 fin_res?;
                 Ok(StepResult::Done)
             }
-            RunningExec::Vdbe { vm, read_instances } => {
+            RunningExec::Vdbe { vm, read_instances, scalar_generation } => {
                 // `db->nChange`, `db->nTotalChange` and `db->lastRowid` belong to the
                 // connection: statements that ran since this one last returned a row have
                 // moved them, and this statement goes on from their values.
@@ -12258,11 +12272,12 @@ impl Statement {
                 let step_res = {
                     let encoding = inner.effective_encoding();
                     let rt_snapshot = vm.runtime_ctx;
+                    let scalar_registry = inner.functions.scalar_registry_at(*scalar_generation);
                     let mut services = ExecutionContext {
                         interrupt_flag: &inner.active_interrupt_flag,
                         runtime: &rt_snapshot,
                         encoding,
-                        functions: &inner.functions,
+                        functions: scalar_registry.as_ref().unwrap_or(&inner.functions),
                         collations: &inner.collations,
                         progress: &mut inner.progress,
                         strict_subtype: inner.strict_subtype,

@@ -170,10 +170,17 @@ fn with_ascii_upper_key<R>(name: &str, f: impl for<'k> FnOnce(&'k str) -> R) -> 
     f(&owned)
 }
 
+#[derive(Debug, Clone)]
+struct RegisteredScalar {
+    definition: ScalarFunctionDef,
+    introduced_at: u64,
+}
+
 /// Connection-level registry for custom and extension scalar, aggregate, and window SQL functions.
 #[derive(Debug, Default, Clone)]
 pub struct FunctionRegistry {
-    scalars: BTreeMap<String, Vec<ScalarFunctionDef>>,
+    scalars: BTreeMap<String, Vec<RegisteredScalar>>,
+    scalar_generation: u64,
     aggregates: BTreeMap<String, Vec<WindowFunctionDef>>,
     user_modified: bool,
     c_like_flags: BTreeMap<Option<usize>, u32>,
@@ -223,12 +230,16 @@ impl FunctionRegistry {
             callback,
         };
         let overloads = self.scalars.entry(key).or_default();
-        if let Some(existing) = overloads.iter_mut().find(|d| d.arity == arity) {
-            *existing = def;
-        } else if def.name.eq_ignore_ascii_case("like") {
-            overloads.insert(0, def);
+        if let Some(existing) = overloads.iter_mut().find(|entry| entry.definition.arity == arity) {
+            existing.definition = def;
         } else {
-            overloads.push(def);
+            self.scalar_generation += 1;
+            let entry = RegisteredScalar { definition: def, introduced_at: self.scalar_generation };
+            if entry.definition.name.eq_ignore_ascii_case("like") {
+                overloads.insert(0, entry);
+            } else {
+                overloads.push(entry);
+            }
         }
     }
 
@@ -242,25 +253,26 @@ impl FunctionRegistry {
     ) where
         F: Fn(&[RuntimeValue]) -> Result<RuntimeValue> + Send + Sync + 'static,
     {
-        self.user_modified = true;
-        let name = name.into();
-        let key = name.to_ascii_uppercase();
-        let name = if key == "LIKE" { "like".to_owned() } else { name };
-        self.clear_c_like_metadata(&key, arity);
-        let def = ScalarFunctionDef {
-            name,
-            arity,
-            flags,
-            callback: Arc::new(callback),
-        };
-        let overloads = self.scalars.entry(key).or_default();
-        if let Some(existing) = overloads.iter_mut().find(|d| d.arity == arity) {
-            *existing = def;
-        } else if def.name.eq_ignore_ascii_case("like") {
-            overloads.insert(0, def);
-        } else {
-            overloads.push(def);
+        self.register_scalar_shared(&name.into(), arity, flags, Arc::new(callback));
+    }
+
+    pub(crate) fn scalar_generation(&self) -> u64 {
+        self.scalar_generation
+    }
+
+    /// A suspended read retains its scalar overload selection. Only consider registrations
+    /// already present when the execution started. Build a temporary view when an
+    /// overload was added between steps so a held statement does not own callback lifetimes.
+    pub(crate) fn scalar_registry_at(&self, generation: u64) -> Option<Self> {
+        if generation == self.scalar_generation {
+            return None;
         }
+        let mut view = self.clone();
+        view.scalars.retain(|_, entries| {
+            entries.retain(|entry| entry.introduced_at <= generation);
+            !entries.is_empty()
+        });
+        Some(view)
     }
 
     /// Removes a registered scalar function overload, returning `true` if one was removed.
@@ -272,7 +284,7 @@ impl FunctionRegistry {
             return false;
         };
         let before = overloads.len();
-        overloads.retain(|d| d.arity != arity);
+        overloads.retain(|entry| entry.definition.arity != arity);
         let removed = overloads.len() != before;
         if overloads.is_empty() {
             self.scalars.remove(&key);
@@ -283,7 +295,7 @@ impl FunctionRegistry {
     /// Finds a registration by its declared arity, including a variadic declaration.
     pub(crate) fn has_scalar_overload(&self, name: &str, arity: Option<usize>) -> bool {
         with_ascii_upper_key(name, |key| self.scalars.get(key))
-            .is_some_and(|overloads| overloads.iter().any(|def| def.arity == arity))
+            .is_some_and(|overloads| overloads.iter().any(|entry| entry.definition.arity == arity))
     }
 
     /// Returns `true` if any scalar overload with `name` (ASCII case-insensitive) is registered.
@@ -305,14 +317,15 @@ impl FunctionRegistry {
         let overloads = with_ascii_upper_key(name, |k| self.scalars.get(k))?;
         overloads
             .iter()
+            .map(|entry| &entry.definition)
             .find(|d| d.arity == Some(argc))
-            .or_else(|| overloads.iter().find(|d| d.arity.is_none()))
+            .or_else(|| overloads.iter().map(|entry| &entry.definition).find(|d| d.arity.is_none()))
     }
 
     /// The (arity, flags) of every scalar function registered under `name` (any arity).
     pub fn scalar_overloads(&self, name: &str) -> Vec<(Option<usize>, FunctionFlags)> {
         with_ascii_upper_key(name, |k| self.scalars.get(k))
-            .map(|v| v.iter().map(|d| (d.arity, d.flags)).collect())
+            .map(|v| v.iter().map(|entry| (entry.definition.arity, entry.definition.flags)).collect())
             .unwrap_or_default()
     }
 
@@ -340,7 +353,7 @@ impl FunctionRegistry {
         let added_flags = SQLITE_FUNC_LIKE | if case_sensitive { SQLITE_FUNC_CASE } else { 0 };
         if active && exact {
             if let Some(def) = self.scalars.get_mut("LIKE")
-                .and_then(|v| v.iter_mut().find(|f| f.arity == Some(arity)))
+                .and_then(|v| v.iter_mut().map(|entry| &mut entry.definition).find(|f| f.arity == Some(arity)))
             {
                 let flags = self.c_like_flags.get(&Some(arity)).copied()
                     .unwrap_or_else(|| crate::cgen::func_flags(def.flags));
@@ -391,7 +404,7 @@ impl FunctionRegistry {
         strict_subtype: bool,
     ) -> Result<RuntimeValue> {
         if let Some(def) = with_ascii_upper_key(name, |k| self.scalars.get(k))
-            .and_then(|v| v.iter().find(|f| f.arity == arity))
+            .and_then(|v| v.iter().map(|entry| &entry.definition).find(|f| f.arity == arity))
         {
             return self.call_scalar_definition(def, args, runtime_ctx, strict_subtype);
         }
@@ -424,7 +437,7 @@ impl FunctionRegistry {
         let name = if key == "LIKE" { "like".to_owned() } else { name };
         if key == "LIKE" {
             self.clear_c_like_metadata(&key, arity);
-            if let Some(v) = self.scalars.get_mut("LIKE") { v.retain(|f| f.arity != arity); }
+            if let Some(v) = self.scalars.get_mut("LIKE") { v.retain(|entry| entry.definition.arity != arity); }
         }
         let def = WindowFunctionDef {
             name,
@@ -573,7 +586,8 @@ impl FunctionRegistry {
             | FunctionFlags::INNOCUOUS.0;
         let mut out = Vec::new();
         for overloads in self.scalars.values() {
-            for def in overloads {
+            for entry in overloads {
+                let def = &entry.definition;
                 out.push((
                     def.name.clone(),
                     "s",
