@@ -257,6 +257,7 @@ fn custom_file_sort_read_program(
 #[allow(non_upper_case_globals)]
 pub(crate) fn mapped_table_read_program(
     inner: &ConnectionInner,
+    functions: &crate::execution_context::FunctionRegistry,
     stmt: Option<&Stmt>,
     sql: &str,
     n_param: usize,
@@ -302,7 +303,7 @@ pub(crate) fn mapped_table_read_program(
     {
         return None;
     }
-    let PrepareResult::Program(program) = crate::cgen::select_schema_probe(inner, sql).0 else {
+    let PrepareResult::Program(program) = crate::cgen::select_schema_probe_with_functions(inner, sql, functions).0 else {
         return None;
     };
     if program.explain != 0
@@ -363,7 +364,7 @@ pub(crate) fn mapped_table_read_program(
         | OP_OpenPseudo | OP_MakeRecord => true,
         OP_Function => matches!(&op.p4, P4::FuncCtx(call)
             if call.p_func.name.eq_ignore_ascii_case("length")
-                && !inner.functions.has_scalar_name("length")),
+                && !functions.has_scalar_name("length")),
         _ => false,
     }) {
         return None;
@@ -2245,7 +2246,9 @@ pub(crate) fn step(
         // the engine's statement context (`ExecContext`), as in a statement that writes.
         let summary = inner.activity.summary_excluding(hid, &inner.db_set);
         let encoding = inner.effective_encoding();
-        let mut stmt_tx = crate::engine::StmtTxTracker::default();
+        let mut stmt_tx = crate::engine::StmtTxTracker {
+            prepared_scalar_generation: Some(scalar_generation), ..Default::default()
+        };
         let mut expire_self_only = false;
         let result = inner.with_exec_ctx(shared, summary, &mut stmt_tx, &mut expire_self_only, |ctx| {
             let steps_before = vm.n_vm_step;
@@ -2258,11 +2261,7 @@ pub(crate) fn step(
         result
     } else {
         let steps_before = vm.n_vm_step;
-        let scalar_registry = if start {
-            None
-        } else {
-            inner.functions.scalar_registry_at(scalar_generation)
-        };
+        let scalar_registry = inner.functions.scalar_registry_at(scalar_generation);
         let mut host = MachineHost::new(inner);
         if let Some(registry) = &scalar_registry {
             host.functions = registry;

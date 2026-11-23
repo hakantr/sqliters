@@ -2485,6 +2485,7 @@ impl ConnectionInner {
                         runtime: &mut self.runtime,
                         interrupt_flag: &self.active_interrupt_flag,
                         functions: &self.functions,
+                        current_functions: &self.functions,
                         collations: &self.collations,
                         progress: &mut self.progress,
                         commit_hooks: &mut self.commit_hooks,
@@ -2734,6 +2735,7 @@ impl ConnectionInner {
                         runtime: &mut self.runtime,
                         interrupt_flag: &self.active_interrupt_flag,
                         functions: &self.functions,
+                        current_functions: &self.functions,
                         collations: &self.collations,
                         progress: &mut self.progress,
                         commit_hooks: &mut self.commit_hooks,
@@ -2866,6 +2868,7 @@ impl ConnectionInner {
                             runtime: &mut self.runtime,
                             interrupt_flag: &self.active_interrupt_flag,
                             functions: &self.functions,
+                            current_functions: &self.functions,
                             collations: &self.collations,
                             progress: &mut self.progress,
                             commit_hooks: &mut self.commit_hooks,
@@ -4694,8 +4697,10 @@ impl Connection {
         let replacing = cgen::scalar_registration_replaces_definition(&inner.functions, name, arity);
         inner.prepare_scalar_change(replacing)?;
         inner.functions.register_scalar(name, arity, flags, func);
-        inner.schema_generation += 1;
-        inner.v1_expire_generation += 1;
+        if replacing {
+            inner.schema_generation += 1;
+            inner.v1_expire_generation += 1;
+        }
         Ok(())
     }
 
@@ -5491,6 +5496,7 @@ pub struct Statement {
     c_machine_fixed: bool,
     cached_read_vm: Option<VdbeVm>,
     write_vm_scratch: sqliters_vdbe::VdbeWriteScratch,
+    compiled_scalar_generation: u64,
     compiled_schema_generation: u64,
     compiled_v1_expire_generation: u64,
     c_sorter_owns_rows: bool,
@@ -7098,6 +7104,8 @@ impl ConnectionInner {
         let mut publish_fn = |rt: &VmRuntimeContext, exp: bool, imp: bool, rb: u64| {
             shared.publish_mirrors(rt, exp, imp, rb);
         };
+        let prepared_functions = stmt_tx.prepared_scalar_generation
+            .and_then(|generation| self.functions.scalar_registry_at(generation));
         let mut ctx = ExecContext {
             db_set: &mut self.db_set,
             connection_encoding: &mut self.connection_encoding,
@@ -7105,7 +7113,8 @@ impl ConnectionInner {
             is_connection_readonly: shared.is_readonly,
             runtime: &mut self.runtime,
             interrupt_flag: &self.active_interrupt_flag,
-            functions: &self.functions,
+            functions: prepared_functions.as_ref().unwrap_or(&self.functions),
+            current_functions: &self.functions,
             collations: &self.collations,
             progress: &mut self.progress,
             commit_hooks: &mut self.commit_hooks,
@@ -8092,7 +8101,7 @@ impl Statement {
             None => Box::new(sqliters_vdbe::vdbe::Vdbe::new(prog)),
         };
 
-        let scalar_generation = inner.functions.scalar_generation();
+        let scalar_generation = self.compiled_scalar_generation;
         let (result, pragma_schema_error_offset) =
             vdbe_host::step(inner, shared, hid, &mut vm, &self.params, true, &self.raw_sql, scalar_generation);
         if vm.expired_on_reset { self.expired = true; }
@@ -8876,6 +8885,7 @@ impl Statement {
             c_machine_fixed: false,
             cached_read_vm: None,
             write_vm_scratch: sqliters_vdbe::VdbeWriteScratch::default(),
+            compiled_scalar_generation: inner.functions.scalar_generation(),
             compiled_schema_generation: inner.schema_generation,
             compiled_v1_expire_generation: inner.v1_expire_generation,
             c_sorter_owns_rows: select_schema_use.as_ref().is_some_and(|usage| usage.sorter_owns_rows),
@@ -9769,6 +9779,7 @@ impl Statement {
             self.params = transferred;
             self.named_params = artifacts.named_params;
             self.ignored_fk_parent_tables = artifacts.ignored_fk_parent_tables;
+            self.compiled_scalar_generation = inner.functions.scalar_generation();
             self.compiled_schema_generation = inner.schema_generation;
             self.compiled_v1_expire_generation = inner.v1_expire_generation;
             self.compiled_advisory_expire_generation = inner.advisory_expire_generation;
@@ -10463,7 +10474,7 @@ impl Statement {
             VdbeVm::from_shared(Arc::clone(prog), &self.params, vm_rt)
         };
         self.lifecycle = StatementLifecycle::Running(RunningExec::Vdbe {
-            vm, read_instances, scalar_generation: inner.functions.scalar_generation(),
+            vm, read_instances, scalar_generation: self.compiled_scalar_generation,
         });
         Some(self.advance_running_in_session(hid, shared, inner))
     }
@@ -10526,7 +10537,13 @@ impl Statement {
             return None;
         }
         vdbe_host::custom_sort_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len())
-            .or_else(|| vdbe_host::mapped_table_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len()))
+            .or_else(|| {
+                let prepared_functions = inner.functions.scalar_registry_at(self.compiled_scalar_generation);
+                vdbe_host::mapped_table_read_program(
+                    inner, prepared_functions.as_ref().unwrap_or(&inner.functions),
+                    self.stmt.as_ref(), &self.raw_sql, self.params.len(),
+                )
+            })
     }
 
     fn start_execution_in_session(
@@ -11161,7 +11178,7 @@ impl Statement {
                             VdbeVm::from_shared(Arc::clone(prog_final), &self.params, vm_rt)
                         };
                         self.lifecycle = StatementLifecycle::Running(RunningExec::Vdbe {
-                            vm, read_instances, scalar_generation: inner.functions.scalar_generation(),
+                            vm, read_instances, scalar_generation: self.compiled_scalar_generation,
                         });
                         return self.advance_running_in_session(hid, shared, inner);
                     }
@@ -11434,6 +11451,7 @@ impl Statement {
                 }
                 let mut expire_self_only = false;
                 let mut stmt_tx = StmtTxTracker {
+                    prepared_scalar_generation: Some(self.compiled_scalar_generation),
                     prepared_ignore_checks: Some(self.compiled_ignore_checks),
                     ..StmtTxTracker::default()
                 };
@@ -11971,6 +11989,7 @@ impl Statement {
                 let top_level_sql = inner.trace_hook.is_some().then(|| self.raw_sql.clone());
                 let mut stmt_tx = StmtTxTracker {
                     prepared_defer_fks: Some(self.compiled_defer_fks),
+                    prepared_scalar_generation: Some(self.compiled_scalar_generation),
                     prepared_ignore_checks: Some(self.compiled_ignore_checks),
                     prepared_reverse_order: self.compiled_reverse_order,
                     view_update_range_tokens: !inner.authorizer.is_some()

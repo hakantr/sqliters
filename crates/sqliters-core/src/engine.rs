@@ -122,6 +122,7 @@ pub struct StmtTxTracker {
     pub prepared_defer_fks: Option<bool>,
     /// CHECK elision is decided when the statement is prepared.
     pub(crate) prepared_ignore_checks: Option<bool>,
+    pub(crate) prepared_scalar_generation: Option<u64>,
     /// The generated rowid loop direction is fixed when the statement is prepared.
     pub(crate) prepared_reverse_order: bool,
     /// The top-level view UPDATE has a plain numeric range in an existing write snapshot.
@@ -480,6 +481,7 @@ pub struct ExecContext<'a> {
     pub runtime: &'a mut VmRuntimeContext,
     pub interrupt_flag: &'a std::sync::atomic::AtomicBool,
     pub functions: &'a FunctionRegistry,
+    pub(crate) current_functions: &'a FunctionRegistry,
     pub collations: &'a CollationRegistry,
     pub progress: &'a mut ProgressTracker,
     pub commit_hooks: &'a mut CommitCoordinatorHooks,
@@ -4749,6 +4751,7 @@ fn execute_internal_vtab_sql_impl(
     counted: bool,
 ) -> Result<usize> {
     ctx.db_set.vtab_registry_mut().internal_sql_depth += 1;
+    let prepared_functions = std::mem::replace(&mut ctx.functions, ctx.current_functions);
     let res = (|| match ctx
         .db_set
         .vtab_registry_mut()
@@ -4822,6 +4825,7 @@ fn execute_internal_vtab_sql_impl(
             Ok(total_changes)
         }
     })();
+    ctx.functions = prepared_functions;
     ctx.db_set.vtab_registry_mut().internal_sql_depth = ctx
         .db_set
         .vtab_registry()
@@ -4837,6 +4841,7 @@ pub fn query_internal_vtab_sql(
     params: &[Value],
 ) -> Result<Vec<Vec<Value>>> {
     ctx.db_set.vtab_registry_mut().internal_sql_depth += 1;
+    let prepared_functions = std::mem::replace(&mut ctx.functions, ctx.current_functions);
     let res = (|| {
         let stmt_arc = match ctx
             .db_set
@@ -4871,6 +4876,7 @@ pub fn query_internal_vtab_sql(
         ctx.runtime.last_insert_rowid = prev_last_rowid;
         Ok(run_res?.rows)
     })();
+    ctx.functions = prepared_functions;
     ctx.db_set.vtab_registry_mut().internal_sql_depth = ctx
         .db_set
         .vtab_registry()

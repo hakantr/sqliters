@@ -539,12 +539,12 @@ pub(crate) fn c_prepare_quiet(inner: &ConnectionInner, sql: &str) -> (PrepareRes
 /// Run C's parser and code generator over one statement (`sqlite3Prepare`).
 /// The third value: C's `sqlite3Init()` loaded the schemas during this prepare.
 pub(crate) fn c_prepare(inner: &ConnectionInner, sql: &str) -> (PrepareResult, usize, bool) {
-    c_prepare_impl(inner, sql, false, PrepareBindings::Unbound, None, false, None)
+    c_prepare_impl(inner, sql, false, PrepareBindings::Unbound, None, false, None, &inner.functions)
 }
 
 /// Recompile with the old statement's parameter values (pParse->pReprepare).
 pub(crate) fn c_prepare_bound(inner: &ConnectionInner, sql: &str, values: &[Value]) -> (PrepareResult, usize, bool) {
-    c_prepare_impl(inner, sql, false, PrepareBindings::Read(values), None, false, None)
+    c_prepare_impl(inner, sql, false, PrepareBindings::Read(values), None, false, None, &inner.functions)
 }
 
 pub(crate) fn c_prepare_bound_partial_index(
@@ -553,14 +553,14 @@ pub(crate) fn c_prepare_bound_partial_index(
     root: u32,
     binding: PartialIndexBinding<'_>,
 ) -> (PrepareResult, usize, bool) {
-    c_prepare_impl(inner, sql, false, PrepareBindings::PartialIndex { root, binding }, None, false, None)
+    c_prepare_impl(inner, sql, false, PrepareBindings::PartialIndex { root, binding }, None, false, None, &inner.functions)
 }
 
 pub(crate) fn c_prepare_table_scan(
     inner: &ConnectionInner, sql: &str, values: Option<&[Value]>, root: u32,
 ) -> PrepareResult {
     let bindings = values.map_or(PrepareBindings::Unbound, PrepareBindings::Read);
-    c_prepare_impl(inner, sql, false, bindings, None, false, Some(root)).0
+    c_prepare_impl(inner, sql, false, bindings, None, false, Some(root), &inner.functions).0
 }
 
 pub(crate) fn c_explain_bound(inner: &ConnectionInner, sql: &str, values: &[Value]) -> CExplain {
@@ -616,13 +616,19 @@ pub(crate) fn select_schema_use(inner: &ConnectionInner, sql: &str) -> Option<Se
 }
 
 pub(crate) fn select_schema_probe(inner: &ConnectionInner, sql: &str) -> (PrepareResult, bool) {
-    c_prepare_probe(inner, sql, true, None)
+    select_schema_probe_with_functions(inner, sql, &inner.functions)
+}
+
+pub(crate) fn select_schema_probe_with_functions(
+    inner: &ConnectionInner, sql: &str, functions: &FunctionRegistry,
+) -> (PrepareResult, bool) {
+    c_prepare_probe(inner, sql, true, None, functions)
 }
 
 /// Resolve the parser's interrupt check. A true result defers to one real xConnect.
 pub(crate) fn c_prepare_while_interrupted(inner: &ConnectionInner, sql: &str) -> sqliters_types::Result<bool> {
     let deferred_vtab_connect = std::cell::Cell::new(false);
-    let result = c_prepare_probe(inner, sql, false, Some(&deferred_vtab_connect)).0;
+    let result = c_prepare_probe(inner, sql, false, Some(&deferred_vtab_connect), &inner.functions).0;
     if deferred_vtab_connect.get() {
         return Ok(true);
     }
@@ -641,7 +647,7 @@ pub(crate) fn c_prepare_while_interrupted(inner: &ConnectionInner, sql: &str) ->
 
 /// Probe the current schema without running optimizer callbacks or publishing prepare effects.
 pub(crate) fn c_prepare_diagnostic(inner: &ConnectionInner, sql: &str) -> PrepareResult {
-    c_prepare_probe(inner, sql, false, None).0
+    c_prepare_probe(inner, sql, false, None, &inner.functions).0
 }
 
 fn c_prepare_probe(
@@ -649,13 +655,14 @@ fn c_prepare_probe(
     sql: &str,
     schema_probe: bool,
     deferred_vtab_connect: Option<&std::cell::Cell<bool>>,
+    functions: &FunctionRegistry,
 ) -> (PrepareResult, bool) {
     let effects = take_c_pragma_effects();
     let temp = take_c_temp_opened();
     let rowest = take_c_rowest_clamped();
     let quiet = C_QUIET.with(|c| c.replace(true));
     let (result, _, reads_schema) = c_prepare_impl(
-        inner, sql, schema_probe, PrepareBindings::Unbound, deferred_vtab_connect, true, None,
+        inner, sql, schema_probe, PrepareBindings::Unbound, deferred_vtab_connect, true, None, functions,
     );
     C_QUIET.with(|c| c.set(quiet));
     C_PRAGMA_EFFECTS.with(|c| *c.borrow_mut() = effects);
@@ -672,11 +679,12 @@ fn c_prepare_impl(
     deferred_vtab_connect: Option<&std::cell::Cell<bool>>,
     suppress_vtab_callbacks: bool,
     table_scan_root: Option<u32>,
+    functions: &FunctionRegistry,
 ) -> (PrepareResult, usize, bool) {
     let interrupted = deferred_vtab_connect.is_some();
     let host = EngineHost {
         bindings,
-        functions: &inner.functions,
+        functions,
         collations: &inner.collations,
         db_set: &inner.db_set,
         busy_timeout: match inner.busy_policy { crate::engine::BusyPolicy::TimeoutMs(ms) => i32::try_from(ms).ok().map(i64::from), _ => Some(0) },

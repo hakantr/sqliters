@@ -2633,3 +2633,57 @@ fn group65_active_registration_matches_existing_function_definition() {
         assert_eq!(db.query("SELECT length('xxx')", &[]).unwrap().rows[0].get_i64(0), Some(44));
     }
 }
+
+#[test]
+fn group65_prepared_scalar_selection_survives_overload_addition_and_reset() {
+    fn integers(stmt: &mut sqliters::Statement) -> Vec<i64> {
+        let mut result = Vec::new();
+        while let StepResult::Row(row) = stmt.step().unwrap() {
+            result.push(row.get_i64(0).unwrap());
+        }
+        result
+    }
+
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for legacy in [true, false] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}';
+                 CREATE TABLE data(id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO data VALUES(1,'x'),(2,'yy'),(3,'zzz');
+                 CREATE VIEW stored AS SELECT id,length(v) AS n FROM data;
+                 CREATE TABLE fire(v); CREATE TABLE log(n);
+                 CREATE TRIGGER capture AFTER INSERT ON fire BEGIN
+                   INSERT INTO log SELECT length(v) FROM data ORDER BY id;
+                 END;
+                 CREATE VIEW registry AS SELECT builtin FROM pragma_function_list
+                 WHERE name='app_marker';"
+            )).unwrap();
+            let prepare = |sql| if legacy { db.prepare_v1(sql) } else { db.prepare(sql) }.unwrap();
+            let read = "SELECT n FROM stored ORDER BY id";
+            let write = "INSERT INTO fire DEFAULT VALUES";
+            let mut held_read = prepare(read);
+            let mut held_write = prepare(write);
+            let mut held_list = prepare("SELECT builtin FROM registry");
+
+            for (name, arity) in [("length", -1), ("app_marker", 0)] {
+                db.register_scalar_function(name, arity, FunctionFlags::NONE, |_| {
+                    Ok(RuntimeValue::plain(Value::Integer(202)))
+                }).unwrap();
+            }
+            for _ in 0..2 {
+                assert_eq!(integers(&mut held_read), [1, 2, 3]);
+                assert!(matches!(held_write.step().unwrap(), StepResult::Done));
+                assert_eq!(integers(&mut held_list), [0]);
+                for stmt in [&mut held_read, &mut held_write, &mut held_list] {
+                    assert_eq!(stmt.c_reprepare_status().0, 0);
+                    stmt.reset().unwrap();
+                }
+            }
+            assert_eq!(integers(&mut prepare(read)), [202; 3]);
+            assert!(matches!(prepare(write).step().unwrap(), StepResult::Done));
+            assert_eq!(integers(&mut prepare("SELECT n FROM log ORDER BY rowid")),
+                       [1, 2, 3, 1, 2, 3, 202, 202, 202]);
+        }
+    }
+}
