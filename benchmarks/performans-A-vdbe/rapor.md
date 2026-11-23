@@ -2727,3 +2727,8 @@ Otomatik reset önceki gerçek kısıt mesajını koruyor. Her kipte 42 C profil
 ## V6b.484 — İki işçide ilk satırdan sonra PMA mmap
 
 Sıfır başlangıçta iki işçi güncel limit ile sonraki PMA aralığını açıyor. Kip başına 144 C API profili, 96 kontrollü iz ve 3.830.224 VFS olayı eş. İlk satır öncesi iz, gerçek aktif işçi, FK ve 266 fallback denetimleri geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/two-worker-late-mmap-preflight/sonuc.md) OFF 1353/0/325, ON 1353/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,272 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_484.md).
+
+
+## V6b.485 — Üç ila sekiz işçide başlangıç PMA mmap
+
+Kip başına 604 C API profili ve 11.067.994 kontrollü VFS olayı eş. Birleşik kaynakta WITHOUT ROWID PK ve BINARY UNIQUE/NOT NULL kontrolleri kip başına 90.034 VFS olayı ile eş. Grup64 OFF/ON 30/30. [Bağımsız ölçüm](/github/sqliters/target/perf-work/multi-worker-initial-mmap-exact-verify/sonuc.md) OFF 1353/0/325, ON 1353/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,270 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_485.md).

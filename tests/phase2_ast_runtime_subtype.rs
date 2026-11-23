@@ -3930,7 +3930,7 @@ fn group64_file_sorter_worker_uses_a_declared_not_null_unique_key() {
 #[test]
 fn group64_file_sorter_initial_mmap_preserves_worker_reset() {
     for (encoding, workers) in ["UTF-8", "UTF-16le", "UTF-16be"]
-        .into_iter().flat_map(|encoding| [(encoding, 1), (encoding, 2)])
+        .into_iter().flat_map(|encoding| (1..=9).map(move |workers| (encoding, workers)))
     {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(&format!(
@@ -3940,6 +3940,8 @@ fn group64_file_sorter_initial_mmap_preserves_worker_reset() {
              WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<17)
              INSERT INTO items SELECT i, printf('x%26000s','z') FROM n;"
         )).unwrap();
+        let setting = db.query("PRAGMA threads", &[]).unwrap();
+        assert_eq!(setting.rows[0].get_i64(0), Some(workers.min(8)));
         for enable_before_prepare in [true, false] {
             db.set_sorter_mmap_limit(if enable_before_prepare { i32::MAX } else { 0 }).unwrap();
             let mut statement = db.prepare("SELECT id FROM items ORDER BY v,id DESC").unwrap();
