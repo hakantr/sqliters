@@ -4248,3 +4248,34 @@ fn group65_char_preserves_text_register_bytes_after_reset() {
         assert!(matches!(statement.step().unwrap(), StepResult::Done));
     }
 }
+
+#[test]
+fn group65_substr_preserves_text_register_boundaries_after_reset() {
+    for (encoding, first_hex, rebound_hex) in [
+        ("UTF-8", "C3BC", "F7BFBFBF"),
+        ("UTF-16le", "FC00", "BFDBFFDF"),
+        ("UTF-16be", "00FC", "DBBFDFFF"),
+    ] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!("PRAGMA encoding='{encoding}'; CREATE TABLE t(i);"))
+            .unwrap();
+        let sql = "SELECT hex(substr(unistr(?1),?2,1)), hex(substring(unistr(?1),?2,1))";
+        let mut statement = db.prepare(sql).unwrap();
+        statement.bind_text(1, r"A\u00FCB").unwrap();
+        statement.bind(2, 2i64).unwrap();
+        let StepResult::Row(first) = statement.step().unwrap() else {
+            panic!("expected a row in {encoding}");
+        };
+        assert_eq!(first.get_str(0), Some(first_hex));
+        assert_eq!(first.get_str(1), Some(first_hex));
+        statement.reset().unwrap();
+        statement.bind_text(1, r"a\UFFFFFFFFZ").unwrap();
+        statement.bind(2, -2i64).unwrap();
+        let StepResult::Row(reused) = statement.step().unwrap() else {
+            panic!("expected a row after reset in {encoding}");
+        };
+        assert_eq!(reused.get_str(0), Some(rebound_hex));
+        assert_eq!(reused.get_str(1), Some(rebound_hex));
+        assert!(matches!(statement.step().unwrap(), StepResult::Done));
+    }
+}

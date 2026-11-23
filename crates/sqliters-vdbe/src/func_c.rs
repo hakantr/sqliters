@@ -225,6 +225,54 @@ fn char_bytes(chars: impl ExactSizeIterator<Item = i64>, preserve_non_scalars: b
     out
 }
 
+/// The start and length rules from substrFunc, before making the result value.
+fn substr_range(bytes: &[u8], blob: bool, mut start: i64, mut count: i64) -> std::ops::Range<usize> {
+    let length = if blob {
+        bytes.len() as i64
+    } else if start < 0 {
+        let mut length = 0;
+        let mut offset = 0;
+        while offset < bytes.len() {
+            offset += skip_utf8(bytes, offset);
+            length += 1;
+        }
+        length
+    } else {
+        0
+    };
+    if start < 0 {
+        start += length;
+        if start < 0 {
+            count = if count < 0 { 0 } else { count + start };
+            start = 0;
+        }
+    } else if start > 0 {
+        start -= 1;
+    } else if count > 0 {
+        count -= 1;
+    }
+    if count < 0 {
+        count = if count < -start { start } else { -count };
+        start -= count;
+    }
+    if blob {
+        start = start.min(length);
+        let end = start + count.min(length - start);
+        return start as usize..end as usize;
+    }
+    let mut first = 0;
+    while start > 0 && first < bytes.len() {
+        first += skip_utf8_lead(bytes, first);
+        start -= 1;
+    }
+    let mut last = first;
+    while count > 0 && last < bytes.len() {
+        last += skip_utf8_lead(bytes, last);
+        count -= 1;
+    }
+    first..last
+}
+
 /// Evaluate built-ins which observe or produce the raw bytes of a TEXT register.
 pub(crate) fn eval_text_register(
     name: &str,
@@ -238,6 +286,21 @@ pub(crate) fn eval_text_register(
     if name.eq_ignore_ascii_case("char") {
         out.z = char_bytes(args.iter().map(Mem::int_value), true);
         out.flags = MEM_STR;
+        out.change_encoding(encoding as u8);
+        return Some(Ok(out));
+    }
+    if (name.eq_ignore_ascii_case("substr") || name.eq_ignore_ascii_case("substring"))
+        && let [input, start, count @ ..] = args
+        && count.len() <= 1 && input.value_type() == 3
+    {
+        let bound = count.first();
+        if start.flags & MEM_NULL != 0 || bound.is_some_and(|arg| arg.flags & MEM_NULL != 0) {
+            return Some(Ok(out));
+        }
+        let Some(bytes) = value_text_register(input) else { return Some(Ok(out)); };
+        let bytes = cstr(&bytes);
+        let range = substr_range(bytes, false, start.int_value(), bound.map_or(i64::MAX, Mem::int_value));
+        out.set_str(&bytes[range]);
         out.change_encoding(encoding as u8);
         return Some(Ok(out));
     }
@@ -583,88 +646,22 @@ pub(crate) fn eval(upper: &str, args: &[Value], ctx: &VmRuntimeContext) -> Optio
         }
         "CHAR" => Ok(text_value(char_bytes(args.iter().map(Value::to_integer_lossy), false))),
         "SUBSTR" | "SUBSTRING" if args.len() == 2 || args.len() == 3 => {
-            let is_blob = matches!(args[0], Value::Blob(_));
-            let mut p1 = args[1].to_integer_lossy();
-            let holder;
-            let (z, len): (&[u8], i64) = if let Value::Blob(b) = &args[0] {
-                if b.is_empty() {
-                    // sqlite3_value_blob() of a zero-length blob is a NULL pointer.
-                    return Some(Ok(Value::Null));
-                }
-                (b.as_slice(), b.len() as i64)
-            } else {
-                match value_text(&args[0], enc) {
-                    Some(t) => {
-                        holder = t;
-                        let z = cstr(&holder);
-                        let mut len = 0i64;
-                        if p1 < 0 {
-                            let mut i = 0;
-                            while i < z.len() {
-                                i += skip_utf8(z, i);
-                                len += 1;
-                            }
-                        }
-                        (z, len)
-                    }
-                    None => return Some(Ok(Value::Null)),
-                }
-            };
-            let mut p2 = if args.len() == 3 {
-                let v = args[2].to_integer_lossy();
-                if v == 0 && args[2].is_null() {
-                    return Some(Ok(Value::Null));
-                }
-                v
-            } else {
-                i64::MAX
-            };
-            if p1 == 0 && args[1].is_null() {
+            if args[1].is_null() || args.get(2).is_some_and(Value::is_null) {
                 return Some(Ok(Value::Null));
             }
-            if p1 < 0 {
-                p1 += len;
-                if p1 < 0 {
-                    if p2 < 0 {
-                        p2 = 0;
-                    } else {
-                        p2 += p1;
-                    }
-                    p1 = 0;
+            let start = args[1].to_integer_lossy();
+            let count = args.get(2).map_or(i64::MAX, Value::to_integer_lossy);
+            if let Value::Blob(bytes) = &args[0] {
+                if bytes.is_empty() {
+                    return Some(Ok(Value::Null));
                 }
-            } else if p1 > 0 {
-                p1 -= 1;
-            } else if p2 > 0 {
-                p2 -= 1;
-            }
-            if p2 < 0 {
-                if p2 < -p1 {
-                    p2 = p1;
-                } else {
-                    p2 = -p2;
-                }
-                p1 -= p2;
-            }
-            if is_blob {
-                if p1 >= len {
-                    p1 = 0;
-                    p2 = 0;
-                } else if p2 > len - p1 {
-                    p2 = len - p1;
-                }
-                Ok(Value::Blob(z[p1 as usize..(p1 + p2) as usize].to_vec()))
+                let range = substr_range(bytes, true, start, count);
+                Ok(Value::Blob(bytes[range].to_vec()))
             } else {
-                let mut a = 0usize;
-                while p1 > 0 && a < z.len() {
-                    a += skip_utf8_lead(z, a);
-                    p1 -= 1;
-                }
-                let mut b = a;
-                while p2 > 0 && b < z.len() {
-                    b += skip_utf8_lead(z, b);
-                    p2 -= 1;
-                }
-                Ok(text_value(z[a..b].to_vec()))
+                let Some(bytes) = value_text(&args[0], enc) else { return Some(Ok(Value::Null)); };
+                let bytes = cstr(&bytes);
+                let range = substr_range(bytes, false, start, count);
+                Ok(text_value(bytes[range].to_vec()))
             }
         }
         "REPLACE" if args.len() == 3 => {
