@@ -1632,7 +1632,7 @@ fn complete_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
 fn worker_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
     if !prog.read_only || prog.btree_mask != 1 || !prog.p_program.is_empty()
         || !builtin_order_sorter(prog, open, key)
-        || !matches!(key.enc, 1..=3) || !matches!(key.n_key_field, 2..=8)
+        || !matches!(key.enc, 1..=3) || key.n_key_field < 2
         || key.a_coll.iter().flatten().any(|coll| !coll.name.eq_ignore_ascii_case("BINARY"))
     {
         return false;

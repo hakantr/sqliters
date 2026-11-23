@@ -2657,3 +2657,8 @@ Son biricik rowid ile iki kipte 144 C profili ve 110.736 API adımı eş. Her ki
 ## V6b.470 — Hazır V1 yazma kısıtlarında adım ve reset tanısı
 
 Yedi DML kısıtı, üç kodlama, V1/V2 ve RETURNING ile iki kipte 168 C profili eşleşti. İlk genel kod, reset ve finalize için özgün kod ve mesaj, OR FAIL geçerli satırları ve FK denetimi doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v470-prepared-v1-constraint-diagnostic-candidate/sonuc.md) OFF 1343/0/325, ON 1343/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,251 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_470.md).
+
+
+## V6b.471 — İşçi PMA ile 2.000 sıralama anahtarına kadar
+
+Son biricik rowid ile her kipte 144 geniş profil ve 27.792 C API adımı eşleşti. 72 ilk satır reseti, gerçek işçilerin join edilmesi, PMA kapanışı ve altı dosyada FK, bütünlük ve SHA doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/worker-wide-key-v469-preflight/sonuc.md) OFF 1344/0/325, ON 1344/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,282 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_471.md).

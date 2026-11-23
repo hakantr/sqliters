@@ -3810,3 +3810,39 @@ fn group65_legacy_write_constraints_keep_the_reset_diagnostic() {
     assert_eq!(partial.finalize().unwrap_err().extended_code, 2067);
     assert_eq!(db.query_row("SELECT count(*) FROM items", &[]).unwrap().unwrap().get_i64(0), Some(2));
 }
+
+#[test]
+fn group64_file_sorter_worker_with_wide_packed_record() {
+    let key_columns: Vec<String> = (1..64).map(|column| format!("c{column}")).collect();
+    let columns_sql = key_columns.join(",");
+    let filler = std::iter::repeat_n("0", 61).collect::<Vec<_>>().join(",");
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}';
+             PRAGMA temp_store=FILE; PRAGMA cache_size=1;
+             CREATE TABLE items(id INTEGER PRIMARY KEY,{columns_sql});
+             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<12)
+             INSERT INTO items SELECT i,printf('x%23000s','z'),{filler},12-i FROM n;"
+        )).unwrap();
+        let sql = format!("SELECT id FROM items ORDER BY {columns_sql},id");
+        let mut statement = db.prepare(&sql).unwrap();
+        db.execute_batch("PRAGMA threads=2").unwrap();
+
+        let StepResult::Row(first) = statement.step().unwrap() else {
+            panic!("expected first row for {encoding}");
+        };
+        assert_eq!(first.get_i64(0), Some(12));
+        assert!(statement.machine_stmt_status(4, false) > 0, "{encoding}");
+        statement.reset().unwrap();
+
+        for id in (1..=12).rev() {
+            let StepResult::Row(row) = statement.step().unwrap() else {
+                panic!("expected row {id} for {encoding}");
+            };
+            assert_eq!(row.get_i64(0), Some(id));
+        }
+        assert!(matches!(statement.step().unwrap(), StepResult::Done));
+        statement.reset().unwrap();
+    }
+}
