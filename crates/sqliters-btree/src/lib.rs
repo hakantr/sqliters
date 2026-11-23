@@ -333,6 +333,15 @@ pub enum CookieStmt {
     Base(u32),
 }
 
+/// Error origin from the two phases of an in-place VACUUM commit.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum VacuumCommitFailure {
+    Other,
+    MainWrite,
+    PhaseTwoCleanup,
+}
+
 impl Btree {
     pub fn new(pager: Pager) -> Self {
         Self {
@@ -688,6 +697,7 @@ impl Btree {
         &mut self,
         super_journal: Option<&str>,
         retain_read_on_av_err: bool,
+        failed_vacuum_write: Option<&mut bool>,
     ) -> Result<()> {
         // (`sqlite3VdbeHalt`: the cursors of the statement are closed before it commits.)
         self.vc_close_all();
@@ -704,14 +714,18 @@ impl Btree {
             );
             return Err(e);
         }
-        self.pager.commit_phase_one(super_journal)
+        if let Some(failed) = failed_vacuum_write {
+            self.pager.commit_phase_one_for_vacuum(failed)
+        } else {
+            self.pager.commit_phase_one(super_journal)
+        }
     }
 
     /// Executes Phase 1 of a two-phase commit (`sqlite3BtreeCommitPhaseOne` in `btree.c:4343-4364`),
     /// running [`Self::auto_vacuum_commit`] first when `auto_vacuum` is active and rolling back with
     /// cursor trip if `auto_vacuum_commit` fails.
     pub fn commit_phase_one(&mut self, super_journal: Option<&str>) -> Result<()> {
-        self.commit_phase_one_internal(super_journal, false)
+        self.commit_phase_one_internal(super_journal, false, None)
     }
 
     /// Executes Phase 2 of a two-phase commit (`sqlite3BtreeCommitPhaseTwo` in `btree.c:4432-4459`).
@@ -725,17 +739,28 @@ impl Btree {
     /// Commits the active write transaction, running [`Self::commit_phase_one`] followed by
     /// [`Self::commit_phase_two`].
     pub fn commit_retaining_read(&mut self, retain_read: bool) -> Result<()> {
-        self.commit_phase_one_internal(None, retain_read)?;
+        self.commit_phase_one_internal(None, retain_read, None)?;
         self.commit_phase_two(retain_read, false)
     }
 
-    /// In-place VACUUM commit, identifying a DELETE journal cleanup or late shrink error.
-    pub fn commit_for_vacuum(&mut self) -> (Result<()>, bool) {
-        if let Err(error) = self.commit_phase_one_internal(None, false) {
-            return (Err(error), false);
+    pub fn commit_for_vacuum(&mut self) -> (Result<()>, VacuumCommitFailure) {
+        let mut failed_main_write = false;
+        if let Err(error) = self.commit_phase_one_internal(None, false, Some(&mut failed_main_write)) {
+            let failure = if failed_main_write {
+                VacuumCommitFailure::MainWrite
+            } else {
+                VacuumCommitFailure::Other
+            };
+            return (Err(error), failure);
         }
         self.has_content = None;
-        self.pager.commit_phase_two_for_vacuum()
+        let (result, failed_cleanup) = self.pager.commit_phase_two_for_vacuum();
+        let failure = if failed_cleanup {
+            VacuumCommitFailure::PhaseTwoCleanup
+        } else {
+            VacuumCommitFailure::Other
+        };
+        (result, failure)
     }
 
     #[inline]
@@ -751,11 +776,34 @@ impl Btree {
         write_only: bool,
         retain_read: bool,
     ) -> Result<()> {
+        self.rollback_with_trip_inner(trip_code, write_only, retain_read, None)
+    }
+
+    #[doc(hidden)]
+    pub fn rollback_for_failed_vacuum_write(&mut self) -> (Result<()>, bool) {
+        let mut failed_restore_write = false;
+        let rollback = self.rollback_with_trip_inner(
+            extended::SQLITE_ABORT_ROLLBACK, false, false, Some(&mut failed_restore_write),
+        );
+        (rollback, failed_restore_write)
+    }
+
+    fn rollback_with_trip_inner(
+        &mut self,
+        trip_code: i32,
+        write_only: bool,
+        retain_read: bool,
+        failed_restore_write: Option<&mut bool>,
+    ) -> Result<()> {
         let trip_res = self.trip_cursors(trip_code, write_only);
         self.vc_close_all();
         // `btreeClearHasContent`
         self.has_content = None;
-        let rb_res = self.pager.rollback_retaining_read(retain_read);
+        let rb_res = if let Some(failed) = failed_restore_write.filter(|_| trip_res.is_ok()) {
+            self.pager.rollback_for_failed_vacuum_write(failed)
+        } else {
+            self.pager.rollback_retaining_read(retain_read)
+        };
         rb_res?;
         trip_res
     }

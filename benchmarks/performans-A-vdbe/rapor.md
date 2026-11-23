@@ -2622,3 +2622,8 @@ Adlandırılmış sütunların izin, yoksayma ve ret kararları 480 doğrudan C 
 ## V6b.463 — pragma_function_list sütun kullanılmayan READ kararı
 
 COUNT(*) ve sabit yansıtmalar C gibi boş sütun adıyla hazırlama yetkisi soruyor. Ret hiçbir satır döndürmüyor. Yoksayma, iç PRAGMA yetkilendirmesi ve adlandırılmış sütun kararları korunuyor. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v463-function-list-anonymous-authorization-candidate/sonuc.md) OFF 1339/0/325, ON 1339/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,285 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_463.md).
+
+
+## V6b.464 — VACUUM kalıcı yazma hatası ve sıcak journal
+
+C ile ilk 778, hata sürerken sonraki okuma ve hata kalkınca aynı bağlantıda eski verinin güvenli kurtarması eşleşti. Dört çapraz salt okunur ve yazılabilir açılışta FK, bütünlük ve dosya baytları doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v463-vacuum-persistent-write-candidate/sonuc.md) OFF 1339/0/325, ON 1339/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_464.md).

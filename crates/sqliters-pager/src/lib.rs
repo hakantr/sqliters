@@ -5398,14 +5398,15 @@ impl Pager {
         Ok(())
     }
 
-    fn end_error_transaction(&mut self, retain_read: bool) {
+    fn end_error_transaction(&mut self, retain_read: bool) -> bool {
         self.state = TransactionState::Read;
-        if !retain_read {
-            self.error_unlock_pending = true;
-            self.release_transient();
-            self.release_page1();
-            self.unlock_error_if_unused();
+        if retain_read {
+            return false;
         }
+        self.error_unlock_pending = true;
+        self.release_transient();
+        self.release_page1();
+        self.unlock_error_if_unused()
     }
 
     /// pager_unlock closes the rollback journal before releasing the database
@@ -5427,10 +5428,11 @@ impl Pager {
     /// pagerUnlockAndRollback: ERROR suppresses playback through the failed
     /// transaction. Leave a disk journal intact for a new shared-lock attempt.
     #[cold]
-    fn unlock_error_if_unused(&mut self) {
+    fn unlock_error_if_unused(&mut self) -> bool {
         if self.cache.n_ref_sum != 0 || !self.mapped_pages.is_empty() {
-            return;
+            return false;
         }
+        let mut journal_closed = true;
         self.error_unlock_pending = false;
         self.pager_error = None;
         let pending_mode = self.pending_sql_journal_mode.take();
@@ -5442,7 +5444,7 @@ impl Pager {
         if self.journal_mode == JournalMode::Memory && self.journal_started_in_tx {
             // An in-memory journal cannot be recovered after it is discarded.
             self.state = TransactionState::Write;
-            let _ = self.rollback_inner(false);
+            let _ = self.rollback_inner(false, None);
         }
         if self.journal_mode == JournalMode::Off
             && let Some(transition) = pending_mode
@@ -5453,7 +5455,7 @@ impl Pager {
         if let Some(wal) = self.wal.as_mut() {
             let _ = wal.end_read_transaction();
         } else if self.locking_mode == LockingMode::Normal {
-            let _ = self.close_journal_before_unlock();
+            journal_closed = self.close_journal_before_unlock().is_ok();
             self.error_lock_unknown = self.unlock_db_file(LockLevel::NoLock).is_err();
         }
         if self.db_kind == DatabaseKind::PrivateTemporary {
@@ -5489,6 +5491,7 @@ impl Pager {
         self.tx_journaled.clear_all();
         self.subsavepoints.clear();
         self.notify_backup_restart();
+        journal_closed && !self.error_lock_unknown
     }
 
     /// Appends a super-journal trailer to the open rollback journal (`writeSuperJournal` in
@@ -5551,6 +5554,20 @@ impl Pager {
     ///   writes the optional `super_journal` trailer **before** syncing `<db>-journal`, flushes
     ///   dirty pages to `.db`, truncates `.db` if needed, syncs `.db`, and marks cache pages clean.
     pub fn commit_phase_one(&mut self, super_journal: Option<&str>) -> Result<()> {
+        self.commit_phase_one_inner(super_journal, None)
+    }
+
+    /// Reports an exact database write failure after the ordinary VACUUM journal was synced.
+    #[doc(hidden)]
+    pub fn commit_phase_one_for_vacuum(&mut self, failed_db_write: &mut bool) -> Result<()> {
+        self.commit_phase_one_inner(None, Some(failed_db_write))
+    }
+
+    fn commit_phase_one_inner(
+        &mut self,
+        super_journal: Option<&str>,
+        failed_db_write: Option<&mut bool>,
+    ) -> Result<()> {
         self.ensure_not_closed()?;
         if self.state != TransactionState::Write || self.commit_phase_one_done {
             return Ok(());
@@ -5725,7 +5742,16 @@ impl Pager {
             // ascending page-number order; pages past the end of the image and pages marked
             // `PGHDR_DONT_WRITE` are skipped.
             let dirty_pgnos = self.cache.dirty_pgnos_sorted();
-            self.pager_write_pagelist(&dirty_pgnos)?;
+            if let Err(error) = self.pager_write_pagelist(&dirty_pgnos) {
+                if let Some(failed) = failed_db_write
+                    && self.vacuum_has_synced_delete_journal()
+                    && error.code == ErrorCode::IoErr
+                    && error.extended_code == extended::SQLITE_IOERR_WRITE
+                {
+                    *failed = true;
+                }
+                return Err(error);
+            }
             // sqlite3PcacheCleanAll
             self.cache.clean_all();
 
@@ -5813,6 +5839,23 @@ impl Pager {
         let mut failure = None;
         let result = self.commit_phase_two_with_journal_cleanup(false, false, false, Some(&mut failure));
         (result, failure.is_some())
+    }
+
+    fn vacuum_has_synced_delete_journal(&self) -> bool {
+        self.db_kind == DatabaseKind::NamedDisk
+            && !self.uses_temp_file_semantics()
+            && self.journal_mode == JournalMode::Delete
+            && self.locking_mode == LockingMode::Normal
+            && self.pending_sql_journal_mode.is_none()
+            && self.pending_byte_copy.is_none()
+            && !self.set_super
+            && !self.pager_no_sync()
+            && self.db_file_modified
+            && self.journal_started_in_tx
+            && self.journal_file.is_some()
+            && self.journal_path.is_some()
+            && self.journal_records_written != 0
+            && self.journal_hdr == self.journal_off
     }
 
     /// Whether ordinary pager ERROR cleanup released the database lock and
@@ -6099,13 +6142,28 @@ impl Pager {
     /// (or discarding dirty disk cache when `JournalMode::Off`), then downgrading to
     /// `TransactionState::Read` (`retain_read == true`) or `TransactionState::Open` (`retain_read == false`).
     pub fn rollback_retaining_read(&mut self, retain_read: bool) -> Result<()> {
+        self.rollback_retaining_read_inner(retain_read, None)
+    }
+
+    /// Reports an exact database write failure during rollback, followed by
+    /// successful journal-handle and lock cleanup.
+    #[doc(hidden)]
+    pub fn rollback_for_failed_vacuum_write(&mut self, failed_restore_write: &mut bool) -> Result<()> {
+        self.rollback_retaining_read_inner(false, Some(failed_restore_write))
+    }
+
+    fn rollback_retaining_read_inner(
+        &mut self,
+        retain_read: bool,
+        mut failed_restore_write: Option<&mut bool>,
+    ) -> Result<()> {
         if let Some(error) = self.pager_error.clone() {
             self.end_error_transaction(retain_read);
             return Err(error);
         }
         self.ensure_not_closed()?;
         let was_write = self.state == TransactionState::Write;
-        let result = self.rollback_inner(retain_read);
+        let result = self.rollback_inner(retain_read, failed_restore_write.as_deref_mut());
         if result.is_ok()
             && let Some(transition) = self.pending_sql_journal_mode.take()
         {
@@ -6121,14 +6179,21 @@ impl Pager {
         }
         if was_write && let Err(ref error) = result {
             self.latch_pager_error(error);
-            if self.pager_error.is_some() {
-                self.end_error_transaction(retain_read);
+            if self.pager_error.is_some()
+                && !self.end_error_transaction(retain_read)
+                && let Some(failed) = failed_restore_write
+            {
+                *failed = false;
             }
         }
         result
     }
 
-    fn rollback_inner(&mut self, retain_read: bool) -> Result<()> {
+    fn rollback_inner(
+        &mut self,
+        retain_read: bool,
+        failed_restore_write: Option<&mut bool>,
+    ) -> Result<()> {
         match self.state {
             TransactionState::Open => Ok(()),
             TransactionState::Read => self.finish_tx_to_read_or_open(retain_read),
@@ -6271,7 +6336,16 @@ impl Pager {
                             }
                             let orig_data = self.tx_preimages.get(&pgno).expect("key exists");
                             let offset = u64::from(pgno - 1) * ps;
-                            self.db_file()?.write_at(orig_data, offset)?;
+                            if let Err(error) = self.db_file()?.write_at(orig_data, offset) {
+                                if let Some(failed) = failed_restore_write
+                                    && self.vacuum_has_synced_delete_journal()
+                                    && error.code == ErrorCode::IoErr
+                                    && error.extended_code == extended::SQLITE_IOERR_WRITE
+                                {
+                                    *failed = true;
+                                }
+                                return Err(error);
+                            }
                             if self.tracks_backup_publications() {
                                 Self::publish_backup_page(&mut self.backup_trackers, pgno, orig_data);
                             }

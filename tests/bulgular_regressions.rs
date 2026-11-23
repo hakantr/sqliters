@@ -925,8 +925,8 @@ impl VfsFile for FaultFile {
         if self.is_main_db {
             let mut st = self.state.lock().unwrap();
             if st.fail_all_main_writes {
-                return Err(SqliteError::new(
-                    ErrorCode::IoErr,
+                return Err(SqliteError::with_extended(
+                    extended::SQLITE_IOERR_WRITE,
                     "injected persistent main DB write error",
                 ));
             }
@@ -934,8 +934,8 @@ impl VfsFile for FaultFile {
             if st.fail_on_main_write_nth == Some(st.main_writes_seen) {
                 st.fail_on_main_write_nth = None;
                 st.fail_all_main_writes = st.persist_main_write_fault;
-                return Err(SqliteError::new(
-                    ErrorCode::IoErr,
+                return Err(SqliteError::with_extended(
+                    extended::SQLITE_IOERR_WRITE,
                     "injected one-shot main DB write_at error",
                 ));
             }
@@ -1201,6 +1201,40 @@ fn test_bulgu_y1_failed_commit_partial_writes_rolled_back_atomically() {
     held.finalize().unwrap();
     conn.try_close().unwrap();
     assert_eq!(fs::read(tmp.path()).unwrap(), before);
+    verify_reopen(tmp.path(), [10, 10, 20, 0]);
+
+    // Fail the VACUUM copy, its rollback, and the first hot-journal replay.
+    let tmp = TempDb::new("y1_vacuum_persistent_write");
+    let (vfs, fault) = FaultVfs::new();
+    let conn = Connection::open_with_vfs(vfs, Some(tmp.path()), flags).unwrap();
+    setup(&conn, "NONE");
+    conn.execute_batch("DROP TABLE ballast").unwrap();
+    let mut held = conn.prepare(VALUES_SQL).unwrap();
+    {
+        let mut state = fault.lock().unwrap();
+        state.main_writes_seen = 0;
+        state.fail_on_main_write_nth = Some(2);
+        state.persist_main_write_fault = true;
+    }
+    let error = conn.execute("VACUUM").unwrap_err();
+    assert_eq!(error.extended_code, extended::SQLITE_IOERR_WRITE);
+    assert_eq!(error.message, "injected one-shot main DB write_at error");
+    assert!(conn.is_autocommit());
+    assert!(tmp.journal_path().exists());
+    assert_eq!(conn.execute("ROLLBACK").unwrap_err().code, ErrorCode::Error);
+    assert_eq!(conn.query(VALUES_SQL, &[]).unwrap_err().extended_code, extended::SQLITE_IOERR_WRITE);
+    assert!(tmp.journal_path().exists());
+    fault.lock().unwrap().fail_all_main_writes = false;
+
+    verify(&conn, [10, 10, 20, 0]);
+    assert!(!tmp.journal_path().exists());
+    let sqliters::StepResult::Row(row) = held.step().unwrap() else {
+        panic!("prepared read did not return a row after the write fault cleared");
+    };
+    assert_eq!(row.get_i64(0), Some(10));
+    assert_eq!(held.c_reprepare_status().0, 1);
+    held.finalize().unwrap();
+    conn.try_close().unwrap();
     verify_reopen(tmp.path(), [10, 10, 20, 0]);
 }
 

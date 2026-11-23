@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use sqliters_btree::{Btree, RootPageMove, commit_btrees_two_phase};
+use sqliters_btree::{Btree, RootPageMove, VacuumCommitFailure, commit_btrees_two_phase};
 use sqliters_pager::{
     AutoVacuumMode, JournalMode, LockingMode, PagerOpenOptions, TransactionState,
     WalCheckpointMode, WalCheckpointResult,
@@ -46196,14 +46196,22 @@ pub(crate) fn exec_vacuum_checked(
             .slot_mut(db_id)
             .and_then(|s| s.btree.as_mut())
             .ok_or_else(|| VacuumFail::Clean(SqliteError::misuse("vacuum btree closed")))?;
-        let (commit, failed_vacuum_cleanup) = bt.commit_for_vacuum();
+        let (commit, failure) = bt.commit_for_vacuum();
         if let Err(cm_err) = commit {
-            if let Err(rb_err) = bt.rollback() {
-                // sqlite3_backup_finish keeps the original error from the
-                // copy, even when destination rollback returns its latch.
-                if failed_vacuum_cleanup && rb_err == cm_err
-                    && bt.pager().vacuum_error_cleanup_completed()
-                {
+            let (rollback, failed_restore_write) = if failure == VacuumCommitFailure::MainWrite {
+                bt.rollback_for_failed_vacuum_write()
+            } else {
+                (bt.rollback(), false)
+            };
+            if let Err(rb_err) = rollback {
+                // sqlite3_backup_finish keeps the original copy error. A
+                // synced DELETE journal still requires ordinary hot playback.
+                let can_retry = match failure {
+                    VacuumCommitFailure::MainWrite => failed_restore_write,
+                    VacuumCommitFailure::PhaseTwoCleanup => rb_err == cm_err,
+                    VacuumCommitFailure::Other => false,
+                };
+                if can_retry && bt.pager().vacuum_error_cleanup_completed() {
                     return Err(VacuumFail::Clean(cm_err));
                 }
                 let root = if cm_err.code == ErrorCode::Busy {
