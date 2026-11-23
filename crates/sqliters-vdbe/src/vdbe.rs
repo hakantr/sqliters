@@ -22,7 +22,7 @@
 #![allow(unexpected_cfgs, non_upper_case_globals, dead_code)]
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::AtomicI32};
 
 use sqliters_btree::Btree;
 use sqliters_btree::btcursor::{BTREE_AUXDELETE, BTREE_SEEK_EQ, BcParked, BtCursor, CURSOR_REQUIRESEEK};
@@ -149,6 +149,11 @@ pub trait VdbeHost {
     /// Maximum mapping size for sorter PMAs. Zero disables sorter xFetch.
     fn sorter_mmap_limit(&mut self) -> i32 {
         0
+    }
+    /// The diagnostic mapping setting, shared with a running sorter task.
+    #[doc(hidden)]
+    fn share_sorter_mmap_limit(&mut self) -> Option<Arc<AtomicI32>> {
+        None
     }
     /// Connection VFS for the sorter's anonymous PMA file.
     fn sorter_vfs(&mut self) -> Option<Arc<dyn sqliters_vfs::Vfs>> {
@@ -5594,6 +5599,9 @@ impl Vdbe {
                         && k.a_coll.iter().flatten().all(|coll| coll.is_binary && coll.custom.is_none())
                     {
                         sorter.enable_workers(worker_count as usize);
+                        if worker_count == 1 {
+                            sorter.set_worker_mmap_limit(host.share_sorter_mmap_limit());
+                        }
                     }
                     if self.prog.fallible_file_sort_open == Some(pc) {
                         sorter.set_sort_callback_error(self.sort_callback_error.clone());

@@ -14,7 +14,7 @@
 //! connection enables the optional sorter test control.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicI32, Ordering}};
 
 use sqliters_types::{ErrorCode, Result as SqlResult, SqliteError, TextEncoding, Value, extended};
 use sqliters_vfs::{FetchRange, OpenFlags, Vfs, VfsFile};
@@ -149,7 +149,7 @@ impl PmaFile {
 
     fn readers(&self, mmap_limit: i32) -> SqlResult<Vec<PmaReader>> {
         self.runs.iter().map(|&start| {
-            let mut disk = PmaDiskReader::open(&self.handle, start, self.end, self.page_size, mmap_limit)?;
+            let mut disk = PmaDiskReader::open(&self.handle, start, self.end, self.page_size, PmaMap::Serial(mmap_limit))?;
             let bytes = disk.varint()?;
             disk.end = disk.offset.checked_add(bytes).filter(|end| *end <= self.end).ok_or_else(pma_short_read)?;
             let mut reader = PmaReader { disk: Some(disk), ..PmaReader::default() };
@@ -239,6 +239,39 @@ fn pma_short_read() -> SqliteError {
     SqliteError::with_extended(extended::SQLITE_IOERR_SHORT_READ, ErrorCode::IoErr.as_str())
 }
 
+#[derive(Clone, Copy)]
+enum PmaMap<'a> {
+    Serial(i32),
+    Worker(&'a AtomicI32),
+}
+
+impl<'a> PmaMap<'a> {
+    fn worker(limit: Option<&'a AtomicI32>) -> Self {
+        limit.map_or(Self::Serial(0), Self::Worker)
+    }
+
+    fn fetch(self, file: &Arc<dyn VfsFile>, length: u64) -> SqlResult<Option<FetchRange>> {
+        match self {
+            Self::Serial(limit) if limit > 0 && length <= limit as u64
+                && file.supports_sorter_range() =>
+            {
+                Arc::clone(file).fetch_sorter_range(0, length as usize)
+            }
+            // Only VFSes that support private bounded ranges can map a
+            // batch after the worker sort has started. The named Unix
+            // fallback has no such lease.
+            Self::Worker(limit) => {
+                let limit = limit.load(Ordering::Relaxed);
+                if limit > 0 && length <= limit as u64 && file.supports_fetch_range() {
+                    return file.fetch_range(0, length as usize);
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
 /// Buffered reads stop at the PMA boundary. The initial prefix is read
 /// from the same partial page that the C reader loads on seeking.
 struct PmaDiskReader {
@@ -252,12 +285,8 @@ struct PmaDiskReader {
 }
 
 impl PmaDiskReader {
-    fn open(file: &Arc<dyn VfsFile>, start: u64, end: u64, page_size: usize, mmap_limit: i32) -> SqlResult<Self> {
-        let mapping = if mmap_limit > 0 && end <= mmap_limit as u64 && file.supports_sorter_range() {
-            Arc::clone(file).fetch_sorter_range(0, end as usize)?
-        } else {
-            None
-        };
+    fn open(file: &Arc<dyn VfsFile>, start: u64, end: u64, page_size: usize, map: PmaMap<'_>) -> SqlResult<Self> {
+        let mapping = map.fetch(file, end)?;
         Ok(Self { mapping, file: Arc::clone(file), offset: start, end, buffer_start: start,
             buffer: Vec::new(), page_size })
     }
@@ -375,6 +404,7 @@ impl PmaIntermediate<'_> {
     }
 }
 
+#[derive(Clone)]
 struct PmaChunk {
     file: Arc<dyn VfsFile>,
     start: u64,
@@ -382,7 +412,7 @@ struct PmaChunk {
 }
 
 impl PmaChunk {
-    fn populate(&self, child: &mut PmaMerge, key: &SorterComparator, capacity: usize, mmap_limit: i32) -> SqlResult<Option<u64>> {
+    fn populate(&self, child: &mut PmaMerge, key: &SorterComparator, capacity: usize, map: PmaMap<'_>) -> SqlResult<Option<u64>> {
         let mut writer = PmaWriter::new(self.file.as_ref(), self.page_size, self.start);
         // The writer retains a VFS error while the merge advances. Finish
         // still flushes a partial page after an input error and keeps the
@@ -394,7 +424,7 @@ impl PmaChunk {
                 break Ok(());
             }
             writer.record(record);
-            if let Err(err) = child.pop(key, capacity, mmap_limit) {
+            if let Err(err) = child.pop(key, capacity, map) {
                 if key.error.as_ref().is_some_and(|error| error.lock().unwrap().is_some()) {
                     return Err(err);
                 }
@@ -477,6 +507,7 @@ struct MergeWork {
     key: SorterComparator,
     page_size: usize,
     capacity: usize,
+    mmap_limit: Option<Arc<AtomicI32>>,
 }
 
 impl MergeWork {
@@ -497,7 +528,8 @@ impl MergeWork {
     }
 
     fn populate(&mut self, chunk: &PmaChunk) -> SqlResult<Option<u64>> {
-        chunk.populate(&mut self.merge, &self.key, self.capacity, 0)
+        let map = PmaMap::worker(self.mmap_limit.as_deref());
+        chunk.populate(&mut self.merge, &self.key, self.capacity, map)
     }
 }
 
@@ -545,7 +577,7 @@ impl ParallelReader {
         }
     }
 
-    fn read_next_file(&mut self) -> SqlResult<Option<PmaDiskReader>> {
+    fn read_next_file(&mut self) -> SqlResult<Option<(PmaChunk, u64)>> {
         self.join()?;
         let Some((mut buffer, result)) = self.finished.take() else {
             return Ok(None);
@@ -562,13 +594,12 @@ impl ParallelReader {
             self.finished = Some((buffer, Ok(None)));
             return Ok(None);
         };
-        let file = Arc::clone(&buffer.files[0].as_ref().expect("worker output is open").file);
-        let page_size = buffer.work.page_size;
+        let file = buffer.files[0].as_ref().expect("worker output is open").clone();
         self.active = Some(SorterJob::start(move || {
             let result = buffer.populate();
             (buffer, result)
         }));
-        PmaDiskReader::open(&file, 0, end, page_size, 0).map(Some)
+        Ok(Some((file, end)))
     }
 }
 
@@ -598,7 +629,7 @@ impl PmaReader {
         Ok(())
     }
 
-    fn refill(&mut self, key: &SorterComparator, refill_bytes: usize, mmap_limit: i32) -> SqlResult<()> {
+    fn refill(&mut self, key: &SorterComparator, refill_bytes: usize, map: PmaMap<'_>) -> SqlResult<()> {
         self.refill_disk()?;
         if !self.records.is_empty() {
             return Ok(());
@@ -606,8 +637,8 @@ impl PmaReader {
         if let Some(parallel) = &mut self.parallel {
             let next = parallel.read_next_file();
             self.disk = None;
-            if let Ok(Some(disk)) = next {
-                self.disk = Some(disk);
+            if let Ok(Some((chunk, end))) = next {
+                self.disk = Some(PmaDiskReader::open(&chunk.file, chunk.start, end, chunk.page_size, map)?);
                 return self.refill_disk();
             }
             // A failed buffer swap clears this reader before its siblings.
@@ -619,12 +650,12 @@ impl PmaReader {
             return Ok(());
         };
         if let Some(chunk) = &self.chunk {
-            let end = chunk.populate(child, key, refill_bytes, mmap_limit);
+            let end = chunk.populate(child, key, refill_bytes, map);
             // The old range remains usable during xWrite, then is released
             // before the seek to the freshly populated range.
             self.disk = None;
             self.disk = end?.map(|end| PmaDiskReader::open(&chunk.file, chunk.start, end,
-                chunk.page_size, mmap_limit)).transpose()?;
+                chunk.page_size, map)).transpose()?;
             return self.refill_disk();
         }
         let mut remaining = refill_bytes;
@@ -633,7 +664,7 @@ impl PmaReader {
         while let Some(record) = child.current() {
             let bytes = record.len() + sqlite3_varint_len(record.len() as u64) as usize;
             let Some(rest) = remaining.checked_sub(bytes) else { break };
-            let Some(record) = child.pop(key, refill_bytes, mmap_limit)? else { break };
+            let Some(record) = child.pop(key, refill_bytes, map)? else { break };
             self.records.push_back(record);
             remaining = rest;
         }
@@ -692,7 +723,7 @@ impl PmaMerge {
                 if let Some(intermediate) = intermediate.as_deref_mut() {
                     reader.chunk = Some(intermediate.reserve(refill_bytes)?);
                 }
-                reader.refill(key, refill_bytes, mmap_limit)?;
+                reader.refill(key, refill_bytes, PmaMap::Serial(mmap_limit))?;
             }
         }
         self.choose_initial(key)
@@ -740,12 +771,12 @@ impl PmaMerge {
         self.readers[self.winners[1]].records.front().map(Vec::as_slice)
     }
 
-    fn pop(&mut self, key: &SorterComparator, refill_bytes: usize, mmap_limit: i32) -> SqlResult<Option<Vec<u8>>> {
+    fn pop(&mut self, key: &SorterComparator, refill_bytes: usize, map: PmaMap<'_>) -> SqlResult<Option<Vec<u8>>> {
         let previous = self.winners[1];
         let reader = &mut self.readers[previous];
         let Some(result) = reader.records.pop_front() else { return Ok(None) };
         if reader.records.is_empty() {
-            reader.refill(key, refill_bytes, mmap_limit)?;
+            reader.refill(key, refill_bytes, map)?;
         }
 
         // vdbeMergeEngineStep keeps the winner in the same argument slot
@@ -793,6 +824,7 @@ pub struct VdbeSorter {
     pma_merge: Option<PmaMerge>,
     auxiliary_tasks: Vec<RunWriter>,
     next_worker: usize,
+    worker_mmap_limit: Option<Arc<AtomicI32>>,
     pma_file: Option<PmaFile>,
     intermediate_file: Option<Arc<dyn VfsFile>>,
     vfs: Option<Arc<dyn Vfs>>,
@@ -834,6 +866,10 @@ impl VdbeSorter {
         }
     }
 
+    pub(crate) fn set_worker_mmap_limit(&mut self, limit: Option<Arc<AtomicI32>>) {
+        self.worker_mmap_limit = limit;
+    }
+
     pub(crate) fn set_mmap_limit(&mut self, limit: i32) {
         self.mmap_limit = limit;
     }
@@ -862,6 +898,7 @@ impl VdbeSorter {
             worker_rows: None,
             auxiliary_tasks: Vec::new(),
             next_worker: 0,
+            worker_mmap_limit: None,
             pma_file: None,
             intermediate_file: None,
             vfs: None,
@@ -1078,7 +1115,10 @@ impl VdbeSorter {
             let retained = Arc::clone(&task.intermediate);
             let mut buffer = DoubleBuffer {
                 files: [None, None],
-                work: MergeWork { merge: *merge, key: key.clone(), page_size, capacity },
+                work: MergeWork {
+                    merge: *merge, key: key.clone(), page_size, capacity,
+                    mmap_limit: self.worker_mmap_limit.clone(),
+                },
             };
             reader.parallel = Some(Box::new(ParallelReader {
                 active: Some(SorterJob::start(move || {
@@ -1092,7 +1132,10 @@ impl VdbeSorter {
 
         let mut buffer = DoubleBuffer {
             files: [None, None],
-            work: MergeWork { merge: root, key: key.clone(), page_size, capacity },
+            work: MergeWork {
+                merge: root, key: key.clone(), page_size, capacity,
+                mmap_limit: self.worker_mmap_limit.clone(),
+            },
         };
         let initial = (|| {
             let root = &mut buffer.work.merge;
@@ -1109,7 +1152,7 @@ impl VdbeSorter {
             }
             // C warms the foreground reader before joining the reader tasks.
             for reader in root.readers.iter_mut().rev() {
-                reader.refill(key, capacity, 0)?;
+                reader.refill(key, capacity, PmaMap::Serial(0))?;
             }
             root.choose_initial(key)?;
             buffer.initialize(vfs.as_ref())
@@ -1123,7 +1166,7 @@ impl VdbeSorter {
             parallel: Some(Box::new(ParallelReader { active: None, finished: Some((buffer, Ok(end))) })),
             ..PmaReader::default()
         };
-        let first = error.map_or_else(|| output.refill(key, capacity, 0), Err);
+        let first = error.map_or_else(|| output.refill(key, capacity, PmaMap::Serial(0)), Err);
         let empty = output.records.is_empty();
         // Keep every still-live reader for the root-first cleanup path,
         // including when initial merge setup failed.
@@ -1141,11 +1184,12 @@ impl VdbeSorter {
     pub(crate) fn next_checked(&mut self) -> SqlResult<bool> {
         if let Some(reader) = &mut self.worker_rows {
             reader.records.pop_front();
-            reader.refill(&self.comparator, self.refill_bytes, 0)?;
+            let map = PmaMap::worker(self.worker_mmap_limit.as_deref());
+            reader.refill(&self.comparator, self.refill_bytes, map)?;
             return Ok(!reader.records.is_empty());
         }
         if let Some(merge) = &mut self.pma_merge {
-            merge.pop(&self.comparator, self.refill_bytes, self.mmap_limit)?;
+            merge.pop(&self.comparator, self.refill_bytes, PmaMap::Serial(self.mmap_limit))?;
             return Ok(merge.current().is_some());
         }
         // (the record is released as C frees it)
@@ -1506,4 +1550,58 @@ fn worker_pma_reset_joins_reader_jobs_and_restarts() {
         assert_eq!(Arc::strong_count(&vfs), 2);
         assert!(sorter.rewind_checked().unwrap());
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn worker_pma_late_anon_mapping_releases_range_on_reset() {
+    use sqliters_types::{decode_record, encode_record};
+    use sqliters_vfs::OsVfs;
+
+    let vfs = Arc::new(OsVfs::default());
+    let probe = open_pma_file(vfs.as_ref()).unwrap();
+    if !probe.supports_fetch_range() {
+        return; // The platform's temporary files use the named fallback.
+    }
+    drop(probe);
+
+    let key = Arc::new(KeyInfoRt {
+        enc: 1,
+        n_key_field: 2,
+        n_all_field: 2,
+        a_sort_flags: vec![0, 0],
+        a_coll: vec![None, None],
+    });
+    let limit = Arc::new(AtomicI32::new(0));
+    let mut sorter = VdbeSorter::init(&key, 0, 512, 1, false);
+    sorter.set_vfs(Some(vfs.clone()));
+    sorter.enable_workers(1);
+    sorter.set_worker_mmap_limit(Some(Arc::clone(&limit)));
+    let padding = "x".repeat(8190);
+    for id in (1..=53).rev() {
+        sorter.write_checked(&encode_record(&[
+            Value::Text(format!("{id:03}{padding}").into()),
+            Value::Integer(id),
+        ])).unwrap();
+    }
+    assert!(!sorter.rewind_checked().unwrap());
+    assert_eq!(decode_record(sorter.rowkey()).unwrap()[1], Value::Integer(1));
+    let is_mapped = |sorter: &VdbeSorter| {
+        sorter.worker_rows.as_ref().unwrap().disk.as_ref().unwrap().mapping.is_some()
+    };
+    assert!(!is_mapped(&sorter));
+    limit.store(i32::MAX, Ordering::Relaxed);
+    for id in 2..=53 {
+        assert!(sorter.next_checked().unwrap());
+        assert_eq!(decode_record(sorter.rowkey()).unwrap()[1], Value::Integer(id));
+        if is_mapped(&sorter) {
+            limit.store(0, Ordering::Relaxed);
+            assert!(is_mapped(&sorter));
+            sorter.reset();
+            assert_eq!(Arc::strong_count(&vfs), 2);
+            assert!(sorter.rewind_checked().unwrap());
+            return;
+        }
+    }
+    panic!("short final PMA batch should fetch an anonymous range");
 }

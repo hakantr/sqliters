@@ -3327,3 +3327,36 @@ fn group65_function_list_table_checks_inner_authorizer_on_each_filter() {
     assert_eq!(row.get_str(0), Some("pow"));
     assert_eq!(checks.load(AtomicOrdering::Relaxed), 4);
 }
+
+#[test]
+fn group64_file_sorter_late_mmap_opt_in_with_one_worker() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "PRAGMA page_size=512; PRAGMA temp_store=FILE; PRAGMA cache_size=1; PRAGMA threads=1;
+         CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);
+         WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<53)
+         INSERT INTO items SELECT i,printf('%03d%8190s',i,'x') FROM n;"
+    ).unwrap();
+    let mut statement = db.prepare(
+        "SELECT id FROM items ORDER BY v COLLATE BINARY NULLS LAST,id"
+    ).unwrap();
+
+    for end in [50, 53] {
+        db.set_sorter_mmap_limit(0).unwrap();
+        statement.machine_stmt_status(4, true);
+        for id in 1..=end {
+            let StepResult::Row(row) = statement.step().unwrap() else {
+                panic!("expected row {id}");
+            };
+            assert_eq!(row.get_i64(0), Some(id));
+            if id == 1 {
+                db.set_sorter_mmap_limit(i32::MAX).unwrap();
+            }
+        }
+        assert!(statement.machine_stmt_status(4, false) > 0);
+        if end == 53 {
+            assert!(matches!(statement.step().unwrap(), StepResult::Done));
+        }
+        statement.reset().unwrap();
+    }
+}

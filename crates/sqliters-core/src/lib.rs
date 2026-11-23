@@ -4112,7 +4112,7 @@ impl Connection {
         let mut session = self.shared.enter()?;
         let inner = session.inner_mut();
         inner.ensure_usable()?;
-        inner.db_set.sorter_mmap_limit = limit;
+        inner.db_set.set_sorter_mmap_limit(limit);
         Ok(())
     }
 

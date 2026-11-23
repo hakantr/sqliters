@@ -10,7 +10,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use sqliters_btree::Btree;
 use sqliters_pager::{AutoVacuumMode, LockingMode, PagerOpenOptions, TransactionState};
@@ -335,7 +335,7 @@ pub struct DatabaseSet {
     pub(crate) next_auto_vacuum: Option<AutoVacuumMode>,
     /// sqlite3.szMmap: inherited by subsequently attached/opened databases.
     pub(crate) mmap_limit: i64,
-    pub(crate) sorter_mmap_limit: i32,
+    sorter_mmap_limit: Option<Arc<AtomicI32>>,
 }
 
 impl std::fmt::Debug for DatabaseSet {
@@ -441,7 +441,7 @@ impl DatabaseSet {
             next_page_size: 0,
             next_auto_vacuum: None,
             mmap_limit: 0,
-            sorter_mmap_limit: 0,
+            sorter_mmap_limit: None,
             xferopt_delta: std::sync::atomic::AtomicU64::new(0),
             open_blobs: std::collections::HashMap::new(),
             vtab_registry: crate::vtab::VTabRegistry::new(),
@@ -1112,6 +1112,18 @@ impl DatabaseSet {
                 bt.set_cell_size_check(enabled);
             }
         }
+    }
+
+    pub(crate) fn sorter_mmap_limit(&self) -> i32 {
+        self.sorter_mmap_limit.as_ref().map_or(0, |limit| limit.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn share_sorter_mmap_limit(&mut self) -> Arc<AtomicI32> {
+        Arc::clone(self.sorter_mmap_limit.get_or_insert_with(|| Arc::new(AtomicI32::new(0))))
+    }
+
+    pub(crate) fn set_sorter_mmap_limit(&mut self, limit: i32) {
+        self.share_sorter_mmap_limit().store(limit, Ordering::Relaxed);
     }
 
     /// Current `PRAGMA temp_store` mode.

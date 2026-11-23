@@ -10,7 +10,7 @@
 //! `vm: fallback: <reason> :: <sql>` on stderr for every prepared statement. Both variables are
 //! temporary port aids and go away at the switch-over.
 
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicI32};
 
 use sqliters_btree::Btree;
 use sqliters_codegen::PrepareResult;
@@ -260,7 +260,7 @@ pub(crate) fn worker_sort_read_program(
     // The standard machine prepare already handles the UTF-8 ON case.
     if (encoding == TextEncoding::Utf8 && exec_switch_on())
         || inner.db_set.worker_threads_limit <= 0 || inner.db_set.temp_store().is_memory()
-        || inner.db_set.sorter_mmap_limit > 0 || inner.collations.get_custom("BINARY").is_some()
+        || inner.db_set.sorter_mmap_limit() > 0 || inner.collations.get_custom("BINARY").is_some()
         || select.order_by.len() != 2 || select.limit.is_some() || read_codegen_blocker(inner).is_some()
     {
         return None;
@@ -1442,7 +1442,11 @@ macro_rules! host_common {
         }
 
         fn sorter_mmap_limit(&mut self) -> i32 {
-            self.dbs().sorter_mmap_limit
+            self.dbs().sorter_mmap_limit()
+        }
+
+        fn share_sorter_mmap_limit(&mut self) -> Option<Arc<AtomicI32>> {
+            Some(self.dbs().share_sorter_mmap_limit())
         }
 
         fn sorter_config(&mut self) -> (i64, i64, bool) {
