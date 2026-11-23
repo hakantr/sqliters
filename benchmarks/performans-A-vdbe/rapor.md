@@ -2642,3 +2642,8 @@ V1 ilk adımda C gibi SQLITE_ERROR, reset sırasında normal yazma için 787 ve 
 ## V6b.467 — Üç sıralama anahtarında işçi PMA
 
 Tek ana rowid tablosu, üç yerel kodlama, FILE ve DEFAULT, son benzersiz rowid ile işçi PMA sonucu, reset, işçi birleştirme ve geçici dosya kapanışı C ile doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/worker-three-key-v464-preflight/sonuc.md) OFF 1341/0/325, ON 1341/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,294 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_467.md).
+
+
+## V6b.468 — VACUUM rollback sync bildirimi ve gerçek sync sırası
+
+Kesin 1034 bildirimi fiziksel sync öncesinde C gibi dönüyor. Hata sürerken sonraki okuma yeniden 1034 alıyor, hata kalkınca olağan kurtarmada ana dosya sync olup FK ve önceki veri okunuyor. Fiziksel sync, close ve kilit kararları ayrı doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v468-vacuum-rollback-sync-notification-candidate/sonuc.md) OFF 1341/0/325, ON 1341/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,280 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_468.md).

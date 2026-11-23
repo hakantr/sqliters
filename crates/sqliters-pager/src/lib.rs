@@ -2210,22 +2210,21 @@ impl Pager {
     /// sqlite3PagerSync after rollback playback, with a NULL super-journal argument.
     fn sync_db_after_playback(&self, failed_restore_io: Option<&mut bool>) -> Result<()> {
         let db = self.db_file()?;
-        if let Err(error) = db.notify_sync(None)
-            && error.extended_code != ErrorCode::NotFound as i32
+        // A failed VFS sync notification skips the separate physical xSync.
+        let result = match db.notify_sync(None) {
+            Err(error) if error.extended_code != ErrorCode::NotFound as i32 => Err(error),
+            _ if !self.pager_no_sync() => db.sync(self.file_sync_flags()),
+            _ => Ok(()),
+        };
+        if let Some(failed) = failed_restore_io
+            && let Err(error) = &result
+            && self.vacuum_has_synced_delete_journal()
+            && error.code == ErrorCode::IoErr
+            && error.extended_code == extended::SQLITE_IOERR_FSYNC
         {
-            return Err(error);
+            *failed = true;
         }
-        if !self.pager_no_sync() && let Err(error) = db.sync(self.file_sync_flags()) {
-            if let Some(failed) = failed_restore_io
-                && self.vacuum_has_synced_delete_journal()
-                && error.code == ErrorCode::IoErr
-                && error.extended_code == extended::SQLITE_IOERR_FSYNC
-            {
-                *failed = true;
-            }
-            return Err(error);
-        }
-        Ok(())
+        result
     }
 
     /// `syncJournal(pPager, newHdr)`: "sync the journal file ... and write the nRec field of
@@ -6152,8 +6151,8 @@ impl Pager {
         self.rollback_retaining_read_inner(retain_read, None)
     }
 
-    /// Reports an exact database write or physical sync failure during
-    /// rollback, followed by successful journal-handle and lock cleanup.
+    /// Reports an exact database write or sync failure during rollback,
+    /// followed by successful journal-handle and lock cleanup.
     #[doc(hidden)]
     pub fn rollback_for_failed_vacuum_write(&mut self, failed_restore_io: &mut bool) -> Result<()> {
         self.rollback_retaining_read_inner(false, Some(failed_restore_io))

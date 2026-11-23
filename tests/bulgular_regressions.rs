@@ -889,6 +889,7 @@ struct FaultState {
     persist_main_write_fault: bool,
     fail_next_truncate: bool,
     fail_next_main_sync: bool,
+    fail_next_main_sync_notification: bool,
     fail_next_journal_delete: bool,
 }
 
@@ -969,6 +970,19 @@ impl VfsFile for FaultFile {
             }
         }
         self.inner.sync(flags)
+    }
+
+    fn notify_sync(&self, journal: Option<&Path>) -> sqliters::Result<()> {
+        if self.is_main_db {
+            let mut state = self.state.lock().unwrap();
+            if std::mem::take(&mut state.fail_next_main_sync_notification) {
+                return Err(SqliteError::with_extended(
+                    extended::SQLITE_IOERR_FSYNC,
+                    "injected main DB sync notification error",
+                ));
+            }
+        }
+        self.inner.notify_sync(journal)
     }
 
     fn file_size(&self) -> sqliters::Result<u64> {
@@ -1265,6 +1279,53 @@ fn test_bulgu_y1_failed_commit_partial_writes_rolled_back_atomically() {
     assert!(!tmp.journal_path().exists());
     let sqliters::StepResult::Row(row) = held.step().unwrap() else {
         panic!("prepared read did not return a row after the sync fault cleared");
+    };
+    assert_eq!(row.get_i64(0), Some(10));
+    assert_eq!(held.c_reprepare_status().0, 1);
+    held.finalize().unwrap();
+    conn.try_close().unwrap();
+    verify_reopen(tmp.path(), [10, 10, 20, 0]);
+
+    // A notification failure precedes the physical sync, both during
+    // rollback and when the first subsequent read attempts recovery.
+    let tmp = TempDb::new("y1_vacuum_sync_notification");
+    let (vfs, fault) = FaultVfs::new();
+    let conn = Connection::open_with_vfs(vfs, Some(tmp.path()), flags).unwrap();
+    setup(&conn, "NONE");
+    conn.execute_batch("DROP TABLE ballast").unwrap();
+    let mut held = conn.prepare(VALUES_SQL).unwrap();
+    {
+        let mut state = fault.lock().unwrap();
+        state.main_writes_seen = 0;
+        state.fail_on_main_write_nth = Some(2);
+        state.fail_next_main_sync_notification = true;
+        state.fail_next_main_sync = true;
+    }
+    let error = conn.execute("VACUUM").unwrap_err();
+    assert_eq!(error.extended_code, extended::SQLITE_IOERR_WRITE);
+    assert_eq!(error.message, "injected one-shot main DB write_at error");
+    assert!(conn.is_autocommit());
+    assert!(tmp.journal_path().exists());
+    assert_eq!(conn.execute("ROLLBACK").unwrap_err().code, ErrorCode::Error);
+    {
+        let mut state = fault.lock().unwrap();
+        assert!(state.fail_next_main_sync);
+        state.fail_next_main_sync_notification = true;
+    }
+    let error = conn.query(VALUES_SQL, &[]).unwrap_err();
+    assert_eq!(error.extended_code, extended::SQLITE_IOERR_FSYNC);
+    assert_eq!(error.message, "injected main DB sync notification error");
+    assert!(tmp.journal_path().exists());
+    {
+        let mut state = fault.lock().unwrap();
+        assert!(state.fail_next_main_sync);
+        state.fail_next_main_sync = false;
+    }
+
+    verify(&conn, [10, 10, 20, 0]);
+    assert!(!tmp.journal_path().exists());
+    let sqliters::StepResult::Row(row) = held.step().unwrap() else {
+        panic!("prepared read did not return a row after the sync notification fault cleared");
     };
     assert_eq!(row.get_i64(0), Some(10));
     assert_eq!(held.c_reprepare_status().0, 1);
