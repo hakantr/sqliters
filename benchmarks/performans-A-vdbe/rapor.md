@@ -2547,3 +2547,8 @@ Yeni uygulama aggregate aritesi eski hazırlanmış seçimi değiştirmez. Taze 
 ## V6b.448 — Uygulama fonksiyonlarının C liste sırası
 
 390 yerel profil, 186.036 sıralı satır ve 3.120 kayıt işlemi C ile eş. Önceki 330 fark kapandı ve 300 yaşam döngüsü korundu. OFF 1328/1/325, ON 1326/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,292 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_448.md).
+
+
+## V6b.449 — Kayıtlı görünüm MATCH güvenilir şema kararı
+
+Güvenilmeyen şemadaki kayıtlı görünüm MATCH ifadesi C gibi reddedildi. Doğrudan okuma, güvenilir görünüm, VACUUM sonrası yeniden açılış ve bütünlük kontrolleri korundu. FTS dosyasındaki 14 test iki kipte geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v449-trusted-match-defense-candidate/sonuc.md) OFF 1328/1/325, ON 1327/2/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_449.md).

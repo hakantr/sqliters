@@ -57022,6 +57022,14 @@ fn validate_expr_static_with_win_stage(
                 LikeOp::Match => "match",
             };
             let argc = if escape.is_some() { 3 } else { 2 };
+            if *op == LikeOp::Match && !ctes.resolving_views.is_empty()
+                && functions.find_scalar(fname, argc).is_some_and(|definition| {
+                    definition.flags.contains(FunctionFlags::DIRECTONLY)
+                        || (!db_set.trusted_schema() && !definition.flags.contains(FunctionFlags::INNOCUOUS))
+                })
+            {
+                return Err(SqliteError::new(ErrorCode::Error, "unsafe use of MATCH()"));
+            }
             let is_vtab_match = *op == LikeOp::Match
                 && escape.is_none()
                 && !functions.has_scalar_name("match")

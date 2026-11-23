@@ -1092,7 +1092,7 @@ fn test_wal_jsonb_window_interoperability_vacuum_savepoint_and_trusted_schema() 
         conn.execute("RELEASE sp_inner;").unwrap();
         conn.execute("RELEASE sp_outer;").unwrap();
 
-        // Innocuous virtual tables (`json_each`, `json_tree`, `fts5`, `rtree`) must work inside VIEWs under `trusted_schema = OFF`
+        // The stored view uses a MATCH function subject to trusted_schema.
         conn.execute(
             "CREATE VIEW v_innocuous AS
              SELECT f.rowid AS fid, r.tag AS rtag, j.value AS jv
@@ -1103,14 +1103,16 @@ fn test_wal_jsonb_window_interoperability_vacuum_savepoint_and_trusted_schema() 
              PRAGMA trusted_schema = OFF;",
         )
         .unwrap();
-        let v_rows = conn
-            .query("SELECT fid, rtag, jv FROM v_innocuous ORDER BY fid", &[])
-            .unwrap();
+        let statement = "SELECT fid, rtag, jv FROM v_innocuous ORDER BY fid";
+        let error = conn.query(statement, &[]).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Error);
+        assert_eq!(error.message, "unsafe use of MATCH()");
+        conn.execute("PRAGMA trusted_schema = ON;").unwrap();
+        let v_rows = conn.query(statement, &[]).unwrap();
         assert_eq!(v_rows.rows.len(), 2);
         assert_eq!(v_rows.rows[0].get_i64(0), Some(1));
         assert_eq!(v_rows.rows[1].get_i64(0), Some(2));
 
-        conn.execute("PRAGMA trusted_schema = ON;").unwrap();
         conn.execute("VACUUM;").unwrap();
         conn.execute(&format!(
             "VACUUM INTO '{}';",
@@ -1126,10 +1128,15 @@ fn test_wal_jsonb_window_interoperability_vacuum_savepoint_and_trusted_schema() 
             reopened
                 .execute("INSERT INTO ft_sp(ft_sp) VALUES('integrity-check');")
                 .unwrap();
+            reopened.execute("PRAGMA trusted_schema = OFF").unwrap();
+            let statement =
+                "SELECT (SELECT rtreecheck('rt_sp')), fid, rtag, jv FROM v_innocuous ORDER BY fid";
+            let error = reopened.query(statement, &[]).unwrap_err();
+            assert_eq!(error.message, "unsafe use of MATCH()");
             let r_chk = run_sqliters_lines(
                 &reopened,
-                "PRAGMA trusted_schema = OFF",
-                "SELECT (SELECT rtreecheck('rt_sp')), fid, rtag, jv FROM v_innocuous ORDER BY fid",
+                "PRAGMA trusted_schema = ON",
+                statement,
             );
             assert_eq!(r_chk, vec!["ok|1|t1|100", "ok|2|t2|100"]);
         }
