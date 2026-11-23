@@ -2482,3 +2482,8 @@ Pinli C SQLite üç kodlamada V1/V2 ve Rust OFF/ON ile karşılaştırıldı. 48
 ## V6b.435 — Tek işçiyle PMA ve kapanış
 
 Mevcut VDBE ON girişinde UTF-8 ana rowid tablosu ve tam BINARY sıralama için bir yardımcı görev çalışır. Çağıran iş parçacığındaki 32 koşuda 63.158 VFS kaydı, 14 gerçek işçi koşusunda satır ve step/reset sonuçları C ile eş. Rust 80 işçi başlattı ve hepsini birleştirdi. PMA testleri 4/4, önceki iki sorter testi her kipte geçti. OFF 1314/1/325, ON 1312/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,355 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_435.md).
+
+
+## V6b.436 — Etkin ifadede fonksiyon kayıt aritesi
+
+Pinli C ile 132 akış ve 972 API kaydı eş. Mevcut doğru ariteyi değiştirme etkin ifadede SQLITE_BUSY verir. Uyumlu uygulama overloadı, yerleşik tanımdan önce seçilir. Hazır function_list, boşta yapılan gerçek yerleşik tanım değişikliğinde yeniden hazırlanır. Önceki 72 fark kapandı. OFF 1315/1/325, ON 1313/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,274 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_436.md).

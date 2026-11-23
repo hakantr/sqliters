@@ -1731,9 +1731,9 @@ impl ConnectionInner {
         }
     }
 
-    fn prepare_scalar_change(&mut self, name: &str, arity: Option<usize>) -> Result<()> {
+    fn prepare_scalar_change(&mut self, replacing: bool) -> Result<()> {
         // sqlite3CreateFunc expires prepared statements when replacing an existing overload.
-        if self.functions.has_scalar_overload(name, arity) {
+        if replacing {
             if !self.activity.leases.is_empty() {
                 return Err(SqliteError::new(
                     ErrorCode::Busy,
@@ -4691,7 +4691,8 @@ impl Connection {
         let mut session = self.shared.enter()?;
         let inner = session.inner_mut();
         inner.ensure_usable()?;
-        inner.prepare_scalar_change(name, arity)?;
+        let replacing = cgen::scalar_registration_replaces_definition(&inner.functions, name, arity);
+        inner.prepare_scalar_change(replacing)?;
         inner.functions.register_scalar(name, arity, flags, func);
         inner.schema_generation += 1;
         inner.v1_expire_generation += 1;
@@ -4722,7 +4723,8 @@ impl Connection {
         let mut session = self.shared.enter()?;
         let inner = session.inner_mut();
         inner.ensure_usable()?;
-        inner.prepare_scalar_change(name, arity)?;
+        let removing = inner.functions.has_scalar_overload(name, arity);
+        inner.prepare_scalar_change(removing)?;
         let removed = inner.functions.unregister_scalar(name, arity);
         if removed {
             inner.schema_generation += 1;

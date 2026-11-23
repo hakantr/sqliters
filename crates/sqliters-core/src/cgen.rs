@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use sqliters_codegen::builtin_funcs::CONNECTION_FUNCS;
+use sqliters_codegen::builtin_funcs::{BUILTIN_FUNCS, BuiltinFunc, CONNECTION_FUNCS};
 use sqliters_codegen::build_tab::SchemaRow;
 use sqliters_codegen::consts::{SQLITE_DqsDML, SQLITE_TrustedSchema};
 use sqliters_codegen::sqliteint::{PartialIndexBinding, VTable, VtabConnect, VtabModule};
@@ -104,6 +104,41 @@ pub(crate) fn func_flags(flags: FunctionFlags) -> u32 {
     // The SQLITE_INNOCUOUS flag is the same bit as SQLITE_FUNC_UNSAFE. But the meaning is
     // inverted. So flip the bit.
     1 /* SQLITE_UTF8 */ | (extra ^ SQLITE_FUNC_UNSAFE)
+}
+
+/// The public scalar registration API supplies SQLITE_UTF8 to sqlite3CreateFunc.
+pub(crate) fn scalar_registration_replaces_definition(
+    functions: &FunctionRegistry,
+    name: &str,
+    arity: Option<usize>,
+) -> bool {
+    let scalar = arity.map_or_else(
+        || functions.has_scalar_overload(name, None).then_some(None),
+        |argc| functions.find_scalar(name, argc).map(|definition| definition.arity),
+    );
+    let aggregates = functions.aggregate_overloads(name);
+    let n_arg = arity.map_or(-1, |argc| argc as i16);
+    let exact_utf8 = |&(candidate, registered_arity, flags, _, _, _): &BuiltinFunc| {
+        candidate.eq_ignore_ascii_case(name) && registered_arity == n_arg
+            && flags & sqliters_codegen::consts::SQLITE_FUNC_ENCMASK == TextEncoding::Utf8 as u32
+    };
+    if scalar == Some(arity)
+        || aggregates.iter().any(|&(registered_arity, _, _)| registered_arity == arity)
+        || CONNECTION_FUNCS.iter().any(exact_utf8)
+    {
+        return true;
+    }
+    // A compatible connection-local overload takes precedence even if a
+    // built-in with the requested arity would otherwise be a better match.
+    if scalar.is_some()
+        || aggregates.iter().any(|&(registered_arity, _, _)| registered_arity.is_none())
+        || CONNECTION_FUNCS.iter().any(|&(candidate, registered_arity, _, _, _, _)| {
+            candidate.eq_ignore_ascii_case(name) && registered_arity == -1
+        })
+    {
+        return false;
+    }
+    BUILTIN_FUNCS.iter().any(exact_utf8)
 }
 
 impl Host for EngineHost<'_> {

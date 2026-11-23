@@ -2601,3 +2601,35 @@ fn group65_direct_function_list_captures_rows_on_prepare() {
         assert_eq!(partial.reset().unwrap_err().code, ErrorCode::Schema);
     }
 }
+
+#[test]
+fn group65_active_registration_matches_existing_function_definition() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}';
+             CREATE TABLE app_data(x);
+             INSERT INTO app_data VALUES('a'),('bc');"
+        )).unwrap();
+        let mut scan = db.prepare("SELECT length(x) FROM app_data ORDER BY rowid").unwrap();
+        assert!(matches!(scan.step().unwrap(), StepResult::Row(_)));
+        for (name, arity) in [("LENGTH", 1), ("printf", -1), ("sum", 1)] {
+            let error = db.register_scalar_function(name, arity, FunctionFlags::NONE, |_| {
+                Ok(RuntimeValue::plain(Value::Integer(44)))
+            }).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Busy, "{encoding} {name}/{arity}");
+        }
+
+        db.register_scalar_function("length", -1, FunctionFlags::NONE, |_| {
+            Ok(RuntimeValue::plain(Value::Integer(88)))
+        }).unwrap();
+        // A connection-local variadic match takes precedence over built-in length(1).
+        db.register_scalar_function("length", 1, FunctionFlags::NONE, |_| {
+            Ok(RuntimeValue::plain(Value::Integer(44)))
+        }).unwrap();
+        let StepResult::Row(row) = scan.step().unwrap() else { panic!("expected second row") };
+        assert_eq!(row.get_i64(0), Some(2));
+        assert!(matches!(scan.step().unwrap(), StepResult::Done));
+        assert_eq!(db.query("SELECT length('xxx')", &[]).unwrap().rows[0].get_i64(0), Some(44));
+    }
+}
