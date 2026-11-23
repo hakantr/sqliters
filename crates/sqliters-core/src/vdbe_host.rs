@@ -129,15 +129,21 @@ pub(crate) fn machine_program_with_prepare(
     read_machine_program(inner, stmt, raw_sql, n_param, ReadMachineScope::Standard, None, prepared)
 }
 
-pub(crate) fn custom_sort_policy_matches(inner: &ConnectionInner, program: &Program) -> bool {
+pub(crate) fn custom_sort_policy_matches(
+    inner: &ConnectionInner, program: &Program, stmt: Option<&Stmt>, require_snapshot: bool,
+) -> bool {
     if program.fallible_limit_sort_open.is_some() {
         !inner.authorizer.is_some()
     } else if let Some(open) = program.fallible_file_sort_open {
-        let collation = program.a_op.get(open).and_then(|op| {
-            let P4::KeyInfo(key) = &op.p4 else { return None };
-            key.a_coll.first()?.as_deref().map(|coll| coll.name.as_str())
-        });
+        let Some(op) = program.a_op.get(open) else { return false };
+        let collation = match &op.p4 {
+            P4::KeyInfo(key) => key.a_coll.first().and_then(Option::as_deref).map(|coll| coll.name.as_str()),
+            _ => None,
+        };
         file_sort_policy(inner, collation)
+            || (op.p3 == 0
+                && matches!(collation.and_then(Collation::from_name), Some(Collation::NoCase | Collation::RTrim))
+                && bounded_worker_file_sort(inner, stmt, require_snapshot))
     } else {
         true
     }
@@ -151,6 +157,15 @@ fn file_sort_policy(inner: &ConnectionInner, collation: Option<&str>) -> bool {
                 collation.and_then(Collation::from_name), Some(Collation::NoCase | Collation::RTrim)),
             TempStoreMode::Memory => false,
         }
+}
+
+pub(crate) fn bounded_worker_file_sort(
+    inner: &ConnectionInner, stmt: Option<&Stmt>, require_snapshot: bool,
+) -> bool {
+    !inner.authorizer.is_some()
+        && crate::engine::bounded_worker_file_sort(
+            stmt, &inner.db_set, &inner.collations, require_snapshot,
+        )
 }
 
 pub(crate) fn custom_sort_read_program(
@@ -208,14 +223,29 @@ fn custom_limit_sort_read_program(
     Some(Arc::new(*program))
 }
 
-#[allow(non_upper_case_globals)]
 pub(crate) fn custom_file_sort_read_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
 ) -> Option<Arc<Program>> {
+    file_sort_read_program(inner, stmt, sql, n_param, false)
+}
+
+pub(crate) fn bounded_worker_file_sort_read_program(
+    inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
+) -> Option<Arc<Program>> {
+    file_sort_read_program(inner, stmt, sql, n_param, true)
+}
+
+#[allow(non_upper_case_globals)]
+fn file_sort_read_program(
+    inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize, with_workers: bool,
+) -> Option<Arc<Program>> {
     use sqliters_vdbe::opcodes::*;
+    if with_workers && !bounded_worker_file_sort(inner, stmt, true) {
+        return None;
+    }
     let Some(Stmt::Select(select)) = stmt else { return None };
     let (name, root) = crate::engine::custom_file_order_collation(select, &inner.db_set, &inner.collations)?;
-    if !file_sort_policy(inner, Some(name)) {
+    if !with_workers && !file_sort_policy(inner, Some(name)) {
         return None;
     }
     let PrepareResult::Program(mut program) = crate::cgen::c_prepare(inner, sql).0 else {
@@ -237,6 +267,7 @@ pub(crate) fn custom_file_sort_read_program(
     if reads.next().is_some() || pseudos.next().is_some()
         || read.p1 == sort.p1 || pseudo.p1 == read.p1 || pseudo.p1 == sort.p1
         || read.p2 != root as i32 || read.p3 != 0 || !matches!(read.p4, P4::Int32(_))
+        || (with_workers && sort.p3 != 0)
     {
         return None;
     }

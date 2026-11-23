@@ -4668,3 +4668,53 @@ fn group65_length_limit_is_applied_to_trim_after_prepare_and_reset() {
     };
     assert_eq!(row.values(), &[Value::Text("62".to_owned())]);
 }
+
+#[test]
+fn group64_small_direct_file_sort_keeps_registered_collation_on_caller() {
+    let sort = sqliters_vdbe::vdbe::SQLITE_STMTSTATUS_SORT;
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for mode in ["FILE", "DEFAULT"] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}'; PRAGMA temp_store={mode}; PRAGMA foreign_keys=ON;
+                 CREATE TABLE parents(id INTEGER PRIMARY KEY);
+                 INSERT INTO parents VALUES(1);
+                 CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT, p INTEGER REFERENCES parents(id));
+                 INSERT INTO items VALUES (1,'A',1),(2,'a',1),(3,'B',1),(4,'b',1),(5,NULL,1),(6,'A ',1);"
+            )).unwrap();
+            for workers in [1, 2] {
+                db.execute_batch(&format!("PRAGMA threads={workers}")).unwrap();
+                for collation in ["NOCASE", "RTRIM"] {
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let observed = Arc::clone(&calls);
+                    let caller = std::thread::current().id();
+                    db.register_collation(collation, move |left, right| {
+                        assert_eq!(std::thread::current().id(), caller);
+                        observed.fetch_add(1, AtomicOrdering::Relaxed);
+                        right.cmp(left)
+                    }).unwrap();
+                    let sql = format!(
+                        "SELECT id FROM items ORDER BY v COLLATE {collation} NULLS LAST,id DESC"
+                    );
+                    let mut statement = db.prepare(&sql).unwrap();
+                    assert_eq!(calls.load(AtomicOrdering::Relaxed), 0);
+                    assert_eq!(statement.machine_stmt_status(sort, false), 0);
+                    let StepResult::Row(first) = statement.step().unwrap() else { panic!("missing row"); };
+                    assert_eq!(first.get_i64(0), Some(4));
+                    assert_eq!(calls.load(AtomicOrdering::Relaxed), 8);
+                    assert_eq!(statement.machine_stmt_status(sort, false), 1);
+                    statement.reset().unwrap();
+                    assert_eq!(statement.machine_stmt_status(sort, false), 1);
+                    for id in [4, 2, 3, 6, 1, 5] {
+                        let StepResult::Row(row) = statement.step().unwrap() else { panic!("missing row {id}"); };
+                        assert_eq!(row.get_i64(0), Some(id));
+                    }
+                    assert!(matches!(statement.step().unwrap(), StepResult::Done));
+                    assert_eq!(calls.load(AtomicOrdering::Relaxed), 16);
+                    assert_eq!(statement.machine_stmt_status(sort, false), 2);
+                }
+            }
+            assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+        }
+    }
+}

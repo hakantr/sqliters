@@ -7555,6 +7555,38 @@ pub(crate) fn custom_file_order_collation<'a>(
         .filter(|(name, _)| registered_order_collation(name, collations))
 }
 
+/// A direct registered FILE sort can defer its route until MAIN is pinned.
+pub(crate) fn bounded_worker_file_sort(
+    stmt: Option<&Stmt>, db_set: &DatabaseSet, collations: &CollationRegistry,
+    require_snapshot: bool,
+) -> bool {
+    if !matches!(db_set.worker_threads_limit, 1 | 2) || db_set.temp_store().is_memory() {
+        return false;
+    }
+    let Some(Stmt::Select(select)) = stmt else { return false; };
+    let Some((name, _)) = custom_file_order_collation(select, db_set, collations) else { return false; };
+    if !registered_builtin_name_collation(name, collations) {
+        return false;
+    }
+    let SelectCore::Select { projection, from: Some(from), .. } = &select.body.head else { return false; };
+    let fields = projection.len() + select.order_by.len();
+    if fields > 3 {
+        return false;
+    }
+    let TableOrSubquery::Table { name, .. } = &from.head else { return false; };
+    let Some((DatabaseId::MAIN, table)) = db_set.find_user_table_in_set(name) else { return false; };
+    // A default for a column absent in an older record uses no space on its page.
+    if table.columns.iter().any(|column| column.default_expr.is_some()) {
+        return false;
+    }
+    if !require_snapshot {
+        return true;
+    }
+    let bt = db_set.main_btree();
+    bt.transaction_state() != TransactionState::Open
+        && sqliters_vdbe::vdbesort::table_sort_fits_default_pma(bt.pager().page_count(), fields)
+}
+
 fn registered_order_collation(name: &str, collations: &CollationRegistry) -> bool {
     registered_builtin_name_collation(name, collations)
         || (Collation::from_name(name).is_none() && collations.get_custom(name).is_some())
