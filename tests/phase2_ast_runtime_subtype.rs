@@ -4294,3 +4294,33 @@ fn group65_substr_preserves_text_register_boundaries_after_reset() {
         assert!(matches!(statement.step().unwrap(), StepResult::Done));
     }
 }
+
+#[test]
+fn group65_replace_preserves_text_register_bytes_after_reset() {
+    for (encoding, first_hex, replaced, unchanged) in [
+        ("UTF-8", "414142", "41F7BFBFBF5A", "61F7BFBFBF5A"),
+        ("UTF-16le", "410041004200", "4100BFDBFFDF5A00", "6100BFDBFFDF5A00"),
+        ("UTF-16be", "004100410042", "0041DBBFDFFF005A", "0061DBBFDFFF005A"),
+    ] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!("PRAGMA encoding='{encoding}'; CREATE TABLE t(i);"))
+            .unwrap();
+        let sql = "SELECT hex(replace(unistr(?1),?2,'A')), hex(replace(unistr(?1),'',NULL))";
+        let mut statement = db.prepare(sql).unwrap();
+        statement.bind_text(1, r"A\u00FCB").unwrap();
+        statement.bind_text(2, "ü").unwrap();
+        let StepResult::Row(first) = statement.step().unwrap() else {
+            panic!("expected a row in {encoding}");
+        };
+        assert_eq!(first.get_str(0), Some(first_hex));
+        statement.reset().unwrap();
+        statement.bind_text(1, r"a\UFFFFFFFFZ").unwrap();
+        statement.bind_text(2, "a").unwrap();
+        let StepResult::Row(reused) = statement.step().unwrap() else {
+            panic!("expected a row after reset in {encoding}");
+        };
+        assert_eq!(reused.get_str(0), Some(replaced));
+        assert_eq!(reused.get_str(1), Some(unchanged));
+        assert!(matches!(statement.step().unwrap(), StepResult::Done));
+    }
+}

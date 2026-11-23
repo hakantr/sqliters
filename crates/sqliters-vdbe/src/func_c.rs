@@ -273,6 +273,35 @@ fn substr_range(bytes: &[u8], blob: bool, mut start: i64, mut count: i64) -> std
     first..last
 }
 
+// replaceFunc allocates the input length and terminator first, then grows on matches.
+fn replace_bytes(input: &[u8], pattern: &[u8], replacement: &[u8], limit: usize) -> Result<Vec<u8>> {
+    if input.len() >= limit {
+        return Err(too_big());
+    }
+    let growth = replacement.len().saturating_sub(pattern.len());
+    let mut expected_len = input.len();
+    let mut out = Vec::with_capacity(expected_len);
+    let mut offset = 0;
+    if pattern.len() <= input.len() {
+        let last = input.len() - pattern.len();
+        while offset <= last {
+            if !input[offset..].starts_with(pattern) {
+                out.push(input[offset]);
+                offset += 1;
+                continue;
+            }
+            expected_len = expected_len.saturating_add(growth);
+            if expected_len > limit {
+                return Err(too_big());
+            }
+            out.extend_from_slice(replacement);
+            offset += pattern.len();
+        }
+    }
+    out.extend_from_slice(&input[offset..]);
+    Ok(out)
+}
+
 /// Evaluate built-ins which observe or produce the raw bytes of a TEXT register.
 pub(crate) fn eval_text_register(
     name: &str,
@@ -301,6 +330,22 @@ pub(crate) fn eval_text_register(
         let bytes = cstr(&bytes);
         let range = substr_range(bytes, false, start.int_value(), bound.map_or(i64::MAX, Mem::int_value));
         out.set_str(&bytes[range]);
+        out.change_encoding(encoding as u8);
+        return Some(Ok(out));
+    }
+    if name.eq_ignore_ascii_case("replace") && let [input, pattern, replacement] = args {
+        let Some(input) = value_text_register(input) else { return Some(Ok(out)); };
+        let Some(pattern) = value_text_register(pattern) else { return Some(Ok(out)); };
+        out.z = if pattern.first().is_none_or(|first| *first == 0) {
+            input.into_owned()
+        } else {
+            let Some(replacement) = value_text_register(replacement) else { return Some(Ok(out)); };
+            match replace_bytes(&input, &pattern, &replacement, limit_length.max(0) as usize) {
+                Ok(bytes) => bytes,
+                Err(error) => return Some(Err(error)),
+            }
+        };
+        out.flags = MEM_STR;
         out.change_encoding(encoding as u8);
         return Some(Ok(out));
     }
@@ -677,26 +722,7 @@ pub(crate) fn eval(upper: &str, args: &[Value], ctx: &VmRuntimeContext) -> Optio
             let Some(rep) = value_text(&args[2], enc) else {
                 return Some(Ok(Value::Null));
             };
-            let (zs, zp, zr): (&[u8], &[u8], &[u8]) = (&s, &pat, &rep);
-            let mut out = Vec::with_capacity(zs.len());
-            let mut i = 0usize;
-            if zp.len() <= zs.len() {
-                let limit = zs.len() - zp.len();
-                while i <= limit {
-                    if zs[i] != zp[0] || &zs[i..i + zp.len()] != zp {
-                        out.push(zs[i]);
-                        i += 1;
-                    } else {
-                        if out.len() + zr.len() + (zs.len() - i) > 1_000_000_000 {
-                            return Some(Err(too_big()));
-                        }
-                        out.extend_from_slice(zr);
-                        i += zp.len();
-                    }
-                }
-            }
-            out.extend_from_slice(&zs[i.min(zs.len())..]);
-            Ok(text_value(out))
+            replace_bytes(&s, &pat, &rep, 1_000_000_000).map(text_value)
         }
         "INSTR" if args.len() == 2 => {
             if args[0].is_null() || args[1].is_null() {

@@ -2777,3 +2777,8 @@ Tamsayı ve gerçek sayı dönüşümü, üç kodlama, NULL bağlar ve kip baş�
 ## V6b.494 — Seri DEFAULT sıralaması ve aynı ifadeyle kip değişimi
 
 Kip başına 252 DEFAULT ve 144 aynı handle kip geçişi C ile eş. 228 guard, Group64 33/33, Unicode 5/5, 12 fiziksel ve 18 FK kontrolü geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/registered-nocase-rtrim-default-v493-rebased-candidate/sonuc.md) OFF 1362/0/324, ON 1362/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,289 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_494.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.495 — Hazır REPLACE baytları ve sonuç sınırı
+
+Üç kodlama ve kip başına 12 C API profili, 210 kontrol ve Group65 31/31 eş. Kalıcı yazma 0/12 tabandan 2/12 bayt eş; 18 C açılışında FK ve bütünlük temiz. [Bağımsız ölçüm](/github/sqliters/target/perf-work/builtin-replace-text-register-candidate/sonuc.md) OFF 1363/0/324, ON 1363/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,303 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_495.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
