@@ -46204,7 +46204,7 @@ pub(crate) fn exec_vacuum_checked(
             .ok_or_else(|| VacuumFail::Clean(SqliteError::misuse("vacuum btree closed")))?;
         let (commit, failure) = bt.commit_for_vacuum();
         if let Err(cm_err) = commit {
-            let (rollback, failed_restore_write) = if failure == VacuumCommitFailure::MainWrite {
+            let (rollback, failed_restore_io) = if failure == VacuumCommitFailure::MainWrite {
                 bt.rollback_for_failed_vacuum_write()
             } else {
                 (bt.rollback(), false)
@@ -46213,7 +46213,7 @@ pub(crate) fn exec_vacuum_checked(
                 // sqlite3_backup_finish keeps the original copy error. A
                 // synced DELETE journal still requires ordinary hot playback.
                 let can_retry = match failure {
-                    VacuumCommitFailure::MainWrite => failed_restore_write,
+                    VacuumCommitFailure::MainWrite => failed_restore_io,
                     VacuumCommitFailure::PhaseTwoCleanup => rb_err == cm_err,
                     VacuumCommitFailure::Other => false,
                 };

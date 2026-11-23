@@ -2208,15 +2208,22 @@ impl Pager {
     }
 
     /// sqlite3PagerSync after rollback playback, with a NULL super-journal argument.
-    fn sync_db_after_playback(&self) -> Result<()> {
+    fn sync_db_after_playback(&self, failed_restore_io: Option<&mut bool>) -> Result<()> {
         let db = self.db_file()?;
         if let Err(error) = db.notify_sync(None)
             && error.extended_code != ErrorCode::NotFound as i32
         {
             return Err(error);
         }
-        if !self.pager_no_sync() {
-            db.sync(self.file_sync_flags())?;
+        if !self.pager_no_sync() && let Err(error) = db.sync(self.file_sync_flags()) {
+            if let Some(failed) = failed_restore_io
+                && self.vacuum_has_synced_delete_journal()
+                && error.code == ErrorCode::IoErr
+                && error.extended_code == extended::SQLITE_IOERR_FSYNC
+            {
+                *failed = true;
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -6145,17 +6152,17 @@ impl Pager {
         self.rollback_retaining_read_inner(retain_read, None)
     }
 
-    /// Reports an exact database write failure during rollback, followed by
-    /// successful journal-handle and lock cleanup.
+    /// Reports an exact database write or physical sync failure during
+    /// rollback, followed by successful journal-handle and lock cleanup.
     #[doc(hidden)]
-    pub fn rollback_for_failed_vacuum_write(&mut self, failed_restore_write: &mut bool) -> Result<()> {
-        self.rollback_retaining_read_inner(false, Some(failed_restore_write))
+    pub fn rollback_for_failed_vacuum_write(&mut self, failed_restore_io: &mut bool) -> Result<()> {
+        self.rollback_retaining_read_inner(false, Some(failed_restore_io))
     }
 
     fn rollback_retaining_read_inner(
         &mut self,
         retain_read: bool,
-        mut failed_restore_write: Option<&mut bool>,
+        mut failed_restore_io: Option<&mut bool>,
     ) -> Result<()> {
         if let Some(error) = self.pager_error.clone() {
             self.end_error_transaction(retain_read);
@@ -6163,7 +6170,7 @@ impl Pager {
         }
         self.ensure_not_closed()?;
         let was_write = self.state == TransactionState::Write;
-        let result = self.rollback_inner(retain_read, failed_restore_write.as_deref_mut());
+        let result = self.rollback_inner(retain_read, failed_restore_io.as_deref_mut());
         if result.is_ok()
             && let Some(transition) = self.pending_sql_journal_mode.take()
         {
@@ -6181,7 +6188,7 @@ impl Pager {
             self.latch_pager_error(error);
             if self.pager_error.is_some()
                 && !self.end_error_transaction(retain_read)
-                && let Some(failed) = failed_restore_write
+                && let Some(failed) = failed_restore_io
             {
                 *failed = false;
             }
@@ -6192,7 +6199,7 @@ impl Pager {
     fn rollback_inner(
         &mut self,
         retain_read: bool,
-        failed_restore_write: Option<&mut bool>,
+        failed_restore_io: Option<&mut bool>,
     ) -> Result<()> {
         match self.state {
             TransactionState::Open => Ok(()),
@@ -6337,7 +6344,7 @@ impl Pager {
                             let orig_data = self.tx_preimages.get(&pgno).expect("key exists");
                             let offset = u64::from(pgno - 1) * ps;
                             if let Err(error) = self.db_file()?.write_at(orig_data, offset) {
-                                if let Some(failed) = failed_restore_write
+                                if let Some(failed) = failed_restore_io
                                     && self.vacuum_has_synced_delete_journal()
                                     && error.code == ErrorCode::IoErr
                                     && error.extended_code == extended::SQLITE_IOERR_WRITE
@@ -6356,7 +6363,7 @@ impl Pager {
                         }
                     }
                     if disk_rollback {
-                        self.sync_db_after_playback()?;
+                        self.sync_db_after_playback(failed_restore_io)?;
                     } else if self.db_kind != DatabaseKind::PrivateTemporary && self.synchronous > 0 {
                         self.db_file()?.sync(self.file_sync_flags())?;
                     }
@@ -7404,7 +7411,7 @@ impl Pager {
             } else {
                 false
             };
-            self.sync_db_after_playback()?;
+            self.sync_db_after_playback(None)?;
             Ok((z_super, should_replay, read_header))
         })();
 

@@ -962,8 +962,8 @@ impl VfsFile for FaultFile {
             let mut st = self.state.lock().unwrap();
             if st.fail_next_main_sync {
                 st.fail_next_main_sync = false;
-                return Err(SqliteError::new(
-                    ErrorCode::IoErr,
+                return Err(SqliteError::with_extended(
+                    extended::SQLITE_IOERR_FSYNC,
                     "injected main DB sync error",
                 ));
             }
@@ -1230,6 +1230,41 @@ fn test_bulgu_y1_failed_commit_partial_writes_rolled_back_atomically() {
     assert!(!tmp.journal_path().exists());
     let sqliters::StepResult::Row(row) = held.step().unwrap() else {
         panic!("prepared read did not return a row after the write fault cleared");
+    };
+    assert_eq!(row.get_i64(0), Some(10));
+    assert_eq!(held.c_reprepare_status().0, 1);
+    held.finalize().unwrap();
+    conn.try_close().unwrap();
+    verify_reopen(tmp.path(), [10, 10, 20, 0]);
+
+    // The copy write fails before database sync. Its rollback writes all
+    // preimages, but the next main-file sync fails and the journal stays hot.
+    let tmp = TempDb::new("y1_vacuum_rollback_sync");
+    let (vfs, fault) = FaultVfs::new();
+    let conn = Connection::open_with_vfs(vfs, Some(tmp.path()), flags).unwrap();
+    setup(&conn, "NONE");
+    conn.execute_batch("DROP TABLE ballast").unwrap();
+    let mut held = conn.prepare(VALUES_SQL).unwrap();
+    {
+        let mut state = fault.lock().unwrap();
+        state.main_writes_seen = 0;
+        state.fail_on_main_write_nth = Some(2);
+        state.fail_next_main_sync = true;
+    }
+    let error = conn.execute("VACUUM").unwrap_err();
+    assert_eq!(error.extended_code, extended::SQLITE_IOERR_WRITE);
+    assert_eq!(error.message, "injected one-shot main DB write_at error");
+    assert!(conn.is_autocommit());
+    assert!(tmp.journal_path().exists());
+    assert_eq!(conn.execute("ROLLBACK").unwrap_err().code, ErrorCode::Error);
+
+    fault.lock().unwrap().fail_next_main_sync = true;
+    assert_eq!(conn.query(VALUES_SQL, &[]).unwrap_err().extended_code, extended::SQLITE_IOERR_FSYNC);
+    assert!(tmp.journal_path().exists());
+    verify(&conn, [10, 10, 20, 0]);
+    assert!(!tmp.journal_path().exists());
+    let sqliters::StepResult::Row(row) = held.step().unwrap() else {
+        panic!("prepared read did not return a row after the sync fault cleared");
     };
     assert_eq!(row.get_i64(0), Some(10));
     assert_eq!(held.c_reprepare_status().0, 1);
