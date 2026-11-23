@@ -83,6 +83,22 @@ enum VacuumCommitCleanupFailure {
     LateShrink,
 }
 
+/// Evidence from the ordinary pager ERROR cleanup used by in-place VACUUM.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum VacuumErrorCleanup {
+    #[default]
+    Incomplete,
+    Released,
+    LockUnknown,
+}
+
+#[derive(Default)]
+struct VacuumRollbackObservation {
+    failed_restore_io: bool,
+    cleanup: VacuumErrorCleanup,
+}
+
 /// Journal operating mode (`PAGER_JOURNALMODE_*` in `sqlite/src/pager.h`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JournalMode {
@@ -326,6 +342,7 @@ pub struct Pager {
     pager_error: Option<SqliteError>,
     error_unlock_pending: bool,
     error_lock_unknown: bool,
+    vacuum_lock_error: Option<SqliteError>,
     synchronous: u8,
     synchronous_user_set: bool,
     default_wal_synchronous: u8,
@@ -676,6 +693,7 @@ impl Pager {
             pager_error: None,
             error_unlock_pending: false,
             error_lock_unknown: false,
+            vacuum_lock_error: None,
             synchronous: 2,
             synchronous_user_set: false,
             default_wal_synchronous: options.default_wal_synchronous.min(3),
@@ -762,10 +780,23 @@ impl Pager {
 
     #[inline]
     fn ensure_not_closed(&self) -> Result<()> {
+        self.ensure_open_for_lock_recovery()?;
+        self.check_vacuum_lock()
+    }
+
+    fn ensure_open_for_lock_recovery(&self) -> Result<()> {
         if self.closed {
             return Err(SqliteError::misuse("pager is closed"));
         }
         self.check_pager_error()
+    }
+
+    #[inline]
+    fn check_vacuum_lock(&self) -> Result<()> {
+        if self.error_lock_unknown && let Some(error) = &self.vacuum_lock_error {
+            return Err(error.clone());
+        }
+        Ok(())
     }
 
     #[inline]
@@ -788,6 +819,7 @@ impl Pager {
 
     #[inline]
     fn db_file(&self) -> Result<&dyn VfsFile> {
+        self.check_vacuum_lock()?;
         self.file
             .as_deref()
             .ok_or_else(|| SqliteError::misuse("database backing file is not open"))
@@ -3314,7 +3346,7 @@ impl Pager {
     /// in `TransactionState::Open` with `!header_loaded`, releasing the temporary read lock before
     /// returning.
     pub fn ensure_header_loaded(&mut self) -> Result<&DatabaseHeader> {
-        self.ensure_not_closed()?;
+        self.ensure_open_for_lock_recovery()?;
         if self.state == TransactionState::Open && !self.header_loaded {
             // (a look at the file header, not a b-tree transaction: page 1 is not fetched)
             self.header_probe = true;
@@ -3460,7 +3492,7 @@ impl Pager {
     /// Starts a read transaction (`SHARED` lock + two-phase WAL discovery + hot-journal recovery
     /// + authoritative 100-byte header validation).
     pub fn begin_read(&mut self) -> Result<()> {
-        self.ensure_not_closed()?;
+        self.ensure_open_for_lock_recovery()?;
         if self.state != TransactionState::Open {
             return Ok(());
         }
@@ -3495,12 +3527,21 @@ impl Pager {
                 .map_or(LockLevel::NoLock, |f| f.lock_level())
         };
 
-        self.lock_db_file(LockLevel::Shared)?;
+        if let Err(error) = self.lock_db_file(LockLevel::Shared) {
+            if self.vacuum_lock_error.is_some() && self.error_lock_unknown {
+                let _ = self.unlock_db_file(LockLevel::NoLock);
+            }
+            return Err(error);
+        }
         // Changing locking_mode during prepare does not release the reader
         // already retained by exclusive mode (C remains PAGER_READER).
         let retained_reader = self.reader_snapshot_held;
         let mut snapshot_established = false;
         if let Err(e) = self.begin_read_under_shared_lock(retained_reader, &mut snapshot_established) {
+            if self.vacuum_lock_error.is_some() && self.error_lock_unknown && self.pager_error.is_none() {
+                let _ = self.unlock_db_file(LockLevel::NoLock);
+                return Err(e);
+            }
             if self.uses_transaction_end_for_hot_recovery() && self.pager_error.is_some() {
                 // Hot recovery already latched the error. Let pager_unlock's
                 // equivalent release the database lock once.
@@ -3555,6 +3596,7 @@ impl Pager {
                 }
             }
         }
+        self.vacuum_lock_error = None;
         Ok(())
     }
 
@@ -3572,6 +3614,15 @@ impl Pager {
                 return Ok(());
             }
         }
+
+        // A VACUUM lock error requires an explicit EXCLUSIVE success even
+        // if the OS shows NO_LOCK or another connection removed the journal.
+        // This precedes WAL discovery and every file-content read.
+        let vacuum_recovered = if self.vacuum_lock_error.is_some() && self.error_lock_unknown {
+            Some(self.recover_hot_journal_under_shared_lock()?)
+        } else {
+            None
+        };
 
         // Pass 1 (`pagerOpenWalIfPresent`, `pager.c:3393-3421`):
         // Check `<db>-wal` under `.db` `SHARED` lock BEFORE touching Page 1 or `<db>-journal`.
@@ -3594,7 +3645,9 @@ impl Pager {
         }
 
         if self.wal.is_none() {
-            let recovered = if retained_reader || self.immutable || self.is_memdb_backing {
+            let recovered = if let Some(recovered) = vacuum_recovered {
+                recovered
+            } else if retained_reader || self.immutable || self.is_memdb_backing {
                 false
             } else {
                 self.recover_hot_journal_under_shared_lock()?
@@ -3942,7 +3995,7 @@ impl Pager {
         target_lock: LockLevel,
         savepoint_depth: usize,
     ) -> Result<()> {
-        self.ensure_not_closed()?;
+        self.ensure_open_for_lock_recovery()?;
         if self.readonly {
             return Err(SqliteError::readonly(
                 "attempt to write a readonly database",
@@ -5404,10 +5457,10 @@ impl Pager {
         Ok(())
     }
 
-    fn end_error_transaction(&mut self, retain_read: bool) -> bool {
+    fn end_error_transaction(&mut self, retain_read: bool) -> VacuumErrorCleanup {
         self.state = TransactionState::Read;
         if retain_read {
-            return false;
+            return VacuumErrorCleanup::Incomplete;
         }
         self.error_unlock_pending = true;
         self.release_transient();
@@ -5434,9 +5487,9 @@ impl Pager {
     /// pagerUnlockAndRollback: ERROR suppresses playback through the failed
     /// transaction. Leave a disk journal intact for a new shared-lock attempt.
     #[cold]
-    fn unlock_error_if_unused(&mut self) -> bool {
+    fn unlock_error_if_unused(&mut self) -> VacuumErrorCleanup {
         if self.cache.n_ref_sum != 0 || !self.mapped_pages.is_empty() {
-            return false;
+            return VacuumErrorCleanup::Incomplete;
         }
         let mut journal_closed = true;
         self.error_unlock_pending = false;
@@ -5497,7 +5550,13 @@ impl Pager {
         self.tx_journaled.clear_all();
         self.subsavepoints.clear();
         self.notify_backup_restart();
-        journal_closed && !self.error_lock_unknown
+        if !journal_closed {
+            VacuumErrorCleanup::Incomplete
+        } else if self.error_lock_unknown {
+            VacuumErrorCleanup::LockUnknown
+        } else {
+            VacuumErrorCleanup::Released
+        }
     }
 
     /// Appends a super-journal trailer to the open rollback journal (`writeSuperJournal` in
@@ -5868,13 +5927,38 @@ impl Pager {
     /// invalidated cached pages. A retained journal still requires recovery
     /// under the next read's shared-lock path.
     pub fn vacuum_error_cleanup_completed(&self) -> bool {
+        self.vacuum_error_cache_released() && !self.error_lock_unknown
+    }
+
+    fn vacuum_error_cache_released(&self) -> bool {
         !self.closed
             && self.state == TransactionState::Open
             && self.pager_error.is_none()
             && !self.error_unlock_pending
-            && !self.error_lock_unknown
             && self.journal_file.is_none()
             && !self.reader_snapshot_held
+    }
+
+    /// Preserve the original VACUUM failure until a subsequent storage access
+    /// obtains EXCLUSIVE and can safely inspect the disk.
+    #[doc(hidden)]
+    pub fn defer_vacuum_lock_recovery(&mut self, error: &SqliteError) -> bool {
+        if self.vacuum_error_cache_released()
+            && self.error_lock_unknown
+            && self.db_kind == DatabaseKind::NamedDisk
+            && self.locking_mode == LockingMode::Normal
+            && self.journal_mode == JournalMode::Delete
+            && self.wal.is_none()
+            && !self.readonly
+            && !self.immutable
+            && self.file.is_some()
+            && self.journal_path.is_some()
+        {
+            self.vacuum_lock_error = Some(error.clone());
+            true
+        } else {
+            false
+        }
     }
 
     fn commit_phase_two_with_journal_cleanup(
@@ -6151,25 +6235,36 @@ impl Pager {
         self.rollback_retaining_read_inner(retain_read, None)
     }
 
-    /// Reports an exact database write or sync failure during rollback,
-    /// followed by successful journal-handle and lock cleanup.
+    /// Reports cleanup from a certified VACUUM failure. A phase-one write
+    /// additionally requires a matching restore-write or restore-sync error.
     #[doc(hidden)]
-    pub fn rollback_for_failed_vacuum_write(&mut self, failed_restore_io: &mut bool) -> Result<()> {
-        self.rollback_retaining_read_inner(false, Some(failed_restore_io))
+    pub fn rollback_for_vacuum(&mut self, failed_main_write: bool) -> (Result<()>, VacuumErrorCleanup) {
+        let mut observation = VacuumRollbackObservation::default();
+        let result = self.rollback_retaining_read_inner(false, Some(&mut observation));
+        let cleanup = if failed_main_write && !observation.failed_restore_io {
+            VacuumErrorCleanup::Incomplete
+        } else {
+            observation.cleanup
+        };
+        (result, cleanup)
     }
 
     fn rollback_retaining_read_inner(
         &mut self,
         retain_read: bool,
-        mut failed_restore_io: Option<&mut bool>,
+        mut vacuum: Option<&mut VacuumRollbackObservation>,
     ) -> Result<()> {
         if let Some(error) = self.pager_error.clone() {
-            self.end_error_transaction(retain_read);
+            let cleanup = self.end_error_transaction(retain_read);
+            if let Some(observation) = vacuum {
+                observation.cleanup = cleanup;
+            }
             return Err(error);
         }
         self.ensure_not_closed()?;
         let was_write = self.state == TransactionState::Write;
-        let result = self.rollback_inner(retain_read, failed_restore_io.as_deref_mut());
+        let failed_restore_io = vacuum.as_mut().map(|observation| &mut observation.failed_restore_io);
+        let result = self.rollback_inner(retain_read, failed_restore_io);
         if result.is_ok()
             && let Some(transition) = self.pending_sql_journal_mode.take()
         {
@@ -6185,11 +6280,11 @@ impl Pager {
         }
         if was_write && let Err(ref error) = result {
             self.latch_pager_error(error);
-            if self.pager_error.is_some()
-                && !self.end_error_transaction(retain_read)
-                && let Some(failed) = failed_restore_io
-            {
-                *failed = false;
+            if self.pager_error.is_some() {
+                let cleanup = self.end_error_transaction(retain_read);
+                if let Some(observation) = vacuum {
+                    observation.cleanup = cleanup;
+                }
             }
         }
         result
@@ -7170,6 +7265,7 @@ impl Pager {
         self.suppress_auto_wal = false;
         self.set_state(TransactionState::Open);
         self.pager_error = None;
+        self.vacuum_lock_error = None;
         self.error_unlock_pending = false;
         self.closed = true;
 

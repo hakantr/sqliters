@@ -11,7 +11,7 @@ use std::sync::Arc;
 use sqliters_btree::{Btree, RootPageMove, VacuumCommitFailure, commit_btrees_two_phase};
 use sqliters_pager::{
     AutoVacuumMode, JournalMode, LockingMode, PagerOpenOptions, TransactionState,
-    WalCheckpointMode, WalCheckpointResult,
+    VacuumErrorCleanup, WalCheckpointMode, WalCheckpointResult,
 };
 use sqliters_codegen::sqliteint::PartialIndexPredicate;
 use sqliters_syntax::{
@@ -45442,6 +45442,7 @@ fn splice_added_column_sql(sql: &str, column_sql: &str) -> Result<String> {
 
 pub(crate) enum VacuumFail {
     Clean(SqliteError),
+    LockRecoveryPending(SqliteError),
     Poison(SqliteError),
 }
 
@@ -45452,7 +45453,7 @@ pub(crate) fn exec_vacuum(
     params: &[Value],
 ) -> Result<QueryOutput> {
     exec_vacuum_checked(ctx, vac_schema, into, params).map_err(|vf| match vf {
-        VacuumFail::Clean(e) | VacuumFail::Poison(e) => e,
+        VacuumFail::Clean(e) | VacuumFail::LockRecoveryPending(e) | VacuumFail::Poison(e) => e,
     })
 }
 
@@ -46204,21 +46205,26 @@ pub(crate) fn exec_vacuum_checked(
             .ok_or_else(|| VacuumFail::Clean(SqliteError::misuse("vacuum btree closed")))?;
         let (commit, failure) = bt.commit_for_vacuum();
         if let Err(cm_err) = commit {
-            let (rollback, failed_restore_io) = if failure == VacuumCommitFailure::MainWrite {
-                bt.rollback_for_failed_vacuum_write()
-            } else {
-                (bt.rollback(), false)
+            let (rollback, cleanup) = match failure {
+                VacuumCommitFailure::MainWrite => bt.rollback_for_vacuum(true),
+                VacuumCommitFailure::PhaseTwoCleanup => bt.rollback_for_vacuum(false),
+                VacuumCommitFailure::Other => (bt.rollback(), VacuumErrorCleanup::Incomplete),
             };
             if let Err(rb_err) = rollback {
-                // sqlite3_backup_finish keeps the original copy error. A
-                // synced DELETE journal still requires ordinary hot playback.
+                // sqlite3_backup_finish preserves the copy error. When the
+                // unlock failed, the pager retains it until lock revalidation.
                 let can_retry = match failure {
-                    VacuumCommitFailure::MainWrite => failed_restore_io,
+                    VacuumCommitFailure::MainWrite => true,
                     VacuumCommitFailure::PhaseTwoCleanup => rb_err == cm_err,
                     VacuumCommitFailure::Other => false,
                 };
-                if can_retry && bt.pager().vacuum_error_cleanup_completed() {
+                if can_retry && cleanup == VacuumErrorCleanup::Released && bt.pager().vacuum_error_cleanup_completed() {
                     return Err(VacuumFail::Clean(cm_err));
+                }
+                if can_retry && cleanup == VacuumErrorCleanup::LockUnknown
+                    && bt.pager_mut().defer_vacuum_lock_recovery(&cm_err)
+                {
+                    return Err(VacuumFail::LockRecoveryPending(cm_err));
                 }
                 let root = if cm_err.code == ErrorCode::Busy {
                     rb_err

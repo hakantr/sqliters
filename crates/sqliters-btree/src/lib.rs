@@ -780,12 +780,12 @@ impl Btree {
     }
 
     #[doc(hidden)]
-    pub fn rollback_for_failed_vacuum_write(&mut self) -> (Result<()>, bool) {
-        let mut failed_restore_io = false;
+    pub fn rollback_for_vacuum(&mut self, failed_main_write: bool) -> (Result<()>, sqliters_pager::VacuumErrorCleanup) {
+        let mut cleanup = sqliters_pager::VacuumErrorCleanup::Incomplete;
         let rollback = self.rollback_with_trip_inner(
-            extended::SQLITE_ABORT_ROLLBACK, false, false, Some(&mut failed_restore_io),
+            extended::SQLITE_ABORT_ROLLBACK, false, false, Some((failed_main_write, &mut cleanup)),
         );
-        (rollback, failed_restore_io)
+        (rollback, cleanup)
     }
 
     fn rollback_with_trip_inner(
@@ -793,14 +793,16 @@ impl Btree {
         trip_code: i32,
         write_only: bool,
         retain_read: bool,
-        failed_restore_io: Option<&mut bool>,
+        vacuum_cleanup: Option<(bool, &mut sqliters_pager::VacuumErrorCleanup)>,
     ) -> Result<()> {
         let trip_res = self.trip_cursors(trip_code, write_only);
         self.vc_close_all();
         // `btreeClearHasContent`
         self.has_content = None;
-        let rb_res = if let Some(failed) = failed_restore_io.filter(|_| trip_res.is_ok()) {
-            self.pager.rollback_for_failed_vacuum_write(failed)
+        let rb_res = if let Some((failed_main_write, cleanup)) = vacuum_cleanup.filter(|_| trip_res.is_ok()) {
+            let (rollback, observed) = self.pager.rollback_for_vacuum(failed_main_write);
+            *cleanup = observed;
+            rollback
         } else {
             self.pager.rollback_retaining_read(retain_read)
         };

@@ -11137,7 +11137,7 @@ impl Statement {
                         self.lifecycle = StatementLifecycle::Halted { last_error: None };
                         Ok(StepResult::Done)
                     }
-                    Err(engine::VacuumFail::Clean(e)) => {
+                    Err(engine::VacuumFail::Clean(e) | engine::VacuumFail::LockRecoveryPending(e)) => {
                         self.lifecycle = StatementLifecycle::Halted {
                             last_error: Some(e.clone()),
                         };

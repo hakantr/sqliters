@@ -888,6 +888,7 @@ struct FaultState {
     fail_all_main_writes: bool,
     persist_main_write_fault: bool,
     fail_next_truncate: bool,
+    fail_unlock_after_truncate: bool,
     fail_next_main_sync: bool,
     fail_next_main_sync_notification: bool,
     fail_next_journal_delete: bool,
@@ -949,8 +950,8 @@ impl VfsFile for FaultFile {
             let mut st = self.state.lock().unwrap();
             if st.fail_next_truncate {
                 st.fail_next_truncate = false;
-                return Err(SqliteError::new(
-                    ErrorCode::IoErr,
+                return Err(SqliteError::with_extended(
+                    extended::SQLITE_IOERR_TRUNCATE,
                     "injected main DB truncate error",
                 ));
             }
@@ -994,7 +995,17 @@ impl VfsFile for FaultFile {
     }
 
     fn unlock(&self, level: LockLevel) -> sqliters::Result<()> {
-        self.inner.unlock(level)
+        self.inner.unlock(level)?;
+        if self.is_main_db && level == LockLevel::NoLock {
+            let mut state = self.state.lock().unwrap();
+            if !state.fail_next_truncate && std::mem::take(&mut state.fail_unlock_after_truncate) {
+                return Err(SqliteError::with_extended(
+                    extended::SQLITE_IOERR_UNLOCK,
+                    "injected error after database unlock",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn lock_level(&self) -> LockLevel {
@@ -1330,6 +1341,40 @@ fn test_bulgu_y1_failed_commit_partial_writes_rolled_back_atomically() {
     assert_eq!(row.get_i64(0), Some(10));
     assert_eq!(held.c_reprepare_status().0, 1);
     held.finalize().unwrap();
+    conn.try_close().unwrap();
+    verify_reopen(tmp.path(), [10, 10, 20, 0]);
+
+    // A reported unlock error requires EXCLUSIVE even if the VFS released
+    // its original lock and the peer can begin a read transaction.
+    let tmp = TempDb::new("y1_vacuum_unknown_lock");
+    let (vfs, fault) = FaultVfs::new();
+    let conn = Connection::open_with_vfs(vfs, Some(tmp.path()), flags).unwrap();
+    setup(&conn, "NONE");
+    conn.execute_batch("DROP TABLE ballast").unwrap();
+    {
+        let mut state = fault.lock().unwrap();
+        state.fail_next_truncate = true;
+        state.fail_unlock_after_truncate = true;
+    }
+    assert_eq!(
+        conn.execute("VACUUM").unwrap_err().extended_code,
+        extended::SQLITE_IOERR_TRUNCATE,
+    );
+    assert!(conn.is_autocommit());
+    assert!(!tmp.journal_path().exists());
+    assert_eq!(conn.execute("ROLLBACK").unwrap_err().code, ErrorCode::Error);
+
+    let peer = Connection::open(tmp.path()).unwrap();
+    peer.execute_batch("PRAGMA foreign_keys=ON; BEGIN").unwrap();
+    verify(&peer, [10, 10, 20, 0]);
+    let before_busy = fs::read(tmp.path()).unwrap();
+    assert_eq!(conn.query(VALUES_SQL, &[]).unwrap_err().code, ErrorCode::Busy);
+    assert_eq!(fs::read(tmp.path()).unwrap(), before_busy);
+    assert!(!tmp.journal_path().exists());
+    peer.execute_batch("ROLLBACK").unwrap();
+    peer.try_close().unwrap();
+
+    verify(&conn, [10, 10, 20, 0]);
     conn.try_close().unwrap();
     verify_reopen(tmp.path(), [10, 10, 20, 0]);
 }
