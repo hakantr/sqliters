@@ -1041,147 +1041,128 @@ impl Vfs for FaultVfs {
 
 #[test]
 fn test_bulgu_y1_failed_commit_partial_writes_rolled_back_atomically() {
-    let tmp = TempDb::new("y1_commit_ioerr");
-    let (vfs, fault) = FaultVfs::new();
-    let rw_flags = OpenFlags::READWRITE | OpenFlags::CREATE;
+    const VALUES_SQL: &str = "SELECT owner.id, memo.owner_id,
+        (SELECT n FROM extra),
+        (SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='ballast')
+        FROM owner JOIN memo ON memo.owner_id=owner.id";
+    let flags = OpenFlags::READWRITE | OpenFlags::CREATE;
 
-    // 1. Exact scenario from `bulgular.md` Y1: fail on the 3rd main-DB `write_at` during COMMIT, then ROLLBACK!
-    {
-        let conn = Connection::open_with_vfs(vfs.clone(), Some(tmp.path()), rw_flags).unwrap();
-        conn.execute(
-            "CREATE TABLE t1(x); CREATE TABLE t2(y);
-             INSERT INTO t1 VALUES (10); INSERT INTO t2 VALUES (20);",
-        )
-        .unwrap();
+    fn setup(conn: &Connection, auto_vacuum: &str) {
+        conn.execute_batch(&format!(
+            "PRAGMA page_size=1024; PRAGMA auto_vacuum={auto_vacuum};
+             PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
+             PRAGMA foreign_keys=ON; PRAGMA cache_size=120;
+             CREATE TABLE owner(id INTEGER PRIMARY KEY);
+             CREATE TABLE memo(id INTEGER PRIMARY KEY,
+                 owner_id INTEGER NOT NULL REFERENCES owner(id) ON UPDATE CASCADE);
+             CREATE TABLE extra(n INTEGER);
+             CREATE TABLE ballast(id INTEGER PRIMARY KEY, p BLOB);
+             INSERT INTO owner VALUES(10);
+             INSERT INTO memo VALUES(1,10);
+             INSERT INTO extra VALUES(20);
+             WITH RECURSIVE seq(i) AS(VALUES(1) UNION ALL SELECT i+1 FROM seq WHERE i<12)
+             INSERT INTO ballast SELECT i,zeroblob(900) FROM seq;"
+        )).unwrap();
+    }
 
-        conn.execute("BEGIN; UPDATE t1 SET x = 11; UPDATE t2 SET y = 21;")
+    fn verify(conn: &Connection, expected: [i64; 4]) {
+        let fk = conn.query_row("PRAGMA foreign_keys", &[]).unwrap().unwrap();
+        assert_eq!(fk.get_i64(0), Some(1));
+        let row = conn.query_row(VALUES_SQL, &[]).unwrap().unwrap();
+        for (column, value) in expected.into_iter().enumerate() {
+            assert_eq!(row.get_i64(column), Some(value));
+        }
+        assert!(conn.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+        let check = conn.query_row("PRAGMA integrity_check", &[]).unwrap().unwrap();
+        assert_eq!(check.get_str(0), Some("ok"));
+    }
+
+    fn verify_reopen(path: &Path, expected: [i64; 4]) {
+        let reopened = Connection::open(path).unwrap();
+        reopened.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        verify(&reopened, expected);
+        reopened.try_close().unwrap();
+
+        let [owner, memo, extra, ballast] = expected;
+        assert_eq!(
+            run_c_sqlite3(
+                path,
+                &format!("PRAGMA foreign_keys=ON; PRAGMA foreign_keys; {VALUES_SQL};
+                          PRAGMA foreign_key_check; PRAGMA integrity_check;"),
+            ),
+            format!("1\n{owner}|{memo}|{extra}|{ballast}\nok"),
+        );
+    }
+
+    for mode in ["write", "sync", "delete", "truncate", "persistent"] {
+        let tmp = TempDb::new(mode);
+        let (vfs, fault) = FaultVfs::new();
+        let conn = Connection::open_with_vfs(vfs, Some(tmp.path()), flags).unwrap();
+        setup(&conn, "FULL");
+        let before = fs::read(tmp.path()).unwrap();
+
+        conn.execute_batch("BEGIN; UPDATE owner SET id=11 WHERE id=10; UPDATE extra SET n=21;")
             .unwrap();
+        if mode == "truncate" {
+            // An ordinary auto_vacuum shrink truncates after finalizing the rollback journal.
+            conn.execute_batch("DROP TABLE ballast").unwrap();
+        }
+        assert!(!conn.is_autocommit(), "{mode}");
         {
             let mut st = fault.lock().unwrap();
             st.main_writes_seen = 0;
-            st.fail_on_main_write_nth = Some(3);
-        }
-
-        let commit_err = conn.execute("COMMIT;").unwrap_err();
-        assert_eq!(commit_err.code, ErrorCode::IoErr);
-        assert!(
-            !conn.is_autocommit(),
-            "tx must remain active after failed COMMIT"
-        );
-
-        conn.execute("ROLLBACK;").unwrap();
-        assert!(conn.is_autocommit());
-    }
-
-    // Reopen fresh from disk and verify BOTH Rust and C `sqlite3` see `(10, 20)` and `integrity_check = ok`!
-    assert_eq!(
-        run_c_sqlite3(tmp.path(), "SELECT (SELECT x FROM t1), (SELECT y FROM t2);"),
-        "10|20"
-    );
-    assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
-
-    // 2. Test failure on `truncate`, `sync`, and `journal delete` during COMMIT followed by ROLLBACK!
-    for mode in ["truncate", "sync", "delete"] {
-        let conn = Connection::open_with_vfs(vfs.clone(), Some(tmp.path()), rw_flags).unwrap();
-        conn.execute("BEGIN; UPDATE t1 SET x = 99; CREATE TABLE extra_tbl(z); INSERT INTO extra_tbl VALUES ('grow');")
-            .unwrap();
-        {
-            let mut st = fault.lock().unwrap();
             match mode {
-                "truncate" => {
-                    // Drop or grow to trigger truncate on commit or rollback
-                    st.fail_next_truncate = true;
-                }
+                "write" => st.fail_on_main_write_nth = Some(3),
                 "sync" => st.fail_next_main_sync = true,
                 "delete" => st.fail_next_journal_delete = true,
+                "truncate" => st.fail_next_truncate = true,
+                "persistent" => {
+                    st.fail_on_main_write_nth = Some(2);
+                    st.persist_main_write_fault = true;
+                }
                 _ => unreachable!(),
             }
         }
+
+        let commit_err = conn.execute("COMMIT").unwrap_err();
+        assert_eq!(commit_err.code, ErrorCode::IoErr, "{mode}");
+        assert!(conn.is_autocommit(), "{mode}");
+        let expected = if mode == "truncate" { [11, 11, 21, 0] } else { [10, 10, 20, 1] };
+        assert_eq!(tmp.journal_path().exists(), matches!(mode, "delete" | "persistent"), "{mode}");
+        if mode != "persistent" {
+            verify(&conn, expected);
+            assert!(!tmp.journal_path().exists(), "{mode}");
+        }
+        let rollback_err = conn.execute("ROLLBACK").unwrap_err();
+        assert_eq!(rollback_err.code, ErrorCode::Error, "{mode}");
+        assert_eq!(rollback_err.message, "cannot rollback - no transaction is active");
+        conn.try_close().unwrap();
+        assert_eq!(tmp.journal_path().exists(), mode == "persistent", "{mode}");
+
+        verify_reopen(tmp.path(), expected);
+        assert!(!tmp.journal_path().exists(), "{mode}");
+        let after = fs::read(tmp.path()).unwrap();
         if mode == "truncate" {
-            // Commit the growth first, then drop `extra_tbl` so `VACUUM` shrinks `page_count` and
-            // triggers `file.truncate` inside `Pager::commit()`, and ALSO test `BEGIN ... COMMIT`
-            // hitting `file.truncate` when trailing bytes exist on disk!
-            fault.lock().unwrap().fail_next_truncate = false;
-            conn.execute("COMMIT;").unwrap();
-            conn.execute("DROP TABLE extra_tbl;").unwrap();
-
-            // (a) `VACUUM` commit hitting `file.truncate` I/O error -> rolls back cleanly!
-            fault.lock().unwrap().fail_next_truncate = true;
-            let vac_err = conn.execute("VACUUM;").unwrap_err();
-            assert_eq!(vac_err.code, ErrorCode::IoErr);
-            assert!(conn.is_autocommit());
-
-            // (b) Explicit `BEGIN ... COMMIT` hitting `file.truncate` I/O error -> `ROLLBACK` restores `(99, 20)`!
-            let cur_len = fs::metadata(tmp.path()).unwrap().len();
-            fs::OpenOptions::new()
-                .write(true)
-                .open(tmp.path())
-                .unwrap()
-                .set_len(cur_len + 4096)
-                .unwrap();
-            conn.execute("BEGIN; UPDATE t1 SET x = 77;").unwrap();
-            fault.lock().unwrap().fail_next_truncate = true;
-            let err = conn.execute("COMMIT;").unwrap_err();
-            assert_eq!(err.code, ErrorCode::IoErr);
-            // `ROLLBACK;` restores `t1 = 99` and truncates trailing bytes back to `cur_len`!
-            conn.execute("ROLLBACK;").unwrap();
-            drop(conn);
-            assert_eq!(run_c_sqlite3(tmp.path(), "SELECT x FROM t1;"), "99");
-            assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
-            // Reset t1 back to 10 and compact cleanly
-            let clean = Connection::open(tmp.path()).unwrap();
-            clean.execute("UPDATE t1 SET x = 10; VACUUM;").unwrap();
+            assert_eq!(after.len(), before.len());
+            assert_ne!(after, before);
         } else {
-            let err = conn.execute("COMMIT;").unwrap_err();
-            assert_eq!(err.code, ErrorCode::IoErr);
-            conn.execute("ROLLBACK;").unwrap();
-            drop(conn);
-            assert_eq!(
-                run_c_sqlite3(tmp.path(), "SELECT (SELECT x FROM t1), (SELECT y FROM t2);"),
-                "10|20"
-            );
-            assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
+            assert_eq!(after, before, "{mode}");
         }
     }
 
-    // 3. Test persistent disk write failure DURING `ROLLBACK` after partial `COMMIT`:
-    //    `<db>-journal` MUST be preserved on disk so the next reopen recovers `(10, 20)`!
-    {
-        let conn = Connection::open_with_vfs(vfs.clone(), Some(tmp.path()), rw_flags).unwrap();
-        conn.execute("BEGIN; UPDATE t1 SET x = 555; UPDATE t2 SET y = 666;")
-            .unwrap();
-        {
-            let mut st = fault.lock().unwrap();
-            st.main_writes_seen = 0;
-            st.fail_on_main_write_nth = Some(2);
-        }
-        assert_eq!(conn.execute("COMMIT;").unwrap_err().code, ErrorCode::IoErr);
-
-        // Inject persistent write failure so `ROLLBACK;` itself fails to restore `.db`
-        fault.lock().unwrap().fail_all_main_writes = true;
-        assert_eq!(
-            conn.execute("ROLLBACK;").unwrap_err().code,
-            ErrorCode::IoErr
-        );
-        drop(conn);
-    }
-    assert!(
-        tmp.journal_path().exists(),
-        "hot journal MUST be preserved when rollback disk writes fail!"
-    );
-    fault.lock().unwrap().fail_all_main_writes = false;
-
-    // Reopening now recovers from the preserved hot journal!
-    {
-        let recovered = Connection::open(tmp.path()).unwrap();
-        let row = recovered
-            .query_row("SELECT (SELECT x FROM t1), (SELECT y FROM t2);", &[])
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.get_i64(0), Some(10));
-        assert_eq!(row.get_i64(1), Some(20));
-    }
-    assert_eq!(run_c_sqlite3(tmp.path(), "PRAGMA integrity_check;"), "ok");
+    // VACUUM also attempts a normal shrink on a healthy file with free pages.
+    let tmp = TempDb::new("y1_vacuum_truncate");
+    let (vfs, fault) = FaultVfs::new();
+    let conn = Connection::open_with_vfs(vfs, Some(tmp.path()), flags).unwrap();
+    setup(&conn, "NONE");
+    conn.execute_batch("DROP TABLE ballast").unwrap();
+    let before_size = fs::metadata(tmp.path()).unwrap().len();
+    fault.lock().unwrap().fail_next_truncate = true;
+    assert_eq!(conn.execute("VACUUM").unwrap_err().code, ErrorCode::IoErr);
+    assert!(conn.is_autocommit());
+    conn.try_close().unwrap();
+    assert_eq!(fs::metadata(tmp.path()).unwrap().len(), before_size);
+    verify_reopen(tmp.path(), [10, 10, 20, 0]);
 }
 
 // ============================================================================

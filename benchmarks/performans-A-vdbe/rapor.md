@@ -2582,3 +2582,8 @@ C kaynaklı dosyada dört indeks araması ve NOT INDEXED taramasında iki Rust k
 ## V6b.455 — Bir anonim işçide ilk satırdan sonra mmap
 
 Kip başına 48 zorlanmış çalıştırmada 714.154 VFS kaydı ve 484 lease eşleşti. Altı gerçek işçi akışı, reset ve kapanış, 132 varsayılan kontrol ve FK açık 180 dosya sonucu doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/pma-worker-mmap-v451-audit/sonuc.md) OFF 1333/1/325, ON 1333/1/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,270 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_455.md).
+
+
+## V6b.456 — Y1 COMMIT hatasından sonra işlem ve dosya durumu
+
+Yazma, kalıcı yazma, sync ve journal silme hatası ile geç truncate pinli C ve iki Rust kipinde işlem durumu, veri ve FK bütünlüğüyle karşılaştırıldı. Var olan Y1 testi C otomatik geri alma sözleşmesini, geç truncate evresinde ise kaydedilmiş geçerli veriyi doğruluyor. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v455-y1-commit-rollback-candidate/sonuc.md) OFF 1334/0/325, ON 1334/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_456.md).
