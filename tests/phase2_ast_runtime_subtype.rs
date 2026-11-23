@@ -3846,3 +3846,38 @@ fn group64_file_sorter_worker_with_wide_packed_record() {
         statement.reset().unwrap();
     }
 }
+
+#[test]
+fn group64_file_sorter_worker_rowid_can_precede_other_keys() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}';
+             PRAGMA temp_store=FILE; PRAGMA cache_size=1; PRAGMA threads=2;
+             CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT, w INTEGER);
+             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<12)
+             INSERT INTO items SELECT i, printf('x%23000s','z'), i%3 FROM n;"
+        )).unwrap();
+        for order in ["+id DESC,v", "v COLLATE BINARY NULLS LAST,id DESC,w"] {
+            let mut statement = db.prepare(&format!(
+                "SELECT id,w FROM items ORDER BY {order}"
+            )).unwrap();
+            let StepResult::Row(first) = statement.step().unwrap() else {
+                panic!("expected a first row in {encoding} for {order}");
+            };
+            assert_eq!(first.get_i64(0), Some(12));
+            assert!(statement.machine_stmt_status(4, false) > 0, "{encoding}/{order}");
+            statement.reset().unwrap();
+
+            for id in (1..=12).rev() {
+                let StepResult::Row(row) = statement.step().unwrap() else {
+                    panic!("expected row {id} in {encoding} for {order}");
+                };
+                assert_eq!(row.get_i64(0), Some(id));
+                assert_eq!(row.get_i64(1), Some(id % 3));
+            }
+            assert!(matches!(statement.step().unwrap(), StepResult::Done));
+            statement.reset().unwrap();
+        }
+    }
+}

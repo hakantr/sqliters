@@ -1627,8 +1627,8 @@ fn complete_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
     })
 }
 
-/// One index-free main rowid scan with a total BINARY order. The rowid
-/// occupies the final comparator field, independently of the result columns.
+/// One index-free main rowid scan with a total BINARY order. One comparator
+/// field is the table's unique rowid, independently of the result columns.
 fn worker_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
     if !prog.read_only || prog.btree_mask != 1 || !prog.p_program.is_empty()
         || !builtin_order_sorter(prog, open, key)
@@ -1666,16 +1666,23 @@ fn worker_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
     let width = usize::from(key.n_key_field);
     let mut inserts = prog.a_op.windows(width + 2)
         .filter(|ops| ops[width + 1].opcode == OP_SorterInsert);
-    let Some([columns @ .., rowid, record, _]) = inserts.next() else { return false };
+    let Some([keys @ .., record, _]) = inserts.next() else { return false };
+    let Some(rowid_index) = keys.iter().position(|source| source.opcode == OP_Rowid) else { return false };
     inserts.next().is_none()
-        && columns.iter().enumerate().all(|(index, column)| {
-            column.opcode == OP_Column && column.p1 == table.p1
-                && record.p1.checked_add(index as i32) == Some(column.p3)
-                && columns[..index].iter().all(|prior| prior.p2 != column.p2)
-        })
-        && rowid.opcode == OP_Rowid && rowid.p1 == table.p1
-        && rowid.p2.checked_sub(i32::from(key.n_key_field) - 1) == Some(record.p1)
         && record.opcode == OP_MakeRecord
+        && keys.iter().enumerate().all(|(index, source)| {
+            if source.p1 != table.p1 {
+                return false;
+            }
+            let Some(register) = record.p1.checked_add(index as i32) else { return false };
+            match source.opcode {
+                OP_Rowid => index == rowid_index && source.p2 == register,
+                OP_Column => source.p3 == register && keys[..index].iter().all(|prior| {
+                    prior.opcode != OP_Column || prior.p2 != source.p2
+                }),
+                _ => false,
+            }
+        })
         && prog.a_op.iter().filter(|op| op.opcode == OP_SorterOpen).count() == 1
 }
 

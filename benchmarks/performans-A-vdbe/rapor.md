@@ -2667,3 +2667,8 @@ Son biricik rowid ile her kipte 144 geniş profil ve 27.792 C API adımı eşle�
 ## V6b.472 — VACUUM sonrası belirsiz kilidin güvenli doğrulanması
 
 Başarılı EXCLUSIVE öncesi journal, WAL ve ana dosya erişimi yapılmıyor. 16 hedef C kilit ve API gözlemi, gerçek peer çekişmesi, C readback, 156 dosya görüntüsü ve Y1 doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v470-vacuum-unknown-lock-candidate/sonuc.md) OFF 1344/0/325, ON 1344/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,282 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_472.md).
+
+
+## V6b.473 — Biricik rowid ilk veya orta anahtardayken işçi PMA
+
+Toplam BINARY sıralamada rowid aynı tek tablo cursor’ının packed anahtar önekinde herhangi bir yerde olabilir. Her kipte 144 profil, 221.400 C adımı ve aynı ifadenin 72 ilk satır reseti doğrulandı. Altı dosyada FK ve bütünlük korundu. [Bağımsız ölçüm](/github/sqliters/target/perf-work/worker-rowid-key-position-preflight/sonuc.md) OFF 1345/0/325, ON 1345/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_473.md).
