@@ -205,6 +205,9 @@ pub trait VdbeHost {
     }
     /// `db->nDeferredCons += n` (`imm == false`) or `db->nDeferredImmCons += n` (`OP_FkCounter`).
     fn add_deferred_cons(&mut self, _imm: bool, _n: i64) {}
+    fn add_deferred_cons_for_table(&mut self, imm: bool, n: i64, _table: Option<(i32, u32)>) {
+        self.add_deferred_cons(imm, n);
+    }
     /// The mask `sqlite3VdbeFindIndexKey` computes for the index a `P4_INDEX` operand names in
     /// database `i_db`: bit `ii` (of the first 64 of `pIdx->nColumn`) is set when column `ii`
     /// of the index is an expression (`XN_EXPR`) or a VIRTUAL generated column of the table.
@@ -7127,10 +7130,14 @@ impl Vdbe {
                 }
 
                 OP_FkCounter => {
+                    let origin = match &op.p4 {
+                        P4::FkCounterTable { db, root } => Some((*db, *root)),
+                        _ => None,
+                    };
                     if op.p1 != 0 {
-                        host.add_deferred_cons(false, i64::from(op.p2));
+                        host.add_deferred_cons_for_table(false, i64::from(op.p2), origin);
                     } else if host.defer_fks() {
-                        host.add_deferred_cons(true, i64::from(op.p2));
+                        host.add_deferred_cons_for_table(true, i64::from(op.p2), origin);
                     } else {
                         self.n_fk_constraint += i64::from(op.p2);
                     }

@@ -157,6 +157,8 @@ pub enum P4 {
     /// `P4_NOTUSED`
     #[default]
     NotUsed,
+    /// Child-table identity for the deferred counter. SQLite exposes a NULL P4.
+    FkCounterTable { db: i32, root: u32 },
     /// `P4_STATIC`: a string with static lifetime
     Static(&'static str),
     /// `P4_DYNAMIC` (and `P4_TRANSIENT`, which C copies into a dynamic string): a C string, or
@@ -197,7 +199,7 @@ impl P4 {
     /// `pOp->p4type != P4_NOTUSED`
     #[inline]
     pub fn is_used(&self) -> bool {
-        !matches!(self, P4::NotUsed)
+        !matches!(self, P4::NotUsed | P4::FkCounterTable { .. })
     }
 }
 
@@ -981,7 +983,7 @@ pub fn sqlite3_vdbe_display_p4_bytes(op: &VdbeOp) -> Option<Vec<u8>> {
     }
     let text = |s: String| Some(s.into_bytes());
     match &op.p4 {
-        P4::NotUsed => None,
+        P4::NotUsed | P4::FkCounterTable { .. } => None,
         P4::KeyInfo(k) => {
             let mut x = format!("k({}", k.n_key_field);
             for j in 0..k.n_key_field as usize {

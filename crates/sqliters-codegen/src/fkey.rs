@@ -16,6 +16,12 @@ use crate::tk::*;
 /// A foreign key: (child table `pFrom`, index into its `p_fkey`).
 pub type FkRef = (TableId, usize);
 
+fn add_fk_counter(p: &mut Parse, child: TableId, deferred: bool, delta: i32) {
+    let table = p.tab(child);
+    let origin = P4::FkCounterTable { db: table.i_db, root: table.tnum };
+    p.v.add_op4(OP_FkCounter, i32::from(deferred), delta, 0, origin);
+}
+
 fn fk<'a>(p: &'a Parse<'_>, r: FkRef) -> &'a FKey {
     &p.tab(r.0).p_fkey[r.1]
 }
@@ -261,7 +267,7 @@ fn fk_lookup_parent(p: &mut Parse, i_db: i32, tab: TableId, idx: IndexId, f: FkR
         if n_incr > 0 && !fkey.is_deferred {
             sqlite3_may_abort(p);
         }
-        p.v.add_op2(OP_FkCounter, fkey.is_deferred as i32, n_incr);
+        add_fk_counter(p, f.0, fkey.is_deferred, n_incr);
     }
 
     p.v.resolve_label(i_ok);
@@ -382,7 +388,7 @@ fn fk_scan_children(p: &mut Parse, src: SrcListId, tab: TableId, idx: IndexId, f
     // row found, increment either the deferred or immediate foreign key constraint counter.
     if p.n_err == 0 {
         let w = crate::where_::sqlite3_where_begin(p, src, where_, ExprListId::NULL, ExprListId::NULL, SelectId::NULL, 0, 0);
-        p.v.add_op2(OP_FkCounter, fkey.is_deferred as i32, n_incr);
+        add_fk_counter(p, f.0, fkey.is_deferred, n_incr);
         if let Some(w) = w {
             crate::where_::sqlite3_where_end(p, w);
         }
@@ -503,7 +509,7 @@ pub fn sqlite3_fk_check(p: &mut Parse, tab: TableId, reg_old: i32, reg_new: i32,
                     let i_reg = sqlite3_table_column_to_storage(p.tab(tab), i_from_col) + reg_old + 1;
                     p.v.add_op2(OP_IsNull, i_reg, i_jump);
                 }
-                p.v.add_op2(OP_FkCounter, fkey.is_deferred as i32, -1);
+                add_fk_counter(p, f.0, fkey.is_deferred, -1);
             }
             continue;
         };

@@ -1647,11 +1647,16 @@ impl VdbeHost for WriteHost<'_, '_> {
     }
 
     fn add_deferred_cons(&mut self, imm: bool, n: i64) {
-        if imm {
-            self.ctx.deferred_fk_suspects.n_deferred_imm_cons += n;
-        } else {
-            self.ctx.deferred_fk_suspects.n_deferred_cons += n;
-        }
+        self.ctx.deferred_fk_suspects.add_machine_count(imm, n, None, *self.ctx.schema_generation);
+    }
+
+    fn add_deferred_cons_for_table(&mut self, imm: bool, n: i64, table: Option<(i32, u32)>) {
+        let origin = table.and_then(|(db, root)| {
+            let db_id = DatabaseId(usize::try_from(db).ok()?);
+            let slot = self.ctx.db_set.slot(db_id)?;
+            (root > 1).then_some((slot.schema_instance_id, root))
+        });
+        self.ctx.deferred_fk_suspects.add_machine_count(imm, n, origin, *self.ctx.schema_generation);
     }
 
     fn randomness(&mut self) -> i64 {
@@ -2025,6 +2030,11 @@ impl VdbeHost for WriteHost<'_, '_> {
             // row-mutation log, the incremental blob handles that write)
             let sp = &self.ctx.savepoints[pos];
             *self.ctx.deferred_fk_suspects = sp.deferred_fk_suspects.clone();
+            if *self.ctx.schema_changed_in_tx {
+                self.ctx.deferred_fk_suspects.restore_machine_schema_generation(
+                    sp.schema_gen_at_open, *self.ctx.schema_generation,
+                );
+            }
             let mlen = sp.mutation_len_at_open;
             self.ctx.mutation_pipeline.truncate(mlen);
             self.ctx.savepoints.truncate(pos + 1);

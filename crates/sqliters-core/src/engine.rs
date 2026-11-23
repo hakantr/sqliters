@@ -2314,6 +2314,9 @@ pub struct FkSuspects {
     pub n_deferred_cons: i64,
     /// `db->nDeferredImmCons`
     pub n_deferred_imm_cons: i64,
+    machine_debts: HashMap<(SchemaInstanceId, u32), (i64, i64)>,
+    machine_schema_generation: Option<u64>,
+    unattributed_machine_count: bool,
 }
 
 impl FkSuspects {
@@ -2322,6 +2325,57 @@ impl FkSuspects {
         self.list.clear();
         self.n_deferred_cons = 0;
         self.n_deferred_imm_cons = 0;
+        self.machine_debts.clear();
+        self.machine_schema_generation = None;
+        self.unattributed_machine_count = false;
+    }
+
+    pub(crate) fn add_machine_count(
+        &mut self,
+        immediate: bool,
+        count: i64,
+        table: Option<(SchemaInstanceId, u32)>,
+        schema_generation: u64,
+    ) {
+        if immediate {
+            self.n_deferred_imm_cons += count;
+        } else {
+            self.n_deferred_cons += count;
+        }
+        let Some(table) = table else {
+            self.unattributed_machine_count = true;
+            return;
+        };
+        let generation = self.machine_schema_generation.get_or_insert(schema_generation);
+        if *generation != schema_generation {
+            self.unattributed_machine_count = true;
+            return;
+        }
+        let (deferred, deferred_immediate) = self.machine_debts.entry(table).or_default();
+        if immediate {
+            *deferred_immediate += count;
+        } else {
+            *deferred += count;
+        }
+    }
+
+    /// ROLLBACK TO restores both the debt counters and the saved schema.
+    pub(crate) fn restore_machine_schema_generation(&mut self, saved: u64, restored: u64) {
+        if self.machine_schema_generation == Some(saved) {
+            self.machine_schema_generation = Some(restored);
+        }
+    }
+
+    fn drop_machine_debts(&mut self, table: (SchemaInstanceId, u32), schema_generation: u64) {
+        if self.machine_schema_generation != Some(schema_generation) || self.unattributed_machine_count
+            || self.machine_debts.values().any(|&(deferred, immediate)| deferred < 0 || immediate < 0)
+        {
+            return;
+        }
+        if let Some((deferred, immediate)) = self.machine_debts.remove(&table) {
+            self.n_deferred_cons -= deferred;
+            self.n_deferred_imm_cons -= immediate;
+        }
     }
 }
 
@@ -2644,6 +2698,11 @@ pub(crate) fn execute_control_stmt(ctx: &mut ExecContext<'_>, stmt: &Stmt) -> Re
                     *ctx.schema_generation += 1;
                     *ctx.v1_expire_generation += 1;
                     *ctx.schema_changed_in_tx = true;
+                }
+                if trip_err.is_none() {
+                    ctx.deferred_fk_suspects.restore_machine_schema_generation(
+                        sp.schema_gen_at_open, *ctx.schema_generation,
+                    );
                 }
                 *ctx.rollback_count += 1;
                 ctx.publish();
@@ -36483,6 +36542,15 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
         ));
     };
 
+    // A table that is also a parent may affect counters through FK actions.
+    let reconcile_deferred_child = *ctx.foreign_keys
+        && tbl.foreign_keys.iter().any(|fk| fk.deferred || ctx.prepared_defer_fks())
+        && ctx.db_set.slot(db_id).is_some_and(|slot| {
+            !slot.schema.tables.iter().any(|table| {
+                table.foreign_keys.iter().any(|fk| fk.ref_table.eq_ignore_ascii_case(&tbl.name))
+            })
+        });
+
     // Per SQLite `sqlite3FkDropTable`, when `foreign_keys = ON`, delete rows first so FK constraints / actions fire!
     if *ctx.foreign_keys {
         let existing_rows = scan_table_raw_entries(ctx, db_id, &tbl)?;
@@ -36644,6 +36712,13 @@ fn exec_drop_table(ctx: &mut ExecContext<'_>, if_exists: bool, name: &QualifiedN
             ctx.db_set.update_blob_root_page(inst_id, mv.from, mv.to);
         }
         ctx.db_set.invalidate_blobs_for_table(inst_id, &tbl.name);
+        // The legacy DROP removed the child table. Reconcile counters whose
+        // ownership is known while their compiled root identities are stable.
+        if reconcile_deferred_child {
+            ctx.deferred_fk_suspects.drop_machine_debts(
+                (inst_id, tbl.root_pgno), *ctx.schema_generation,
+            );
+        }
     }
     *ctx.schema_generation += 1;
     *ctx.v1_expire_generation += 1;

@@ -56,3 +56,39 @@ fn deferred_flag_prepare_schema_load_and_transaction_lifetime() {
         db.execute_batch("ROLLBACK;").unwrap();
     }
 }
+
+#[test]
+fn drop_child_reconciles_only_its_deferred_constraints() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "PRAGMA foreign_keys=ON;
+         CREATE TABLE parent(id INTEGER PRIMARY KEY);
+         CREATE TABLE first_child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id));
+         CREATE TABLE second_child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id));
+         INSERT INTO parent VALUES(1);
+         INSERT INTO first_child VALUES(11,1);
+         INSERT INTO second_child VALUES(21,1);
+         BEGIN;
+         PRAGMA defer_foreign_keys=ON;
+         DELETE FROM parent;
+         SAVEPOINT before_drop;
+         DROP TABLE first_child;",
+    ).unwrap();
+    assert_eq!(db.execute_batch("COMMIT").unwrap_err().extended_code, 787);
+    assert!(!db.is_autocommit());
+
+    db.execute_batch(
+        "ROLLBACK TO before_drop;
+         RELEASE before_drop;
+         DELETE FROM second_child;
+         DROP TABLE first_child;
+         COMMIT;",
+    ).unwrap();
+    assert!(db.is_autocommit());
+    assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+    assert_eq!(
+        db.query("SELECT name FROM sqlite_schema WHERE name='first_child'", &[]).unwrap().rows.len(),
+        0,
+    );
+    assert_eq!(db.query("PRAGMA integrity_check", &[]).unwrap().rows[0].get_str(0), Some("ok"));
+}

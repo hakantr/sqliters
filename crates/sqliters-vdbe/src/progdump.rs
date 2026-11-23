@@ -265,7 +265,7 @@ fn func_text(f: &FuncDef) -> String {
 fn op_text(o: &VdbeOp, sub_index: &mut dyn FnMut(&Arc<SubProgram>) -> usize) -> String {
     let mut s = format!("O {} {} {} {} {} ", OPCODE_NAME[o.opcode as usize], o.p1, o.p2, o.p3, o.p5);
     match &o.p4 {
-        P4::NotUsed => s.push('-'),
+        P4::NotUsed | P4::FkCounterTable { .. } => s.push('-'),
         P4::Static(z) => {
             s.push_str("S ");
             s.push_str(&hexs(z.as_bytes()));
