@@ -176,13 +176,19 @@ struct RegisteredScalar {
     introduced_at: u64,
 }
 
+#[derive(Debug, Clone)]
+struct RegisteredAggregate {
+    definition: WindowFunctionDef,
+    introduced_at: u64,
+}
+
 /// Connection-level registry for custom and extension scalar, aggregate, and window SQL functions.
 #[derive(Debug, Default, Clone)]
 pub struct FunctionRegistry {
     scalars: BTreeMap<String, Vec<RegisteredScalar>>,
-    scalar_generation: u64,
+    function_generation: u64,
     deleted_scalar_arities: BTreeMap<String, Vec<Option<usize>>>,
-    aggregates: BTreeMap<String, Vec<WindowFunctionDef>>,
+    aggregates: BTreeMap<String, Vec<RegisteredAggregate>>,
     user_modified: bool,
     c_like_flags: BTreeMap<Option<usize>, u32>,
     c_like_modes: BTreeMap<Option<usize>, bool>,
@@ -236,8 +242,8 @@ impl FunctionRegistry {
         if let Some(existing) = overloads.iter_mut().find(|entry| entry.definition.arity == arity) {
             existing.definition = def;
         } else {
-            self.scalar_generation += 1;
-            let entry = RegisteredScalar { definition: def, introduced_at: self.scalar_generation };
+            self.function_generation += 1;
+            let entry = RegisteredScalar { definition: def, introduced_at: self.function_generation };
             if entry.definition.name.eq_ignore_ascii_case("like") {
                 overloads.insert(0, entry);
             } else {
@@ -259,19 +265,22 @@ impl FunctionRegistry {
         self.register_scalar_shared(&name.into(), arity, flags, Arc::new(callback));
     }
 
-    pub(crate) fn scalar_generation(&self) -> u64 {
-        self.scalar_generation
+    pub(crate) fn function_generation(&self) -> u64 {
+        self.function_generation
     }
 
-    /// A suspended read retains its scalar overload selection. Only consider registrations
-    /// already present when the execution started. Build a temporary view when an
-    /// overload was added between steps so a held statement does not own callback lifetimes.
-    pub(crate) fn scalar_registry_at(&self, generation: u64) -> Option<Self> {
-        if generation == self.scalar_generation {
+    /// Resolve overloads visible at prepare time. Build a temporary view only when the
+    /// registry grew, keeping callback ownership in the connection.
+    pub(crate) fn function_registry_at(&self, generation: u64) -> Option<Self> {
+        if generation == self.function_generation {
             return None;
         }
         let mut view = self.clone();
         view.scalars.retain(|_, entries| {
+            entries.retain(|entry| entry.introduced_at <= generation);
+            !entries.is_empty()
+        });
+        view.aggregates.retain(|_, entries| {
             entries.retain(|entry| entry.introduced_at <= generation);
             !entries.is_empty()
         });
@@ -304,7 +313,7 @@ impl FunctionRegistry {
 
     fn remove_aggregate_overload(&mut self, key: &str, arity: Option<usize>) {
         if let Some(overloads) = self.aggregates.get_mut(key) {
-            overloads.retain(|definition| definition.arity != arity);
+            overloads.retain(|entry| entry.definition.arity != arity);
             if overloads.is_empty() {
                 self.aggregates.remove(key);
             }
@@ -398,7 +407,7 @@ impl FunctionRegistry {
         if name.eq_ignore_ascii_case("like") {
             self.c_like_flags.remove(&arity);
             self.c_like_modes.remove(&arity);
-            if let Some(v) = self.aggregates.get_mut("LIKE") { v.retain(|f| f.arity != arity); }
+            if let Some(v) = self.aggregates.get_mut("LIKE") { v.retain(|entry| entry.definition.arity != arity); }
         }
     }
 
@@ -425,7 +434,7 @@ impl FunctionRegistry {
                 self.c_like_flags.insert(Some(arity), (flags | added_flags) & !SQLITE_FUNC_UNSAFE);
                 def.flags = def.flags | FunctionFlags::INNOCUOUS;
             } else if let Some(def) = self.aggregates.get_mut("LIKE")
-                .and_then(|v| v.iter_mut().find(|f| f.arity == Some(arity)))
+                .and_then(|v| v.iter_mut().map(|entry| &mut entry.definition).find(|f| f.arity == Some(arity)))
             {
                 let flags = self.c_like_flags.get(&Some(arity)).copied()
                     .unwrap_or_else(|| crate::cgen::func_flags(def.flags));
@@ -441,7 +450,7 @@ impl FunctionRegistry {
             sqliters_vdbe::eval_registered_like(&values, &VmRuntimeContext::default(), case_sensitive)
                 .map(RuntimeValue::plain)
         });
-        if let Some(v) = self.aggregates.get_mut("LIKE") { v.retain(|f| f.arity != Some(arity)); }
+        if let Some(v) = self.aggregates.get_mut("LIKE") { v.retain(|entry| entry.definition.arity != Some(arity)); }
         self.c_like_flags.insert(Some(arity), 1 | added_flags);
         self.c_like_modes.insert(Some(arity), case_sensitive);
         exact
@@ -480,7 +489,7 @@ impl FunctionRegistry {
     /// under `name` (any arity).
     pub fn aggregate_overloads(&self, name: &str) -> Vec<(Option<usize>, FunctionFlags, bool)> {
         with_ascii_upper_key(name, |k| self.aggregates.get(k))
-            .map(|v| v.iter().map(|d| (d.arity, d.flags, d.supports_window)).collect())
+            .map(|v| v.iter().map(|entry| &entry.definition).map(|d| (d.arity, d.flags, d.supports_window)).collect())
             .unwrap_or_default()
     }
 
@@ -511,12 +520,16 @@ impl FunctionRegistry {
             factory: Arc::new(factory),
         };
         let overloads = self.aggregates.entry(key).or_default();
-        if let Some(existing) = overloads.iter_mut().find(|d| d.arity == arity) {
-            *existing = def;
-        } else if def.name.eq_ignore_ascii_case("like") {
-            overloads.insert(0, def);
+        if let Some(existing) = overloads.iter_mut().find(|entry| entry.definition.arity == arity) {
+            existing.definition = def;
         } else {
-            overloads.push(def);
+            self.function_generation += 1;
+            let entry = RegisteredAggregate { definition: def, introduced_at: self.function_generation };
+            if entry.definition.name.eq_ignore_ascii_case("like") {
+                overloads.insert(0, entry);
+            } else {
+                overloads.push(entry);
+            }
         }
     }
 
@@ -538,8 +551,9 @@ impl FunctionRegistry {
         let overloads = with_ascii_upper_key(name, |k| self.aggregates.get(k))?;
         overloads
             .iter()
+            .map(|entry| &entry.definition)
             .find(|d| d.arity == Some(argc))
-            .or_else(|| overloads.iter().find(|d| d.arity.is_none()))
+            .or_else(|| overloads.iter().map(|entry| &entry.definition).find(|d| d.arity.is_none()))
     }
 
     /// Validates a SQL function call at `prepare` time against registered custom scalar and
@@ -666,7 +680,8 @@ impl FunctionRegistry {
             }
         }
         for overloads in self.aggregates.values() {
-            for def in overloads {
+            for entry in overloads {
+                let def = &entry.definition;
                 let kind = if def.supports_window { "w" } else { "a" };
                 out.push((
                     def.name.clone(),

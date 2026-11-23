@@ -3023,3 +3023,45 @@ fn group65_direct_function_list_preserves_rust_name_with_embedded_nul() {
         statement.reset().unwrap();
     }
 }
+
+#[test]
+fn group65_prepared_aggregate_keeps_selected_definition_on_reset() {
+    struct ConstantTotal;
+
+    impl sqliters::WindowAggregateInstance for ConstantTotal {
+        fn step(&mut self, _: &[RuntimeValue]) -> Result<()> {
+            Ok(())
+        }
+
+        fn finalize(&mut self) -> Result<RuntimeValue> {
+            Ok(RuntimeValue::plain(Value::Integer(81)))
+        }
+    }
+
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}';
+             CREATE TABLE data(id INTEGER PRIMARY KEY);
+             INSERT INTO data VALUES(1),(2),(3);"
+        )).unwrap();
+        let sql = "SELECT sum(id) FROM data";
+        let mut legacy = db.prepare_v1(sql).unwrap();
+        let mut modern = db.prepare(sql).unwrap();
+
+        db.create_aggregate_function("sum", -1, FunctionFlags::NONE, || Box::new(ConstantTotal))
+            .unwrap();
+        for statement in [&mut legacy, &mut modern] {
+            for _ in 0..2 {
+                let StepResult::Row(row) = statement.step().unwrap() else {
+                    panic!("missing aggregate result");
+                };
+                assert_eq!(row.get_i64(0), Some(6));
+                assert!(matches!(statement.step().unwrap(), StepResult::Done));
+                assert_eq!(statement.c_reprepare_status().0, 0);
+                statement.reset().unwrap();
+            }
+        }
+        assert_eq!(db.query(sql, &[]).unwrap().rows[0].get_i64(0), Some(81));
+    }
+}

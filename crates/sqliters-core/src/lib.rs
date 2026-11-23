@@ -921,7 +921,7 @@ pub(crate) enum RunningExec {
     Vdbe {
         vm: VdbeVm,
         read_instances: SmallInstVec,
-        scalar_generation: u64,
+        function_generation: u64,
     },
     PointSelectRowYielded {
         read_instances: SmallInstVec,
@@ -937,7 +937,7 @@ pub(crate) enum RunningExec {
         vm: Box<sqliters_vdbe::vdbe::Vdbe>,
         lease_cursors: Vec<(SchemaInstanceId, CursorId)>,
         read_instances: SmallInstVec,
-        scalar_generation: u64,
+        function_generation: u64,
     },
     FastSingleTextArena {
         arena: String,
@@ -4795,8 +4795,10 @@ impl Connection {
             supports_inverse,
             factory,
         );
-        inner.schema_generation += 1;
-        inner.v1_expire_generation += 1;
+        if replacing {
+            inner.schema_generation += 1;
+            inner.v1_expire_generation += 1;
+        }
         Ok(())
     }
 
@@ -5502,7 +5504,7 @@ pub struct Statement {
     c_machine_fixed: bool,
     cached_read_vm: Option<VdbeVm>,
     write_vm_scratch: sqliters_vdbe::VdbeWriteScratch,
-    compiled_scalar_generation: u64,
+    compiled_function_generation: u64,
     compiled_schema_generation: u64,
     compiled_v1_expire_generation: u64,
     c_sorter_owns_rows: bool,
@@ -7134,8 +7136,8 @@ impl ConnectionInner {
         let mut publish_fn = |rt: &VmRuntimeContext, exp: bool, imp: bool, rb: u64| {
             shared.publish_mirrors(rt, exp, imp, rb);
         };
-        let prepared_functions = stmt_tx.prepared_scalar_generation
-            .and_then(|generation| self.functions.scalar_registry_at(generation));
+        let prepared_functions = stmt_tx.prepared_function_generation
+            .and_then(|generation| self.functions.function_registry_at(generation));
         let mut ctx = ExecContext {
             db_set: &mut self.db_set,
             connection_encoding: &mut self.connection_encoding,
@@ -8131,9 +8133,9 @@ impl Statement {
             None => Box::new(sqliters_vdbe::vdbe::Vdbe::new(prog)),
         };
 
-        let scalar_generation = self.compiled_scalar_generation;
+        let function_generation = self.compiled_function_generation;
         let (result, pragma_schema_error_offset) =
-            vdbe_host::step(inner, shared, hid, &mut vm, &self.params, true, &self.raw_sql, scalar_generation);
+            vdbe_host::step(inner, shared, hid, &mut vm, &self.params, true, &self.raw_sql, function_generation);
         if vm.expired_on_reset { self.expired = true; }
         match result {
             Ok(Some(row)) => {
@@ -8145,7 +8147,7 @@ impl Statement {
                     vm,
                     lease_cursors,
                     read_instances,
-                    scalar_generation,
+                    function_generation,
                 });
                 MachineStart::Stepped(Ok(StepResult::Row(Row::new(row))))
             }
@@ -8234,13 +8236,13 @@ impl Statement {
         shared: &Arc<ConnectionShared>,
         inner: &mut ConnectionInner,
     ) -> Result<StepResult> {
-        let StatementLifecycle::Running(RunningExec::Machine { vm, scalar_generation, .. }) =
+        let StatementLifecycle::Running(RunningExec::Machine { vm, function_generation, .. }) =
             &mut self.lifecycle
         else {
             unreachable!("machine_advance requires a statement suspended on the machine");
         };
         let (res, pragma_schema_error_offset) =
-            vdbe_host::step(inner, shared, hid, vm, &self.params, false, &self.raw_sql, *scalar_generation);
+            vdbe_host::step(inner, shared, hid, vm, &self.params, false, &self.raw_sql, *function_generation);
         if vm.expired_on_reset { self.expired = true; }
         if let Ok(Some(row)) = res {
             if vm.prog.uses_vtab() {
@@ -8919,7 +8921,7 @@ impl Statement {
             c_machine_fixed: false,
             cached_read_vm: None,
             write_vm_scratch: sqliters_vdbe::VdbeWriteScratch::default(),
-            compiled_scalar_generation: inner.functions.scalar_generation(),
+            compiled_function_generation: inner.functions.function_generation(),
             compiled_schema_generation: inner.schema_generation,
             compiled_v1_expire_generation: inner.v1_expire_generation,
             c_sorter_owns_rows: select_schema_use.as_ref().is_some_and(|usage| usage.sorter_owns_rows),
@@ -9819,7 +9821,7 @@ impl Statement {
             self.params = transferred;
             self.named_params = artifacts.named_params;
             self.ignored_fk_parent_tables = artifacts.ignored_fk_parent_tables;
-            self.compiled_scalar_generation = inner.functions.scalar_generation();
+            self.compiled_function_generation = inner.functions.function_generation();
             self.compiled_schema_generation = inner.schema_generation;
             self.compiled_v1_expire_generation = inner.v1_expire_generation;
             self.compiled_advisory_expire_generation = inner.advisory_expire_generation;
@@ -10514,7 +10516,7 @@ impl Statement {
             VdbeVm::from_shared(Arc::clone(prog), &self.params, vm_rt)
         };
         self.lifecycle = StatementLifecycle::Running(RunningExec::Vdbe {
-            vm, read_instances, scalar_generation: self.compiled_scalar_generation,
+            vm, read_instances, function_generation: self.compiled_function_generation,
         });
         Some(self.advance_running_in_session(hid, shared, inner))
     }
@@ -10579,7 +10581,7 @@ impl Statement {
         vdbe_host::custom_sort_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len())
             .or_else(|| vdbe_host::worker_sort_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len()))
             .or_else(|| {
-                let prepared_functions = inner.functions.scalar_registry_at(self.compiled_scalar_generation);
+                let prepared_functions = inner.functions.function_registry_at(self.compiled_function_generation);
                 vdbe_host::mapped_table_read_program(
                     inner, prepared_functions.as_ref().unwrap_or(&inner.functions),
                     self.stmt.as_ref(), &self.raw_sql, self.params.len(),
@@ -11219,7 +11221,7 @@ impl Statement {
                             VdbeVm::from_shared(Arc::clone(prog_final), &self.params, vm_rt)
                         };
                         self.lifecycle = StatementLifecycle::Running(RunningExec::Vdbe {
-                            vm, read_instances, scalar_generation: self.compiled_scalar_generation,
+                            vm, read_instances, function_generation: self.compiled_function_generation,
                         });
                         return self.advance_running_in_session(hid, shared, inner);
                     }
@@ -11492,7 +11494,7 @@ impl Statement {
                 }
                 let mut expire_self_only = false;
                 let mut stmt_tx = StmtTxTracker {
-                    prepared_scalar_generation: Some(self.compiled_scalar_generation),
+                    prepared_function_generation: Some(self.compiled_function_generation),
                     prepared_ignore_checks: Some(self.compiled_ignore_checks),
                     ..StmtTxTracker::default()
                 };
@@ -12030,7 +12032,7 @@ impl Statement {
                 let top_level_sql = inner.trace_hook.is_some().then(|| self.raw_sql.clone());
                 let mut stmt_tx = StmtTxTracker {
                     prepared_defer_fks: Some(self.compiled_defer_fks),
-                    prepared_scalar_generation: Some(self.compiled_scalar_generation),
+                    prepared_function_generation: Some(self.compiled_function_generation),
                     prepared_ignore_checks: Some(self.compiled_ignore_checks),
                     prepared_reverse_order: self.compiled_reverse_order,
                     view_update_range_tokens: !inner.authorizer.is_some()
@@ -12348,7 +12350,7 @@ impl Statement {
                 fin_res?;
                 Ok(StepResult::Done)
             }
-            RunningExec::Vdbe { vm, read_instances, scalar_generation } => {
+            RunningExec::Vdbe { vm, read_instances, function_generation } => {
                 // `db->nChange`, `db->nTotalChange` and `db->lastRowid` belong to the
                 // connection: statements that ran since this one last returned a row have
                 // moved them, and this statement goes on from their values.
@@ -12359,12 +12361,12 @@ impl Statement {
                 let step_res = {
                     let encoding = inner.effective_encoding();
                     let rt_snapshot = vm.runtime_ctx;
-                    let scalar_registry = inner.functions.scalar_registry_at(*scalar_generation);
+                    let prepared_functions = inner.functions.function_registry_at(*function_generation);
                     let mut services = ExecutionContext {
                         interrupt_flag: &inner.active_interrupt_flag,
                         runtime: &rt_snapshot,
                         encoding,
-                        functions: scalar_registry.as_ref().unwrap_or(&inner.functions),
+                        functions: prepared_functions.as_ref().unwrap_or(&inner.functions),
                         collations: &inner.collations,
                         progress: &mut inner.progress,
                         strict_subtype: inner.strict_subtype,

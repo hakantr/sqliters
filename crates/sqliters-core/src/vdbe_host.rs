@@ -2245,7 +2245,7 @@ pub(crate) fn step(
     params: &[Value],
     start: bool,
     sql: &str,
-    scalar_generation: u64,
+    function_generation: u64,
 ) -> (Result<Option<Vec<Value>>>, Option<usize>) {
     if start {
         vm.rewind();
@@ -2273,7 +2273,7 @@ pub(crate) fn step(
         let summary = inner.activity.summary_excluding(hid, &inner.db_set);
         let encoding = inner.effective_encoding();
         let mut stmt_tx = crate::engine::StmtTxTracker {
-            prepared_scalar_generation: Some(scalar_generation), ..Default::default()
+            prepared_function_generation: Some(function_generation), ..Default::default()
         };
         let mut expire_self_only = false;
         let result = inner.with_exec_ctx(shared, summary, &mut stmt_tx, &mut expire_self_only, |ctx| {
@@ -2287,9 +2287,9 @@ pub(crate) fn step(
         result
     } else {
         let steps_before = vm.n_vm_step;
-        let scalar_registry = inner.functions.scalar_registry_at(scalar_generation);
+        let prepared_functions = inner.functions.function_registry_at(function_generation);
         let mut host = MachineHost::new(inner);
-        if let Some(registry) = &scalar_registry {
+        if let Some(registry) = &prepared_functions {
             host.functions = registry;
         }
         let r = vm.exec(&mut host);

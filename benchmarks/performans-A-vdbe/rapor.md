@@ -2532,3 +2532,8 @@ Altı şema biçimi, dört yetkilendirme seçimi, üç kodlama ve V1/V2 üzerind
 ## V6b.445 — Doğrudan function_list EXPLAIN ve ilerleme
 
 Yetkilendirici kurulu olmayan doğrudan kullanımda 24 C ve EXPLAIN izi, 156 adım zamanlaması ve 52.740 API kaydı eş. İptal, reset ve farklı ilerleme periyotları ölçüldü. Hazırlanabilir olmayan Rust-only adlar önceki satır yaşam döngüsünü korur. OFF 1325/1/325, ON 1323/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,281 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_445.md).
+
+
+## V6b.446 — Hazırlanmış aggregate ilk adımı ve reset
+
+Yeni uygulama aggregate aritesi eski hazırlanmış seçimi değiştirmez. Taze sorgu yeni tanımı kullanır. 12 C akışı ve 132 kayıt eş. 288 kapsam dışı kontrol ve her kipte odak testi doğrulandı. OFF 1326/1/325, ON 1324/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,257 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_446.md).

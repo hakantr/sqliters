@@ -122,7 +122,7 @@ pub struct StmtTxTracker {
     pub prepared_defer_fks: Option<bool>,
     /// CHECK elision is decided when the statement is prepared.
     pub(crate) prepared_ignore_checks: Option<bool>,
-    pub(crate) prepared_scalar_generation: Option<u64>,
+    pub(crate) prepared_function_generation: Option<u64>,
     /// The generated rowid loop direction is fixed when the statement is prepared.
     pub(crate) prepared_reverse_order: bool,
     /// The top-level view UPDATE has a plain numeric range in an existing write snapshot.
@@ -20075,6 +20075,7 @@ fn eval_expr_rt(
                 AggregateKind::from_name(name, true)
             } else if let FunctionArgs::Exprs(es) = args {
                 if ctx.functions.find_scalar(name, es.len()).is_some()
+                    || ctx.functions.find_aggregate(name, es.len()).is_some()
                     || ((upper == "MIN" || upper == "MAX") && es.len() != 1)
                 {
                     None
