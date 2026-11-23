@@ -1021,8 +1021,8 @@ impl Vfs for FaultVfs {
             let mut st = self.state.lock().unwrap();
             if st.fail_next_journal_delete {
                 st.fail_next_journal_delete = false;
-                return Err(SqliteError::new(
-                    ErrorCode::IoErr,
+                return Err(SqliteError::with_extended(
+                    extended::SQLITE_IOERR_DELETE,
                     "injected journal delete error",
                 ));
             }
@@ -1172,6 +1172,35 @@ fn test_bulgu_y1_failed_commit_partial_writes_rolled_back_atomically() {
     held.finalize().unwrap();
     conn.try_close().unwrap();
     assert_eq!(fs::metadata(tmp.path()).unwrap().len(), before_size);
+    verify_reopen(tmp.path(), [10, 10, 20, 0]);
+
+    // A failed DELETE journal unlink leaves the original database recoverable.
+    let tmp = TempDb::new("y1_vacuum_delete");
+    let (vfs, fault) = FaultVfs::new();
+    let conn = Connection::open_with_vfs(vfs, Some(tmp.path()), flags).unwrap();
+    setup(&conn, "NONE");
+    conn.execute_batch("DROP TABLE ballast").unwrap();
+    let before = fs::read(tmp.path()).unwrap();
+    let mut held = conn.prepare(VALUES_SQL).unwrap();
+    fault.lock().unwrap().fail_next_journal_delete = true;
+    assert_eq!(
+        conn.execute("VACUUM").unwrap_err().extended_code,
+        extended::SQLITE_IOERR_DELETE,
+    );
+    assert!(conn.is_autocommit());
+    assert!(tmp.journal_path().exists());
+    assert_eq!(conn.execute("ROLLBACK").unwrap_err().code, ErrorCode::Error);
+    verify(&conn, [10, 10, 20, 0]);
+    assert!(!tmp.journal_path().exists());
+    let sqliters::StepResult::Row(row) = held.step().unwrap() else {
+        panic!("prepared read did not return a row after journal recovery");
+    };
+    assert_eq!(row.get_i64(0), Some(10));
+    assert_eq!(row.get_i64(1), Some(10));
+    assert_eq!(held.c_reprepare_status().0, 1);
+    held.finalize().unwrap();
+    conn.try_close().unwrap();
+    assert_eq!(fs::read(tmp.path()).unwrap(), before);
     verify_reopen(tmp.path(), [10, 10, 20, 0]);
 }
 

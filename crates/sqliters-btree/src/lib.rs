@@ -729,7 +729,7 @@ impl Btree {
         self.commit_phase_two(retain_read, false)
     }
 
-    /// In-place VACUUM commit, identifying a failed shrink after journal finalization.
+    /// In-place VACUUM commit, identifying a DELETE journal cleanup or late shrink error.
     pub fn commit_for_vacuum(&mut self) -> (Result<()>, bool) {
         if let Err(error) = self.commit_phase_one_internal(None, false) {
             return (Err(error), false);

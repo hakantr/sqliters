@@ -77,6 +77,12 @@ pub enum TransactionState {
     Write,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VacuumCommitCleanupFailure {
+    JournalDelete,
+    LateShrink,
+}
+
 /// Journal operating mode (`PAGER_JOURNALMODE_*` in `sqlite/src/pager.h`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JournalMode {
@@ -5801,19 +5807,18 @@ impl Pager {
         self.commit_phase_two_with_journal_cleanup(retain_read, cleanup_benign, false, None)
     }
 
-    /// The boolean identifies an error from physical shrink after the VACUUM
-    /// transaction's DELETE journal was successfully finalized.
+    /// The boolean identifies an error finalizing an ordinary VACUUM DELETE
+    /// journal, or shrinking the database after successful journal finalization.
     pub fn commit_phase_two_for_vacuum(&mut self) -> (Result<()>, bool) {
-        let mut late_shrink_failure = false;
-        let result = self.commit_phase_two_with_journal_cleanup(
-            false, false, false, Some(&mut late_shrink_failure),
-        );
-        (result, late_shrink_failure)
+        let mut failure = None;
+        let result = self.commit_phase_two_with_journal_cleanup(false, false, false, Some(&mut failure));
+        (result, failure.is_some())
     }
 
-    /// Whether ordinary pager ERROR cleanup released the file and invalidated
-    /// cached pages after VACUUM's failed post-commit shrink.
-    pub fn vacuum_late_shrink_cleanup_completed(&self) -> bool {
+    /// Whether ordinary pager ERROR cleanup released the database lock and
+    /// invalidated cached pages. A retained journal still requires recovery
+    /// under the next read's shared-lock path.
+    pub fn vacuum_error_cleanup_completed(&self) -> bool {
         !self.closed
             && self.state == TransactionState::Open
             && self.pager_error.is_none()
@@ -5828,13 +5833,13 @@ impl Pager {
         retain_read: bool,
         cleanup_benign: bool,
         remove_transition_journal: bool,
-        late_shrink_failure: Option<&mut bool>,
+        vacuum_cleanup_failure: Option<&mut Option<VacuumCommitCleanupFailure>>,
     ) -> Result<()> {
         let was_write = self.state == TransactionState::Write;
         let can_commit = self.ensure_not_closed();
         let count_failed_commit = was_write && !cleanup_benign && can_commit.is_ok();
         let result = can_commit.and_then(|()| {
-            self.commit_phase_two_inner(retain_read, remove_transition_journal, late_shrink_failure)
+            self.commit_phase_two_inner(retain_read, remove_transition_journal, vacuum_cleanup_failure)
         });
         if let Err(ref error) = result {
             // btree.c:4447–4451 skips compensating iDataVersion when the
@@ -5862,7 +5867,7 @@ impl Pager {
         &mut self,
         retain_read: bool,
         remove_transition_journal: bool,
-        late_shrink_failure: Option<&mut bool>,
+        mut vacuum_cleanup_failure: Option<&mut Option<VacuumCommitCleanupFailure>>,
     ) -> Result<()> {
         match self.state {
             TransactionState::Open => Ok(()),
@@ -5923,7 +5928,7 @@ impl Pager {
                     || (disk_rollback
                         && (self.journal_mode != JournalMode::Persist || self.cache_modified || self.db_file_modified));
                 let finalized = self.finalize_rollback_commit(
-                    remove_transition_journal, late_shrink_failure,
+                    remove_transition_journal, vacuum_cleanup_failure.as_deref_mut(),
                 );
                 let notified = if notify && finalized.is_ok() {
                     self.notify_commit_phase_two()
@@ -5937,6 +5942,12 @@ impl Pager {
                 } else {
                     Ok(())
                 };
+                if downgraded.is_err()
+                    && let Some(failure) = vacuum_cleanup_failure
+                    && *failure == Some(VacuumCommitCleanupFailure::JournalDelete)
+                {
+                    *failure = None;
+                }
                 finalized?;
                 if let Err(error) = notified {
                     // The journal is already finalized. An upper-layer
@@ -5964,9 +5975,9 @@ impl Pager {
     fn finalize_rollback_commit(
         &mut self,
         remove_transition_journal: bool,
-        late_shrink_failure: Option<&mut bool>,
+        vacuum_cleanup_failure: Option<&mut Option<VacuumCommitCleanupFailure>>,
     ) -> Result<()> {
-        let observe_delete_shrink = late_shrink_failure.is_some()
+        let observe_delete_cleanup = vacuum_cleanup_failure.is_some()
             && self.db_kind == DatabaseKind::NamedDisk
             && !self.uses_temp_file_semantics()
             && self.journal_mode == JournalMode::Delete
@@ -5978,8 +5989,17 @@ impl Pager {
             && self.journal_path.is_some();
         if remove_transition_journal {
             self.remove_delete_journal()?;
-        } else {
-            self.finalize_journal_after_tx(self.set_super)?;
+        } else if let Err(error) = self.finalize_journal_after_tx(self.set_super) {
+            if let Some(failure) = vacuum_cleanup_failure
+                && observe_delete_cleanup
+                && !self.set_super
+                && self.pending_byte_copy.is_none()
+                && error.code == ErrorCode::IoErr
+                && error.extended_code == extended::SQLITE_IOERR_DELETE
+            {
+                *failure = Some(VacuumCommitCleanupFailure::JournalDelete);
+            }
+            return Err(error);
         }
 
         if let Some(transition) = self.pending_sql_journal_mode.take() {
@@ -6008,11 +6028,11 @@ impl Pager {
                 && f.file_size().is_ok_and(|sz| sz > target_size)
                 && let Err(error) = f.truncate(target_size)
             {
-                if let Some(failed) = late_shrink_failure
-                    && observe_delete_shrink
+                if let Some(failure) = vacuum_cleanup_failure
+                    && observe_delete_cleanup
                     && error.code == ErrorCode::IoErr
                 {
-                    *failed = true;
+                    *failure = Some(VacuumCommitCleanupFailure::LateShrink);
                 }
                 return Err(error);
             }

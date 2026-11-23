@@ -46196,13 +46196,13 @@ pub(crate) fn exec_vacuum_checked(
             .slot_mut(db_id)
             .and_then(|s| s.btree.as_mut())
             .ok_or_else(|| VacuumFail::Clean(SqliteError::misuse("vacuum btree closed")))?;
-        let (commit, failed_late_shrink) = bt.commit_for_vacuum();
+        let (commit, failed_vacuum_cleanup) = bt.commit_for_vacuum();
         if let Err(cm_err) = commit {
             if let Err(rb_err) = bt.rollback() {
                 // sqlite3_backup_finish keeps the original error from the
                 // copy, even when destination rollback returns its latch.
-                if failed_late_shrink && rb_err == cm_err
-                    && bt.pager().vacuum_late_shrink_cleanup_completed()
+                if failed_vacuum_cleanup && rb_err == cm_err
+                    && bt.pager().vacuum_error_cleanup_completed()
                 {
                     return Err(VacuumFail::Clean(cm_err));
                 }
