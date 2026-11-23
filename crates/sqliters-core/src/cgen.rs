@@ -641,7 +641,9 @@ pub(crate) fn unistr_register_read(program: &sqliters_vdbe::vdbeaux::Program) ->
                 }
                 if func.name.eq_ignore_ascii_case("unistr") {
                     has_unistr = true;
-                } else if !func.name.eq_ignore_ascii_case("hex") {
+                } else if !["hex", "length", "octet_length", "unicode"].iter()
+                    .any(|name| func.name.eq_ignore_ascii_case(name))
+                {
                     return false;
                 }
             }

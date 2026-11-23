@@ -4117,3 +4117,34 @@ fn group64_file_sorter_worker_uses_stock_collation_and_rowid() {
         }
     }
 }
+
+#[test]
+fn group65_unistr_length_and_unicode_use_text_registers() {
+    for (encoding, byte_count, scalar) in [
+        ("UTF-8", 3, 2_097_151),
+        ("UTF-16le", 6, 1_048_575),
+        ("UTF-16be", 6, 1_048_575),
+    ] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!("PRAGMA encoding='{encoding}'; CREATE TABLE t(i);"))
+            .unwrap();
+        let sql = "SELECT length(unistr(?1)), octet_length(unistr(?1)), unicode(unistr(?1))";
+        let mut statement = db.prepare(sql).unwrap();
+        statement.bind_text(1, r"A\u0000B").unwrap();
+        let StepResult::Row(first) = statement.step().unwrap() else {
+            panic!("expected a row in {encoding}");
+        };
+        assert_eq!(first.get_i64(0), Some(1));
+        assert_eq!(first.get_i64(1), Some(byte_count));
+        assert_eq!(first.get_i64(2), Some(65));
+        statement.reset().unwrap();
+        statement.bind_text(1, r"\UFFFFFFFF").unwrap();
+        let StepResult::Row(reused) = statement.step().unwrap() else {
+            panic!("expected a row after reset in {encoding}");
+        };
+        assert_eq!(reused.get_i64(0), Some(1));
+        assert_eq!(reused.get_i64(1), Some(4));
+        assert_eq!(reused.get_i64(2), Some(scalar));
+        assert!(matches!(statement.step().unwrap(), StepResult::Done));
+    }
+}

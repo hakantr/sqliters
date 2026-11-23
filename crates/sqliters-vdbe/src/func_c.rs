@@ -176,6 +176,44 @@ fn hex_bytes(bytes: &[u8]) -> String {
     out
 }
 
+fn value_text_register(arg: &crate::vdbemem::Mem) -> Option<Cow<'_, [u8]>> {
+    use crate::vdbemem::{MEM_BLOB, MEM_NULL, MEM_STR, MEM_ZERO};
+
+    if arg.flags & MEM_NULL != 0 {
+        return None;
+    }
+    let text_or_blob = arg.flags & (MEM_STR | MEM_BLOB) != 0;
+    if text_or_blob && arg.enc == TextEncoding::Utf8 as u8 && arg.flags & MEM_ZERO == 0 {
+        return Some(Cow::Borrowed(&arg.z));
+    }
+    let mut input = arg.clone();
+    if text_or_blob {
+        input.expand_blob();
+        input.flags |= MEM_STR;
+        input.change_encoding(TextEncoding::Utf8 as u8);
+    } else {
+        input.stringify(false);
+    }
+    Some(Cow::Owned(input.z))
+}
+
+// lengthFunc groups continuation bytes after any non-ASCII byte.
+fn text_register_length(bytes: &[u8]) -> i64 {
+    let bytes = cstr(bytes);
+    let mut length = 0;
+    let mut pos = 0;
+    while let Some(&byte) = bytes.get(pos) {
+        length += 1;
+        pos += 1;
+        if byte >= 0x80 {
+            while bytes.get(pos).is_some_and(|next| next & 0xc0 == 0x80) {
+                pos += 1;
+            }
+        }
+    }
+    length
+}
+
 /// Evaluate built-ins which observe or produce the raw bytes of a TEXT register.
 pub(crate) fn eval_text_register(
     name: &str,
@@ -187,18 +225,8 @@ pub(crate) fn eval_text_register(
 
     let mut out = Mem::null();
     if name.eq_ignore_ascii_case("unistr") {
-        if arg.flags & MEM_NULL != 0 {
-            return Some(Ok(out));
-        }
-        let mut input = arg.clone();
-        if input.flags & (MEM_BLOB | MEM_STR) != 0 {
-            input.expand_blob();
-            input.flags |= MEM_STR;
-            input.change_encoding(TextEncoding::Utf8 as u8);
-        } else {
-            input.stringify(false);
-        }
-        match unistr_bytes(&input.z, true) {
+        let Some(input) = value_text_register(arg) else { return Some(Ok(out)); };
+        match unistr_bytes(&input, true) {
             Ok(bytes) => {
                 out.z = bytes;
                 out.flags = MEM_STR;
@@ -221,6 +249,20 @@ pub(crate) fn eval_text_register(
         input.expand_blob();
         out.z = hex_bytes(&input.z[..count]).into_bytes();
         out.flags = MEM_STR;
+    } else if arg.value_type() == 3 {
+        if name.eq_ignore_ascii_case("octet_length") {
+            let zeroes = if arg.flags & MEM_ZERO != 0 { arg.n_zero.max(0) } else { 0 };
+            out.set_int64(i64::from(arg.n()) + i64::from(zeroes));
+        } else if name.eq_ignore_ascii_case("length") || name.eq_ignore_ascii_case("unicode") {
+            let Some(bytes) = value_text_register(arg) else { return Some(Ok(out)); };
+            if name.eq_ignore_ascii_case("length") {
+                out.set_int64(text_register_length(&bytes));
+            } else if bytes.first().is_some_and(|byte| *byte != 0) {
+                out.set_int64(i64::from(utf8_read(&bytes).0));
+            }
+        } else {
+            return None;
+        }
     } else {
         return None;
     }
