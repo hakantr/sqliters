@@ -2702,3 +2702,8 @@ Kip başına 84 API profili, 48 zorlanmış eş VFS kaydı, ilk xOpen 14, sını
 ## V6b.479 — Aktif WAL okuyucusunda mantıksal sayfa sayısı
 
 Geçerli Page 1 sayısı ile WAL commit extent ayrıldı. 45 çapraz açılışta sekiz eski fark kapandı. Mevcut extent olağan UPDATE ve büyümede korunuyor, gerçek VACUUM daralıyor. C ile 36 ham görüntü ve 24 writable reopen eş. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v477-active-wal-logical-page-count-candidate/sonuc.md) OFF 1349/0/325, ON 1349/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,276 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_479.md).
+
+
+## V6b.480 — WITHOUT ROWID BINARY PK sıralamasında işçi PMA
+
+Aynı tablonun packed fiziksel birincil anahtarı doğrulandı. Kip başına 144 profil, 73.944 C adımı, 72 ilk satır reseti ve 96.530 VFS olayı eş. Önceki 60 guard ve altı fiziksel FK kontrolü geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/worker-without-rowid-pk-rebased-candidate/sonuc.md) OFF 1350/0/325, ON 1350/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_480.md).

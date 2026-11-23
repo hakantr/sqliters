@@ -26,7 +26,7 @@ use sqliters_vdbe::vdbe::{
     COLTYPE_ANY, COLTYPE_BLOB, COLTYPE_CUSTOM, COLTYPE_INT, COLTYPE_INTEGER, COLTYPE_REAL, COLTYPE_TEXT, TableColRt, TableRt, Vdbe,
     VdbeHost, unsupported_reason,
 };
-use sqliters_vdbe::vdbeaux::{COLNAME_NAME, FuncDef, Program, VdbeOp};
+use sqliters_vdbe::vdbeaux::{COLNAME_NAME, FuncDef, KEYINFO_ORDER_DESC, Program, VdbeOp};
 use sqliters_vdbe::vdbemem::{CollRt, Mem};
 use sqliters_vdbe::vdbeaux::{P4, P4Vtab};
 
@@ -278,6 +278,43 @@ fn has_declared_unique_sort_key(db_set: &DatabaseSet, root: u32, keys: &[VdbeOp]
     })
 }
 
+fn has_worker_sort_table_key(db_set: &DatabaseSet, encoding: TextEncoding, read: &VdbeOp, keys: &[VdbeOp]) -> bool {
+    let Ok(root) = u32::try_from(read.p2) else { return false };
+    let P4::KeyInfo(primary) = &read.p4 else {
+        return matches!(read.p4, P4::Int32(_)) && has_declared_unique_sort_key(db_set, root, keys);
+    };
+    let schema = &db_set.main_slot().schema;
+    if !schema.loaded || db_set.writable_schema_effective() {
+        return false;
+    }
+    let Some(table) = schema.tables.iter().find(|table| table.root_pgno == root && table.without_rowid) else {
+        return false;
+    };
+    let fields = &table.without_rowid_pk_cols;
+    let n_cols = table.columns.len();
+    if fields.len() != keys.len() || usize::from(primary.n_key_field) != fields.len()
+        || usize::from(primary.n_all_field) != n_cols || primary.enc != encoding as u8
+        || primary.a_sort_flags.len() != n_cols || primary.a_coll.len() != n_cols
+        || primary.a_coll.iter().flatten().any(|coll| {
+            !coll.name.eq_ignore_ascii_case("BINARY") || coll.enc != primary.enc
+        })
+        || table.columns.iter().any(|column| column.generated.is_some())
+        || primary.a_sort_flags[fields.len()..].iter().any(|&flag| flag != 0)
+    {
+        return false;
+    }
+    fields.iter().enumerate().all(|(slot, part)| {
+        let flags = if part.sort_order.desc { KEYINFO_ORDER_DESC } else { 0 };
+        part.expr.is_none() && part.sort_order.collation == Collation::Binary
+            && part.sort_order.custom_collation.is_none() && primary.a_sort_flags[slot] == flags
+            && part.col_idx.is_some_and(|column| {
+                table.columns.get(column).is_some_and(|column| column.not_null.is_some())
+                    && table.physical_record_slot(column) == slot
+                    && keys.iter().any(|key| usize::try_from(key.p2).ok() == Some(slot))
+            })
+    })
+}
+
 /// Admit only native BINARY table scans with a total ORDER BY key.
 pub(crate) fn worker_sort_read_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
@@ -297,8 +334,8 @@ pub(crate) fn worker_sort_read_program(
         return None;
     };
     if program.explain != 0 || program.n_var as usize != n_param
-        || !sqliters_vdbe::vdbe::is_worker_sort_with_declared_unique_key(&program, encoding, |root, keys| {
-            has_declared_unique_sort_key(&inner.db_set, root, keys)
+        || !sqliters_vdbe::vdbe::is_worker_sort_with_table_key(&program, encoding, |read, keys| {
+            has_worker_sort_table_key(&inner.db_set, encoding, read, keys)
         })
     {
         return None;
@@ -1487,6 +1524,12 @@ macro_rules! host_common {
 }
 
 impl VdbeHost for MachineHost<'_> {
+    fn sorter_has_worker_table_key(&self, read: &VdbeOp, keys: &[VdbeOp]) -> bool {
+        self.db_set.main_slot().btree.as_ref()
+            .is_some_and(|btree| btree.transaction_state() != TransactionState::Open)
+            && has_worker_sort_table_key(self.db_set, self.encoding, read, keys)
+    }
+
     fn sorter_has_declared_unique_key(&self, root: u32, keys: &[VdbeOp]) -> bool {
         self.db_set.main_slot().btree.as_ref()
             .is_some_and(|btree| btree.transaction_state() != TransactionState::Open)

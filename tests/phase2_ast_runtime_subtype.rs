@@ -3950,3 +3950,35 @@ fn group64_file_sorter_initial_mmap_preserves_worker_reset() {
         }
     }
 }
+
+#[test]
+fn group64_file_sorter_worker_uses_without_rowid_physical_primary_key() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}';
+             PRAGMA temp_store=FILE; PRAGMA cache_size=1; PRAGMA threads=2;
+             CREATE TABLE items(payload TEXT,tag INTEGER,b INTEGER,a TEXT,
+                                PRIMARY KEY(a,b DESC)) WITHOUT ROWID;
+             WITH RECURSIVE r(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM r WHERE i<12)
+             INSERT INTO items SELECT printf('x%23000s','z'),i,i,'key' FROM r;"
+        )).unwrap();
+        let sql = "SELECT tag,payload FROM items ORDER BY b DESC,a COLLATE BINARY NULLS LAST";
+        let mut statement = db.prepare(sql).unwrap();
+        let StepResult::Row(first) = statement.step().unwrap() else {
+            panic!("expected first row for {encoding}");
+        };
+        assert_eq!(first.get_i64(0), Some(12));
+        assert!(statement.machine_stmt_status(4, false) > 0, "{encoding}");
+        statement.reset().unwrap();
+
+        for id in (1..=12).rev() {
+            let StepResult::Row(row) = statement.step().unwrap() else {
+                panic!("expected row {id} for {encoding}");
+            };
+            assert_eq!(row.get_i64(0), Some(id));
+        }
+        assert!(matches!(statement.step().unwrap(), StepResult::Done));
+        statement.reset().unwrap();
+    }
+}
