@@ -142,6 +142,10 @@ pub trait VdbeHost {
     fn progress_invoke(&mut self) -> Result<bool>;
     /// `(page size of the main database, db->aDb[0].pSchema->cache_size, sqlite3TempInMemory(db))`
     fn sorter_config(&mut self) -> (i64, i64, bool);
+    /// Auxiliary sorter threads configured for the connection.
+    fn sorter_worker_threads(&mut self) -> i32 {
+        0
+    }
     /// Maximum mapping size for sorter PMAs. Zero disables sorter xFetch.
     fn sorter_mmap_limit(&mut self) -> i32 {
         0
@@ -1615,6 +1619,51 @@ fn complete_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
                     && usize::try_from(next.p2).ok() == Some(index + 2)
             })
     })
+}
+
+/// One index-free main rowid scan with a total BINARY order. The rowid
+/// occupies the final comparator field, independently of the result columns.
+fn worker_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
+    if !prog.read_only || prog.btree_mask != 1 || !prog.p_program.is_empty()
+        || !builtin_order_sorter(prog, open, key)
+        || key.enc != 1 || key.n_key_field != 2
+        || key.a_coll.iter().flatten().any(|coll| !coll.name.eq_ignore_ascii_case("BINARY"))
+    {
+        return false;
+    }
+    let mut table_reads = prog.a_op.iter().filter(|op| op.opcode == OP_OpenRead);
+    let Some(table) = table_reads.next() else { return false };
+    if table_reads.next().is_some() || table.p3 != 0 || !matches!(table.p4, P4::Int32(_)) {
+        return false;
+    }
+    let mut pseudo_reads = prog.a_op.iter().filter(|op| op.opcode == OP_OpenPseudo);
+    let Some(pseudo) = pseudo_reads.next() else { return false };
+    if pseudo_reads.next().is_some()
+        || [open.p1, pseudo.p1].contains(&table.p1) || open.p1 == pseudo.p1
+    {
+        return false;
+    }
+    let cursor = open.p1;
+    if !prog.a_op.iter().all(|op| match op.opcode {
+        OP_Init | OP_MakeRecord | OP_ResultRow | OP_Goto | OP_Halt
+        | OP_OpenRead | OP_OpenPseudo => true,
+        OP_Transaction => op.p1 == 0 && op.p2 == 0,
+        OP_Rewind | OP_Rowid | OP_Next => op.p1 == table.p1,
+        OP_Column => op.p1 == table.p1 || op.p1 == pseudo.p1,
+        OP_SorterOpen => op.p1 == cursor,
+        OP_SorterInsert | OP_SorterSort | OP_SorterNext => op.p1 == cursor,
+        OP_SorterData => op.p1 == cursor && op.p3 == pseudo.p1,
+        _ => false,
+    }) {
+        return false;
+    }
+    let mut inserts = prog.a_op.windows(4).filter(|ops| ops[3].opcode == OP_SorterInsert);
+    let Some([column, rowid, record, _]) = inserts.next() else { return false };
+    inserts.next().is_none()
+        && column.opcode == OP_Column && column.p1 == table.p1 && column.p3 == record.p1
+        && rowid.opcode == OP_Rowid && rowid.p1 == table.p1
+        && rowid.p2.checked_sub(1) == Some(record.p1) && record.opcode == OP_MakeRecord
+        && prog.a_op.iter().filter(|op| op.opcode == OP_SorterOpen).count() == 1
 }
 
 /// Find the single complete sorter that owns the application's first order key.
@@ -5528,6 +5577,13 @@ impl Vdbe {
                     let (pgsz, cache_size, temp_in_memory) = host.sorter_config();
                     let mut sorter = VdbeSorter::init(k, op.p3, pgsz, cache_size, temp_in_memory);
                     sorter.set_vfs(host.sorter_vfs());
+                    if !temp_in_memory && self.prog.fallible_sort_open().is_none()
+                        && host.sorter_worker_threads() == 1 && host.sorter_mmap_limit() <= 0
+                        && matches!(&op.p4, P4::KeyInfo(key) if worker_order_sorter(&self.prog, op, key))
+                        && k.a_coll.iter().flatten().all(|coll| coll.is_binary && coll.custom.is_none())
+                    {
+                        sorter.enable_worker();
+                    }
                     if self.prog.fallible_file_sort_open == Some(pc) {
                         sorter.set_sort_callback_error(self.sort_callback_error.clone());
                     }

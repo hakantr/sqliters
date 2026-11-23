@@ -1348,6 +1348,13 @@ macro_rules! host_common {
             Some(Arc::clone(self.dbs().disk_vfs()))
         }
 
+        fn sorter_worker_threads(&mut self) -> i32 {
+            if self.colls().get_custom("BINARY").is_some() {
+                return 0;
+            }
+            self.dbs().worker_threads_limit
+        }
+
         fn sorter_mmap_limit(&mut self) -> i32 {
             self.dbs().sorter_mmap_limit
         }
