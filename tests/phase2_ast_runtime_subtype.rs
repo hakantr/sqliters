@@ -1335,18 +1335,14 @@ fn group64_registered_builtin_memory_sort_tracks_current_temp_store() {
                 ("a", "b"), ("a", "B"), ("A", "B"), ("A", "A "),
             ]
             .map(|(left, right)| (left.to_owned(), right.to_owned()));
-            for (mode, first) in [("FILE", 1), ("MEMORY", 4), ("FILE", 1), ("MEMORY", 4)] {
+            for mode in ["FILE", "MEMORY", "FILE", "MEMORY"] {
                 db.execute_batch(&format!("PRAGMA temp_store={mode};")).unwrap();
                 let StepResult::Row(row) = statement.step().unwrap() else {
                     panic!("missing first row in {encoding}/{name}/{mode}");
                 };
-                assert_eq!(row.values(), &[Value::Integer(first)]);
+                assert_eq!(row.values(), &[Value::Integer(4)]);
                 let observed = std::mem::take(&mut *calls.lock().unwrap());
-                if mode == "MEMORY" {
-                    assert_eq!(observed, expected, "{encoding}/{name}");
-                } else {
-                    assert!(observed.is_empty());
-                }
+                assert_eq!(observed, expected, "{encoding}/{name}/{mode}");
                 statement.reset().unwrap();
             }
 
@@ -4146,5 +4142,48 @@ fn group65_unistr_length_and_unicode_use_text_registers() {
         assert_eq!(reused.get_i64(1), Some(4));
         assert_eq!(reused.get_i64(2), Some(scalar));
         assert!(matches!(statement.step().unwrap(), StepResult::Done));
+    }
+}
+
+#[test]
+fn group64_file_sort_uses_registered_nocase_and_rtrim_utf8_slots() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for name in ["NOCASE", "RTRIM"] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}'; PRAGMA temp_store=FILE; PRAGMA threads=0;
+                 CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT COLLATE {name});
+                 INSERT INTO items VALUES (1,'a'),(2,'B'),(3,'a '),(4,'é'),(5,NULL);"
+            )).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let log = Arc::clone(&calls);
+            db.register_collation(name, move |left, right| {
+                log.fetch_add(1, AtomicOrdering::Relaxed);
+                right.cmp(left)
+            }).unwrap();
+
+            let sql = "SELECT id FROM items ORDER BY v DESC NULLS FIRST,id DESC";
+            let mut statement = db.prepare(sql).unwrap();
+            assert_eq!(calls.load(AtomicOrdering::Relaxed), 0);
+            let StepResult::Row(first) = statement.step().unwrap() else {
+                panic!("expected first row for {encoding} {name}");
+            };
+            assert_eq!(first.get_i64(0), Some(5));
+            assert!(calls.load(AtomicOrdering::Relaxed) > 0);
+            statement.reset().unwrap();
+
+            db.register_collation(name, |left, right| left.cmp(right)).unwrap();
+            for id in [5, 4, 3, 1, 2] {
+                let StepResult::Row(row) = statement.step().unwrap() else {
+                    panic!("expected row {id} for {encoding} {name}");
+                };
+                assert_eq!(row.get_i64(0), Some(id));
+            }
+            assert!(matches!(statement.step().unwrap(), StepResult::Done));
+            statement.reset().unwrap();
+            let rows = db.query(sql, &[]).unwrap().rows;
+            assert_eq!(rows.iter().map(|row| row.get_i64(0)).collect::<Vec<_>>(),
+                [5, 4, 3, 1, 2].map(Some));
+        }
     }
 }

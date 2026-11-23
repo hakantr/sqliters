@@ -7494,7 +7494,8 @@ pub(crate) fn custom_file_order_collation<'a>(
         return None;
     }
     main_rowid_order_collation(db_set, &select.body.head, &select.order_by)
-        .filter(|(name, _)| Collation::from_name(name).is_none() && collations.get_custom(name).is_some())
+        .filter(|(name, _)| registered_builtin_name_collation(name, collations)
+            || (Collation::from_name(name).is_none() && collations.get_custom(name).is_some()))
 }
 
 fn registered_memory_sort_builtin(

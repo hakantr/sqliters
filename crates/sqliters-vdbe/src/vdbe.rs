@@ -1788,7 +1788,12 @@ pub fn custom_file_sort_open(prog: &Program, name: &str, enc: u8) -> Option<usiz
     (opens.next().is_none() && key.enc == enc && key.n_key_field <= 2
         && ordinary_order_key(key, |index, coll| {
             let name = if index == 0 { name } else { "BINARY" };
-            coll.name.eq_ignore_ascii_case(name) && coll.enc == enc
+            let collation_enc = if name.eq_ignore_ascii_case("NOCASE") || name.eq_ignore_ascii_case("RTRIM") {
+                crate::vdbeaux::SQLITE_UTF8
+            } else {
+                enc
+            };
+            coll.name.eq_ignore_ascii_case(name) && coll.enc == collation_enc
         })
         && complete_order_sorter(prog, op, key))
         .then_some(pc)
@@ -3449,15 +3454,17 @@ impl Vdbe {
         scoped_sort: Option<(usize, &SortCallbackError)>,
     ) -> Result<Vec<OpRt>> {
         let mut rt = vec![OpRt::None; a_op.len()];
+        let find_registered = |name: &str, host: &mut H| {
+            host.find_collation(name).map(Arc::new).ok_or_else(|| {
+                SqliteError::new(ErrorCode::Error, format!("no such collation sequence: {name}"))
+            })
+        };
         let find = |c: &CollSeq, host: &mut H| -> Result<Arc<CollRt>> {
             if let Some(mut b) = builtin_coll(&c.name) {
                 b.enc = c.enc;
                 return Ok(Arc::new(b));
             }
-            match host.find_collation(&c.name) {
-                Some(c) => Ok(Arc::new(c)),
-                None => Err(SqliteError::new(ErrorCode::Error, format!("no such collation sequence: {}", c.name))),
-            }
+            find_registered(&c.name, host)
         };
         for (i, op) in a_op.iter().enumerate() {
             match &op.p4 {
@@ -3469,7 +3476,7 @@ impl Vdbe {
                         a_coll.push(match c {
                             Some(c) if field == 0 && scoped_sort.is_some_and(|(pc, _)| i == pc) => {
                                 let (_, error) = scoped_sort.expect("checked sort address");
-                                Some(Arc::new(fallible_sort_collation(find(c, host)?, error)?))
+                                Some(Arc::new(fallible_sort_collation(find_registered(&c.name, host)?, error)?))
                             }
                             Some(c) => Some(find(c, host)?),
                             None => None,
