@@ -4324,3 +4324,65 @@ fn group65_replace_preserves_text_register_bytes_after_reset() {
         assert!(matches!(statement.step().unwrap(), StepResult::Done));
     }
 }
+
+#[test]
+fn group65_text_register_write_keeps_bytes_and_foreign_keys_after_reset() {
+    let path = std::env::temp_dir().join(format!("sqliters-text-register-{}.db", std::process::id()));
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(
+        "PRAGMA encoding='UTF-16be'; PRAGMA foreign_keys=ON;
+         CREATE TABLE parent(id INTEGER PRIMARY KEY);
+         CREATE TABLE child(id INTEGER PRIMARY KEY, p INTEGER REFERENCES parent(id), memo TEXT);
+         INSERT INTO parent VALUES(1);",
+    ).unwrap();
+
+    let sql = "INSERT INTO child VALUES(?1,1,replace(unistr(?2),'a','A'))";
+    let mut statement = db.prepare_v1(sql).unwrap();
+    statement.bind(1, 10_i64).unwrap();
+    statement.bind_text(2, r"a\u00FCZ").unwrap();
+    assert!(matches!(statement.step().unwrap(), StepResult::Done));
+    statement.reset().unwrap();
+    statement.bind(1, 11_i64).unwrap();
+    statement.bind_text(2, r"a\UFFFFFFFFZ").unwrap();
+    assert!(matches!(statement.step().unwrap(), StepResult::Done));
+    statement.finalize().unwrap();
+
+    assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+    drop(db);
+    let reopened = Command::new(c_p2a_helper())
+        .arg(&path)
+        .arg("SELECT id,p,hex(memo) FROM child ORDER BY id; PRAGMA integrity_check;")
+        .output()
+        .unwrap();
+    let _ = fs::remove_file(&path);
+    assert!(reopened.status.success(), "{}", String::from_utf8_lossy(&reopened.stderr));
+    assert_eq!(String::from_utf8(reopened.stdout).unwrap(), "10|1|004100FC005A\n11|1|0041DBBFDFFF005A\nok\n");
+}
+
+#[test]
+fn group65_text_register_write_respects_registered_comparison() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "PRAGMA encoding='UTF-16be';
+         CREATE TABLE items(id INTEGER PRIMARY KEY, tag TEXT, memo TEXT);
+         INSERT INTO items VALUES(1,'Alpha','first'),(2,'alpha','second');",
+    ).unwrap();
+    db.register_collation("NOCASE", |left, right| left.cmp(right)).unwrap();
+    let statement = db.prepare(r"UPDATE items SET memo=unistr('\u0058') WHERE tag='alpha' COLLATE NOCASE")
+        .unwrap();
+    assert!(statement.c_program_for_testing().is_none());
+}
+
+#[test]
+fn group65_text_register_write_honors_mutation_trace_enabled_after_prepare() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "PRAGMA encoding='UTF-16le';
+         CREATE TABLE items(id INTEGER PRIMARY KEY, memo TEXT);
+         INSERT INTO items VALUES(1,'first');",
+    ).unwrap();
+    let mut stmt = db.prepare(r"UPDATE items SET memo=unistr('\u0058') WHERE id=1").unwrap();
+    db.set_mutation_trace_enabled(true).unwrap();
+    assert!(matches!(stmt.step().unwrap(), StepResult::Done));
+    assert_eq!(db.take_mutation_trace().unwrap().len(), 1);
+}

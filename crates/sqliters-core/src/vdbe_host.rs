@@ -1116,6 +1116,76 @@ pub(crate) enum WriteRoute {
     Error { code: i32, message: String, offset: i32 },
 }
 
+/// Plain rowid writes whose assignment can keep SQLite's raw text bytes in the VM.
+pub(crate) fn text_register_write(stmt: Option<&Stmt>) -> bool {
+    use sqliters_syntax::InsertSource;
+    let (table, uses_register) = match stmt {
+        Some(Stmt::Insert(insert)) if insert.ctes.is_empty() && insert.or_conflict.is_none()
+            && insert.upsert_clauses.is_empty() && insert.returning.is_empty() => {
+            let InsertSource::Values(rows) = &insert.source else { return false; };
+            (&insert.table, rows.iter().flatten().any(text_register_expression))
+        }
+        Some(Stmt::Update(update)) if update.ctes.is_empty() && update.or_conflict.is_none()
+            && update.from.is_none() && update.indexed_by.is_none() && update.returning.is_empty() => {
+            (&update.table, update.assignments.iter().filter(|a| !a.row_value)
+                .any(|a| text_register_expression(&a.expr)))
+        }
+        _ => return false,
+    };
+    uses_register && table.schema.as_ref().is_none_or(|schema| schema.eq_ignore_ascii_case("main"))
+}
+
+fn text_register_expression(expr: &sqliters_syntax::Expr) -> bool {
+    use sqliters_syntax::{Expr, FunctionArgs};
+    match expr {
+        Expr::FunctionCall { name, args: FunctionArgs::Exprs(args), filter: None, over: None, .. } => {
+            name.eq_ignore_ascii_case("unistr") || name.eq_ignore_ascii_case("char")
+                || args.iter().any(text_register_expression)
+        }
+        Expr::Binary { left, right, .. } => text_register_expression(left) || text_register_expression(right),
+        Expr::Collate { expr, .. } | Expr::Unary { expr, .. } => text_register_expression(expr),
+        _ => false,
+    }
+}
+
+/// Restrict the exception to the main rowid write program and original built-ins.
+#[allow(non_upper_case_globals)]
+fn text_register_write_program(prog: &Program, collations: &CollationRegistry) -> bool {
+    use sqliters_vdbe::opcodes::*;
+    use sqliters_codegen::consts::SQLITE_FUNC_BUILTIN;
+    if prog.read_only || prog.btree_mask != 1 || !prog.p_program.is_empty()
+        || prog.n_res_column != 0 || !prog.a_op.iter().any(|op| op.opcode == OP_Insert)
+        || prog.a_op.iter().filter(|op| op.opcode == OP_OpenWrite).count() != 1
+    {
+        return false;
+    }
+    let mut has_producer = false;
+    for op in &prog.a_op {
+        if matches!(op.p4, P4::KeyInfo(_))
+            || matches!(&op.p4, P4::CollSeq(coll) if collations.get_custom(&coll.name).is_some())
+            || matches!(op.opcode, OP_VBegin | OP_VUpdate | OP_VOpen | OP_VFilter | OP_VColumn | OP_VNext | OP_RowCell)
+        {
+            return false;
+        }
+        if matches!(op.opcode, OP_Function | OP_PureFunc) {
+            let P4::FuncCtx(ctx) = &op.p4 else { return false; };
+            let func = &ctx.p_func;
+            if func.func_flags & SQLITE_FUNC_BUILTIN == 0 {
+                return false;
+            }
+            if func.name.eq_ignore_ascii_case("unistr") || func.name.eq_ignore_ascii_case("char") {
+                has_producer = true;
+            } else if !["hex", "length", "octet_length", "unicode", "quote", "unistr_quote",
+                        "substr", "substring", "replace"].iter()
+                .any(|name| func.name.eq_ignore_ascii_case(name))
+            {
+                return false;
+            }
+        }
+    }
+    has_producer
+}
+
 /// The route of an INSERT / UPDATE / DELETE (also with a WITH prefix): C's compile result —
 /// the program or C's error — decides before the engine's own prepare (diagnostic switch
 /// `SQLITERS_VDBE_EXEC`). The second value: C's `sqlite3Init()` loaded the schemas during the
@@ -1126,7 +1196,10 @@ pub(crate) fn machine_write_program(
     raw_sql: &str,
     bound_partial: Option<(u32, PartialIndexBinding<'_>)>,
 ) -> (WriteRoute, bool) {
-    if !exec_switch_on() {
+    let use_codegen_switch = exec_switch_on();
+    let standard_write = use_codegen_switch && inner.effective_encoding() == TextEncoding::Utf8;
+    let scoped_write = !standard_write && text_register_write(stmt);
+    if !use_codegen_switch && !scoped_write {
         return (WriteRoute::Engine, false);
     }
     if !matches!(
@@ -1173,7 +1246,7 @@ pub(crate) fn machine_write_program(
         trace("fallback: schema with an application-defined collation", raw_sql);
         return (WriteRoute::Engine, false);
     }
-    if inner.effective_encoding() != TextEncoding::Utf8 {
+    if !standard_write && !scoped_write {
         trace("fallback: UTF-16 database", raw_sql);
         return (WriteRoute::Engine, false);
     }
@@ -1183,7 +1256,7 @@ pub(crate) fn machine_write_program(
     };
     let route = match r {
         PrepareResult::Program(p) => {
-            if p.explain != 0 {
+            if p.explain != 0 || (!standard_write && !text_register_write_program(&p, &inner.collations)) {
                 return (WriteRoute::Engine, loaded);
             }
             if let Some(why) = sqliters_vdbe::vdbe::unsupported_reason_write(&p) {
@@ -1204,6 +1277,7 @@ pub(crate) fn machine_write_program(
             trace("machine", raw_sql);
             WriteRoute::Program(Arc::new(*p))
         }
+        PrepareResult::Error { .. } if !standard_write => WriteRoute::Engine,
         PrepareResult::Error { code, message, offset } => {
             // A function the engine's library has and the generator's function table does not
             // (testfixture functions of `enable_test_functions`): the engine runs the statement.

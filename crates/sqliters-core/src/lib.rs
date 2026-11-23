@@ -8452,7 +8452,8 @@ impl Statement {
         raw_sql: &str,
         bound_partial: Option<(u32, PartialIndexBinding<'_>)>,
     ) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
-        if !vdbe_host::exec_switch_on()
+        let use_codegen_switch = vdbe_host::exec_switch_on();
+        if (!use_codegen_switch && !vdbe_host::text_register_write(stmt))
             || !matches!(
                 stmt,
                 Some(
@@ -8471,7 +8472,7 @@ impl Statement {
         }
         // (C connects the virtual tables a statement names while it prepares it; the port of
         // the generator reaches them through the engine's connected instances)
-        if let Some(st) = stmt {
+        if use_codegen_switch && let Some(st) = stmt {
             let _ = inner.with_default_exec_ctx(shared, ActivitySummary::default(), |ctx| {
                 crate::vtab::ensure_stmt_vtabs_connected(ctx, st)
             });
@@ -12219,6 +12220,12 @@ impl Statement {
                     }
                 }
 
+                let machine_write_ref = self.c_machine_write.as_ref().filter(|_| {
+                    // These can change without expiring a prepared statement.
+                    self.c_machine_fixed
+                        || (vdbe_host::exec_switch_on() && inner.effective_encoding() == TextEncoding::Utf8)
+                        || (!inner.mutation_pipeline.is_trace_enabled() && inner.db_set.open_blobs().is_empty())
+                });
                 // Open an anonymous statement subsavepoint whenever an outer tx or another writer exists!
                 let stmt_sp_slot = (!inner.is_autocommit() || pre_summary.other_writers > 0)
                     .then_some(inner.savepoints.len());
@@ -12229,14 +12236,14 @@ impl Statement {
                     prepared_ignore_checks: Some(self.compiled_ignore_checks),
                     prepared_reverse_order: self.compiled_reverse_order,
                     view_update_range_tokens: !inner.authorizer.is_some()
-                        && self.c_machine_write.is_none()
+                        && machine_write_ref.is_none()
                         && self.stmt.as_ref().is_some_and(|stmt| {
                             inner.explicit_tx
                                 && inner.db_set.main_btree().transaction_state() == TransactionState::Write
                                 && engine::view_update_range_tokens(stmt, &inner.db_set, &self.raw_sql)
                         }),
                     rowid_view_text_range_tokens: !inner.authorizer.is_some()
-                        && self.c_machine_write.is_none()
+                        && machine_write_ref.is_none()
                         && self.stmt.as_ref().is_some_and(|stmt| {
                             engine::rowid_view_text_range_tokens(stmt, &inner.db_set, &self.raw_sql)
                         }),
@@ -12312,7 +12319,6 @@ impl Statement {
 
                 let stmt_ref = self.stmt.as_ref().expect("non-empty statement");
                 let compiled_prog_ref = self.compiled_vdbe.as_ref();
-                let machine_write_ref = self.c_machine_write.as_ref();
                 let legacy_view_cookie = if self.mode == PrepareMode::V1
                     && machine_write_ref.is_none()
                     && compiled_prog_ref.is_none()
