@@ -1250,6 +1250,12 @@ pub(crate) fn machine_write_program(
         trace("fallback: UTF-16 database", raw_sql);
         return (WriteRoute::Engine, false);
     }
+    if let Some(Stmt::Update(update)) = stmt
+        && crate::engine::rowid_update_collation_operands(update, &inner.db_set, &inner.collations).is_some()
+    {
+        trace("fallback: registered UPDATE WHERE collation", raw_sql);
+        return (WriteRoute::Engine, false);
+    }
     let (r, _, loaded) = match bound_partial {
         Some((root, binding)) => crate::cgen::c_prepare_bound_partial_index(inner, raw_sql, root, binding),
         None => crate::cgen::c_prepare(inner, raw_sql),

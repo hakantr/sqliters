@@ -3035,6 +3035,63 @@ fn registered_builtin_name_collation(name: &str, collations: &CollationRegistry)
         && collations.get_custom(name).is_some()
 }
 
+/// WHERE operands of a plain MAIN rowid UPDATE using an explicit registered collation.
+pub(crate) fn rowid_update_collation_operands<'a>(
+    update: &'a UpdateStmt,
+    db_set: &DatabaseSet,
+    collations: &CollationRegistry,
+) -> Option<(&'a Expr, &'a Expr)> {
+    let Expr::Binary { left, op: BinaryOp::Eq, right } = update.selection.as_ref()? else {
+        return None;
+    };
+    let (bare_left, bare_right) = match (left.as_ref(), right.as_ref()) {
+        (Expr::Collate { .. }, Expr::Collate { .. }) => return None,
+        (Expr::Collate { expr, .. }, right) => (expr.as_ref(), right),
+        (left, Expr::Collate { expr, .. }) => (left, expr.as_ref()),
+        _ => return None,
+    };
+    // C's whereexpr.c exprAnalyze/exprCommute places the column on the left,
+    // so that value must also be the first argument to the application comparator.
+    let (key, operands) = match (bare_left, bare_right) {
+        (Expr::Column(key), Expr::Bind(_) | Expr::String(_)) => (key, (left.as_ref(), right.as_ref())),
+        (Expr::Bind(_) | Expr::String(_), Expr::Column(key)) => (key, (right.as_ref(), left.as_ref())),
+        _ => return None,
+    };
+    let collation = explicit_comparison_collation(left, right)?;
+    if !registered_builtin_name_collation(collation, collations)
+        || key.schema.is_some() || key.table.is_some()
+        || update.or_conflict.is_some() || update.alias.is_some() || update.from.is_some()
+        || update.indexed_by.is_some() || !update.ctes.is_empty() || !update.returning.is_empty()
+    {
+        return None;
+    }
+    let [assign] = update.assignments.as_slice() else { return None; };
+    let [target] = assign.columns.as_slice() else { return None; };
+    let simple_assignment = match &assign.expr {
+        Expr::FunctionCall {
+            name, distinct: false, args: FunctionArgs::Exprs(args), filter: None, over: None,
+        } if name.eq_ignore_ascii_case("unistr") => matches!(args.as_slice(), [arg] if scalar_operand(arg)),
+        expr => scalar_operand(expr),
+    };
+    if assign.row_value || !simple_assignment {
+        return None;
+    }
+    let (DatabaseId::MAIN, table) = db_set.find_user_table_in_set(&update.table)? else {
+        return None;
+    };
+    let (key_index, _) = table.find_column(&key.column)?;
+    let (target_index, _) = table.find_column(target)?;
+    (table.root_pgno > 1 && !table.without_rowid
+        && Some(key_index) != table.rowid_alias_col && Some(target_index) != table.rowid_alias_col
+        && !table.columns.iter().any(|column| column.generated.is_some())
+        && !db_set.main_slot().schema.indexes.iter()
+            .any(|index| index.table_name.eq_ignore_ascii_case(&table.name))
+        && !db_set.has_active_triggers_for_event(
+            DatabaseId::MAIN, &table.name, TriggerEventKind::Update, Some(&[target.as_str()]),
+        ))
+        .then_some(operands)
+}
+
 /// Fast-path VDBE execution for compiled single-table DML (`INSERT`, `UPDATE`, `DELETE`) programs.
 pub(crate) fn try_execute_compiled_insert(
     ctx: &mut ExecContext<'_>,
@@ -32159,6 +32216,14 @@ fn prepare_update_exec<'a>(
                 }
             } else {
                 // Plain `UPDATE` (`update.c:819-830`): pass 1 collects matching `old_key`s only!
+                let ordered_selection = rowid_update_collation_operands(upd, ctx.db_set, ctx.collations)
+                    .map(|(column, argument)| Expr::Binary {
+                        left: Box::new(column.clone()),
+                        op: BinaryOp::Eq,
+                        right: Box::new(argument.clone()),
+                    });
+                let use_override = ordered_selection.is_some();
+                let selection = ordered_selection.as_ref().or(upd.selection.as_ref());
                 let mut keys = Vec::new();
                 let mut key_ords: Vec<u32> = Vec::new();
                 let n_scanned = candidates.len();
@@ -32179,8 +32244,15 @@ fn prepare_update_exec<'a>(
                     let mut scopes = Vec::with_capacity(1 + outer_scopes.len());
                     scopes.push(scope);
                     scopes.extend_from_slice(outer_scopes);
-                    if let Some(ref w) = upd.selection {
-                        let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None)?;
+                    if let Some(w) = selection {
+                        let saved_override = use_override.then(|| {
+                            std::mem::replace(&mut ctx.stmt_tx.explicit_collation_override, true)
+                        });
+                        let cond = eval_expr(ctx, w, params, &scopes, &dml_ctes, None);
+                        if let Some(saved) = saved_override {
+                            ctx.stmt_tx.explicit_collation_override = saved;
+                        }
+                        let cond = cond?;
                         if cond.truthiness_with_encoding(ctx.encoding()) != Some(true) {
                             continue;
                         }

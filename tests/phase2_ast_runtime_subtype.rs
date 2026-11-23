@@ -4499,3 +4499,73 @@ fn group65_table_text_observers_keep_bytes_after_rebind() {
         assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
     }
 }
+
+#[test]
+fn group64_plain_update_uses_explicit_registered_builtin_collation() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for name in ["NOCASE", "RTRIM"] {
+            for (predicate, bound) in [
+                (format!("tag COLLATE {name}=?2"), true),
+                (format!("tag='alpha' COLLATE {name}"), false),
+                (format!("?2 COLLATE {name}=tag"), true),
+                (format!("'alpha'=tag COLLATE {name}"), false),
+            ] {
+                let db = Connection::open_in_memory().unwrap();
+                db.execute_batch(&format!(
+                    "PRAGMA encoding='{encoding}';
+                     PRAGMA foreign_keys=ON;
+                     CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                     CREATE TABLE child(id INTEGER PRIMARY KEY, p INTEGER REFERENCES parent, tag TEXT, memo TEXT);
+                     INSERT INTO parent VALUES(1);
+                     INSERT INTO child VALUES(1,1,'alpha','orig'),(2,1,'ALPHA','orig'),(3,1,'alpha ','orig');"
+                )).unwrap();
+                let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let observed = Arc::clone(&calls);
+                db.register_collation(name, move |left, right| {
+                    observed.lock().unwrap().push((left.to_owned(), right.to_owned()));
+                    left.cmp(right)
+                }).unwrap();
+                let expected_calls = |argument: &str| {
+                    ["alpha", "ALPHA", "alpha "].map(|tag| (tag.to_owned(), argument.to_owned()))
+                };
+
+                let mut statement = db.prepare(&format!(
+                    "UPDATE child SET memo=unistr(?1) WHERE {predicate}"
+                )).unwrap();
+                statement.bind_text(1, "first").unwrap();
+                if bound {
+                    statement.bind_text(2, "alpha").unwrap();
+                }
+                assert!(matches!(statement.step().unwrap(), StepResult::Done));
+                assert_eq!(db.changes(), 1);
+                assert_eq!(*calls.lock().unwrap(), expected_calls("alpha"));
+
+                statement.reset().unwrap();
+                assert_eq!(*calls.lock().unwrap(), expected_calls("alpha"));
+                calls.lock().unwrap().clear();
+                let second_key = match (bound, name) {
+                    (false, _) => "alpha",
+                    (true, "NOCASE") => "ALPHA",
+                    (true, _) => "alpha ",
+                };
+                statement.bind_text(1, "second").unwrap();
+                if bound {
+                    statement.bind_text(2, second_key).unwrap();
+                }
+                assert!(matches!(statement.step().unwrap(), StepResult::Done));
+                assert_eq!(db.changes(), 1);
+                assert_eq!(*calls.lock().unwrap(), expected_calls(second_key));
+                statement.finalize().unwrap();
+
+                let values = db.query("SELECT memo FROM child ORDER BY id", &[]).unwrap();
+                let values: Vec<_> = values.rows.iter().map(|row| row.get_str(0).unwrap()).collect();
+                assert_eq!(values, match (bound, name) {
+                    (false, _) => ["second", "orig", "orig"],
+                    (true, "NOCASE") => ["first", "second", "orig"],
+                    (true, _) => ["first", "orig", "second"],
+                });
+                assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+            }
+        }
+    }
+}
