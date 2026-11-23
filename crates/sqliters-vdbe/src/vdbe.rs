@@ -1632,7 +1632,7 @@ fn complete_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
 fn worker_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
     if !prog.read_only || prog.btree_mask != 1 || !prog.p_program.is_empty()
         || !builtin_order_sorter(prog, open, key)
-        || !matches!(key.enc, 1..=3) || key.n_key_field != 2
+        || !matches!(key.enc, 1..=3) || !matches!(key.n_key_field, 2..=3)
         || key.a_coll.iter().flatten().any(|coll| !coll.name.eq_ignore_ascii_case("BINARY"))
     {
         return false;
@@ -1663,12 +1663,19 @@ fn worker_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
     }) {
         return false;
     }
-    let mut inserts = prog.a_op.windows(4).filter(|ops| ops[3].opcode == OP_SorterInsert);
-    let Some([column, rowid, record, _]) = inserts.next() else { return false };
+    let width = usize::from(key.n_key_field);
+    let mut inserts = prog.a_op.windows(width + 2)
+        .filter(|ops| ops[width + 1].opcode == OP_SorterInsert);
+    let Some([columns @ .., rowid, record, _]) = inserts.next() else { return false };
     inserts.next().is_none()
-        && column.opcode == OP_Column && column.p1 == table.p1 && column.p3 == record.p1
+        && columns.iter().enumerate().all(|(index, column)| {
+            column.opcode == OP_Column && column.p1 == table.p1
+                && record.p1.checked_add(index as i32) == Some(column.p3)
+        })
+        && (columns.len() == 1 || columns[0].p2 != columns[1].p2)
         && rowid.opcode == OP_Rowid && rowid.p1 == table.p1
-        && rowid.p2.checked_sub(1) == Some(record.p1) && record.opcode == OP_MakeRecord
+        && rowid.p2.checked_sub(i32::from(key.n_key_field) - 1) == Some(record.p1)
+        && record.opcode == OP_MakeRecord
         && prog.a_op.iter().filter(|op| op.opcode == OP_SorterOpen).count() == 1
 }
 

@@ -2637,3 +2637,8 @@ V1 ilk adımda C gibi SQLITE_ERROR, reset sırasında normal yazma için 787 ve 
 ## V6b.466 — VACUUM rollback fiziksel sync hatası ve yeniden açılış
 
 İlk 778 korunurken sonraki okuma fiziksel rollback sync hatasını 1034 olarak bildiriyor ve hata kalkınca sıcak journal olağan yoldan oynatılıyor. Dört çift yönlü doğrulama ve 108 dosya imajı geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v466-vacuum-rollback-sync-candidate/sonuc.md) OFF 1340/0/325, ON 1340/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,280 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_466.md).
+
+
+## V6b.467 — Üç sıralama anahtarında işçi PMA
+
+Tek ana rowid tablosu, üç yerel kodlama, FILE ve DEFAULT, son benzersiz rowid ile işçi PMA sonucu, reset, işçi birleştirme ve geçici dosya kapanışı C ile doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/worker-three-key-v464-preflight/sonuc.md) OFF 1341/0/325, ON 1341/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,294 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_467.md).

@@ -3691,3 +3691,49 @@ fn group65_legacy_fk_error_retains_the_check_phase_on_reset() {
     assert!(db.query("SELECT * FROM child", &[]).unwrap().rows.is_empty());
     assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
 }
+
+#[test]
+fn group64_file_sorter_worker_three_key_order_and_reset() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}';
+             PRAGMA temp_store=FILE; PRAGMA cache_size=1;
+             CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT, w INTEGER);
+             INSERT INTO items SELECT id,
+               CASE WHEN id=5 THEN NULL
+                    WHEN id<5 THEN printf('a%70000s','x')
+                    ELSE printf('b%70000s','x') END,
+               w
+             FROM (SELECT 1 id, 1 w UNION ALL SELECT 2,NULL UNION ALL SELECT 3,3
+                   UNION ALL SELECT 4,NULL UNION ALL SELECT 5,0
+                   UNION ALL SELECT 6,1 UNION ALL SELECT 7,2);"
+        )).unwrap();
+        let mut statement = db.prepare(
+            "SELECT id, w FROM items
+             ORDER BY v COLLATE BINARY NULLS LAST, w COLLATE BINARY DESC NULLS FIRST, id",
+        ).unwrap();
+        for threads in [1, 2] {
+            db.execute_batch(&format!("PRAGMA threads={threads}")).unwrap();
+            statement.machine_stmt_status(4, true);
+            let StepResult::Row(first) = statement.step().unwrap() else {
+                panic!("expected the first row in {encoding}");
+            };
+            assert_eq!(first.values(), &[Value::Integer(2), Value::Null]);
+            assert!(statement.machine_stmt_status(4, false) > 0, "{encoding}");
+            statement.reset().unwrap();
+
+            for (id, w) in [(2, None), (4, None), (3, Some(3)), (1, Some(1)),
+                (7, Some(2)), (6, Some(1)), (5, Some(0))]
+            {
+                let StepResult::Row(row) = statement.step().unwrap() else {
+                    panic!("expected id {id} in {encoding}");
+                };
+                assert_eq!(row.get_i64(0), Some(id));
+                assert_eq!(row.get_i64(1), w);
+            }
+            assert!(matches!(statement.step().unwrap(), StepResult::Done));
+            statement.reset().unwrap();
+        }
+    }
+}
