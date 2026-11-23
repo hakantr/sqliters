@@ -482,6 +482,7 @@ pub struct ExecContext<'a> {
     pub interrupt_flag: &'a std::sync::atomic::AtomicBool,
     pub functions: &'a FunctionRegistry,
     pub(crate) current_functions: &'a FunctionRegistry,
+    pub(crate) authorizer: &'a mut crate::driver::AuthorizerSlot,
     pub collations: &'a CollationRegistry,
     pub progress: &'a mut ProgressTracker,
     pub commit_hooks: &'a mut CommitCoordinatorHooks,
@@ -4858,6 +4859,19 @@ pub fn query_internal_vtab_sql(
                 Arc::new(stmt)
             }
         };
+        if let Stmt::Pragma { schema: None, name, value: None } = stmt_arc.as_ref()
+            && name.eq_ignore_ascii_case("function_list")
+        {
+            // pragmaVtabFilter prepares this statement against the current
+            // connection, outside the authorization context of its caller.
+            use crate::driver::{AuthorizerAction, AuthorizerResult};
+            let decision = ctx.authorizer.check(
+                AuthorizerAction::Pragma, Some(name), None, None, None,
+            )?;
+            if decision == AuthorizerResult::Ignore {
+                return Ok(Vec::new());
+            }
+        }
         crate::vtab::ensure_stmt_vtabs_connected(ctx, &stmt_arc)?;
         let prev_last_changes = ctx.runtime.last_changes;
         let prev_total_changes = ctx.runtime.total_changes;

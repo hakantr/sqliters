@@ -2489,6 +2489,7 @@ impl ConnectionInner {
                         interrupt_flag: &self.active_interrupt_flag,
                         functions: &self.functions,
                         current_functions: &self.functions,
+                        authorizer: &mut self.authorizer,
                         collations: &self.collations,
                         progress: &mut self.progress,
                         commit_hooks: &mut self.commit_hooks,
@@ -2739,6 +2740,7 @@ impl ConnectionInner {
                         interrupt_flag: &self.active_interrupt_flag,
                         functions: &self.functions,
                         current_functions: &self.functions,
+                        authorizer: &mut self.authorizer,
                         collations: &self.collations,
                         progress: &mut self.progress,
                         commit_hooks: &mut self.commit_hooks,
@@ -2872,6 +2874,7 @@ impl ConnectionInner {
                             interrupt_flag: &self.active_interrupt_flag,
                             functions: &self.functions,
                             current_functions: &self.functions,
+                            authorizer: &mut self.authorizer,
                             collations: &self.collations,
                             progress: &mut self.progress,
                             commit_hooks: &mut self.commit_hooks,
@@ -7221,6 +7224,7 @@ impl ConnectionInner {
             interrupt_flag: &self.active_interrupt_flag,
             functions: prepared_functions.as_ref().unwrap_or(&self.functions),
             current_functions: &self.functions,
+            authorizer: &mut self.authorizer,
             collations: &self.collations,
             progress: &mut self.progress,
             commit_hooks: &mut self.commit_hooks,
@@ -10388,6 +10392,10 @@ impl Statement {
         mode: PrepareMode,
         error: SqliteError,
     ) -> SqliteError {
+        if mode == PrepareMode::V1 && error.code == ErrorCode::Auth && inner.authorizer.is_some() {
+            // A nested PRAGMA authorization failure is retained for reset/finalize.
+            return inner.legacy_c_step_error();
+        }
         // vdbe.c:9501–9510 and vdbeapi.c:951–956: only a saved-SQL statement exposes
         // its execution error at step. Reset/finalize retain the actual interruption.
         if inner.uses_default_interrupt_flag(shared) {

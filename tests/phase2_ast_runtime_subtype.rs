@@ -3280,3 +3280,50 @@ fn group65_function_list_authorized_machine_progress_and_reauthorization() {
     assert_eq!(ignored.column_count(), 0);
     assert_eq!(ignored.machine_stmt_status(4, false), 4);
 }
+
+#[test]
+fn group65_function_list_table_checks_inner_authorizer_on_each_filter() {
+    use sqliters::{AuthorizerAction, AuthorizerResult};
+
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch("CREATE VIEW visible_functions AS SELECT name FROM pragma_function_list").unwrap();
+    let decision = Arc::new(AtomicUsize::new(1));
+    let checks = Arc::new(AtomicUsize::new(0));
+    let state = decision.clone();
+    let calls = checks.clone();
+    db.set_authorizer(Some(Box::new(move |action, a, b, schema, inner| {
+        if action == AuthorizerAction::Pragma {
+            assert_eq!((a, b, schema, inner), (Some("function_list"), None, None, None));
+            calls.fetch_add(1, AtomicOrdering::Relaxed);
+            return match state.load(AtomicOrdering::Relaxed) {
+                0 => AuthorizerResult::Ok,
+                1 => AuthorizerResult::Ignore,
+                _ => AuthorizerResult::Deny,
+            };
+        }
+        AuthorizerResult::Ok
+    }))).unwrap();
+
+    let mut held = db.prepare("SELECT name FROM visible_functions LIMIT 1").unwrap();
+    assert_eq!(checks.load(AtomicOrdering::Relaxed), 0);
+    assert!(matches!(held.step().unwrap(), StepResult::Done));
+    assert_eq!(checks.load(AtomicOrdering::Relaxed), 1);
+    held.reset().unwrap();
+
+    decision.store(2, AtomicOrdering::Relaxed);
+    assert_eq!(held.step().unwrap_err().code, ErrorCode::Auth);
+    assert_eq!(checks.load(AtomicOrdering::Relaxed), 2);
+    assert_eq!(held.reset().unwrap_err().code, ErrorCode::Auth);
+
+    let mut legacy = db.prepare_v1("SELECT name FROM pragma_function_list LIMIT 1").unwrap();
+    assert_eq!(legacy.step().unwrap_err().code, ErrorCode::Error);
+    assert_eq!(legacy.finalize().unwrap_err().code, ErrorCode::Auth);
+    assert_eq!(checks.load(AtomicOrdering::Relaxed), 3);
+
+    decision.store(0, AtomicOrdering::Relaxed);
+    let StepResult::Row(row) = held.step().unwrap() else {
+        panic!("missing allowed function name");
+    };
+    assert_eq!(row.get_str(0), Some("pow"));
+    assert_eq!(checks.load(AtomicOrdering::Relaxed), 4);
+}

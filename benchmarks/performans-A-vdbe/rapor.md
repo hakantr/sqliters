@@ -2572,3 +2572,8 @@ C kaynaklı dosyada dört bulunan ve bulunamayan anahtar yolunun satırları, ok
 ## V6b.453 — Taşma sayfasında doğrudan kısmi okuma
 
 C kaynaklı dosyada dört indeks araması ve NOT INDEXED taramasında iki Rust kipi C ile aynı fiziksel boyut ve ofseti kullandı. Son 511 baytlık okuma eşleşti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v452-direct-overflow-read-experiment/sonuc.md) OFF 1330/1/325, ON 1330/1/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,283 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_453.md).
+
+
+## V6b.454 — pragma_function_list iç yetkilendirmesi
+
+840 iç çağrı ve yaşam döngüsü profili iki kipte C ile eşleşti. Reddedilen veya yoksayılan 864 tarama fonksiyon kaydı döndürmedi. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v454-function-list-table-inner-authorizer-rebased-candidate/sonuc.md) OFF 1331/1/325, ON 1331/1/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 0,861 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_454.md).
