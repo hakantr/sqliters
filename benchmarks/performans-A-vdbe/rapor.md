@@ -2842,3 +2842,8 @@ Kip başına 96 C eş hedef, 384 taban kontrolü ve dokuz snapshot profili. Kü�
 ## V6b.507 — TEXT ve BLOB bind uzunluğu ve yürütmede Variable sınırı
 
 Üç kodlama ve DELETE/WAL ile 24 V1/V2 native rota, 12 TEXT/BLOB bağlama ve 24 sağlıklı C açılışı eş. Nokta okumada ve kısa DML’de limit korunur. V1 step/reset 1/18, V2 18/18. Group65 her kipte 44/44. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v507-bind-length-exact/sonuc.md) OFF 1380/0/324, ON 1380/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,278 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_507.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.508 — Hazır TEXT bağının encoding bilgisini koruma
+
+UTF-8, UTF-16LE/BE, iki slot ve limitli/varsayılan yürütmede 116 native C eş. V507’nin 24 rota ve 12 bind kontrolü, Group65 45/45, Group64 36/36. Bağlama ayarı tek atomik görüntü olarak yayımlanır. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v508-bind-encoding-exact/sonuc.md) OFF 1381/0/324, ON 1381/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,280 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_508.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)

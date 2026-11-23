@@ -651,6 +651,7 @@ pub(crate) fn text_register_read(program: &sqliters_vdbe::vdbeaux::Program) -> b
     let mut table_cursor = None;
     let mut has_text_producer = false;
     let mut has_text_observer = false;
+    let mut has_bound_byte_observer = false;
     for op in &program.a_op {
         match op.opcode {
             OP_Function | OP_PureFunc => {
@@ -661,6 +662,12 @@ pub(crate) fn text_register_read(program: &sqliters_vdbe::vdbeaux::Program) -> b
                 }
                 if is_text_register_observer(&func.name) {
                     has_text_observer = true;
+                    if !table_read && ctx.argc == 1
+                        && (func.name.eq_ignore_ascii_case("hex") || func.name.eq_ignore_ascii_case("octet_length"))
+                        && program.a_op.iter().any(|source| source.opcode == OP_Variable && source.p2 == op.p2)
+                    {
+                        has_bound_byte_observer = true;
+                    }
                 } else if func.name.eq_ignore_ascii_case("unistr") || func.name.eq_ignore_ascii_case("char") {
                     has_text_producer = true;
                 } else if !["substr", "substring", "replace", "concat", "concat_ws", "trim", "ltrim", "rtrim", "lower", "upper"].iter()
@@ -686,7 +693,7 @@ pub(crate) fn text_register_read(program: &sqliters_vdbe::vdbeaux::Program) -> b
     if table_read {
         table_cursor.is_some() && has_text_observer
     } else {
-        has_text_producer
+        has_text_producer || has_bound_byte_observer
     }
 }
 

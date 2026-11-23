@@ -2352,6 +2352,21 @@ pub(crate) fn halt_transaction(ctx: &mut ExecContext<'_>, read_only: bool) -> Re
     }
 }
 
+/// Load text registers in the encoding from `bind`, including after a reprepare.
+fn bind_machine_parameters(
+    vm: &mut Vdbe,
+    (values, text_encodings): (&[Value], &[Option<TextEncoding>]),
+    current_encoding: TextEncoding,
+) {
+    debug_assert_eq!(values.len(), text_encodings.len());
+    for (i, (value, encoding)) in values.iter().zip(text_encodings).enumerate() {
+        let encoding = encoding.unwrap_or(current_encoding) as u8;
+        vm.bind(i + 1, value);
+        vm.a_var[i].change_encoding(encoding);
+        vm.a_var[i].enc = encoding;
+    }
+}
+
 /// A statement that writes, run by the machine to its end inside the engine's write
 /// statement (`lib.rs`: the implicit transaction, the statement savepoint, the commit or
 /// the abort of the statement are the engine's, as for its own executor). `prog` is the
@@ -2362,7 +2377,7 @@ pub(crate) fn halt_transaction(ctx: &mut ExecContext<'_>, read_only: bool) -> Re
 pub(crate) fn run_write(
     ctx: &mut ExecContext<'_>,
     prog: &Arc<Program>,
-    params: &[Value],
+    params: (&[Value], &[Option<TextEncoding>]),
     sql: &str,
 ) -> Result<crate::engine::QueryOutput> {
     // `Vdbe.usesStmtJournal` (C: `isMultiWrite && mayAbort`): without it C opens no
@@ -2382,11 +2397,7 @@ pub(crate) fn run_write(
     }
     let mut vm = Vdbe::new(Arc::clone(prog));
     vm.rewind();
-    for (i, v) in params.iter().enumerate() {
-        vm.bind(i + 1, v);
-        vm.a_var[i].change_encoding(ctx.encoding() as u8);
-        vm.a_var[i].enc = ctx.encoding() as u8;
-    }
+    bind_machine_parameters(&mut vm, params, ctx.encoding());
     vm.trace_sql(sql);
     RUNS.with(|r| r.set(r.get() + 1));
     let encoding = ctx.encoding();
@@ -2542,18 +2553,14 @@ pub(crate) fn step(
     shared: &crate::ConnectionShared,
     hid: crate::HandleId,
     vm: &mut Vdbe,
-    params: &[Value],
+    params: (&[Value], &[Option<TextEncoding>]),
     start: bool,
     sql: &str,
     function_generation: u64,
 ) -> (Result<Option<Vec<Value>>>, Option<usize>) {
     if start {
         vm.rewind();
-        for (i, v) in params.iter().enumerate() {
-            vm.bind(i + 1, v);
-            vm.a_var[i].change_encoding(inner.effective_encoding() as u8);
-            vm.a_var[i].enc = inner.effective_encoding() as u8;
-        }
+        bind_machine_parameters(vm, params, inner.effective_encoding());
         vm.trace_sql(sql);
         vm.expire_seq = inner.db_set.c_expire_seq();
         RUNS.with(|r| r.set(r.get() + 1));

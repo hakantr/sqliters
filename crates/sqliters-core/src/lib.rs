@@ -1101,6 +1101,25 @@ pub(crate) struct ConnectionInner {
     pub(crate) lit_insert_scratch: sqliters_vdbe::VdbeWriteScratch,
 }
 
+#[derive(Clone, Copy)]
+struct BindingSettings {
+    encoding: TextEncoding,
+    length_limit: usize,
+}
+
+impl BindingSettings {
+    fn packed(self) -> u64 {
+        ((self.length_limit as u64) << 32) | self.encoding as u64
+    }
+
+    fn from_packed(packed: u64) -> Self {
+        Self {
+            encoding: TextEncoding::from_header_u32(packed as u32).expect("published connection encoding"),
+            length_limit: (packed >> 32) as usize,
+        }
+    }
+}
+
 pub(crate) struct ConnectionShared {
     pub(crate) conn_id: u64,
     pub(crate) db_path: Option<PathBuf>,
@@ -1125,7 +1144,7 @@ pub(crate) struct ConnectionShared {
     pub(crate) mirror_autocommit: AtomicBool,
     pub(crate) mirror_rollback_count: AtomicU64,
     pub(crate) mirror_attached_limit: AtomicUsize,
-    pub(crate) mirror_length_limit: AtomicUsize,
+    mirror_binding_settings: AtomicU64,
     pub(crate) pending_drops: Mutex<Vec<PendingDrop>>,
     pub(crate) inner: Mutex<ConnectionInner>,
 }
@@ -1141,6 +1160,20 @@ impl ConnectionShared {
         if self.conn_state.load(Ordering::Relaxed) != code {
             self.conn_state.store(code, Ordering::Release);
         }
+    }
+
+    // Called with the gate and the inner guard held. Fast bind reads one snapshot.
+    fn sync_binding_settings(&self, inner: &ConnectionInner) {
+        if matches!(inner.state, ConnectionState::Open) {
+            let settings = inner.binding_settings().packed();
+            if self.mirror_binding_settings.load(Ordering::Relaxed) != settings {
+                self.mirror_binding_settings.store(settings, Ordering::Release);
+            }
+        }
+    }
+
+    fn binding_settings(&self) -> BindingSettings {
+        BindingSettings::from_packed(self.mirror_binding_settings.load(Ordering::Acquire))
     }
 
     pub(crate) fn publish_mirrors(
@@ -1449,6 +1482,7 @@ impl ConnectionShared {
             let mut inner = self.lock_inner();
             inner.process_pending_drops(batch, self);
             self.sync_conn_state(&inner.state);
+            self.sync_binding_settings(&inner);
             drop(inner);
         }
     }
@@ -1650,6 +1684,7 @@ impl Drop for ConnSession<'_> {
     fn drop(&mut self) {
         if let Some(ref g) = self.guard {
             self.shared.sync_conn_state(&g.state);
+            self.shared.sync_binding_settings(g);
         }
         drop(self.guard.take());
         self.shared.drain_and_release_gate();
@@ -1685,9 +1720,11 @@ impl Drop for DualConnSession<'_> {
     fn drop(&mut self) {
         if let Some(ref g) = self.second_guard {
             self.second.sync_conn_state(&g.state);
+            self.second.sync_binding_settings(g);
         }
         if let Some(ref g) = self.first_guard {
             self.first.sync_conn_state(&g.state);
+            self.first.sync_binding_settings(g);
         }
         drop(self.second_guard.take());
         drop(self.first_guard.take());
@@ -1726,6 +1763,13 @@ impl ConnectionInner {
             self.db_set.main_btree().encoding()
         } else {
             self.connection_encoding
+        }
+    }
+
+    fn binding_settings(&self) -> BindingSettings {
+        BindingSettings {
+            encoding: self.effective_encoding(),
+            length_limit: self.runtime.effective_length_limit() as usize,
         }
     }
 
@@ -3739,7 +3783,7 @@ impl Connection {
             mirror_autocommit: AtomicBool::new(true),
             mirror_rollback_count: AtomicU64::new(0),
             mirror_attached_limit: AtomicUsize::new(SQLITE_MAX_ATTACHED),
-            mirror_length_limit: AtomicUsize::new(SQLITE_MAX_LENGTH),
+            mirror_binding_settings: AtomicU64::new(inner.binding_settings().packed()),
             pending_drops: Mutex::new(Vec::new()),
             inner: Mutex::new(inner),
         });
@@ -4519,7 +4563,7 @@ impl Connection {
     /// Queries or changes the connection's string and BLOB length limit.
     /// Returns the previous limit. A negative input leaves the limit unchanged.
     pub fn set_length_limit(&self, limit: i32) -> i32 {
-        let hard_limit = sqliters_types::SQLITE_MAX_LENGTH as i32;
+        let hard_limit = SQLITE_MAX_LENGTH as i32;
         let Ok(mut session) = self.shared.enter() else {
             return hard_limit;
         };
@@ -4530,9 +4574,7 @@ impl Connection {
         let previous = inner.runtime.effective_length_limit();
         if limit >= 0 {
             // sqlite3_limit() clamps SQLITE_LIMIT_LENGTH to SQLITE_MIN_LENGTH.
-            let actual = limit.clamp(30, hard_limit);
-            inner.runtime.length_limit = Some(actual);
-            self.shared.mirror_length_limit.store(actual as usize, Ordering::Release);
+            inner.runtime.length_limit = Some(limit.clamp(30, hard_limit));
         }
         previous
     }
@@ -5577,6 +5619,7 @@ pub struct Statement {
     /// Names from the current prepare of an ordinary SELECT using column-name flags.
     preserve_prepared_column_names: bool,
     params: Vec<Value>,
+    param_text_encodings: Vec<Option<TextEncoding>>,
     named_params: HashMap<String, usize>,
     ignored_fk_parent_tables: Vec<(DatabaseId, String)>,
     unparsed_tail: String,
@@ -8258,7 +8301,7 @@ impl Statement {
         let no_lock = self.category == Some(StmtCategory::NoLockPragma);
         let function_generation = self.compiled_function_generation;
         let (result, pragma_schema_error_offset) =
-            vdbe_host::step(inner, shared, hid, &mut vm, &self.params, true, &self.raw_sql, function_generation);
+            vdbe_host::step(inner, shared, hid, &mut vm, (&self.params, &self.param_text_encodings), true, &self.raw_sql, function_generation);
         if vm.expired_on_reset { self.expired = true; }
         match result {
             Ok(Some(row)) => {
@@ -8374,7 +8417,7 @@ impl Statement {
             unreachable!("machine_advance requires a statement suspended on the machine");
         };
         let (res, pragma_schema_error_offset) =
-            vdbe_host::step(inner, shared, hid, vm, &self.params, false, &self.raw_sql, *function_generation);
+            vdbe_host::step(inner, shared, hid, vm, (&self.params, &self.param_text_encodings), false, &self.raw_sql, *function_generation);
         if vm.expired_on_reset { self.expired = true; }
         if let Ok(Some(row)) = res {
             if vm.prog.uses_vtab() {
@@ -9086,6 +9129,7 @@ impl Statement {
             column_names: artifacts.column_names,
             preserve_prepared_column_names,
             params: vec![Value::Null; artifacts.max_param],
+            param_text_encodings: vec![None; artifacts.max_param],
             named_params: artifacts.named_params,
             ignored_fk_parent_tables: artifacts.ignored_fk_parent_tables,
             unparsed_tail,
@@ -9350,30 +9394,33 @@ impl Statement {
         Ok(())
     }
 
-    fn check_bind_size(&mut self, index: usize, len: usize) -> Result<()> {
-        if len > self.shared.mirror_length_limit.load(Ordering::Acquire) {
+    fn check_bind_size(&mut self, index: usize, len: usize, limit: usize) -> Result<()> {
+        if len > limit {
             // C vdbeUnbind clears the old value before validating the new payload.
             self.params[index] = Value::Null;
+            self.param_text_encodings[index] = None;
             return Err(SqliteError::new(ErrorCode::TooBig, "string or blob too big"));
         }
         Ok(())
     }
 
-    fn set_bound_value(&mut self, index_1_based: usize, value: impl Into<Value>) -> Result<()> {
+    fn set_bound_value(&mut self, index_1_based: usize, value: impl Into<Value>, settings: BindingSettings) -> Result<()> {
         self.check_bind_index(index_1_based)?;
         let value = value.into();
         self.expire_for_binding(index_1_based, Some(&value));
         let index = index_1_based - 1;
-        self.check_bind_size(index, value.as_bytes().map_or(0, <[u8]>::len))?;
+        self.check_bind_size(index, value.as_bytes().map_or(0, <[u8]>::len), settings.length_limit)?;
+        self.param_text_encodings[index] = matches!(value, Value::Text(_)).then_some(settings.encoding);
         self.params[index] = value;
         Ok(())
     }
 
-    fn set_bound_text(&mut self, index_1_based: usize, text: &str) -> Result<()> {
+    fn set_bound_text(&mut self, index_1_based: usize, text: &str, settings: BindingSettings) -> Result<()> {
         self.check_bind_index(index_1_based)?;
         self.expire_for_binding(index_1_based, None);
         let index = index_1_based - 1;
-        self.check_bind_size(index, text.len())?;
+        self.check_bind_size(index, text.len(), settings.length_limit)?;
+        self.param_text_encodings[index] = Some(settings.encoding);
         let slot = &mut self.params[index];
         if let Value::Text(buffer) = slot {
             buffer.clear();
@@ -9384,7 +9431,7 @@ impl Statement {
         Ok(())
     }
 
-    fn set_bound_values(&mut self, values: &[Value]) -> Result<()> {
+    fn set_bound_values(&mut self, values: &[Value], settings: BindingSettings) -> Result<()> {
         self.ensure_ready_for_bind()?;
         if values.len() > self.params.len() {
             return Err(SqliteError::new(
@@ -9398,7 +9445,8 @@ impl Statement {
         }
         for (i, v) in values.iter().enumerate() {
             self.expire_for_binding(i + 1, Some(v));
-            self.check_bind_size(i, v.as_bytes().map_or(0, <[u8]>::len))?;
+            self.check_bind_size(i, v.as_bytes().map_or(0, <[u8]>::len), settings.length_limit)?;
+            self.param_text_encodings[i] = matches!(v, Value::Text(_)).then_some(settings.encoding);
             self.params[i] = v.clone();
         }
         Ok(())
@@ -9406,7 +9454,7 @@ impl Statement {
 
     fn bind_all_in_session(&mut self, inner: &ConnectionInner, values: &[Value]) -> Result<()> {
         inner.ensure_usable()?;
-        self.set_bound_values(values)
+        self.set_bound_values(values, inner.binding_settings())
     }
 
     #[inline]
@@ -9445,7 +9493,7 @@ impl Statement {
     pub fn bind(&mut self, index_1_based: usize, value: impl Into<Value>) -> Result<&mut Self> {
         if self.can_fast_bind() {
             self.ensure_ready_for_bind()?;
-            let result = self.set_bound_value(index_1_based, value);
+            let result = self.set_bound_value(index_1_based, value, self.shared.binding_settings());
             self.check_fast_positional_bind(result)?;
             return Ok(self);
         }
@@ -9453,7 +9501,7 @@ impl Statement {
         let mut session = shared.enter()?;
         session.inner().ensure_usable()?;
         self.ensure_ready_for_bind()?;
-        self.set_bound_value(index_1_based, value)
+        self.set_bound_value(index_1_based, value, session.inner().binding_settings())
             .map_err(|e| Self::positional_bind_error(session.inner_mut(), e))?;
         drop(session);
         Ok(self)
@@ -9465,7 +9513,7 @@ impl Statement {
     pub fn bind_text(&mut self, index_1_based: usize, text: &str) -> Result<&mut Self> {
         if self.can_fast_bind() {
             self.ensure_ready_for_bind()?;
-            let result = self.set_bound_text(index_1_based, text);
+            let result = self.set_bound_text(index_1_based, text, self.shared.binding_settings());
             self.check_fast_positional_bind(result)?;
             return Ok(self);
         }
@@ -9473,7 +9521,7 @@ impl Statement {
         let mut session = shared.enter()?;
         session.inner().ensure_usable()?;
         self.ensure_ready_for_bind()?;
-        self.set_bound_text(index_1_based, text)
+        self.set_bound_text(index_1_based, text, session.inner().binding_settings())
             .map_err(|e| Self::positional_bind_error(session.inner_mut(), e))?;
         drop(session);
         Ok(self)
@@ -9491,7 +9539,7 @@ impl Statement {
                     format!("unknown bind parameter: {name}"),
                 ));
             };
-            let result = self.set_bound_value(idx, value);
+            let result = self.set_bound_value(idx, value, self.shared.binding_settings());
             self.check_fast_positional_bind(result)?;
             return Ok(self);
         }
@@ -9505,7 +9553,7 @@ impl Statement {
                 format!("unknown bind parameter: {name}"),
             ));
         };
-        self.set_bound_value(idx, value)
+        self.set_bound_value(idx, value, session.inner().binding_settings())
             .map_err(|error| Self::positional_bind_error(session.inner_mut(), error))?;
         drop(session);
         Ok(self)
@@ -9516,7 +9564,7 @@ impl Statement {
     #[inline]
     pub fn bind_all(&mut self, values: &[Value]) -> Result<&mut Self> {
         if self.can_fast_bind() {
-            let result = self.set_bound_values(values);
+            let result = self.set_bound_values(values, self.shared.binding_settings());
             if result.as_ref().is_err_and(|error| error.code == ErrorCode::TooBig) {
                 self.check_fast_positional_bind(result)?;
             } else {
@@ -9546,6 +9594,7 @@ impl Statement {
         if self.can_fast_bind() {
             if self.c_bind_expmask() != 0 { self.expired = true; }
             self.params.fill(Value::Null);
+            self.param_text_encodings.fill(None);
             return Ok(());
         }
         let shared = Arc::clone(&self.shared);
@@ -9553,6 +9602,7 @@ impl Statement {
         session.inner().ensure_usable()?;
         if self.c_bind_expmask() != 0 { self.expired = true; }
         self.params.fill(Value::Null);
+        self.param_text_encodings.fill(None);
         Ok(())
     }
 
@@ -10005,6 +10055,7 @@ impl Statement {
             self.reprepare_machine_vm(counters);
             self.column_names = artifacts.column_names;
             self.params = transferred;
+            self.param_text_encodings.resize(artifacts.max_param, None);
             self.named_params = artifacts.named_params;
             self.ignored_fk_parent_tables = artifacts.ignored_fk_parent_tables;
             self.compiled_function_generation = inner.functions.function_generation();
@@ -12466,6 +12517,7 @@ impl Statement {
                 let raw_sql_ref = self.raw_sql.as_str();
                 let write_scratch = &mut self.write_vm_scratch;
                 let params_ref = &self.params;
+                let param_text_encodings = &self.param_text_encodings;
                 let prev_ts = inner.runtime.stmt_timestamp_ms;
                 let needs_ts_for_compiled =
                     compiled_prog_ref.is_none_or(|p| p.needs_stmt_timestamp());
@@ -12493,7 +12545,7 @@ impl Statement {
                                 ctx.runtime.stmt_timestamp_ms =
                                     Some(ctx.db_set.main_btree().pager().vfs().current_unix_millis());
                             }
-                            return vdbe_host::run_write(ctx, prog, params_ref, raw_sql_ref);
+                            return vdbe_host::run_write(ctx, prog, (params_ref, param_text_encodings), raw_sql_ref);
                         }
                         if let Some(cookie) = legacy_view_cookie {
                             // Use the snapshot that normal view materialization will read.

@@ -4878,3 +4878,54 @@ fn group65_low_length_limit_named_and_bulk_bind_keep_error_offset() {
         stmt.reset().unwrap();
     }
 }
+
+#[test]
+fn group65_bound_byte_observers_keep_each_slots_encoding_across_reset() {
+    for (encoding, utf16_hex) in [
+        ("UTF-16le", "41005A00FC002B7334D81EDD"),
+        ("UTF-16be", "0041005A00FC732BD834DD1E"),
+    ] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        let sql = "SELECT octet_length(?1),hex(:shown)";
+        let mut stmt = db.prepare(sql).unwrap();
+        let long = "a".repeat(64);
+        let shown = "AZü猫𝄞";
+        stmt.bind_text(1, &long).unwrap();
+        stmt.bind_named(":shown", Value::Text(shown.to_owned())).unwrap();
+        db.prepare(&format!("PRAGMA encoding='{encoding}'")).unwrap().finalize().unwrap();
+        db.execute_batch(
+            "CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent);
+             INSERT INTO parent VALUES(1); INSERT INTO child VALUES(1,1);",
+        ).unwrap();
+        db.set_length_limit(64);
+
+        let read = |stmt: &mut sqliters::Statement| {
+            let StepResult::Row(row) = stmt.step().unwrap() else { panic!("expected bound byte observer row") };
+            stmt.reset().unwrap();
+            row.into_values()
+        };
+        let original = [Value::Integer(64), Value::Text("415AC3BCE78CABF09D849E".to_owned())];
+        assert_eq!(read(&mut stmt), original);
+        assert_eq!(read(&mut stmt), original);
+        assert_eq!(stmt.c_reprepare_status().0, 1);
+
+        stmt.bind_named(":shown", Value::Text(shown.to_owned())).unwrap();
+        assert_eq!(read(&mut stmt), [Value::Integer(64), Value::Text(utf16_hex.to_owned())]);
+        stmt.bind(1, Value::Text(long.clone())).unwrap();
+        assert_eq!(stmt.step().unwrap_err().code, ErrorCode::TooBig);
+        assert_eq!(stmt.reset().unwrap_err().code, ErrorCode::TooBig);
+        stmt.clear_bindings().unwrap();
+        assert_eq!(read(&mut stmt), [Value::Null, Value::Text(String::new())]);
+
+        db.set_length_limit(1_000_000_000);
+        let rebound = [Value::Text(long), Value::Text(shown.to_owned())];
+        stmt.bind_all(&rebound).unwrap();
+        assert_eq!(read(&mut stmt), [Value::Integer(128), Value::Text(utf16_hex.to_owned())]);
+        stmt.finalize().unwrap();
+        assert_eq!(db.query(sql, &rebound).unwrap().rows[0].values(),
+            &[Value::Integer(128), Value::Text(utf16_hex.to_owned())]);
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+    }
+}
