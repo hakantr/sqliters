@@ -19301,6 +19301,7 @@ pub(crate) fn eval_expr_rt_pub(
 
 #[inline]
 fn try_borrow_simple_expr_val<'a>(
+    ctx: &ExecContext<'_>,
     expr: &'a Expr,
     params: &'a [Value],
     scopes: &'a [EvalRow],
@@ -19323,9 +19324,9 @@ fn try_borrow_simple_expr_val<'a>(
             let idx = match bp {
                 BindParam::Anonymous(i) | BindParam::Numbered(i) | BindParam::Named(_, i) => *i,
             };
-            Ok(Some(
-                params.get(idx.saturating_sub(1)).unwrap_or(&Value::Null),
-            ))
+            let value = params.get(idx.saturating_sub(1)).unwrap_or(&Value::Null);
+            ctx.runtime.check_bound_value_limit(value, ctx.encoding())?;
+            Ok(Some(value))
         }
         _ => Ok(None),
     }
@@ -19373,12 +19374,9 @@ fn eval_expr_rt(
             let idx = match bp {
                 BindParam::Anonymous(i) | BindParam::Numbered(i) | BindParam::Named(_, i) => *i,
             };
-            Ok(RuntimeValue::plain(
-                params
-                    .get(idx.saturating_sub(1))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            ))
+            let value = params.get(idx.saturating_sub(1)).unwrap_or(&Value::Null);
+            ctx.runtime.check_bound_value_limit(value, ctx.encoding())?;
+            Ok(RuntimeValue::plain(value.clone()))
         }
         Expr::Column(cref) => {
             if cref.schema.as_deref() == Some(WIN_SLOT_SCHEMA) {
@@ -19518,7 +19516,7 @@ fn eval_expr_rt(
                 if ctx.functions.find_scalar(fname, 2).is_none() {
                     let as_sql = *op == BinaryOp::JsonExtractText;
                     if let Expr::String(path_str) = right.as_ref()
-                        && let Some(lhs_ref) = try_borrow_simple_expr_val(left, params, scopes)?
+                        && let Some(lhs_ref) = try_borrow_simple_expr_val(ctx, left, params, scopes)?
                     {
                         return sqliters_types::json::eval_json_arrow_path_str(
                             lhs_ref, path_str, as_sql,

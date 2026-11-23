@@ -2016,6 +2016,7 @@ fn step_ops_loop(
                 // p1 = 1-based parameter index, p2 = dest_reg
                 let idx = (ins.p1 as usize).saturating_sub(1);
                 let src = params.get(idx).unwrap_or(&Value::Null);
+                runtime_ctx.check_bound_value_limit(src, runtime_ctx.text_encoding)?;
                 pool.assign_cloned_value(&mut regs[ins.p2 as usize], src, 0);
             }
             Opcode::Copy => {

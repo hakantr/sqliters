@@ -4767,3 +4767,114 @@ fn group65_readonly_application_header_setters_expire_on_write_rejection() {
     assert_eq!(fs::read(&path).unwrap(), seed);
     fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn group65_low_length_limit_rejects_bind_and_clears_old_value() {
+    let db = Connection::open_in_memory().unwrap();
+    let mut stmt = db.prepare("SELECT typeof(?1), length(?1)").unwrap();
+    let limit = db.set_length_limit(64);
+    let text = "a".repeat(65);
+    let blob = vec![b'a'; 65];
+
+    stmt.bind_text(1, &text[..64]).unwrap();
+    let err = stmt.bind_text(1, &text).unwrap_err();
+    assert_eq!(err.code, ErrorCode::TooBig);
+    assert_eq!(err.message, "string or blob too big");
+    let StepResult::Row(row) = stmt.step().unwrap() else {
+        panic!("expected a row with the cleared binding");
+    };
+    assert_eq!(row.values(), &[Value::Text("null".to_owned()), Value::Null]);
+    stmt.reset().unwrap();
+
+    stmt.bind(1, Value::Blob(blob[..64].to_vec())).unwrap();
+    let err = stmt.bind(1, Value::Blob(blob.clone())).unwrap_err();
+    assert_eq!(err.code, ErrorCode::TooBig);
+    let StepResult::Row(row) = stmt.step().unwrap() else {
+        panic!("expected a row with the cleared binding");
+    };
+    assert_eq!(row.values(), &[Value::Text("null".to_owned()), Value::Null]);
+    stmt.reset().unwrap();
+
+    db.set_length_limit(limit);
+    stmt.bind(1, Value::Blob(blob)).unwrap();
+    let StepResult::Row(row) = stmt.step().unwrap() else {
+        panic!("expected blob after restoring the length limit");
+    };
+    assert_eq!(row.values(), &[Value::Text("blob".to_owned()), Value::Integer(65)]);
+}
+
+#[test]
+fn group65_bound_text_length_is_checked_in_database_encoding() {
+    for encoding in ["UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!("PRAGMA encoding='{encoding}'; CREATE TABLE marker(id);"))
+            .unwrap();
+        let mut stmt = db.prepare("SELECT length(?1), octet_length(?1)").unwrap();
+        db.set_length_limit(64);
+        stmt.bind_text(1, &"a".repeat(64)).unwrap();
+        assert_eq!(stmt.step().unwrap_err().code, ErrorCode::TooBig);
+        assert_eq!(stmt.reset().unwrap_err().code, ErrorCode::TooBig);
+
+        stmt.bind(1, Value::Blob(vec![b'a'; 64])).unwrap();
+        let StepResult::Row(row) = stmt.step().unwrap() else {
+            panic!("expected blob within the length limit");
+        };
+        assert_eq!(row.values(), &[Value::Integer(64), Value::Integer(64)]);
+    }
+}
+
+#[test]
+fn group65_low_length_limit_reaches_point_reads_and_single_inserts() {
+    for (legacy, step_code) in [(false, ErrorCode::TooBig), (true, ErrorCode::Error)] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY, p REFERENCES parent, label TEXT);
+             INSERT INTO parent VALUES(1);
+             INSERT INTO child VALUES(1,1,'first');",
+        )
+        .unwrap();
+
+        for sql in [
+            "SELECT id FROM child WHERE id=?1",
+            "INSERT INTO child(p,label) VALUES(1,?1)",
+            "SELECT length(?1)",
+        ] {
+            let mut stmt = if legacy { db.prepare_v1(sql) } else { db.prepare(sql) }.unwrap();
+            stmt.bind_text(1, &"a".repeat(65)).unwrap();
+            let previous = db.set_length_limit(64);
+            assert_eq!(stmt.step().expect_err(sql).code, step_code, "{sql}");
+            assert_eq!(stmt.reset().unwrap_err().code, ErrorCode::TooBig, "{sql}");
+            db.set_length_limit(previous);
+        }
+        assert_eq!(
+            db.query("SELECT count(*) FROM child", &[]).unwrap().rows[0].get_i64(0),
+            Some(1),
+        );
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+    }
+}
+
+#[test]
+fn group65_low_length_limit_named_and_bulk_bind_keep_error_offset() {
+    let db = Connection::open_in_memory().unwrap();
+    let mut stmt = db.prepare("SELECT typeof(:payload)").unwrap();
+    let value = Value::Text("a".repeat(65));
+    db.set_length_limit(64);
+    for bulk in [false, true] {
+        let invalid = db.prepare("SELECT FROM t").unwrap_err();
+        assert_eq!(invalid.c_offset(), 7);
+        let error = if bulk {
+            stmt.bind_all(std::slice::from_ref(&value)).unwrap_err()
+        } else {
+            stmt.bind_named(":payload", value.clone()).unwrap_err()
+        };
+        assert_eq!((error.code, error.c_offset()), (ErrorCode::TooBig, 7));
+        let StepResult::Row(row) = stmt.step().unwrap() else {
+            panic!("expected cleared binding");
+        };
+        assert_eq!(row.values(), &[Value::Text("null".to_owned())]);
+        stmt.reset().unwrap();
+    }
+}

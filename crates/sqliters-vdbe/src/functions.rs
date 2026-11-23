@@ -88,6 +88,26 @@ impl VmRuntimeContext {
         self.length_limit.unwrap_or(sqliters_types::SQLITE_MAX_LENGTH as i32)
     }
 
+    /// The Variable opcode checks the stored size using the database encoding.
+    pub fn check_bound_value_limit(&self, value: &Value, encoding: TextEncoding) -> Result<()> {
+        if self.bound_value_exceeds_length_limit(value, encoding) {
+            return Err(SqliteError::new(ErrorCode::TooBig, "string or blob too big"));
+        }
+        Ok(())
+    }
+
+    pub fn bound_value_exceeds_length_limit(&self, value: &Value, encoding: TextEncoding) -> bool {
+        let Some(limit) = self.length_limit else {
+            return false;
+        };
+        let bytes = match value {
+            Value::Text(text) => encoding.encoded_byte_len(text),
+            Value::Blob(blob) => blob.len(),
+            _ => 0,
+        };
+        bytes > limit as usize
+    }
+
     /// Returns the statement's frozen UTC timestamp in Unix epoch milliseconds,
     /// falling back to `SystemTime::now()` if not explicitly initialized.
     #[inline]

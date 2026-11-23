@@ -1125,6 +1125,7 @@ pub(crate) struct ConnectionShared {
     pub(crate) mirror_autocommit: AtomicBool,
     pub(crate) mirror_rollback_count: AtomicU64,
     pub(crate) mirror_attached_limit: AtomicUsize,
+    pub(crate) mirror_length_limit: AtomicUsize,
     pub(crate) pending_drops: Mutex<Vec<PendingDrop>>,
     pub(crate) inner: Mutex<ConnectionInner>,
 }
@@ -1831,6 +1832,13 @@ impl ConnectionInner {
             || (is_read && self.db_set.c_ddl_rollback_expiry().is_some())
         {
             self.c_connection_diagnostic_code = status;
+        }
+    }
+
+    fn binds_require_length_check(&self, params: &[Value]) -> bool {
+        self.runtime.length_limit.is_some() && {
+            let encoding = self.effective_encoding();
+            params.iter().any(|param| self.runtime.bound_value_exceeds_length_limit(param, encoding))
         }
     }
 
@@ -3731,6 +3739,7 @@ impl Connection {
             mirror_autocommit: AtomicBool::new(true),
             mirror_rollback_count: AtomicU64::new(0),
             mirror_attached_limit: AtomicUsize::new(SQLITE_MAX_ATTACHED),
+            mirror_length_limit: AtomicUsize::new(SQLITE_MAX_LENGTH),
             pending_drops: Mutex::new(Vec::new()),
             inner: Mutex::new(inner),
         });
@@ -4521,7 +4530,9 @@ impl Connection {
         let previous = inner.runtime.effective_length_limit();
         if limit >= 0 {
             // sqlite3_limit() clamps SQLITE_LIMIT_LENGTH to SQLITE_MIN_LENGTH.
-            inner.runtime.length_limit = Some(limit.clamp(30, hard_limit));
+            let actual = limit.clamp(30, hard_limit);
+            inner.runtime.length_limit = Some(actual);
+            self.shared.mirror_length_limit.store(actual as usize, Ordering::Release);
         }
         previous
     }
@@ -5557,7 +5568,7 @@ pub struct Statement {
     c_v1_expired_before_run: bool,
     c_v1_retained_expiry_diagnostic: bool,
     c_v1_app_aggregate_diagnostic: bool,
-    c_v1_write_constraint_diagnostic: bool,
+    c_v1_write_exec_diagnostic: bool,
     // A bind-triggered generated reprepare may consider a scoped partial-index value.
     c_write_expired_by_binding: bool,
     c_reprepare_count: u32,
@@ -9068,7 +9079,7 @@ impl Statement {
             c_v1_expired_before_run: false,
             c_v1_retained_expiry_diagnostic: false,
             c_v1_app_aggregate_diagnostic: false,
-            c_v1_write_constraint_diagnostic: false,
+            c_v1_write_exec_diagnostic: false,
             c_write_expired_by_binding: false,
             c_reprepare_count: 0,
             c_reprepare_after_schema_check: false,
@@ -9123,11 +9134,11 @@ impl Statement {
         !matches!(self.lifecycle, StatementLifecycle::Ready) && !self.c_v1_expired_before_run
     }
 
-    fn c_legacy_read_mismatch(&self, error: Option<&SqliteError>) -> bool {
+    fn c_v1_read_exec_diagnostic(&self, error: Option<&SqliteError>) -> bool {
         self.mode == PrepareMode::V1
             && self.category == Some(StmtCategory::Read)
             && !self.read_io_during_prepare
-            && error.is_some_and(|error| error.code == ErrorCode::Mismatch)
+            && error.is_some_and(|error| matches!(error.code, ErrorCode::Mismatch | ErrorCode::TooBig))
     }
 
     /// A legacy step can autoreset a previously run statement and transfer its diagnostic.
@@ -9139,8 +9150,8 @@ impl Statement {
         self.mode == PrepareMode::V1
             && !self.c_v1_expired_before_run
             && (self.is_journal_mode_pragma()
-                || self.c_v1_write_constraint_diagnostic
-                || self.c_legacy_read_mismatch(last_error.as_ref())
+                || self.c_v1_write_exec_diagnostic
+                || self.c_v1_read_exec_diagnostic(last_error.as_ref())
                 || last_error.as_ref().is_some_and(|error| self.is_readonly_application_header_error(error))
                 || self.expired
                     && last_error.as_ref().is_some_and(|error| error.code == ErrorCode::Schema))
@@ -9339,10 +9350,10 @@ impl Statement {
         Ok(())
     }
 
-    fn check_bind_size(slot: &mut Value, len: usize) -> Result<()> {
-        if len > SQLITE_MAX_LENGTH {
+    fn check_bind_size(&mut self, index: usize, len: usize) -> Result<()> {
+        if len > self.shared.mirror_length_limit.load(Ordering::Acquire) {
             // C vdbeUnbind clears the old value before validating the new payload.
-            *slot = Value::Null;
+            self.params[index] = Value::Null;
             return Err(SqliteError::new(ErrorCode::TooBig, "string or blob too big"));
         }
         Ok(())
@@ -9352,17 +9363,18 @@ impl Statement {
         self.check_bind_index(index_1_based)?;
         let value = value.into();
         self.expire_for_binding(index_1_based, Some(&value));
-        let slot = &mut self.params[index_1_based - 1];
-        Self::check_bind_size(slot, value.as_bytes().map_or(0, <[u8]>::len))?;
-        *slot = value;
+        let index = index_1_based - 1;
+        self.check_bind_size(index, value.as_bytes().map_or(0, <[u8]>::len))?;
+        self.params[index] = value;
         Ok(())
     }
 
     fn set_bound_text(&mut self, index_1_based: usize, text: &str) -> Result<()> {
         self.check_bind_index(index_1_based)?;
         self.expire_for_binding(index_1_based, None);
-        let slot = &mut self.params[index_1_based - 1];
-        Self::check_bind_size(slot, text.len())?;
+        let index = index_1_based - 1;
+        self.check_bind_size(index, text.len())?;
+        let slot = &mut self.params[index];
         if let Value::Text(buffer) = slot {
             buffer.clear();
             buffer.push_str(text);
@@ -9386,9 +9398,8 @@ impl Statement {
         }
         for (i, v) in values.iter().enumerate() {
             self.expire_for_binding(i + 1, Some(v));
-            let slot = &mut self.params[i];
-            Self::check_bind_size(slot, v.as_bytes().map_or(0, <[u8]>::len))?;
-            *slot = v.clone();
+            self.check_bind_size(i, v.as_bytes().map_or(0, <[u8]>::len))?;
+            self.params[i] = v.clone();
         }
         Ok(())
     }
@@ -9407,19 +9418,19 @@ impl Statement {
     }
 
     fn positional_bind_error(inner: &mut ConnectionInner, error: SqliteError) -> SqliteError {
-        if error.code == ErrorCode::Range {
-            // vdbeUnbind clears pErr, and sqlite3Error retains the previous byte offset.
+        if matches!(error.code, ErrorCode::Range | ErrorCode::TooBig) {
+            // sqlite3Error replaces the message and retains the previous byte offset.
             inner.c_retained_error_message = None;
-            inner.c_connection_diagnostic_code = ErrorCode::Range;
+            inner.c_connection_diagnostic_code = error.code;
             let offset = usize::try_from(inner.c_error_byte_offset).unwrap_or(SqliteError::NO_OFFSET);
-            return SqliteError::new(ErrorCode::Range, ErrorCode::Range.as_str()).with_offset(offset);
+            return SqliteError::new(error.code, error.code.as_str()).with_offset(offset);
         }
         error
     }
 
     fn check_fast_positional_bind(&self, result: Result<()>) -> Result<()> {
         if let Err(error) = result {
-            if error.code == ErrorCode::Range {
+            if matches!(error.code, ErrorCode::Range | ErrorCode::TooBig) {
                 let mut session = self.shared.enter()?;
                 return Err(Self::positional_bind_error(session.inner_mut(), error));
             }
@@ -9480,11 +9491,12 @@ impl Statement {
                     format!("unknown bind parameter: {name}"),
                 ));
             };
-            self.set_bound_value(idx, value)?;
+            let result = self.set_bound_value(idx, value);
+            self.check_fast_positional_bind(result)?;
             return Ok(self);
         }
         let shared = Arc::clone(&self.shared);
-        let session = shared.enter()?;
+        let mut session = shared.enter()?;
         session.inner().ensure_usable()?;
         self.ensure_ready_for_bind()?;
         let Some(&idx) = self.named_params.get(name) else {
@@ -9493,7 +9505,8 @@ impl Statement {
                 format!("unknown bind parameter: {name}"),
             ));
         };
-        self.set_bound_value(idx, value)?;
+        self.set_bound_value(idx, value)
+            .map_err(|error| Self::positional_bind_error(session.inner_mut(), error))?;
         drop(session);
         Ok(self)
     }
@@ -9503,12 +9516,23 @@ impl Statement {
     #[inline]
     pub fn bind_all(&mut self, values: &[Value]) -> Result<&mut Self> {
         if self.can_fast_bind() {
-            self.set_bound_values(values)?;
+            let result = self.set_bound_values(values);
+            if result.as_ref().is_err_and(|error| error.code == ErrorCode::TooBig) {
+                self.check_fast_positional_bind(result)?;
+            } else {
+                result?;
+            }
             return Ok(self);
         }
         let shared = Arc::clone(&self.shared);
-        let session = shared.enter()?;
-        self.bind_all_in_session(session.inner(), values)?;
+        let mut session = shared.enter()?;
+        self.bind_all_in_session(session.inner(), values).map_err(|error| {
+            if error.code == ErrorCode::TooBig {
+                Self::positional_bind_error(session.inner_mut(), error)
+            } else {
+                error
+            }
+        })?;
         drop(session);
         Ok(self)
     }
@@ -9541,7 +9565,7 @@ impl Statement {
     ) {
         if ran
             && let Err(error) = result
-            && (self.c_v1_write_constraint_diagnostic || self.c_legacy_read_mismatch(Some(error))
+            && (self.c_v1_write_exec_diagnostic || self.c_v1_read_exec_diagnostic(Some(error))
                 || self.is_readonly_application_header_error(error))
         {
             inner.transfer_c_read_error(Some(error));
@@ -9658,7 +9682,7 @@ impl Statement {
         };
         self.transfer_c_cleanup_diagnostic(inner, shared, ran, &result);
         self.c_v1_app_aggregate_diagnostic = false;
-        self.c_v1_write_constraint_diagnostic = false;
+        self.c_v1_write_exec_diagnostic = false;
         result
     }
 
@@ -10063,6 +10087,7 @@ impl Statement {
                     || inner.simulated_cleanup_io_error.is_some()
                     || inner.db_set.vtab_registry().has_any_in_tx()
                     || inner.db_set.main_slot().btree.as_ref().is_some_and(|bt| bt.pager().uses_fetch())
+                    || inner.binds_require_length_check(&self.params)
                 {
                     PointOutcome::Fallback
                 } else {
@@ -10261,7 +10286,7 @@ impl Statement {
             && self.category == Some(StmtCategory::Write)
             && !self.expired
             && self.compiled_vdbe.is_some()
-            && !self.c_v1_write_constraint_diagnostic
+            && !self.c_v1_write_exec_diagnostic
         {
             let fast_write = {
                 let mode = self.mode;
@@ -10277,7 +10302,7 @@ impl Statement {
                     ref params,
                     ref mut lifecycle,
                     ref mut write_vm_scratch,
-                    ref mut c_v1_write_constraint_diagnostic,
+                    ref mut c_v1_write_exec_diagnostic,
                     ..
                 } = *self;
                 let mut session = shared.enter()?;
@@ -10304,8 +10329,8 @@ impl Statement {
                 };
                 result.map(|result| {
                     inner.note_c_step_result(&result, false);
-                    *c_v1_write_constraint_diagnostic = mode == PrepareMode::V1
-                        && result.as_ref().is_err_and(|error| error.code == ErrorCode::Constraint);
+                    *c_v1_write_exec_diagnostic = mode == PrepareMode::V1
+                        && result.as_ref().is_err_and(|error| matches!(error.code, ErrorCode::Constraint | ErrorCode::TooBig));
                     result.map_err(|error| Self::write_step_error(inner, mode, error))
                 })
             };
@@ -10324,7 +10349,7 @@ impl Statement {
             && !self.expired
             && self.compiled_fast_read.is_some()
             && !matches!(&self.lifecycle, StatementLifecycle::Halted { last_error }
-                if self.c_legacy_read_mismatch(last_error.as_ref()))
+                if self.c_v1_read_exec_diagnostic(last_error.as_ref()))
         {
             let mode = self.mode;
             let fast_read_res = {
@@ -10453,8 +10478,8 @@ impl Statement {
                 }
                 inner.transfer_c_read_error(Some(error));
             }
-            self.c_v1_write_constraint_diagnostic = self.mode == PrepareMode::V1
-                && result.as_ref().is_err_and(|error| error.code == ErrorCode::Constraint);
+            self.c_v1_write_exec_diagnostic = self.mode == PrepareMode::V1
+                && result.as_ref().is_err_and(|error| matches!(error.code, ErrorCode::Constraint | ErrorCode::TooBig));
             return result.map_err(|error| Self::write_step_error(inner, self.mode, error));
         }
         if (self.category == Some(StmtCategory::Read) || self.has_function_list_no_lock_program())
@@ -10495,8 +10520,15 @@ impl Statement {
         matches!(self.stmt.as_ref(), Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("journal_mode"))
     }
 
-    fn write_step_error(inner: &ConnectionInner, mode: PrepareMode, error: SqliteError) -> SqliteError {
-        if mode == PrepareMode::V1 && matches!(error.code, ErrorCode::Full | ErrorCode::Constraint) {
+    fn write_step_error(inner: &mut ConnectionInner, mode: PrepareMode, error: SqliteError) -> SqliteError {
+        if error.code == ErrorCode::TooBig {
+            if mode == PrepareMode::V1 {
+                inner.c_connection_diagnostic_code = ErrorCode::Error;
+            } else {
+                inner.transfer_c_read_error(Some(&error));
+            }
+        }
+        if mode == PrepareMode::V1 && matches!(error.code, ErrorCode::Full | ErrorCode::Constraint | ErrorCode::TooBig) {
             // V1 reports the generic step result while the statement stores its own error.
             return inner.legacy_c_step_error().with_conflict_effect(error.conflict_effect);
         }
@@ -10509,7 +10541,14 @@ impl Statement {
         mode: PrepareMode,
         error: SqliteError,
     ) -> SqliteError {
-        if mode == PrepareMode::V1 && error.code == ErrorCode::Mismatch {
+        if error.code == ErrorCode::TooBig {
+            if mode == PrepareMode::V1 {
+                inner.c_connection_diagnostic_code = ErrorCode::Error;
+            } else {
+                inner.transfer_c_read_error(Some(&error));
+            }
+        }
+        if mode == PrepareMode::V1 && matches!(error.code, ErrorCode::Mismatch | ErrorCode::TooBig) {
             return inner.legacy_c_step_error();
         }
         if mode == PrepareMode::V1 && error.code == ErrorCode::Auth && inner.authorizer.is_some() {
@@ -10541,7 +10580,7 @@ impl Statement {
 
         // Autoreset a completed execution while retaining its bindings.
         if let StatementLifecycle::Halted { last_error } = &self.lifecycle {
-            if self.c_v1_write_constraint_diagnostic || self.c_legacy_read_mismatch(last_error.as_ref())
+            if self.c_v1_write_exec_diagnostic || self.c_v1_read_exec_diagnostic(last_error.as_ref())
                 || self.mode == PrepareMode::V1 && last_error.as_ref()
                     .is_some_and(|error| self.is_readonly_application_header_error(error))
             {
@@ -10552,7 +10591,7 @@ impl Statement {
         self.c_v1_expired_before_run = false;
         self.c_v1_retained_expiry_diagnostic = false;
         self.c_v1_app_aggregate_diagnostic = false;
-        self.c_v1_write_constraint_diagnostic = false;
+        self.c_v1_write_exec_diagnostic = false;
 
         // Empty / comment-only SQL (`stmt.is_none()` with no parsed statement)
         if self.stmt.is_none() && matches!(parse_one(&self.raw_sql), Ok((None, _))) {
@@ -13796,6 +13835,7 @@ fn try_fast_read_plan_fields(
         || inner.progress.is_enabled()
         || inner.simulated_cleanup_io_error.is_some()
         || inner.db_set.vtab_registry().has_any_in_tx()
+        || inner.binds_require_length_check(params)
     {
         return None;
     }
@@ -14053,6 +14093,7 @@ fn try_fast_compiled_main_write_fields(
         || inner.mutation_pipeline.is_trace_enabled()
         || !inner.db_set.open_blobs().is_empty()
         || inner.db_set.vtab_registry().has_any_in_tx()
+        || inner.binds_require_length_check(params)
     {
         return None;
     }
