@@ -2647,3 +2647,8 @@ Tek ana rowid tablosu, üç yerel kodlama, FILE ve DEFAULT, son benzersiz rowid 
 ## V6b.468 — VACUUM rollback sync bildirimi ve gerçek sync sırası
 
 Kesin 1034 bildirimi fiziksel sync öncesinde C gibi dönüyor. Hata sürerken sonraki okuma yeniden 1034 alıyor, hata kalkınca olağan kurtarmada ana dosya sync olup FK ve önceki veri okunuyor. Fiziksel sync, close ve kilit kararları ayrı doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v468-vacuum-rollback-sync-notification-candidate/sonuc.md) OFF 1341/0/325, ON 1341/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,280 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_468.md).
+
+
+## V6b.469 — Dört ila sekiz sıralama anahtarıyla işçi PMA
+
+Son biricik rowid ile iki kipte 144 C profili ve 110.736 API adımı eş. Her kipte 72 ilk satır resetinde PMA dosyalarının kapanması, bütün işçilerin join edilmesi ve altı ana dosyada FK, bütünlük ve SHA doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/worker-four-to-eight-key-v467-preflight/sonuc.md) OFF 1342/0/325, ON 1342/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,294 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_469.md).

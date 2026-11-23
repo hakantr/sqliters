@@ -261,7 +261,7 @@ pub(crate) fn worker_sort_read_program(
     if (encoding == TextEncoding::Utf8 && exec_switch_on())
         || inner.db_set.worker_threads_limit <= 0 || inner.db_set.temp_store().is_memory()
         || inner.db_set.sorter_mmap_limit() > 0 || inner.collations.get_custom("BINARY").is_some()
-        || !matches!(select.order_by.len(), 2..=3) || select.limit.is_some() || read_codegen_blocker(inner).is_some()
+        || !matches!(select.order_by.len(), 2..=8) || select.limit.is_some() || read_codegen_blocker(inner).is_some()
     {
         return None;
     }

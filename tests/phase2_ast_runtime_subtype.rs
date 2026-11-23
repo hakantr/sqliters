@@ -3737,3 +3737,47 @@ fn group64_file_sorter_worker_three_key_order_and_reset() {
         }
     }
 }
+
+#[test]
+fn group64_file_sorter_worker_four_through_eight_keys() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}';
+             PRAGMA temp_store=FILE; PRAGMA cache_size=1;
+             CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT, w INTEGER, z INTEGER,
+                                q INTEGER, r INTEGER, s INTEGER, t INTEGER);
+             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<12)
+             INSERT INTO items SELECT i, printf('x%23000s','z'), 0,
+                                      i%2, i%3, i%5, i%7, i%11 FROM n;"
+        )).unwrap();
+        let columns = ["v COLLATE BINARY", "w", "z", "q", "r", "s", "t"];
+        let divisors = [2, 3, 5, 7, 11];
+        for width in 4..=8 {
+            db.execute_batch("PRAGMA threads=0").unwrap();
+            let sql = format!("SELECT id FROM items ORDER BY {},id", columns[..width-1].join(","));
+            let mut statement = db.prepare(&sql).unwrap();
+            db.execute_batch("PRAGMA threads=2").unwrap();
+
+            let mut expected: Vec<i64> = (1..=12).collect();
+            expected.sort_unstable_by_key(|id| {
+                (divisors[..width-3].iter().map(|d| id % d).collect::<Vec<_>>(), *id)
+            });
+            let StepResult::Row(first) = statement.step().unwrap() else {
+                panic!("expected the first row in {encoding} for {width} keys");
+            };
+            assert_eq!(first.get_i64(0), Some(expected[0]));
+            assert!(statement.machine_stmt_status(4, false) > 0, "{encoding}/{width}");
+            statement.reset().unwrap();
+
+            for id in expected {
+                let StepResult::Row(row) = statement.step().unwrap() else {
+                    panic!("expected row {id} in {encoding} for {width} keys");
+                };
+                assert_eq!(row.get_i64(0), Some(id));
+            }
+            assert!(matches!(statement.step().unwrap(), StepResult::Done));
+            statement.reset().unwrap();
+        }
+    }
+}
