@@ -9,14 +9,15 @@
 //! the same order as the general one for the records they are chosen for, so the general
 //! comparator is used), `sqlite3VdbeSorterCompare`, `sqlite3VdbeSorterRowkey`.
 //!
-//! Level-0 runs use the connection's anonymous temporary file when the host
-//! supplies its VFS. Intermediate merge batches remain in memory.
+//! Runs and intermediate batches use anonymous temporary files when the
+//! host supplies a VFS. External sorts read through buffers unless the
+//! connection enables the optional sorter test control.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use sqliters_types::{ErrorCode, Result as SqlResult, SqliteError, TextEncoding, Value, extended};
-use sqliters_vfs::{OpenFlags, Vfs, VfsFile};
+use sqliters_vfs::{FetchRange, OpenFlags, Vfs, VfsFile};
 
 use crate::vdbeaux_rt::{
     KeyInfoRt, UnpackedRecord, get_varint32, put_varint, sqlite3_varint_len, sqlite3_vdbe_record_compare_with_skip,
@@ -130,6 +131,10 @@ impl PmaFile {
         Ok(Self { handle: open_pma_file(vfs)?, runs: Vec::new(), end: 0, page_size })
     }
 
+    fn prepare_run(&self, bytes: u64, mmap_limit: i32) {
+        extend_pma_file(self.handle.as_ref(), self.end.saturating_add(bytes).saturating_add(9), mmap_limit);
+    }
+
     fn write_run(&mut self, bytes: u64, run: Vec<Vec<u8>>) -> SqlResult<()> {
         let start = self.end;
         let mut writer = PmaWriter::new(self.handle.as_ref(), self.page_size, start);
@@ -142,12 +147,9 @@ impl PmaFile {
         Ok(())
     }
 
-    fn readers(&self) -> SqlResult<Vec<PmaReader>> {
+    fn readers(&self, mmap_limit: i32) -> SqlResult<Vec<PmaReader>> {
         self.runs.iter().map(|&start| {
-            let mut disk = PmaDiskReader {
-                file: Arc::clone(&self.handle), offset: start, end: self.end, buffer_start: start,
-                buffer: Vec::new(), page_size: self.page_size,
-            };
+            let mut disk = PmaDiskReader::open(&self.handle, start, self.end, self.page_size, mmap_limit)?;
             let bytes = disk.varint()?;
             disk.end = disk.offset.checked_add(bytes).filter(|end| *end <= self.end).ok_or_else(pma_short_read)?;
             let mut reader = PmaReader { disk: Some(disk), ..PmaReader::default() };
@@ -164,6 +166,15 @@ fn open_pma_file(vfs: &dyn Vfs) -> SqlResult<Arc<dyn VfsFile>> {
     // vdbeSorterOpenTempFile issues a hint even with sorter xFetch disabled.
     let _ = file.mmap_size(0x7fff_0000);
     Ok(Arc::from(file))
+}
+
+fn extend_pma_file(file: &dyn VfsFile, size: u64, mmap_limit: i32) {
+    if mmap_limit > 0 && size <= mmap_limit as u64 && file.supports_fetch_range() {
+        let _ = file.set_chunk_size(4096);
+        let _ = file.size_hint(size);
+        // The preallocation probe is best effort and immediately unpins.
+        let _ = file.fetch_range(0, size as usize);
+    }
 }
 
 struct PmaWriter<'a> {
@@ -231,6 +242,7 @@ fn pma_short_read() -> SqliteError {
 /// Buffered reads stop at the PMA boundary. The initial prefix is read
 /// from the same partial page that the C reader loads on seeking.
 struct PmaDiskReader {
+    mapping: Option<FetchRange>,
     file: Arc<dyn VfsFile>,
     offset: u64,
     end: u64,
@@ -240,9 +252,24 @@ struct PmaDiskReader {
 }
 
 impl PmaDiskReader {
+    fn open(file: &Arc<dyn VfsFile>, start: u64, end: u64, page_size: usize, mmap_limit: i32) -> SqlResult<Self> {
+        let mapping = if mmap_limit > 0 && end <= mmap_limit as u64 && file.supports_fetch_range() {
+            file.fetch_range(0, end as usize)?
+        } else {
+            None
+        };
+        Ok(Self { mapping, file: Arc::clone(file), offset: start, end, buffer_start: start,
+            buffer: Vec::new(), page_size })
+    }
+
     fn read_exact(&mut self, mut output: &mut [u8]) -> SqlResult<()> {
         if output.len() as u64 > self.end - self.offset {
             return Err(pma_short_read());
+        }
+        if let Some(mapping) = &self.mapping {
+            mapping.copy_into(self.offset as usize, output)?;
+            self.offset += output.len() as u64;
+            return Ok(());
         }
         while !output.is_empty() {
             let offset = (self.offset - self.buffer_start) as usize;
@@ -327,6 +354,8 @@ struct PmaIntermediate<'a> {
     file: Option<Arc<dyn VfsFile>>,
     next_offset: u64,
     page_size: usize,
+    allocation: u64,
+    mmap_limit: i32,
 }
 
 impl PmaIntermediate<'_> {
@@ -335,6 +364,7 @@ impl PmaIntermediate<'_> {
             Some(file) => Arc::clone(file),
             None => {
                 let opened = open_pma_file(self.vfs)?;
+                extend_pma_file(opened.as_ref(), self.allocation, self.mmap_limit);
                 self.file = Some(Arc::clone(&opened));
                 opened
             }
@@ -352,7 +382,7 @@ struct PmaChunk {
 }
 
 impl PmaChunk {
-    fn populate(&self, child: &mut PmaMerge, key: &SorterComparator, capacity: usize) -> SqlResult<Option<PmaDiskReader>> {
+    fn populate(&self, child: &mut PmaMerge, key: &SorterComparator, capacity: usize, mmap_limit: i32) -> SqlResult<Option<u64>> {
         let mut writer = PmaWriter::new(self.file.as_ref(), self.page_size, self.start);
         // The writer retains a VFS error while the merge advances. Finish
         // still flushes a partial page after an input error and keeps the
@@ -364,7 +394,7 @@ impl PmaChunk {
                 break Ok(());
             }
             writer.record(record);
-            if let Err(err) = child.pop(key, capacity) {
+            if let Err(err) = child.pop(key, capacity, mmap_limit) {
                 if key.error.as_ref().is_some_and(|error| error.lock().unwrap().is_some()) {
                     return Err(err);
                 }
@@ -374,10 +404,7 @@ impl PmaChunk {
         let end = writer.finish();
         advanced?;
         let end = end?;
-        Ok((end != self.start).then(|| PmaDiskReader {
-            file: Arc::clone(&self.file), offset: self.start, end, buffer_start: self.start,
-            buffer: Vec::new(), page_size: self.page_size,
-        }))
+        Ok((end != self.start).then_some(end))
     }
 }
 
@@ -387,8 +414,8 @@ const PMA_FANOUT: usize = 16;
 #[derive(Default)]
 struct PmaReader {
     records: VecDeque<Vec<u8>>,
-    child: Option<Box<PmaMerge>>,
     disk: Option<PmaDiskReader>,
+    child: Option<Box<PmaMerge>>,
     chunk: Option<PmaChunk>,
 }
 
@@ -400,14 +427,22 @@ impl PmaReader {
         Ok(())
     }
 
-    fn refill(&mut self, key: &SorterComparator, refill_bytes: usize) -> SqlResult<()> {
+    fn refill(&mut self, key: &SorterComparator, refill_bytes: usize, mmap_limit: i32) -> SqlResult<()> {
         self.refill_disk()?;
         if !self.records.is_empty() {
             return Ok(());
         }
-        let Some(child) = &mut self.child else { return Ok(()) };
+        let Some(child) = &mut self.child else {
+            self.disk = None;
+            return Ok(());
+        };
         if let Some(chunk) = &self.chunk {
-            self.disk = chunk.populate(child, key, refill_bytes)?;
+            let end = chunk.populate(child, key, refill_bytes, mmap_limit);
+            // The old range remains usable during xWrite, then is released
+            // before the seek to the freshly populated range.
+            self.disk = None;
+            self.disk = end?.map(|end| PmaDiskReader::open(&chunk.file, chunk.start, end,
+                chunk.page_size, mmap_limit)).transpose()?;
             return self.refill_disk();
         }
         let mut remaining = refill_bytes;
@@ -416,7 +451,7 @@ impl PmaReader {
         while let Some(record) = child.current() {
             let bytes = record.len() + sqlite3_varint_len(record.len() as u64) as usize;
             let Some(rest) = remaining.checked_sub(bytes) else { break };
-            let Some(record) = child.pop(key, refill_bytes)? else { break };
+            let Some(record) = child.pop(key, refill_bytes, mmap_limit)? else { break };
             self.records.push_back(record);
             remaining = rest;
         }
@@ -462,15 +497,20 @@ impl PmaMerge {
         Self::new(readers, PMA_FANOUT)
     }
 
-    fn initialize(&mut self, key: &SorterComparator, refill_bytes: usize,
+    fn intermediate_readers(&self) -> u64 {
+        self.readers.iter().filter_map(|reader| reader.child.as_deref())
+            .map(|child| 1 + child.intermediate_readers()).sum()
+    }
+
+    fn initialize(&mut self, key: &SorterComparator, refill_bytes: usize, mmap_limit: i32,
         mut intermediate: Option<&mut PmaIntermediate<'_>>) -> SqlResult<()> {
         for reader in &mut self.readers {
             if let Some(child) = &mut reader.child {
-                child.initialize(key, refill_bytes, intermediate.as_deref_mut())?;
+                child.initialize(key, refill_bytes, mmap_limit, intermediate.as_deref_mut())?;
                 if let Some(intermediate) = intermediate.as_deref_mut() {
                     reader.chunk = Some(intermediate.reserve(refill_bytes)?);
                 }
-                reader.refill(key, refill_bytes)?;
+                reader.refill(key, refill_bytes, mmap_limit)?;
             }
         }
         // vdbeMergeEngineInit visits the nodes from the end of the tree.
@@ -503,12 +543,12 @@ impl PmaMerge {
         self.readers[self.winners[1]].records.front().map(Vec::as_slice)
     }
 
-    fn pop(&mut self, key: &SorterComparator, refill_bytes: usize) -> SqlResult<Option<Vec<u8>>> {
+    fn pop(&mut self, key: &SorterComparator, refill_bytes: usize, mmap_limit: i32) -> SqlResult<Option<Vec<u8>>> {
         let previous = self.winners[1];
         let reader = &mut self.readers[previous];
         let Some(result) = reader.records.pop_front() else { return Ok(None) };
         if reader.records.is_empty() {
-            reader.refill(key, refill_bytes)?;
+            reader.refill(key, refill_bytes, mmap_limit)?;
         }
 
         // vdbeMergeEngineStep keeps the winner in the same argument slot
@@ -557,6 +597,7 @@ pub struct VdbeSorter {
     intermediate_file: Option<Arc<dyn VfsFile>>,
     vfs: Option<Arc<dyn Vfs>>,
     page_size: usize,
+    mmap_limit: i32,
     /// `bUsePMA`
     b_use_pma: bool,
     /// `mxKeysize`, including the length varint.
@@ -579,6 +620,10 @@ impl std::fmt::Debug for VdbeSorter {
 impl VdbeSorter {
     pub(crate) fn set_vfs(&mut self, vfs: Option<Arc<dyn Vfs>>) {
         self.vfs = vfs;
+    }
+
+    pub(crate) fn set_mmap_limit(&mut self, limit: i32) {
+        self.mmap_limit = limit;
     }
 
     pub(crate) fn set_sort_callback_error(&mut self, error: Option<SortCallbackError>) {
@@ -606,6 +651,7 @@ impl VdbeSorter {
             intermediate_file: None,
             vfs: None,
             page_size: pgsz.max(1) as usize,
+            mmap_limit: 0,
             b_use_pma: false,
             largest_pma_record: 0,
             pma_merge: None,
@@ -673,6 +719,9 @@ impl VdbeSorter {
         if self.pma_file.is_none() && let Some(vfs) = &self.vfs {
             self.pma_file = Some(PmaFile::open(vfs.as_ref(), self.page_size)?);
         }
+        if let Some(file) = &self.pma_file {
+            file.prepare_run(self.sz_pma as u64, self.mmap_limit);
+        }
         let run = self.sort_list()?;
         if let Some(file) = &mut self.pma_file {
             file.write_run(self.sz_pma as u64, run)?;
@@ -733,7 +782,7 @@ impl VdbeSorter {
         self.flush_pma()?;
         self.refill_bytes = (self.mx_pma_size as usize / 2).max(self.largest_pma_record + 9);
         let readers = if let Some(file) = &self.pma_file {
-            file.readers()?
+            file.readers(self.mmap_limit)?
         } else {
             std::mem::take(&mut self.pmas).into_iter().map(|run| PmaReader {
                 records: run.into(),
@@ -743,8 +792,11 @@ impl VdbeSorter {
         let mut merge = PmaMerge::from_readers(readers);
         let mut intermediate = self.vfs.as_deref().map(|vfs| PmaIntermediate {
             vfs, file: None, next_offset: 0, page_size: self.page_size,
+            allocation: if self.mmap_limit > 0 { (self.refill_bytes as u64)
+                .saturating_mul(merge.intermediate_readers()) } else { 0 },
+            mmap_limit: self.mmap_limit,
         });
-        let init = merge.initialize(&self.comparator, self.refill_bytes, intermediate.as_mut());
+        let init = merge.initialize(&self.comparator, self.refill_bytes, self.mmap_limit, intermediate.as_mut());
         self.intermediate_file = intermediate.and_then(|files| files.file);
         init?;
         let empty = merge.current().is_none();
@@ -761,7 +813,7 @@ impl VdbeSorter {
 
     pub(crate) fn next_checked(&mut self) -> SqlResult<bool> {
         if let Some(merge) = &mut self.pma_merge {
-            merge.pop(&self.comparator, self.refill_bytes)?;
+            merge.pop(&self.comparator, self.refill_bytes, self.mmap_limit)?;
             return Ok(merge.current().is_some());
         }
         // (the record is released as C frees it)

@@ -2502,3 +2502,43 @@ fn group65_active_read_retains_preexisting_scalar_overload() {
         }
     }
 }
+
+#[test]
+fn group64_file_sorter_mmap_control_survives_early_reset() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "PRAGMA page_size=512;
+         PRAGMA temp_store=FILE; PRAGMA cache_size=1; PRAGMA threads=0;
+         CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);
+         WITH RECURSIVE seq(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM seq WHERE i<80)
+         INSERT INTO items SELECT i,printf('%03d%040000d', i, 0) FROM seq;",
+    )
+    .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    db.register_collation("app_order", move |left, right| {
+        observed.fetch_add(1, AtomicOrdering::Relaxed);
+        right.cmp(left)
+    }).unwrap();
+    let mut statement = db.prepare("SELECT id FROM items ORDER BY v COLLATE app_order,id").unwrap();
+
+    let mut step_counts = Vec::new();
+    for limit in [0, i32::MAX, 0] {
+        db.set_sorter_mmap_limit(limit).unwrap();
+        calls.store(0, AtomicOrdering::Relaxed);
+        let mut counts = Vec::new();
+        for expected in [80, 79, 78] {
+            let StepResult::Row(row) = statement.step().unwrap() else {
+                panic!("missing row {expected}");
+            };
+            assert_eq!(row.get_i64(0), Some(expected));
+            counts.push(calls.load(AtomicOrdering::Relaxed));
+        }
+        assert!(statement.machine_stmt_status(4, false) > 0);
+        assert!(counts[0] > 0);
+        statement.reset().unwrap();
+        step_counts.push(counts);
+    }
+    assert_eq!(step_counts[0], step_counts[1]);
+    assert_eq!(step_counts[0], step_counts[2]);
+}

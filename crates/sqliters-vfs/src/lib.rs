@@ -184,6 +184,38 @@ impl FetchPage {
     }
 }
 
+/// Read access to a pinned file range. No reference into mapped memory
+/// escapes the VFS. Dropping the range releases its xFetch reference.
+#[doc(hidden)]
+pub struct FetchRange(FetchRangeSource);
+
+enum FetchRangeSource {
+    Bytes(FetchPage),
+    #[cfg(unix)]
+    Unix(fetch::RangeLease),
+}
+
+impl FetchRange {
+    #[doc(hidden)]
+    pub fn from_page(page: FetchPage) -> Self {
+        Self(FetchRangeSource::Bytes(page))
+    }
+
+    #[doc(hidden)]
+    pub fn copy_into(&self, offset: usize, output: &mut [u8]) -> Result<()> {
+        match &self.0 {
+            FetchRangeSource::Bytes(page) => {
+                let input = page.data().get(offset..).and_then(|input| input.get(..output.len()))
+                    .ok_or_else(|| SqliteError::misuse("fetch range out of bounds"))?;
+                output.copy_from_slice(input);
+                Ok(())
+            }
+            #[cfg(unix)]
+            FetchRangeSource::Unix(range) => range.copy_into(offset, output),
+        }
+    }
+}
+
 /// Open file handle corresponding to `sqlite3_file` / `sqlite3_io_methods`.
 pub trait VfsFile: Send + Sync {
     /// Reads up to `buf.len()` bytes starting at `offset`.
@@ -267,6 +299,12 @@ pub trait VfsFile: Send + Sync {
         Ok(None)
     }
 
+    /// SQLITE_FCNTL_CHUNK_SIZE for an explicitly mapped sorter file.
+    #[doc(hidden)]
+    fn set_chunk_size(&self, _size: u32) -> Result<()> {
+        Err(SqliteError::new(ErrorCode::NotFound, ErrorCode::NotFound.as_str()))
+    }
+
     /// SQLITE_FCNTL_SIZE_HINT. A backend may use it to prepare for upcoming writes.
     fn size_hint(&self, _size: u64) -> Result<()> {
         Ok(())
@@ -281,6 +319,19 @@ pub trait VfsFile: Send + Sync {
     /// dropped. The owned bytes keep mapped memory out of the safe pager API.
     fn fetch(&self, _offset: u64, _amount: usize) -> Result<Option<FetchPage>> {
         Ok(None)
+    }
+
+    /// Whether this handle supports long-lived ranges for a sorter.
+    #[doc(hidden)]
+    fn supports_fetch_range(&self) -> bool {
+        self.supports_fetch()
+    }
+
+    /// Pin a range for a sorter reader. The default adapts existing xFetch
+    /// implementations. The OS VFS avoids copying the entire mapped file.
+    #[doc(hidden)]
+    fn fetch_range(&self, offset: u64, amount: usize) -> Result<Option<FetchRange>> {
+        self.fetch(offset, amount).map(|page| page.map(FetchRange::from_page))
     }
 
     /// `xUnfetch(fd, 0, NULL)`: invalidate the mapping after all leases return.
@@ -2186,6 +2237,8 @@ struct OsFile {
     mmap_size_max: AtomicI64,
     #[cfg(unix)]
     fetch_state: Arc<Mutex<fetch::FetchState>>,
+    #[cfg(unix)]
+    private_sorter_inode: bool,
     lock_geometry: LockGeometry,
     min_shm_granularity: usize,
     lock_level: Mutex<LockLevel>,
@@ -2302,6 +2355,22 @@ impl VfsFile for OsFile {
         }))
     }
 
+    fn set_chunk_size(&self, size: u32) -> Result<()> {
+        self.file_ref()?;
+        #[cfg(unix)]
+        {
+            if !self.private_sorter_inode {
+                return Err(SqliteError::new(ErrorCode::NotFound, ErrorCode::NotFound.as_str()));
+            }
+            fetch::set_chunk_size(&self.fetch_state, size)
+        }
+        #[cfg(windows)]
+        {
+            let _ = size;
+            Err(SqliteError::new(ErrorCode::NotFound, ErrorCode::NotFound.as_str()))
+        }
+    }
+
     fn size_hint(&self, size: u64) -> Result<()> {
         #[cfg(unix)]
         {
@@ -2349,6 +2418,30 @@ impl VfsFile for OsFile {
         }
     }
 
+    fn supports_fetch_range(&self) -> bool {
+        #[cfg(unix)]
+        { self.private_sorter_inode }
+        #[cfg(windows)]
+        { false }
+    }
+
+    fn fetch_range(&self, offset: u64, amount: usize) -> Result<Option<FetchRange>> {
+        let file = self.file_ref()?;
+        #[cfg(unix)]
+        {
+            // Long-lived live ranges are confined to anonymous O_TMPFILE
+            // inodes that have never had a name. Their truncate path shares
+            // the fetch-state mutex with every range copy.
+            if !self.private_sorter_inode {
+                return Ok(None);
+            }
+            fetch::fetch_range(&self.fetch_state, file, offset, amount)
+                .map(|range| range.map(|range| FetchRange(FetchRangeSource::Unix(range))))
+        }
+        #[cfg(windows)]
+        { let _ = (file, offset, amount); Ok(None) }
+    }
+
     fn unfetch_all(&self) -> Result<()> {
         self.file_ref()?;
         #[cfg(unix)]
@@ -2374,7 +2467,11 @@ impl VfsFile for OsFile {
         let file = self.file_ref()?;
         #[cfg(unix)]
         {
-            sys::unix::pwrite_all(file, buf, offset, extended::SQLITE_IOERR_WRITE)
+            if self.private_sorter_inode {
+                fetch::write_private_sorter(&self.fetch_state, file, buf, offset)
+            } else {
+                sys::unix::pwrite_all(file, buf, offset, extended::SQLITE_IOERR_WRITE)
+            }
         }
         #[cfg(windows)]
         {
@@ -3774,6 +3871,8 @@ impl Vfs for OsVfs {
             mmap_size_max: AtomicI64::new(0),
             #[cfg(unix)]
             fetch_state: Arc::new(Mutex::new(fetch::FetchState::default())),
+            #[cfg(unix)]
+            private_sorter_inode: has_unnamed_inode && flags.contains(OpenFlags::TEMP_JOURNAL),
             lock_geometry: self.lock_geometry,
             min_shm_granularity: self.min_shm_granularity,
             lock_level: Mutex::new(LockLevel::NoLock),
@@ -4532,6 +4631,35 @@ mod tests {
         let mut os_h2 = vfs_test.open(Some(&tmp), OpenFlags::READWRITE).unwrap();
         os_h2.close().unwrap();
         vfs_prod.delete(&tmp, false).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_private_sorter_fetch_range_stays_within_truncated_length() {
+        let flags = OpenFlags::TEMP_JOURNAL | OpenFlags::READWRITE | OpenFlags::CREATE
+            | OpenFlags::EXCLUSIVE | OpenFlags::DELETEONCLOSE;
+        let mut file = OsVfs::default().open(None, flags).unwrap();
+        if !file.supports_fetch_range() {
+            return; // This filesystem uses the named fallback.
+        }
+        file.mmap_size(8192).unwrap();
+        file.set_chunk_size(4096).unwrap();
+        file.size_hint(2000).unwrap();
+        assert_eq!(file.file_size().unwrap(), 4096);
+        assert!(file.fetch_range(0, 2000).unwrap().is_none());
+
+        let mapping = file.fetch_range(0, 1024).unwrap().unwrap();
+        let mut bytes = [0; 16];
+        file.write_at(&[57; 16], 500).unwrap();
+        mapping.copy_into(500, &mut bytes).unwrap();
+        assert_eq!(bytes, [57; 16]);
+        assert!(file.unfetch_all().is_err());
+        file.truncate(508).unwrap();
+        assert!(mapping.copy_into(500, &mut bytes).is_err());
+        mapping.copy_into(500, &mut bytes[..8]).unwrap();
+        drop(mapping);
+        file.unfetch_all().unwrap();
+        file.close().unwrap();
     }
 
     #[test]

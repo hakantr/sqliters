@@ -1348,6 +1348,10 @@ macro_rules! host_common {
             Some(Arc::clone(self.dbs().disk_vfs()))
         }
 
+        fn sorter_mmap_limit(&mut self) -> i32 {
+            self.dbs().sorter_mmap_limit
+        }
+
         fn sorter_config(&mut self) -> (i64, i64, bool) {
             let bt = self.dbs().main_btree();
             (i64::from(bt.pager().page_size()), i64::from(bt.cache_size()), self.dbs().temp_store().is_memory())

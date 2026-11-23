@@ -335,6 +335,7 @@ pub struct DatabaseSet {
     pub(crate) next_auto_vacuum: Option<AutoVacuumMode>,
     /// sqlite3.szMmap: inherited by subsequently attached/opened databases.
     pub(crate) mmap_limit: i64,
+    pub(crate) sorter_mmap_limit: i32,
 }
 
 impl std::fmt::Debug for DatabaseSet {
@@ -440,6 +441,7 @@ impl DatabaseSet {
             next_page_size: 0,
             next_auto_vacuum: None,
             mmap_limit: 0,
+            sorter_mmap_limit: 0,
             xferopt_delta: std::sync::atomic::AtomicU64::new(0),
             open_blobs: std::collections::HashMap::new(),
             vtab_registry: crate::vtab::VTabRegistry::new(),

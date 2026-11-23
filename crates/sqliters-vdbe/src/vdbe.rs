@@ -142,6 +142,10 @@ pub trait VdbeHost {
     fn progress_invoke(&mut self) -> Result<bool>;
     /// `(page size of the main database, db->aDb[0].pSchema->cache_size, sqlite3TempInMemory(db))`
     fn sorter_config(&mut self) -> (i64, i64, bool);
+    /// Maximum mapping size for sorter PMAs. Zero disables sorter xFetch.
+    fn sorter_mmap_limit(&mut self) -> i32 {
+        0
+    }
     /// Connection VFS for the sorter's anonymous PMA file.
     fn sorter_vfs(&mut self) -> Option<Arc<dyn sqliters_vfs::Vfs>> {
         None
@@ -6332,6 +6336,7 @@ impl Vdbe {
                         let Some(s) = pc_.sorter.as_mut() else {
                             return Err(internal("not a sorter"));
                         };
+                        s.set_mmap_limit(host.sorter_mmap_limit());
                         res = s.rewind_checked()?;
                     } else {
                         let bt = btree_of!(pc_);
@@ -6361,6 +6366,7 @@ impl Vdbe {
                         let Some(s) = pc_.sorter.as_mut() else {
                             return Err(internal("not a sorter"));
                         };
+                        s.set_mmap_limit(host.sorter_mmap_limit());
                         ok = s.next_checked()?;
                     } else {
                         let bt = btree_of!(pc_);
@@ -6520,6 +6526,7 @@ impl Vdbe {
                     let Some(s) = c.sorter.as_mut() else {
                         return Err(internal("not a sorter"));
                     };
+                    s.set_mmap_limit(host.sorter_mmap_limit());
                     s.write_checked(&self.a_mem[op.p2 as usize].z)?;
                 }
 

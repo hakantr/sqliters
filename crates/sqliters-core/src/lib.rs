@@ -4077,6 +4077,19 @@ impl Connection {
         Ok(())
     }
 
+    /// Sets the maximum byte length passed to the sorter VFS's optional
+    /// xFetch method. Zero (the default) leaves external sort reads buffered.
+    /// Mirrors SQLITE_TESTCTRL_SORTER_MMAP. This per-connection diagnostic
+    /// control is independent of `PRAGMA mmap_size`.
+    #[doc(hidden)]
+    pub fn set_sorter_mmap_limit(&self, limit: i32) -> Result<()> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        inner.db_set.sorter_mmap_limit = limit;
+        Ok(())
+    }
+
     /// Reloads the in-memory schema catalog from Page 1 (`sqlite_schema`).
     pub fn reload_schema(&self) -> Result<()> {
         let mut session = self.shared.enter()?;

@@ -935,19 +935,27 @@ impl ReadMapping {
         self.len
     }
 
+    fn byte(&self, offset: usize) -> u8 {
+        // SAFETY: callers check bounds against the live mapping. Atomic loads
+        // expose no references to bytes the OS page cache can also update.
+        unsafe {
+            (&*self.ptr.as_ptr().add(offset).cast::<std::sync::atomic::AtomicU8>())
+                .load(Ordering::Relaxed)
+        }
+    }
+
+    pub(crate) fn copy_into(&self, offset: usize, output: &mut [u8]) {
+        assert!(offset <= self.len && output.len() <= self.len - offset);
+        for (index, byte) in output.iter_mut().enumerate() {
+            *byte = self.byte(offset + index);
+        }
+    }
+
     pub(crate) fn copy(&self, offset: usize, amount: usize) -> Vec<u8> {
         assert!(offset <= self.len && amount <= self.len - offset);
         let mut bytes = Vec::with_capacity(amount);
         for i in offset..offset + amount {
-            // SAFETY: bounds were checked against the live mapping; AtomicU8
-            // has byte alignment. Atomic loads expose no Rust references to
-            // bytes the OS page cache can also update. Database locking is the
-            // caller's responsibility, as for xRead/xFetch in SQLite's VFS.
-            let byte = unsafe {
-                (&*self.ptr.as_ptr().add(i).cast::<std::sync::atomic::AtomicU8>())
-                    .load(Ordering::Relaxed)
-            };
-            bytes.push(byte);
+            bytes.push(self.byte(i));
         }
         bytes
     }
