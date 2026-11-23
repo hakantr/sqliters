@@ -3304,11 +3304,16 @@ impl Vdbe {
         }
     }
 
-    /// Port aid: address and name of the instruction that was running when the statement
-    /// failed.
+    /// Returns the opcode that failed in the most recent execution step.
+    #[doc(hidden)]
+    pub fn failed_opcode(&self) -> Option<u8> {
+        self.prog.a_op.get(self.err_pc).map(|op| op.opcode)
+    }
+
+    /// Address and name of the instruction at the last statement error.
     pub fn failed_op(&self) -> String {
-        match self.prog.a_op.get(self.err_pc) {
-            Some(op) => format!("{}:{}", self.err_pc, sqlite3_opcode_name(op.opcode)),
+        match self.failed_opcode() {
+            Some(opcode) => format!("{}:{}", self.err_pc, sqlite3_opcode_name(opcode)),
             None => "?".to_owned(),
         }
     }

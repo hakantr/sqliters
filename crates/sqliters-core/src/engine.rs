@@ -275,6 +275,8 @@ pub struct StmtTxTracker {
     /// — a top-level INSERT with `isMultiWrite == 0`: an immediate foreign key whose parent
     /// row is missing halts the statement before the row is written.
     pub insert_fk_halts_immediately: bool,
+    /// The immediate FK check failed before emitting RETURNING or a count row.
+    pub fk_check_before_result: bool,
     /// The statement runs inside a transaction (or beside another active statement) *without*
     /// a statement journal, because C's code generator would not have opened one
     /// (`Vdbe.usesStmtJournal == 0`): an ABORT leaves what the statement has written so far.
@@ -28417,10 +28419,14 @@ fn finalize_dml_step_result(
             Ok(mut out) => {
                 // `sqlite3AutoincrementEnd` is the last thing the statement's program does.
                 autoinc_end(ctx)?;
-                if *ctx.foreign_keys && !suspects.is_empty() {
-                    verify_fk_suspects(ctx, &suspects)?;
-                }
                 let count_row = ctx.prepared_count_changes() && out.column_names.is_empty();
+                if *ctx.foreign_keys && !suspects.is_empty()
+                    && let Err(error) = verify_fk_suspects(ctx, &suspects)
+                {
+                    ctx.stmt_tx.fk_check_before_result = ctx.stmt_tx.exec_depth == 1
+                        && (ctx.stmt_tx.defer_returning_changes || count_row);
+                    return Err(error);
+                }
                 if (ctx.stmt_tx.defer_returning_changes
                     || (count_row && ctx.stmt_tx.prepared_count_changes.is_some()))
                     && ctx.stmt_tx.exec_depth == 1

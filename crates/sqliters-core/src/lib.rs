@@ -10403,8 +10403,10 @@ impl Statement {
     }
 
     fn write_step_error(inner: &ConnectionInner, mode: PrepareMode, error: SqliteError) -> SqliteError {
-        if mode == PrepareMode::V1 && error.code == ErrorCode::Full {
-            // V1 exposes SQLITE_ERROR. The halted statement retains SQLITE_FULL.
+        if mode == PrepareMode::V1
+            && (error.code == ErrorCode::Full || error.extended_code == extended::SQLITE_CONSTRAINT_FOREIGNKEY)
+        {
+            // V1 reports the generic step result while the statement stores its own error.
             return inner.legacy_c_step_error();
         }
         error
@@ -12460,8 +12462,18 @@ impl Statement {
                     Err(err) => {
                         let final_err =
                             inner.abort_write_statement(hid, &err, abort_snapshot, shared);
+                        let retained = if self.mode == PrepareMode::V1
+                            && stmt_tx.fk_check_before_result
+                            && final_err.extended_code == extended::SQLITE_CONSTRAINT_FOREIGNKEY
+                        {
+                            // OP_FkCheck turns the V1 immediate check's status into
+                            // SQLITE_ERROR before the VM stores it for reset/finalize.
+                            SqliteError::new(ErrorCode::Error, &final_err.message)
+                        } else {
+                            final_err.clone()
+                        };
                         self.lifecycle = StatementLifecycle::Halted {
-                            last_error: Some(final_err.clone()),
+                            last_error: Some(retained),
                         };
                         Err(final_err)
                     }

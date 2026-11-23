@@ -3659,3 +3659,35 @@ fn group65_function_list_table_authorizes_a_read_without_columns() {
         assert_eq!(checks.load(AtomicOrdering::Relaxed), 1);
     }
 }
+
+#[test]
+fn group65_legacy_fk_error_retains_the_check_phase_on_reset() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "PRAGMA foreign_keys=ON;
+         CREATE TABLE parent(id INTEGER PRIMARY KEY);
+         CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+         INSERT INTO parent VALUES(1);",
+    ).unwrap();
+
+    for (sql, saved) in [
+        ("INSERT INTO child VALUES(?1,?2)", 787),
+        ("INSERT INTO child VALUES(?1,?2) RETURNING id", 1),
+    ] {
+        let mut legacy = db.prepare_v1(sql).unwrap();
+        let mut modern = db.prepare(sql).unwrap();
+        for (stmt, mode, cleanup) in [(&mut legacy, 1, saved), (&mut modern, 787, 787)] {
+            stmt.bind(1, Value::Integer(9)).unwrap().bind(2, Value::Integer(4)).unwrap();
+            let error = stmt.step().unwrap_err();
+            assert_eq!(error.extended_code, mode);
+            assert_eq!(error.message, if mode == 1 { "SQL logic error" } else { "FOREIGN KEY constraint failed" });
+            let error = stmt.reset().unwrap_err();
+            assert_eq!(error.extended_code, cleanup);
+            assert_eq!(error.message, "FOREIGN KEY constraint failed");
+            assert!(db.is_autocommit());
+        }
+    }
+
+    assert!(db.query("SELECT * FROM child", &[]).unwrap().rows.is_empty());
+    assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+}

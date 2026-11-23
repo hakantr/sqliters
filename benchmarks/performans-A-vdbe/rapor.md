@@ -2627,3 +2627,8 @@ COUNT(*) ve sabit yansıtmalar C gibi boş sütun adıyla hazırlama yetkisi sor
 ## V6b.464 — VACUUM kalıcı yazma hatası ve sıcak journal
 
 C ile ilk 778, hata sürerken sonraki okuma ve hata kalkınca aynı bağlantıda eski verinin güvenli kurtarması eşleşti. Dört çapraz salt okunur ve yazılabilir açılışta FK, bütünlük ve dosya baytları doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v463-vacuum-persistent-write-candidate/sonuc.md) OFF 1339/0/325, ON 1339/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_464.md).
+
+
+## V6b.465 — Hazır V1 FK yazmalarında adım ve reset kodu
+
+V1 ilk adımda C gibi SQLITE_ERROR, reset sırasında normal yazma için 787 ve sonuç öncesi FK denetimi için 1 döndürüyor. V2, 787 ve özgün mesajı koruyor. 288 C/OFF/ON dosyasında FK, bütünlük ve ana dosya baytları eş. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v465-prepared-v1-fk-diagnostic-candidate/sonuc.md) OFF 1340/0/325, ON 1340/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,265 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_465.md).

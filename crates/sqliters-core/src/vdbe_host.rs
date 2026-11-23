@@ -2213,6 +2213,11 @@ pub(crate) fn run_write(
                 host.ctx.stmt_tx.pending_changes = Some(n);
             }
         } else {
+            if r.as_ref().is_err_and(|error| error.extended_code == sqliters_types::extended::SQLITE_CONSTRAINT_FOREIGNKEY)
+                && vm.failed_opcode() == Some(sqliters_vdbe::opcodes::OP_FkCheck)
+            {
+                host.ctx.stmt_tx.fk_check_before_result = true;
+            }
             if let Some(path) = std::env::var_os("SQLITERS_VDBE_ERRLOG") {
                 use std::io::Write;
                 if let (Err(e), Ok(mut f)) = (&r, std::fs::OpenOptions::new().create(true).append(true).open(path)) {
