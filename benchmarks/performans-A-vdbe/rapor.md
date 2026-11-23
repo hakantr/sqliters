@@ -2512,3 +2512,8 @@ Kararlı filtresiz Linux üzerinde adlandırılıp silinen sorter dosyasının e
 ## V6b.441 — Scalar ve aggregate tanımı değiştirme
 
 Etkin ifadede aynı fonksiyon tanımı üzerine kayıt SQLITE_BUSY verir. Boştayken uygulama callback türü tek liste girdisi bırakacak şekilde değişir. 36 akış, 540 kayıt ve 252 kapsam dışı kontrol doğrulandı. OFF 1320/1/325, ON 1318/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,272 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_441.md).
+
+
+## V6b.442 — Varsayılan function_list sırası ve sütun metadatası
+
+36 yerel C karşılaştırması eş. Önceki 24 fark kapandı. 3.198 satır, 204 kolon kaydı, 108 yaşam döngüsü ve 288 önceki kontrol doğrulandı. OFF 1321/1/325, ON 1319/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_442.md).

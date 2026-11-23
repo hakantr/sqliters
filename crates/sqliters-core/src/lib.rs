@@ -9014,7 +9014,7 @@ impl Statement {
 
         struct SrcTable {
             alias: String,
-            all_cols: Vec<(String, String, bool)>,
+            all_cols: Vec<(String, Option<String>, bool)>,
         }
         let load_tos = |tos: &sqliters_syntax::TableOrSubquery| -> Option<SrcTable> {
             let sqliters_syntax::TableOrSubquery::Table {
@@ -9032,20 +9032,27 @@ impl Statement {
                 let cols = tbl
                     .columns
                     .iter()
-                    .map(|c| (c.name.clone(), c.type_name.clone(), false))
+                    .map(|c| (c.name.clone(), Some(c.type_name.clone()), false))
                     .collect();
                 return Some(SrcTable {
                     alias: eff,
                     all_cols: cols,
                 });
             }
-            if let Some((_, _, _, decl)) = db_set.find_connected_vtab_in_set(name, true) {
+            if let Some((_, _, entry)) = db_set.find_connected_vtab_entry_in_set(name, true) {
+                let decl = &entry.declared;
+                let function_list = entry.is_eponymous_only
+                    && entry.module_name.eq_ignore_ascii_case("pragma_function_list");
                 let cols = decl
                     .table_schema
                     .columns
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| (c.name.clone(), c.type_name.clone(), decl.is_hidden(i)))
+                    .map(|(i, c)| {
+                        let datatype = (!function_list || !c.type_name.is_empty())
+                            .then(|| c.type_name.clone());
+                        (c.name.clone(), datatype, decl.is_hidden(i))
+                    })
                     .collect();
                 return Some(SrcTable {
                     alias: eff,
@@ -9072,7 +9079,7 @@ impl Statement {
                     for s in &srcs {
                         for (_, dt, hidden) in &s.all_cols {
                             if !*hidden {
-                                decls.push(Some(dt.clone()));
+                                decls.push(dt.clone());
                             }
                         }
                     }
@@ -9082,7 +9089,7 @@ impl Statement {
                         if s.alias.eq_ignore_ascii_case(tname) {
                             for (_, dt, hidden) in &s.all_cols {
                                 if !*hidden {
-                                    decls.push(Some(dt.clone()));
+                                    decls.push(dt.clone());
                                 }
                             }
                         }
@@ -9104,7 +9111,7 @@ impl Statement {
                                 .iter()
                                 .find(|(cn, _, _)| cn.eq_ignore_ascii_case(&cref.column))
                             {
-                                found = Some(dt.clone());
+                                found = dt.clone();
                                 break;
                             }
                         }

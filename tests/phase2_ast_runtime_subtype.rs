@@ -2820,3 +2820,57 @@ fn group65_function_kind_replacement_keeps_one_active_definition() {
     assert_eq!(listed.rows.len(), 1);
     assert_eq!(listed.rows[0].get_str(0), Some("s"));
 }
+
+#[test]
+fn group65_function_list_order_and_column_decltype() {
+    let names = ["name", "builtin", "type", "enc", "narg", "flags"];
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}';
+             CREATE TABLE schema_anchor(x);
+             CREATE VIEW list_view AS SELECT * FROM pragma_function_list;"
+        )).unwrap();
+
+        let mut statements = [
+            db.prepare("PRAGMA function_list").unwrap(),
+            db.prepare("SELECT p.* FROM pragma_function_list AS p").unwrap(),
+            db.prepare("SELECT * FROM list_view").unwrap(),
+        ];
+        let mut results = Vec::new();
+        for statement in &mut statements {
+            assert_eq!(statement.column_names(), names);
+            for col in 0..names.len() {
+                assert_eq!(statement.column_decltype(col), None);
+            }
+            let mut rows = Vec::new();
+            while let StepResult::Row(row) = statement.step().unwrap() {
+                rows.push(row.values().to_vec());
+            }
+            assert_eq!(rows.len(), 173);
+            assert_eq!(rows[0], [
+                Value::Text("pow".to_owned()), Value::Integer(1), Value::Text("s".to_owned()),
+                Value::Text("utf8".to_owned()), Value::Integer(2), Value::Integer(2099200),
+            ]);
+            assert_eq!(rows[1][0], Value::Text("group_concat".to_owned()));
+            assert_eq!(rows[1][4], Value::Integer(1));
+            assert_eq!(rows[2][0], Value::Text("group_concat".to_owned()));
+            assert_eq!(rows[2][4], Value::Integer(2));
+            assert_eq!(rows[161][0], Value::Text("fts5_locale".to_owned()));
+            assert_eq!(rows[161][1], Value::Integer(0));
+            assert_eq!(rows[172][0], Value::Text("bm25".to_owned()));
+            results.push(rows);
+        }
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[0], results[2]);
+
+        let projection = db.prepare("SELECT p.narg AS arguments, p.name FROM pragma_function_list AS p").unwrap();
+        assert_eq!(projection.column_names(), ["arguments", "name"]);
+        assert_eq!(projection.column_decltype(0), None);
+        assert_eq!(projection.column_decltype(1), None);
+
+        db.execute_batch("CREATE TEMP TABLE pragma_function_list(name TEXT)").unwrap();
+        let shadow = db.prepare("SELECT name FROM temp.pragma_function_list").unwrap();
+        assert_eq!(shadow.column_decltype(0).as_deref(), Some("TEXT"));
+    }
+}
