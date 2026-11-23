@@ -24913,6 +24913,56 @@ fn find_referencing_fks(
     out
 }
 
+/// A parent TEXT key and numeric child use distinct lookup and action comparisons.
+pub(crate) fn parent_fk_counter_program_needed(stmt: Option<&Stmt>, db_set: &DatabaseSet) -> bool {
+    let (target, update) = match stmt {
+        Some(Stmt::Update(update))
+            if update.ctes.is_empty() && update.or_conflict.is_none()
+                && update.from.is_none() && update.indexed_by.is_none()
+                && update.returning.is_empty() => (&update.table, true),
+        Some(Stmt::Delete(delete))
+            if delete.ctes.is_empty() && delete.indexed_by.is_none()
+                && delete.returning.is_empty() => (&delete.table, false),
+        _ => return false,
+    };
+    let Some((DatabaseId::MAIN, parent)) = db_set.find_user_table_in_set(target) else {
+        return false;
+    };
+    if !parent.without_rowid || !parent.foreign_keys.is_empty() {
+        return false;
+    }
+    let main = db_set.main_slot();
+    let refs = find_referencing_fks(&main.schema, &parent.name);
+    let [(child, fk)] = refs.as_slice() else {
+        return false;
+    };
+    let action = if update { fk.on_update } else { fk.on_delete };
+    if !matches!(action, FkAction::Cascade | FkAction::SetNull | FkAction::SetDefault)
+        || child.foreign_keys.len() != 1 || child.name.eq_ignore_ascii_case(&parent.name)
+    {
+        return false;
+    }
+    let Ok((_, parent_cols)) = resolve_fk_parent_cols(&main.schema, &main.name, &child.name, fk) else {
+        return false;
+    };
+    if [&parent.name, &child.name].into_iter()
+        .any(|table| !db_set.triggers_for_relation(DatabaseId::MAIN, table).is_empty())
+    {
+        return false;
+    }
+    if let Some(Stmt::Update(update)) = stmt
+        && !update.assignments.iter().flat_map(|assign| &assign.columns).any(|name| {
+            parent_cols.iter().any(|&column| name.eq_ignore_ascii_case(&parent.columns[column].name))
+        })
+    {
+        return false;
+    }
+    parent_cols.iter().zip(&fk.from_cols).any(|(&pi, &ci)| {
+        parent.columns[pi].affinity == TypeAffinity::Text
+            && matches!(child.columns[ci].affinity, TypeAffinity::Integer | TypeAffinity::Numeric | TypeAffinity::Real)
+    })
+}
+
 fn parent_key_changed(
     ptbl: &TableSchema,
     parent_col_idxs: &[usize],

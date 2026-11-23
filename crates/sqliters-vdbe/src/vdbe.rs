@@ -1009,6 +1009,11 @@ pub fn unsupported_reason_write(prog: &Program) -> Option<String> {
     unsupported(prog, true, ReadKeyScope::Utf8, None, false)
 }
 
+/// Physical MAIN keys of a separately checked foreign-key action program.
+pub fn unsupported_reason_fk_action_write(prog: &Program, encoding: u8) -> Option<String> {
+    unsupported(prog, true, ReadKeyScope::ForeignKeyWrite, Some(encoding), true)
+}
+
 /// Allow BINARY UTF-16 sorter keys for the checked mapped and row CASE reads.
 pub fn unsupported_reason_mapped_read(prog: &Program) -> Option<String> {
     unsupported(prog, false, ReadKeyScope::BinarySorter, None, false)
@@ -1587,6 +1592,7 @@ enum ReadKeyScope {
     BuiltinGroup,
     BinaryDistinct,
     BuiltinDistinct,
+    ForeignKeyWrite,
 }
 
 fn group_compare_width(prog: &Program, index: usize, op: &VdbeOp, key: &KeyInfo) -> Option<usize> {
@@ -3081,11 +3087,19 @@ fn unsupported(
                 && recursive_priority_key(prog, index, |coll| {
                     binary_in_key_encoding(coll) || (builtin_collations && builtin_read_key_collation(coll, k.enc))
                 });
-            if k.enc != 1 && !prog.references_like
-                && !(binary_sort || binary_group_compare || builtin_group || streamed_group
+            let utf16_key_allowed = if key_scope == ReadKeyScope::ForeignKeyWrite {
+                row_case_encoding == Some(k.enc)
+                    && matches!(op.opcode, OP_OpenRead | OP_OpenWrite)
+                    && op.p2 > 1 && op.p3 == 0
+                    && k.n_key_field > 0 && k.n_key_field <= k.n_all_field
+                    && k.a_coll.len() == usize::from(k.n_all_field)
+                    && k.a_coll.iter().flatten().all(|c| builtin_read_key_collation(c, k.enc))
+            } else {
+                binary_sort || binary_group_compare || builtin_group || streamed_group
                     || distinct || physical_index || without_rowid_or_set
-                    || membership || builtin_sort || limit_sort || partial_sort || recursive_fifo || rowid_list || recursive_priority)
-            {
+                    || membership || builtin_sort || limit_sort || partial_sort || recursive_fifo || rowid_list || recursive_priority
+            };
+            if k.enc != 1 && !prog.references_like && !utf16_key_allowed {
                 return Some("UTF-16 key".to_owned());
             }
             // An application-defined collation can fail in this engine (its callback returns a

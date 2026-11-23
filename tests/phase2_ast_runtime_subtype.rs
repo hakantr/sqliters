@@ -5078,3 +5078,47 @@ fn group64_registered_builtin_worker_sort_preserves_tied_key_groups() {
         assert_eq!(db.query("PRAGMA integrity_check", &[]).unwrap().rows[0].get_str(0), Some("ok"));
     }
 }
+
+#[test]
+fn group65_fk_action_numeric_child_preserves_sqlite_constraint_counter() {
+    use sqliters::types::extended::SQLITE_CONSTRAINT_FOREIGNKEY;
+
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for deferred in [false, true] {
+            let db = Connection::open_in_memory().unwrap();
+            let defer = if deferred { "DEFERRABLE INITIALLY DEFERRED" } else { "" };
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}';
+                 PRAGMA foreign_keys=ON;
+                 CREATE TABLE parent(a TEXT COLLATE NOCASE,b TEXT,
+                     PRIMARY KEY(a,b)) WITHOUT ROWID;
+                 CREATE TABLE child(id INTEGER PRIMARY KEY,a TEXT,b INTEGER,
+                     FOREIGN KEY(a,b) REFERENCES parent(a,b) ON UPDATE CASCADE {defer});
+                 INSERT INTO parent VALUES('North','007'),('North','7');
+                 INSERT INTO child VALUES(1,'north',7);",
+            ))
+            .unwrap();
+            let child_key = || db.query("SELECT b FROM child WHERE id=1", &[]).unwrap()
+                .rows[0].get_i64(0).unwrap();
+            let update = "UPDATE parent SET b='8' WHERE a='north' AND b='007'";
+            let error = if deferred {
+                db.execute_batch("BEGIN").unwrap();
+                db.execute(update).unwrap();
+                assert_eq!(child_key(), 8);
+                assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+                let error = db.execute("COMMIT").unwrap_err();
+                assert!(!db.is_autocommit());
+                db.execute_batch("ROLLBACK").unwrap();
+                error
+            } else {
+                db.execute(update).unwrap_err()
+            };
+            assert_eq!(error.extended_code, SQLITE_CONSTRAINT_FOREIGNKEY);
+            assert_eq!(child_key(), 7);
+
+            db.execute("UPDATE parent SET b='8' WHERE a='north' AND b='7'").unwrap();
+            assert_eq!(child_key(), 8);
+            assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+        }
+    }
+}

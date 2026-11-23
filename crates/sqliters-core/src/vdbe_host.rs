@@ -1231,6 +1231,24 @@ fn text_register_write_program(prog: &Program, collations: &CollationRegistry) -
     has_producer
 }
 
+#[allow(non_upper_case_globals)]
+fn parent_fk_counter_program(program: &Program, collations: &CollationRegistry) -> bool {
+    use sqliters_vdbe::opcodes::*;
+    if program.read_only || program.btree_mask != 1 || program.n_res_column != 0 {
+        return false;
+    }
+    let [action] = program.p_program.as_slice() else {
+        return false;
+    };
+    program.a_op.iter().any(|op| op.opcode == OP_FkCounter)
+        && action.a_op.iter().any(|op| op.opcode == OP_Param)
+        && program.a_op.iter().chain(&action.a_op).all(|op| {
+            !matches!(op.opcode, OP_VBegin | OP_VUpdate | OP_VOpen | OP_VFilter | OP_VColumn
+                | OP_VNext | OP_RowCell | OP_Function | OP_PureFunc)
+                && !matches!(&op.p4, P4::CollSeq(coll) if collations.get_custom(&coll.name).is_some())
+        })
+}
+
 /// The route of an INSERT / UPDATE / DELETE (also with a WITH prefix): C's compile result —
 /// the program or C's error — decides before the engine's own prepare (diagnostic switch
 /// `SQLITERS_VDBE_EXEC`). The second value: C's `sqlite3Init()` loaded the schemas during the
@@ -1243,8 +1261,10 @@ pub(crate) fn machine_write_program(
 ) -> (WriteRoute, bool) {
     let use_codegen_switch = exec_switch_on();
     let standard_write = use_codegen_switch && inner.effective_encoding() == TextEncoding::Utf8;
-    let scoped_write = !standard_write && text_register_write(stmt);
-    if !use_codegen_switch && !scoped_write {
+    let scoped_text = !standard_write && text_register_write(stmt);
+    let scoped_fk = !standard_write && inner.foreign_keys
+        && crate::engine::parent_fk_counter_program_needed(stmt, &inner.db_set);
+    if !use_codegen_switch && !scoped_text && !scoped_fk {
         return (WriteRoute::Engine, false);
     }
     if !matches!(
@@ -1291,7 +1311,7 @@ pub(crate) fn machine_write_program(
         trace("fallback: schema with an application-defined collation", raw_sql);
         return (WriteRoute::Engine, false);
     }
-    if !standard_write && !scoped_write {
+    if !standard_write && !scoped_text && !scoped_fk {
         trace("fallback: UTF-16 database", raw_sql);
         return (WriteRoute::Engine, false);
     }
@@ -1307,10 +1327,20 @@ pub(crate) fn machine_write_program(
     };
     let route = match r {
         PrepareResult::Program(p) => {
-            if p.explain != 0 || (!standard_write && !text_register_write_program(&p, &inner.collations)) {
+            let fk_program = scoped_fk && parent_fk_counter_program(&p, &inner.collations);
+            if p.explain != 0
+                || !(standard_write
+                    || scoped_text && text_register_write_program(&p, &inner.collations)
+                    || fk_program)
+            {
                 return (WriteRoute::Engine, loaded);
             }
-            if let Some(why) = sqliters_vdbe::vdbe::unsupported_reason_write(&p) {
+            let unsupported = if fk_program {
+                sqliters_vdbe::vdbe::unsupported_reason_fk_action_write(&p, inner.effective_encoding() as u8)
+            } else {
+                sqliters_vdbe::vdbe::unsupported_reason_write(&p)
+            };
+            if let Some(why) = unsupported {
                 trace(&format!("fallback: {why}"), raw_sql);
                 return (WriteRoute::Engine, loaded);
             }
