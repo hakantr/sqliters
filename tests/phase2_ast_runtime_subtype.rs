@@ -1335,7 +1335,7 @@ fn group64_registered_builtin_memory_sort_tracks_current_temp_store() {
                 ("a", "b"), ("a", "B"), ("A", "B"), ("A", "A "),
             ]
             .map(|(left, right)| (left.to_owned(), right.to_owned()));
-            for mode in ["FILE", "MEMORY", "FILE", "MEMORY"] {
+            for mode in ["FILE", "DEFAULT", "MEMORY", "DEFAULT", "FILE", "MEMORY"] {
                 db.execute_batch(&format!("PRAGMA temp_store={mode};")).unwrap();
                 let StepResult::Row(row) = statement.step().unwrap() else {
                     panic!("missing first row in {encoding}/{name}/{mode}");
@@ -1345,6 +1345,21 @@ fn group64_registered_builtin_memory_sort_tracks_current_temp_store() {
                 assert_eq!(observed, expected, "{encoding}/{name}/{mode}");
                 statement.reset().unwrap();
             }
+
+            let mut prepared_in_memory = db
+                .prepare(&format!("SELECT id FROM items ORDER BY v COLLATE {name} NULLS LAST,id"))
+                .unwrap();
+            for mode in ["MEMORY", "DEFAULT"] {
+                db.execute_batch(&format!("PRAGMA temp_store={mode};")).unwrap();
+                let StepResult::Row(row) = prepared_in_memory.step().unwrap() else {
+                    panic!("missing first row after preparation in MEMORY for {encoding}/{name}/{mode}");
+                };
+                assert_eq!(row.values(), &[Value::Integer(4)]);
+                let observed = std::mem::take(&mut *calls.lock().unwrap());
+                assert_eq!(observed, expected, "{encoding}/{name}/{mode}");
+                prepared_in_memory.reset().unwrap();
+            }
+            db.execute_batch("PRAGMA temp_store=MEMORY;").unwrap();
 
             let seen = Arc::clone(&calls);
             db.register_fallible_collation(name, move |left, right| {

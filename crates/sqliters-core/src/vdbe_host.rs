@@ -132,28 +132,32 @@ pub(crate) fn machine_program_with_prepare(
 pub(crate) fn custom_sort_policy_matches(inner: &ConnectionInner, program: &Program) -> bool {
     if program.fallible_limit_sort_open.is_some() {
         !inner.authorizer.is_some()
-    } else if program.fallible_file_sort_open.is_some() {
-        file_sort_policy(inner)
+    } else if let Some(open) = program.fallible_file_sort_open {
+        let collation = program.a_op.get(open).and_then(|op| {
+            let P4::KeyInfo(key) = &op.p4 else { return None };
+            key.a_coll.first()?.as_deref().map(|coll| coll.name.as_str())
+        });
+        file_sort_policy(inner, collation)
     } else {
         true
     }
 }
 
-fn file_sort_policy(inner: &ConnectionInner) -> bool {
-    !inner.authorizer.is_some() && inner.db_set.temp_store() == TempStoreMode::File
-        && inner.db_set.worker_threads_limit == 0
+fn file_sort_policy(inner: &ConnectionInner, collation: Option<&str>) -> bool {
+    !inner.authorizer.is_some() && inner.db_set.worker_threads_limit == 0
+        && match inner.db_set.temp_store() {
+            TempStoreMode::File => true,
+            TempStoreMode::Default => matches!(
+                collation.and_then(Collation::from_name), Some(Collation::NoCase | Collation::RTrim)),
+            TempStoreMode::Memory => false,
+        }
 }
 
 pub(crate) fn custom_sort_read_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
 ) -> Option<Arc<Program>> {
-    custom_limit_sort_read_program(inner, stmt, sql, n_param).or_else(|| {
-        if file_sort_policy(inner) {
-            custom_file_sort_read_program(inner, stmt, sql, n_param)
-        } else {
-            None
-        }
-    })
+    custom_limit_sort_read_program(inner, stmt, sql, n_param)
+        .or_else(|| custom_file_sort_read_program(inner, stmt, sql, n_param))
 }
 
 /// A plain ORDER BY with LIMIT uses a private index rather than the full sorter.
@@ -205,12 +209,15 @@ fn custom_limit_sort_read_program(
 }
 
 #[allow(non_upper_case_globals)]
-fn custom_file_sort_read_program(
+pub(crate) fn custom_file_sort_read_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
 ) -> Option<Arc<Program>> {
     use sqliters_vdbe::opcodes::*;
     let Some(Stmt::Select(select)) = stmt else { return None };
     let (name, root) = crate::engine::custom_file_order_collation(select, &inner.db_set, &inner.collations)?;
+    if !file_sort_policy(inner, Some(name)) {
+        return None;
+    }
     let PrepareResult::Program(mut program) = crate::cgen::c_prepare(inner, sql).0 else {
         return None;
     };

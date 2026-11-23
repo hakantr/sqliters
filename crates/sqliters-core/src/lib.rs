@@ -8208,7 +8208,7 @@ impl Statement {
         mapped_program: Option<Arc<sqliters_vdbe::vdbeaux::Program>>,
         retried: bool,
     ) -> MachineStart {
-        let Some(prog) = self.c_machine.clone().or(mapped_program) else {
+        let Some(prog) = mapped_program.or_else(|| self.c_machine.clone()) else {
             return MachineStart::Fallback(lease_cursors, read_instances);
         };
         let mut vm = match self.c_machine_vm.take().filter(|vm| Arc::ptr_eq(&vm.prog, &prog)) {
@@ -10730,10 +10730,23 @@ impl Statement {
     }
 
     fn mapped_read_program(&self, inner: &ConnectionInner) -> Option<Arc<sqliters_vdbe::vdbeaux::Program>> {
-        if self.category != Some(StmtCategory::Read) || self.c_machine.is_some() || self.expired
+        if self.category != Some(StmtCategory::Read) || self.expired
             || self.uses_registered_builtin_memory_sort(inner)
         {
             return None;
+        }
+        if let Some(program) = &self.c_machine {
+            // TEMP storage can change after prepare without expiring the standard
+            // program. A validated DEFAULT sorter must use the registered callback.
+            return if !self.c_machine_fixed && program.fallible_sort_open().is_none()
+                && inner.db_set.temp_store() == TempStoreMode::Default
+            {
+                vdbe_host::custom_file_sort_read_program(
+                    inner, self.stmt.as_ref(), &self.raw_sql, self.params.len(),
+                )
+            } else {
+                None
+            };
         }
         vdbe_host::custom_sort_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len())
             .or_else(|| vdbe_host::worker_sort_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len()))
