@@ -398,6 +398,65 @@ pub(crate) fn mapped_table_read_program(
     Some(Arc::new(*program))
 }
 
+fn without_rowid_seek_root(inner: &ConnectionInner, stmt: Option<&Stmt>) -> Option<u32> {
+    use sqliters_syntax::{BinaryOp, Expr, SelectCore, TableOrSubquery};
+    let Some(Stmt::Select(select)) = stmt else { return None };
+    let SelectCore::Select {
+        from: Some(from), selection: Some(Expr::Binary { op: BinaryOp::Eq, .. }), ..
+    } = &select.body.head else { return None };
+    if inner.authorizer.is_some() || inner.collations.get_custom("BINARY").is_some()
+        || !select.ctes.is_empty() || !select.body.compounds.is_empty() || !from.joins.is_empty()
+        || !select.order_by.is_empty()
+        || select.limit.as_ref().is_some_and(|limit| {
+            limit.offset.is_some() || !matches!(limit.limit, Expr::Integer(_))
+        })
+    {
+        return None;
+    }
+    let TableOrSubquery::Table { name, table_args: None, .. } = &from.head else { return None };
+    let (db, crate::db_set::RelationRef::Table(table)) =
+        inner.db_set.find_relation_ref_in_set(name).ok()?? else { return None };
+    (db == DatabaseId::MAIN && table.without_rowid).then_some(table.root_pgno)
+}
+
+#[allow(non_upper_case_globals)]
+fn without_rowid_seek_matches(prog: &Program, root: u32) -> bool {
+    use sqliters_vdbe::opcodes::*;
+    if !prog.read_only || prog.btree_mask != 1 || !prog.p_program.is_empty()
+        || prog.a_op.iter().filter(|op| op.opcode == OP_SeekGE).count() != 1
+        || !prog.a_op.iter().any(|op| op.opcode == OP_OpenRead && op.p2 == root as i32)
+    {
+        return false;
+    }
+    prog.a_op.iter().all(|op| match op.opcode {
+        OP_OpenRead => op.p3 == 0 && matches!(&op.p4, P4::KeyInfo(key) if
+            key.a_coll.iter().flatten().all(|coll| coll.name.eq_ignore_ascii_case("BINARY"))),
+        OP_Transaction => op.p1 == 0 && op.p2 == 0,
+        OP_Init | OP_Halt | OP_Goto | OP_String8 | OP_Integer | OP_Int64
+        | OP_Null | OP_Variable | OP_Affinity | OP_IsNull | OP_SeekGE | OP_IdxGT
+        | OP_NotFound | OP_Next | OP_Column | OP_ResultRow | OP_IfNot | OP_DecrJumpZero => true,
+        _ => false,
+    })
+}
+
+pub(crate) fn without_rowid_point_read_program(
+    inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
+) -> Option<Arc<Program>> {
+    let root = without_rowid_seek_root(inner, stmt)?;
+    let PrepareResult::Program(program) = crate::cgen::c_prepare(inner, sql).0 else {
+        return None;
+    };
+    (program.n_var as usize == n_param && without_rowid_seek_matches(&program, root)
+        && sqliters_vdbe::vdbe::unsupported_reason(&program).is_none())
+        .then(|| Arc::new(*program))
+}
+
+pub(crate) fn machine_owns_without_rowid_seek(
+    inner: &ConnectionInner, stmt: Option<&Stmt>, prog: &Program,
+) -> bool {
+    without_rowid_seek_root(inner, stmt).is_some_and(|root| without_rowid_seek_matches(prog, root))
+}
+
 /// LIKE's binding and index selection depend on prepare-time function metadata.
 pub(crate) fn like_machine_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, raw_sql: &str, n_param: usize, bound_values: Option<&[Value]>,

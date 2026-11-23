@@ -8375,6 +8375,10 @@ impl Statement {
         );
         let result = if custom_sort.is_some() {
             Ok(custom_sort)
+        } else if let Some(point_read) = vdbe_host::without_rowid_point_read_program(
+            inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param,
+        ) {
+            Ok(Some(point_read))
         } else if has_like {
             vdbe_host::like_machine_program(inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param, bound_values)
         } else if vdbe_host::exec_switch_on() {
@@ -11483,6 +11487,18 @@ impl Statement {
                     Vec::new(),
                 );
 
+                let point_read = self.c_machine.as_deref().is_some_and(|prog| {
+                    vdbe_host::machine_owns_without_rowid_seek(inner, self.stmt.as_ref(), prog)
+                });
+                if point_read {
+                    // The machine's SeekGE positions its own cursor. A legacy
+                    // lease would read the unrelated leftmost path before the seek.
+                    match self.machine_start(hid, shared, inner, Vec::new(), read_instances, None) {
+                        MachineStart::Stepped(result) => return result,
+                        MachineStart::Fallback(_, instances) => read_instances = instances,
+                    }
+                }
+
                 let mut lease_cursors: Vec<(SchemaInstanceId, CursorId)> =
                     Vec::with_capacity(specs.len());
                 for spec in specs {
@@ -11550,8 +11566,9 @@ impl Statement {
 
                 // Diagnostic switch SQLITERS_VDBE_EXEC: the statement runs on the port of C's
                 // virtual machine, one row per step.
-                if (self.c_machine.as_ref().is_some_and(|prog| vdbe_host::custom_sort_policy_matches(inner, prog))
-                    || mapped_program.is_some())
+                if !point_read
+                    && (self.c_machine.as_ref().is_some_and(|prog| vdbe_host::custom_sort_policy_matches(inner, prog))
+                        || mapped_program.is_some())
                     && !self.uses_registered_builtin_memory_sort(inner)
                 {
                     match self.machine_start(hid, shared, inner, lease_cursors, read_instances, mapped_program) {

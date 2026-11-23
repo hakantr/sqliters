@@ -2562,3 +2562,8 @@ Güvenilmeyen şemadaki kayıtlı görünüm MATCH ifadesi C gibi reddedildi. Do
 ## V6b.451 — Yetkilendiricili doğrudan function_list yürütmesi
 
 Geçerli izin, yoksayma ve ret kararı korunarak doğrudan PRAGMA programı C ile 312 yaşam döngüsü profili ve 35.424 olayda eşleşti. İlk adım, reset, V1/V2, tekrar yetkilendirme ve iptal doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v451-function-list-authorized-vdbe-rebased-candidate/sonuc.md) OFF 1330/1/325, ON 1329/2/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_451.md).
+
+
+## V6b.452 — WITHOUT ROWID indeks aramalarında fiziksel okuma
+
+C kaynaklı dosyada dört bulunan ve bulunamayan anahtar yolunun satırları, okuma sırası, boyutu ve ofseti iki Rust kipinde pinli C ile eşleşti. NOT INDEXED yolunda 32 okuma ve sayfa sırası eş. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v452-without-rowid-seek-io-rebased-candidate/sonuc.md) OFF 1330/1/325, ON 1330/1/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,285 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_452.md).
