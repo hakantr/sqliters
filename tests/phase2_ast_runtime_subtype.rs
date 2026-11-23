@@ -2542,3 +2542,62 @@ fn group64_file_sorter_mmap_control_survives_early_reset() {
     assert_eq!(step_counts[0], step_counts[1]);
     assert_eq!(step_counts[0], step_counts[2]);
 }
+
+#[test]
+fn group65_direct_function_list_captures_rows_on_prepare() {
+    const LIST: &str = "PRAGMA function_list";
+    const NAME: &str = "app_function_list_marker";
+
+    fn marker_flags(stmt: &mut sqliters::Statement) -> Result<Option<i64>> {
+        let mut flags = None;
+        while let StepResult::Row(row) = stmt.step()? {
+            if row.get_str(0) == Some(NAME) {
+                assert!(flags.is_none());
+                flags = row.get_i64(5);
+            }
+        }
+        Ok(flags)
+    }
+
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!("PRAGMA encoding='{encoding}';")).unwrap();
+        let mut legacy = db.prepare_v1(LIST).unwrap();
+        let mut modern = db.prepare(LIST).unwrap();
+        db.register_scalar_function(NAME, 1, FunctionFlags::NONE, |_| {
+            Ok(RuntimeValue::plain(Value::Integer(1)))
+        }).unwrap();
+
+        assert_eq!(marker_flags(&mut legacy).unwrap(), None);
+        assert_eq!(marker_flags(&mut modern).unwrap(), None);
+        legacy.reset().unwrap();
+        modern.reset().unwrap();
+
+        let err = marker_flags(&mut legacy).unwrap_err();
+        assert_eq!((err.code, err.message.as_str()), (ErrorCode::Error, "not an error"));
+        assert_eq!(legacy.finalize().unwrap_err().code, ErrorCode::Schema);
+        assert_eq!(marker_flags(&mut modern).unwrap(), Some(0));
+        assert_eq!(modern.c_reprepare_status().0, 1);
+
+        let mut replacement = db.prepare(LIST).unwrap();
+        db.register_scalar_function(NAME, 1, FunctionFlags::DETERMINISTIC, |_| {
+            Ok(RuntimeValue::plain(Value::Integer(2)))
+        }).unwrap();
+        assert_eq!(
+            marker_flags(&mut replacement).unwrap(),
+            Some(i64::from(FunctionFlags::DETERMINISTIC.0)),
+        );
+        assert_eq!(replacement.c_reprepare_status().0, 1);
+
+        let mut removed = db.prepare(LIST).unwrap();
+        assert!(db.unregister_scalar_function(NAME, 1).unwrap());
+        assert_eq!(marker_flags(&mut removed).unwrap(), None);
+        assert_eq!(removed.c_reprepare_status().0, 1);
+
+        let mut partial = db.prepare_v1(LIST).unwrap();
+        assert!(matches!(partial.step().unwrap(), StepResult::Row(_)));
+        partial.reset().unwrap();
+        assert_eq!(partial.step().unwrap_err().code, ErrorCode::Error);
+        assert_eq!(partial.reset().unwrap_err().code, ErrorCode::Schema);
+    }
+}

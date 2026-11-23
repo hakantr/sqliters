@@ -2472,3 +2472,8 @@ Literal ve bağlı parametreli 576 C profilinde 1.440 adım ve 461.760 VFS okuma
 ## V6b.433 — Anonim Linux PMA dosyasında isteğe bağlı eşleme
 
 Seri FILE sıralayıcıda test denetimi ile C eşleme ve kapatma davranışı doğrulandı. Aynı özel tanıtıcının G/Ç ve eşleme erişimi aynı kilitle sıralanır. Varsayılan kip ve ana dosya mmap PRAGMA davranışı korunuyor. OFF 1312/1/325, ON 1310/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,277 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_433.md).
+
+
+## V6b.434 — Doğrudan function_list hazırlama ve reset
+
+Pinli C SQLite üç kodlamada V1/V2 ve Rust OFF/ON ile karşılaştırıldı. 48 akış ve 390 API kaydında ilk adım, reset, aynı aritede değiştirme ve kaldırma, yeniden hazırlama ve finalize eş. 168 kapsam dışı kontrol ve her kipte 27 odak testi doğrulandı. OFF 1313/1/325, ON 1311/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,286 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_434.md).

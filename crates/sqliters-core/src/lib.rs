@@ -1731,13 +1731,16 @@ impl ConnectionInner {
         }
     }
 
-    fn check_active_scalar_change(&self, name: &str, arity: Option<usize>) -> Result<()> {
-        // sqlite3CreateFunc rejects a change to an existing definition while a VM is active.
-        if !self.activity.leases.is_empty() && self.functions.has_scalar_overload(name, arity) {
-            return Err(SqliteError::new(
-                ErrorCode::Busy,
-                "unable to delete/modify user-function due to active statements",
-            ));
+    fn prepare_scalar_change(&mut self, name: &str, arity: Option<usize>) -> Result<()> {
+        // sqlite3CreateFunc expires prepared statements when replacing an existing overload.
+        if self.functions.has_scalar_overload(name, arity) {
+            if !self.activity.leases.is_empty() {
+                return Err(SqliteError::new(
+                    ErrorCode::Busy,
+                    "unable to delete/modify user-function due to active statements",
+                ));
+            }
+            self.db_set.c_expire_all();
         }
         Ok(())
     }
@@ -4688,7 +4691,7 @@ impl Connection {
         let mut session = self.shared.enter()?;
         let inner = session.inner_mut();
         inner.ensure_usable()?;
-        inner.check_active_scalar_change(name, arity)?;
+        inner.prepare_scalar_change(name, arity)?;
         inner.functions.register_scalar(name, arity, flags, func);
         inner.schema_generation += 1;
         inner.v1_expire_generation += 1;
@@ -4719,7 +4722,7 @@ impl Connection {
         let mut session = self.shared.enter()?;
         let inner = session.inner_mut();
         inner.ensure_usable()?;
-        inner.check_active_scalar_change(name, arity)?;
+        inner.prepare_scalar_change(name, arity)?;
         let removed = inner.functions.unregister_scalar(name, arity);
         if removed {
             inner.schema_generation += 1;
@@ -5494,7 +5497,7 @@ pub struct Statement {
     compiled_slot_cookies: Vec<(SchemaInstanceId, u32, bool)>,
     expired: bool,
     c_v1_expired_before_run: bool,
-    c_v1_flag_pragma_expired: bool,
+    c_v1_retained_expiry_diagnostic: bool,
     // A bind-triggered generated reprepare may consider a scoped partial-index value.
     c_write_expired_by_binding: bool,
     c_reprepare_count: u32,
@@ -6768,7 +6771,14 @@ fn prepare_auto_vacuum_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, 
 #[allow(non_upper_case_globals)]
 fn prepare_constant_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str) -> Result<Option<Box<QueryOutput>>> {
     use sqliters_vdbe::opcodes::{OP_Int64, OP_Integer, OP_String8};
-    let Some(Stmt::Pragma { name, value, .. }) = stmt else { return Ok(None); };
+    let Some(Stmt::Pragma { schema, name, value }) = stmt else { return Ok(None); };
+    if name.eq_ignore_ascii_case("function_list")
+        && !inner.authorizer.is_some()
+        && schema.as_deref().is_none_or(|schema| inner.db_set.find_db_id(schema).is_some())
+    {
+        // pragmaFunclistLine emits literal rows as the direct statement is prepared.
+        return Ok(Some(Box::new(engine::pragma_function_list(&inner.functions))));
+    }
     if name.eq_ignore_ascii_case("auto_vacuum") && value.is_some() { return Ok(None); }
     if !sqliters_codegen::pragma::prepare_constant(name) {
         return Ok(None);
@@ -8872,7 +8882,7 @@ impl Statement {
             compiled_slot_cookies: inner.snapshot_slot_cookies(),
             expired: false,
             c_v1_expired_before_run: false,
-            c_v1_flag_pragma_expired: false,
+            c_v1_retained_expiry_diagnostic: false,
             c_write_expired_by_binding: false,
             c_reprepare_count: 0,
             c_reprepare_after_schema_check: false,
@@ -9390,11 +9400,11 @@ impl Statement {
 
         let prev = std::mem::replace(&mut self.lifecycle, StatementLifecycle::Ready);
         let ran = !matches!(prev, StatementLifecycle::Ready);
-        let flag_pragma_expired = std::mem::take(&mut self.c_v1_flag_pragma_expired);
+        let retained_expiry_diagnostic = std::mem::take(&mut self.c_v1_retained_expiry_diagnostic);
         let result = match prev {
             StatementLifecycle::Ready => Ok(()),
             StatementLifecycle::Halted { last_error } => match last_error {
-                Some(_) if flag_pragma_expired => Err(inner.legacy_c_error_with_diagnostic(
+                Some(_) if retained_expiry_diagnostic => Err(inner.legacy_c_error_with_diagnostic(
                     ErrorCode::Schema, inner.c_connection_diagnostic_code,
                 )),
                 Some(err) => Err(err),
@@ -9468,7 +9478,7 @@ impl Statement {
                 }
             }
             StatementLifecycle::Halted { last_error } => match last_error {
-                Some(_) if self.c_v1_flag_pragma_expired => Err(inner.legacy_c_error_with_diagnostic(
+                Some(_) if self.c_v1_retained_expiry_diagnostic => Err(inner.legacy_c_error_with_diagnostic(
                     ErrorCode::Schema, inner.c_connection_diagnostic_code,
                 )),
                 Some(err) => Err(err),
@@ -10267,7 +10277,7 @@ impl Statement {
             self.lifecycle = StatementLifecycle::Ready;
         }
         self.c_v1_expired_before_run = false;
-        self.c_v1_flag_pragma_expired = false;
+        self.c_v1_retained_expiry_diagnostic = false;
 
         // Empty / comment-only SQL (`stmt.is_none()` with no parsed statement)
         if self.stmt.is_none() && matches!(parse_one(&self.raw_sql), Ok((None, _))) {
@@ -10572,14 +10582,16 @@ impl Statement {
                 self.lifecycle = StatementLifecycle::Halted {
                     last_error: Some(err.clone()),
                 };
-                if expired_before_run
-                    && matches!(self.category, Some(StmtCategory::Read | StmtCategory::Write))
+                let prepared_function_list = self.c_prepared_pragma.is_some()
+                    && matches!(self.stmt.as_ref(), Some(Stmt::Pragma { name, .. })
+                        if name.eq_ignore_ascii_case("function_list"));
+                let flag_pragma_expired = matches!(self.category, Some(StmtCategory::Read | StmtCategory::Write))
                     && inner.c_flag_pragma_expiry()
-                        .is_some_and(|seq| self.compiled_c_expire_seq != seq)
-                {
-                    // The flag pragma setter ran OP_Expire. This legacy statement
-                    // returns before executing, leaving the connection diagnostic alone.
-                    self.c_v1_flag_pragma_expired = true;
+                        .is_some_and(|seq| self.compiled_c_expire_seq != seq);
+                if expired_before_run && (prepared_function_list || flag_pragma_expired) {
+                    // Legacy step leaves the connection diagnostic unchanged.
+                    // Reset and finalize still return the statement's SQLITE_SCHEMA.
+                    self.c_v1_retained_expiry_diagnostic = true;
                     return Err(inner.legacy_c_step_error_with_diagnostic(inner.c_connection_diagnostic_code));
                 }
                 if self.expired

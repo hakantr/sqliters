@@ -47861,6 +47861,41 @@ fn is_mixed_collation_filter(expr: &Expr, name: &str, outer: Collation, inner: C
     }
 }
 
+pub(crate) fn pragma_function_list(functions: &FunctionRegistry) -> QueryOutput {
+    let mut rows = Vec::with_capacity(crate::vtab::SQLITE_BUILTIN_FUNCTION_LIST.len());
+    for &(fname, ftype, narg, flags) in crate::vtab::SQLITE_BUILTIN_FUNCTION_LIST {
+        rows.push(vec![
+            Value::Text(fname.to_owned()),
+            Value::Integer(1),
+            Value::Text(ftype.to_owned()),
+            Value::Text("utf8".to_owned()),
+            Value::Integer(narg),
+            Value::Integer(flags),
+        ]);
+    }
+    for (fname, ftype, narg, flags) in functions.custom_function_entries() {
+        rows.push(vec![
+            Value::Text(fname),
+            Value::Integer(0),
+            Value::Text(ftype.to_owned()),
+            Value::Text("utf8".to_owned()),
+            Value::Integer(narg),
+            Value::Integer(flags),
+        ]);
+    }
+    QueryOutput {
+        column_names: vec![
+            "name".to_owned(),
+            "builtin".to_owned(),
+            "type".to_owned(),
+            "enc".to_owned(),
+            "narg".to_owned(),
+            "flags".to_owned(),
+        ],
+        rows,
+    }
+}
+
 fn exec_pragma(
     ctx: &mut ExecContext<'_>,
     schema: Option<&str>,
@@ -48149,40 +48184,7 @@ fn exec_pragma(
                 rows,
             });
         }
-        "FUNCTION_LIST" => {
-            let mut rows = Vec::with_capacity(crate::vtab::SQLITE_BUILTIN_FUNCTION_LIST.len());
-            for &(fname, ftype, narg, flags) in crate::vtab::SQLITE_BUILTIN_FUNCTION_LIST {
-                rows.push(vec![
-                    Value::Text(fname.to_owned()),
-                    Value::Integer(1),
-                    Value::Text(ftype.to_owned()),
-                    Value::Text("utf8".to_owned()),
-                    Value::Integer(narg),
-                    Value::Integer(flags),
-                ]);
-            }
-            for (fname, ftype, narg, flags) in ctx.functions.custom_function_entries() {
-                rows.push(vec![
-                    Value::Text(fname),
-                    Value::Integer(0),
-                    Value::Text(ftype.to_owned()),
-                    Value::Text("utf8".to_owned()),
-                    Value::Integer(narg),
-                    Value::Integer(flags),
-                ]);
-            }
-            return Ok(QueryOutput {
-                column_names: vec![
-                    "name".to_owned(),
-                    "builtin".to_owned(),
-                    "type".to_owned(),
-                    "enc".to_owned(),
-                    "narg".to_owned(),
-                    "flags".to_owned(),
-                ],
-                rows,
-            });
-        }
+        "FUNCTION_LIST" => return Ok(pragma_function_list(ctx.functions)),
         "MODULE_LIST" => {
             let rows = ctx
                 .db_set
