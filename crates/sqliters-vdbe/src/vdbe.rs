@@ -1666,10 +1666,10 @@ fn worker_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
         && prog.a_op.iter().filter(|op| op.opcode == OP_SorterOpen).count() == 1
 }
 
-/// Check the same worker-sort shape before admitting UTF-16 statement execution.
+/// Check the same worker-sort shape before admitting statement execution.
 #[doc(hidden)]
-pub fn is_utf16_worker_sort(prog: &Program, encoding: TextEncoding) -> bool {
-    encoding != TextEncoding::Utf8 && prog.a_op.iter().any(|op| {
+pub fn is_worker_sort(prog: &Program, encoding: TextEncoding) -> bool {
+    prog.a_op.iter().any(|op| {
         matches!(&op.p4, P4::KeyInfo(key)
             if key.enc == encoding as u8 && worker_order_sorter(prog, op, key))
     })

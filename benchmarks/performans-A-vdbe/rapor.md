@@ -2517,3 +2517,8 @@ Etkin ifadede aynı fonksiyon tanımı üzerine kayıt SQLITE_BUSY verir. Boşta
 ## V6b.442 — Varsayılan function_list sırası ve sütun metadatası
 
 36 yerel C karşılaştırması eş. Önceki 24 fark kapandı. 3.198 satır, 204 kolon kaydı, 108 yaşam döngüsü ve 288 önceki kontrol doğrulandı. OFF 1321/1/325, ON 1319/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_442.md).
+
+
+## V6b.443 — OFF ve ON tek işçi PMA
+
+Üç kodlama ve DELETE/WAL için zorlanmış koşulda 890.408 VFS kaydı eş. Gerçek işçilerde satır, adım, dosya ve hata sonucu eş. 18 okuyucu kilidi ve 180 olağan FK koşusu ile son imajlar doğrulandı. OFF 1322/1/325, ON 1320/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,272 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_443.md).

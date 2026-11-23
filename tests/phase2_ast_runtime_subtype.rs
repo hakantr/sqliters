@@ -2874,3 +2874,32 @@ fn group65_function_list_order_and_column_decltype() {
         assert_eq!(shadow.column_decltype(0).as_deref(), Some("TEXT"));
     }
 }
+
+#[test]
+fn group64_file_sorter_worker_runs_in_both_execution_modes() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}';
+             PRAGMA temp_store=DEFAULT; PRAGMA cache_size=1; PRAGMA threads=0;
+             CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);
+             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<20)
+             INSERT INTO items SELECT i, printf('%03d%20000s',20-i,'x') FROM n;"
+        )).unwrap();
+        let mut statement = db
+            .prepare("SELECT id FROM items ORDER BY v COLLATE BINARY NULLS LAST,id")
+            .unwrap();
+        for threads in [1, 0, 1] {
+            db.execute_batch(&format!("PRAGMA threads={threads}")).unwrap();
+            statement.machine_stmt_status(4, true);
+            let StepResult::Row(row) = statement.step().unwrap() else {
+                panic!("expected first row in {encoding}");
+            };
+            assert_eq!(row.get_i64(0), Some(20));
+            if threads == 1 {
+                assert!(statement.machine_stmt_status(4, false) > 0, "{encoding}");
+            }
+            statement.reset().unwrap();
+        }
+    }
+}

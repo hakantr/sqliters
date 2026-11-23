@@ -252,12 +252,13 @@ fn custom_file_sort_read_program(
 }
 
 /// The worker sorter admits only the complete native BINARY rowid order.
-pub(crate) fn utf16_worker_sort_read_program(
+pub(crate) fn worker_sort_read_program(
     inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
 ) -> Option<Arc<Program>> {
     let Some(Stmt::Select(select)) = stmt else { return None };
     let encoding = inner.effective_encoding();
-    if encoding == TextEncoding::Utf8 || !exec_switch_on()
+    // The standard machine prepare already handles the UTF-8 ON case.
+    if (encoding == TextEncoding::Utf8 && exec_switch_on())
         || inner.db_set.worker_threads_limit != 1 || inner.db_set.temp_store().is_memory()
         || inner.db_set.sorter_mmap_limit > 0 || inner.collations.get_custom("BINARY").is_some()
         || select.order_by.len() != 2 || select.limit.is_some() || read_codegen_blocker(inner).is_some()
@@ -268,11 +269,11 @@ pub(crate) fn utf16_worker_sort_read_program(
         return None;
     };
     if program.explain != 0 || program.n_var as usize != n_param
-        || !sqliters_vdbe::vdbe::is_utf16_worker_sort(&program, encoding)
+        || !sqliters_vdbe::vdbe::is_worker_sort(&program, encoding)
     {
         return None;
     }
-    trace("machine: UTF-16 worker sorter", sql);
+    trace("machine: worker sorter", sql);
     Some(Arc::new(*program))
 }
 
@@ -1375,9 +1376,7 @@ macro_rules! host_common {
         }
 
         fn sorter_worker_threads(&mut self) -> i32 {
-            if self.colls().get_custom("BINARY").is_some()
-                || (self.text_encoding() != TextEncoding::Utf8 && !exec_switch_on())
-            {
+            if self.colls().get_custom("BINARY").is_some() {
                 return 0;
             }
             self.dbs().worker_threads_limit
