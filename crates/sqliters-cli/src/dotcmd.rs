@@ -3355,6 +3355,9 @@ fn limit_access(p: &mut ShellState, i: usize, set: Option<i32>) -> i32 {
         }
         let db = p.db();
         match A_LIMIT[i] {
+            "length" => {
+                db.set_length_limit(v);
+            }
             "attached" => {
                 db.set_attached_limit(v as isize);
             }

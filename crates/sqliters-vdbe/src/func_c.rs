@@ -358,13 +358,17 @@ fn trim_text_bytes<'a>(
     Ok(input)
 }
 
-fn ascii_case_bytes(mut input: Vec<u8>, lowercase: bool) -> Vec<u8> {
+fn ascii_case_bytes(mut input: Vec<u8>, lowercase: bool, limit: usize) -> Result<Vec<u8>> {
+    // C's contextMalloc includes the terminating byte in the size check.
+    if input.len() >= limit {
+        return Err(too_big());
+    }
     if lowercase {
         input.make_ascii_lowercase();
     } else {
         input.make_ascii_uppercase();
     }
-    input
+    Ok(input)
 }
 
 /// Evaluate built-ins which observe or produce the raw bytes of a TEXT register.
@@ -481,11 +485,12 @@ pub(crate) fn eval_text_register(
     } else if arg.value_type() == 3 {
         if name.eq_ignore_ascii_case("lower") || name.eq_ignore_ascii_case("upper") {
             let Some(bytes) = value_text_register(arg) else { return Some(Ok(out)); };
-            // C's contextMalloc includes the terminating byte in the size check.
-            if bytes.len() >= limit_length.max(0) as usize {
-                return Some(Err(too_big()));
-            }
-            out.z = ascii_case_bytes(bytes.into_owned(), name.eq_ignore_ascii_case("lower"));
+            out.z = match ascii_case_bytes(
+                bytes.into_owned(), name.eq_ignore_ascii_case("lower"), limit_length.max(0) as usize,
+            ) {
+                Ok(bytes) => bytes,
+                Err(error) => return Some(Err(error)),
+            };
             out.flags = MEM_STR;
         } else if name.eq_ignore_ascii_case("quote") || name.eq_ignore_ascii_case("unistr_quote") {
             let Some(bytes) = value_text_register(arg) else { return Some(Ok(out)); };
@@ -881,11 +886,18 @@ pub(crate) fn eval(upper: &str, args: &[Value], ctx: &VmRuntimeContext) -> Optio
                     None => return Some(Ok(Value::Null)),
                 },
             };
-            trim_text_bytes(&input, set.as_deref(), upper, usize::MAX).map(|bytes| text_value(bytes.to_vec()))
+            let limit = ctx.effective_length_limit() as usize;
+            trim_text_bytes(&input, set.as_deref(), upper, limit).and_then(|bytes| {
+                if bytes.len() > limit {
+                    return Err(too_big());
+                }
+                Ok(text_value(bytes.to_vec()))
+            })
         }
         "LOWER" | "UPPER" if args.len() == 1 => {
             let Some(bytes) = value_text(&args[0], enc) else { return Some(Ok(Value::Null)); };
-            Ok(text_value(ascii_case_bytes(bytes.into_owned(), upper == "LOWER")))
+            ascii_case_bytes(bytes.into_owned(), upper == "LOWER", ctx.effective_length_limit() as usize)
+                .map(text_value)
         }
         "LIKE" | "GLOB" if args.len() == 2 || (upper == "LIKE" && args.len() == 3) => {
             // likeFunc: the ESCAPE argument is examined first; all three are C strings.

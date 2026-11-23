@@ -3128,6 +3128,7 @@ pub(crate) fn try_execute_compiled_insert(
         stmt_timestamp_ms: ctx.runtime.stmt_timestamp_ms,
         enable_test_functions: ctx.runtime.enable_test_functions,
         text_encoding: enc,
+        length_limit: ctx.runtime.length_limit,
     };
     let svc_rt = vm_rt;
     let run_res = {

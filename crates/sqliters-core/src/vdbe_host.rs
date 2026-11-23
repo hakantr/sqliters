@@ -1509,11 +1509,6 @@ macro_rules! host_common {
             Ok(bt)
         }
 
-        fn limit_length(&self) -> i32 {
-            // SQLITE_MAX_LENGTH (the engine has no sqlite3_limit())
-            1_000_000_000
-        }
-
         fn check_interrupt(&mut self) -> Result<()> {
             if self.intr().load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(SqliteError::new(ErrorCode::Interrupt, "interrupted"));
@@ -1633,6 +1628,10 @@ macro_rules! host_common {
 }
 
 impl VdbeHost for MachineHost<'_> {
+    fn limit_length(&self) -> i32 {
+        self.runtime.effective_length_limit()
+    }
+
     fn sorter_has_worker_table_key(&self, read: &VdbeOp, keys: &[VdbeOp]) -> bool {
         self.db_set.main_slot().btree.as_ref()
             .is_some_and(|btree| btree.transaction_state() != TransactionState::Open)
@@ -1757,6 +1756,10 @@ impl WriteHost<'_, '_> {
 }
 
 impl VdbeHost for WriteHost<'_, '_> {
+    fn limit_length(&self) -> i32 {
+        self.ctx.runtime.effective_length_limit()
+    }
+
     fn text_encoding(&self) -> TextEncoding { self.encoding }
     fn btree(&mut self, i_db: usize) -> Option<&mut Btree> {
         self.ctx.db_set.slot_mut(DatabaseId(i_db)).and_then(|s| s.btree.as_mut())

@@ -4507,6 +4507,25 @@ impl Connection {
         }
     }
 
+    /// Queries or changes the connection's string and BLOB length limit.
+    /// Returns the previous limit. A negative input leaves the limit unchanged.
+    pub fn set_length_limit(&self, limit: i32) -> i32 {
+        let hard_limit = sqliters_types::SQLITE_MAX_LENGTH as i32;
+        let Ok(mut session) = self.shared.enter() else {
+            return hard_limit;
+        };
+        let inner = session.inner_mut();
+        if inner.ensure_usable().is_err() {
+            return hard_limit;
+        }
+        let previous = inner.runtime.effective_length_limit();
+        if limit >= 0 {
+            // sqlite3_limit() clamps SQLITE_LIMIT_LENGTH to SQLITE_MIN_LENGTH.
+            inner.runtime.length_limit = Some(limit.clamp(30, hard_limit));
+        }
+        previous
+    }
+
     /// Queries (`limit < 0`) or updates (`limit >= 0`, clamped to `0..=SQLITE_MAX_EXPR_DEPTH`)
     /// `SQLITE_LIMIT_EXPR_DEPTH`, returning the **previous** limit.
     pub fn set_expr_depth_limit(&self, limit: isize) -> usize {
@@ -7615,6 +7634,7 @@ impl ConnectionInner {
                 stmt_timestamp_ms: stmt_ts,
                 enable_test_functions: self.runtime.enable_test_functions,
                 text_encoding: enc,
+                length_limit: self.runtime.length_limit,
             };
             let svc_rt = vm_rt;
             let r = {
@@ -12581,6 +12601,7 @@ impl Statement {
                 vm.runtime_ctx.last_changes = inner.runtime.last_changes;
                 vm.runtime_ctx.total_changes = inner.runtime.total_changes;
                 vm.runtime_ctx.nested_changes = inner.runtime.nested_changes;
+                vm.runtime_ctx.length_limit = inner.runtime.length_limit;
                 let step_res = {
                     let encoding = inner.effective_encoding();
                     let rt_snapshot = vm.runtime_ctx;
@@ -14212,6 +14233,7 @@ fn try_fast_compiled_main_write_fields(
             stmt_timestamp_ms: stmt_ts,
             enable_test_functions: inner.runtime.enable_test_functions,
             text_encoding: enc,
+            length_limit: inner.runtime.length_limit,
         };
         let svc_rt = vm_rt;
         let r = {

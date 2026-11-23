@@ -79,9 +79,15 @@ pub struct VmRuntimeContext {
     /// Text encoding of the database (`sqlite3.enc`): `hex()` and `octet_length()` see the
     /// stored bytes of a TEXT value, which are UTF-16 in a UTF-16 database.
     pub text_encoding: sqliters_types::TextEncoding,
+    /// Connection's SQLITE_LIMIT_LENGTH override, if one has been set.
+    pub length_limit: Option<i32>,
 }
 
 impl VmRuntimeContext {
+    pub fn effective_length_limit(&self) -> i32 {
+        self.length_limit.unwrap_or(sqliters_types::SQLITE_MAX_LENGTH as i32)
+    }
+
     /// Returns the statement's frozen UTC timestamp in Unix epoch milliseconds,
     /// falling back to `SystemTime::now()` if not explicitly initialized.
     #[inline]

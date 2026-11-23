@@ -4645,3 +4645,26 @@ fn group65_application_header_writes_expire_but_header_reads_reuse() {
         reader.finalize().unwrap();
     }
 }
+
+#[test]
+fn group65_length_limit_is_applied_to_trim_after_prepare_and_reset() {
+    let db = Connection::open_in_memory().unwrap();
+    let other = Connection::open_in_memory().unwrap();
+    let sql = "SELECT hex(trim(unistr('cab'), 'acdefg'))";
+    let mut stmt = db.prepare(sql).unwrap();
+    let initial_limit = db.set_length_limit(64);
+    assert_eq!(db.set_length_limit(-1), 64);
+    let message = stmt.step().unwrap_err();
+    assert_eq!(message.code, sqliters::ErrorCode::TooBig);
+    assert_eq!(message.message, "string or blob too big");
+    assert_eq!(stmt.reset().unwrap_err().code, sqliters::ErrorCode::TooBig);
+
+    let separate = other.query(sql, &[]).unwrap();
+    assert_eq!(separate.rows[0].values(), &[Value::Text("62".to_owned())]);
+
+    assert_eq!(db.set_length_limit(initial_limit), 64);
+    let StepResult::Row(row) = stmt.step().unwrap() else {
+        panic!("expected trim result after raising the limit");
+    };
+    assert_eq!(row.values(), &[Value::Text("62".to_owned())]);
+}
