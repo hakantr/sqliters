@@ -199,6 +199,22 @@ enum FetchRangeSource {
 }
 
 impl FetchRange {
+    /// A worker may return to buffered reads when the Linux kernel could not
+    /// copy a named mapping. Bounds and lifecycle errors still propagate.
+    #[doc(hidden)]
+    pub fn can_buffer_after_copy_error(&self, error: &SqliteError) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            matches!(&self.0, FetchRangeSource::KernelCopy(..))
+                && matches!(error.extended_code, extended::SQLITE_IOERR_READ | extended::SQLITE_IOERR_SHORT_READ)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = error;
+            false
+        }
+    }
+
     #[doc(hidden)]
     pub fn from_page(page: FetchPage) -> Self {
         Self(FetchRangeSource::Bytes(page))
@@ -357,6 +373,16 @@ pub trait VfsFile: Send + Sync {
     #[doc(hidden)]
     fn fetch_sorter_range(self: Arc<Self>, offset: u64, amount: usize) -> Result<Option<FetchRange>> {
         self.fetch_range(offset, amount)
+    }
+
+    /// Retain a range for a sorter batch running on a worker thread.
+    #[doc(hidden)]
+    fn fetch_worker_sorter_range(self: Arc<Self>, offset: u64, amount: usize) -> Result<Option<FetchRange>> {
+        if self.supports_fetch_range() {
+            self.fetch_range(offset, amount)
+        } else {
+            Ok(None)
+        }
     }
 
     /// `xUnfetch(fd, 0, NULL)`: invalidate the mapping after all leases return.
@@ -2497,6 +2523,18 @@ impl VfsFile for OsFile {
             return Ok(range.map(|range| FetchRange(FetchRangeSource::KernelCopy(range, self))));
         }
         self.fetch_range(offset, amount)
+    }
+
+    fn fetch_worker_sorter_range(self: Arc<Self>, offset: u64, amount: usize) -> Result<Option<FetchRange>> {
+        #[cfg(target_os = "linux")]
+        if self.unlinked_sorter_file {
+            return self.fetch_sorter_range(offset, amount);
+        }
+        if self.supports_fetch_range() {
+            self.fetch_range(offset, amount)
+        } else {
+            Ok(None)
+        }
     }
 
     fn unfetch_all(&self) -> Result<()> {
@@ -4737,6 +4775,10 @@ mod tests {
         assert_eq!(file.file_size().unwrap(), 4096);
         assert!(file.fetch_range(0, 1024).unwrap().is_none());
         let range = Arc::clone(&file).fetch_sorter_range(0, 1024).unwrap().unwrap();
+        let worker_range = Arc::clone(&file).fetch_worker_sorter_range(0, 1024).unwrap().unwrap();
+        let copy_error = SqliteError::with_extended(extended::SQLITE_IOERR_READ, ErrorCode::IoErr.as_str());
+        assert!(worker_range.can_buffer_after_copy_error(&copy_error));
+        assert!(!worker_range.can_buffer_after_copy_error(&SqliteError::misuse("fetch range out of bounds")));
         file.write_at(&[57; 16], 500).unwrap();
         let mut bytes = [0; 16];
         range.copy_into(500, &mut bytes).unwrap();
@@ -4746,6 +4788,7 @@ mod tests {
         assert!(file.unfetch_all().is_err());
         drop(file);
         range.copy_into(500, &mut bytes[..8]).unwrap();
+        worker_range.copy_into(500, &mut bytes[..8]).unwrap();
         assert_eq!(bytes, [57; 16]);
     }
 

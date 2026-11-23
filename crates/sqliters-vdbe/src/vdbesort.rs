@@ -257,13 +257,10 @@ impl<'a> PmaMap<'a> {
             {
                 Arc::clone(file).fetch_sorter_range(0, length as usize)
             }
-            // Only VFSes that support private bounded ranges can map a
-            // batch after the worker sort has started. The named Unix
-            // fallback has no such lease.
             Self::Worker(limit) => {
                 let limit = limit.load(Ordering::Relaxed);
-                if limit > 0 && length <= limit as u64 && file.supports_fetch_range() {
-                    return file.fetch_range(0, length as usize);
+                if limit > 0 && length <= limit as u64 {
+                    return Arc::clone(file).fetch_worker_sorter_range(0, length as usize);
                 }
                 Ok(None)
             }
@@ -276,6 +273,7 @@ impl<'a> PmaMap<'a> {
 /// from the same partial page that the C reader loads on seeking.
 struct PmaDiskReader {
     mapping: Option<FetchRange>,
+    worker_mapping: bool,
     file: Arc<dyn VfsFile>,
     offset: u64,
     end: u64,
@@ -287,7 +285,8 @@ struct PmaDiskReader {
 impl PmaDiskReader {
     fn open(file: &Arc<dyn VfsFile>, start: u64, end: u64, page_size: usize, map: PmaMap<'_>) -> SqlResult<Self> {
         let mapping = map.fetch(file, end)?;
-        Ok(Self { mapping, file: Arc::clone(file), offset: start, end, buffer_start: start,
+        Ok(Self { mapping, worker_mapping: matches!(map, PmaMap::Worker(_)),
+            file: Arc::clone(file), offset: start, end, buffer_start: start,
             buffer: Vec::new(), page_size })
     }
 
@@ -296,9 +295,16 @@ impl PmaDiskReader {
             return Err(pma_short_read());
         }
         if let Some(mapping) = &self.mapping {
-            mapping.copy_into(self.offset as usize, output)?;
-            self.offset += output.len() as u64;
-            return Ok(());
+            match mapping.copy_into(self.offset as usize, output) {
+                Ok(()) => {
+                    self.offset += output.len() as u64;
+                    return Ok(());
+                }
+                Err(error) if self.worker_mapping && mapping.can_buffer_after_copy_error(&error) => {
+                    self.mapping = None;
+                }
+                Err(error) => return Err(error),
+            }
         }
         while !output.is_empty() {
             let offset = (self.offset - self.buffer_start) as usize;

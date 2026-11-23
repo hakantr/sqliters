@@ -2677,3 +2677,8 @@ Toplam BINARY sıralamada rowid aynı tek tablo cursor’ının packed anahtar �
 ## V6b.474 — VACUUM kilit doğrulamasından sonra sürüm alanı ve WAL sırası
 
 Sıcak journal kararından sonra sürüm alanı WAL keşfinden önce okunuyor. 266, 3338 ve 522, gerçek peer WAL, retry ve 168 önceki dosya görüntüsü 22 hedef C sözleşmesiyle doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v471-vacuum-unknown-lock-version-order-candidate/sonuc.md) OFF 1345/0/325, ON 1345/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,287 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_474.md).
+
+
+## V6b.475 — Adlandırılmış işçi PMA dosyasında geç eşleme
+
+Kip başına 12 sonuç/reset profili, 50.642 VFS kaydı ve altı kopya EIO geri dönüşü doğrulandı. Sağlam dosyadan tamponlu okuma sonuçları koruyor. Fiziksel açma, unlink, mmap, munmap ve kapanış sayıları eş. [Bağımsız ölçüm](/github/sqliters/target/perf-work/worker-named-late-mmap-recovery-candidate/sonuc.md) OFF 1345/0/325, ON 1345/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,283 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_475.md).
