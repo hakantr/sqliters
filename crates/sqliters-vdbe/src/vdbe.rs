@@ -5678,13 +5678,15 @@ impl Vdbe {
                     let worker_count = host.sorter_worker_threads();
                     if !temp_in_memory && self.prog.fallible_sort_open().is_none()
                         && (k.enc == 1 || k.enc == host.text_encoding() as u8)
-                        && worker_count > 0 && (worker_count == 1 || host.sorter_mmap_limit() <= 0)
+                        && worker_count > 0 && (worker_count <= 2 || host.sorter_mmap_limit() <= 0)
                         && matches!(&op.p4, P4::KeyInfo(key) if worker_order_sorter(&self.prog, op, key,
                             |read, keys| host.sorter_has_worker_table_key(read, keys)))
                         && k.a_coll.iter().flatten().all(|coll| coll.is_binary && coll.custom.is_none())
                     {
                         sorter.enable_workers(worker_count as usize);
-                        if worker_count == 1 {
+                        // Two workers share the limit only when mapping is
+                        // already enabled at sorter open.
+                        if worker_count == 1 || (worker_count == 2 && host.sorter_mmap_limit() > 0) {
                             sorter.set_worker_mmap_limit(host.share_sorter_mmap_limit());
                         }
                     }

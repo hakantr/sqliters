@@ -2712,3 +2712,8 @@ Aynı tablonun packed fiziksel birincil anahtarı doğrulandı. Kip başına 144
 ## V6b.481 — Hazır V1 LIMIT/OFFSET tür uyuşmazlığı ve reset
 
 V1 hata adımı genel kodu, reset/finalize özgün 20 ve tanıyı veriyor. Açık ve otomatik tekrar dahil 1.536 API profili C ile eş. Dört Group65 testi iki kipte geçti ve altı dosya FK sağlığını korudu. [Bağımsız ölçüm](/github/sqliters/target/perf-work/prepared-limit-offset-lifecycle-candidate/sonuc.md) OFF 1351/0/325, ON 1351/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_481.md).
+
+
+## V6b.482 — İlk adımdan önce etkin iki işçili PMA mmap
+
+Kip başına 156 API profili, 60 kontrollü iz ve 2.494.892 VFS olayı C ile eş. 24 gerçek iki işçi, 14/778/266, reset ve FK dosya kontrolleri geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/two-worker-initial-mmap-rebased-candidate/sonuc.md) OFF 1351/0/325, ON 1351/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,266 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_482.md).

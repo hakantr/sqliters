@@ -324,7 +324,7 @@ pub(crate) fn worker_sort_read_program(
     // The standard machine prepare already handles the UTF-8 ON case.
     if (encoding == TextEncoding::Utf8 && exec_switch_on())
         || inner.db_set.worker_threads_limit <= 0 || inner.db_set.temp_store().is_memory()
-        || (inner.db_set.worker_threads_limit != 1 && inner.db_set.sorter_mmap_limit() > 0)
+        || (inner.db_set.worker_threads_limit > 2 && inner.db_set.sorter_mmap_limit() > 0)
         || inner.collations.get_custom("BINARY").is_some()
         || select.order_by.is_empty() || select.limit.is_some() || read_codegen_blocker(inner).is_some()
     {

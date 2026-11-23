@@ -3920,11 +3920,13 @@ fn group64_file_sorter_worker_uses_a_declared_not_null_unique_key() {
 
 #[test]
 fn group64_file_sorter_initial_mmap_preserves_worker_reset() {
-    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+    for (encoding, workers) in ["UTF-8", "UTF-16le", "UTF-16be"]
+        .into_iter().flat_map(|encoding| [(encoding, 1), (encoding, 2)])
+    {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(&format!(
             "PRAGMA page_size=512; PRAGMA encoding='{encoding}';
-             PRAGMA temp_store=FILE; PRAGMA cache_size=1; PRAGMA threads=1;
+             PRAGMA temp_store=FILE; PRAGMA cache_size=1; PRAGMA threads={workers};
              CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);
              WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<17)
              INSERT INTO items SELECT i, printf('x%26000s','z') FROM n;"
@@ -3934,10 +3936,10 @@ fn group64_file_sorter_initial_mmap_preserves_worker_reset() {
             let mut statement = db.prepare("SELECT id FROM items ORDER BY v,id DESC").unwrap();
             db.set_sorter_mmap_limit(i32::MAX).unwrap();
             let StepResult::Row(first) = statement.step().unwrap() else {
-                panic!("expected first row in {encoding}");
+                panic!("expected first row in {encoding} with {workers} workers");
             };
             assert_eq!(first.get_i64(0), Some(17));
-            assert!(statement.machine_stmt_status(4, false) > 0, "{encoding}");
+            assert!(statement.machine_stmt_status(4, false) > 0, "{encoding}/{workers}");
             statement.reset().unwrap();
             for id in (1..=17).rev() {
                 let StepResult::Row(row) = statement.step().unwrap() else {
