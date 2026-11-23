@@ -5538,6 +5538,7 @@ pub struct Statement {
     c_v1_expired_before_run: bool,
     c_v1_retained_expiry_diagnostic: bool,
     c_v1_app_aggregate_diagnostic: bool,
+    c_v1_write_constraint_diagnostic: bool,
     // A bind-triggered generated reprepare may consider a scoped partial-index value.
     c_write_expired_by_binding: bool,
     c_reprepare_count: u32,
@@ -9030,6 +9031,7 @@ impl Statement {
             c_v1_expired_before_run: false,
             c_v1_retained_expiry_diagnostic: false,
             c_v1_app_aggregate_diagnostic: false,
+            c_v1_write_constraint_diagnostic: false,
             c_write_expired_by_binding: false,
             c_reprepare_count: 0,
             c_reprepare_after_schema_check: false,
@@ -9490,6 +9492,10 @@ impl Statement {
         ran: bool,
         result: &Result<()>,
     ) {
+        if ran && self.c_v1_write_constraint_diagnostic && let Err(error) = result {
+            inner.transfer_c_read_error(Some(error));
+            return;
+        }
         if !ran || !inner.uses_default_interrupt_flag(shared) {
             return;
         }
@@ -9601,6 +9607,7 @@ impl Statement {
         };
         self.transfer_c_cleanup_diagnostic(inner, shared, ran, &result);
         self.c_v1_app_aggregate_diagnostic = false;
+        self.c_v1_write_constraint_diagnostic = false;
         result
     }
 
@@ -10375,6 +10382,8 @@ impl Statement {
             return Err(error);
         }
         if self.category == Some(StmtCategory::Write) {
+            self.c_v1_write_constraint_diagnostic = self.mode == PrepareMode::V1
+                && result.as_ref().is_err_and(|error| error.code == ErrorCode::Constraint);
             return result.map_err(|error| Self::write_step_error(inner, self.mode, error));
         }
         if (self.category == Some(StmtCategory::Read) || self.has_function_list_no_lock_program())
@@ -10403,11 +10412,9 @@ impl Statement {
     }
 
     fn write_step_error(inner: &ConnectionInner, mode: PrepareMode, error: SqliteError) -> SqliteError {
-        if mode == PrepareMode::V1
-            && (error.code == ErrorCode::Full || error.extended_code == extended::SQLITE_CONSTRAINT_FOREIGNKEY)
-        {
+        if mode == PrepareMode::V1 && matches!(error.code, ErrorCode::Full | ErrorCode::Constraint) {
             // V1 reports the generic step result while the statement stores its own error.
-            return inner.legacy_c_step_error();
+            return inner.legacy_c_step_error().with_conflict_effect(error.conflict_effect);
         }
         error
     }
@@ -10452,6 +10459,7 @@ impl Statement {
         self.c_v1_expired_before_run = false;
         self.c_v1_retained_expiry_diagnostic = false;
         self.c_v1_app_aggregate_diagnostic = false;
+        self.c_v1_write_constraint_diagnostic = false;
 
         // Empty / comment-only SQL (`stmt.is_none()` with no parsed statement)
         if self.stmt.is_none() && matches!(parse_one(&self.raw_sql), Ok((None, _))) {

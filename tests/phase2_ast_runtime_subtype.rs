@@ -3781,3 +3781,32 @@ fn group64_file_sorter_worker_four_through_eight_keys() {
         }
     }
 }
+
+#[test]
+fn group65_legacy_write_constraints_keep_the_reset_diagnostic() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch("CREATE TABLE items(id INTEGER PRIMARY KEY, tag TEXT UNIQUE);
+                      INSERT INTO items VALUES(1,'present');").unwrap();
+    let mut stmt = db.prepare_v1("INSERT INTO items VALUES(2,'present') RETURNING id").unwrap();
+
+    let first = stmt.step().unwrap_err();
+    assert_eq!((first.extended_code, first.message.as_str()), (1, "SQL logic error"));
+    let reset = stmt.reset().unwrap_err();
+    assert_eq!(reset.extended_code, 2067);
+    assert_eq!(reset.message, "UNIQUE constraint failed: items.tag");
+    let retry = stmt.step().unwrap_err();
+    assert_eq!((retry.extended_code, retry.message.as_str()), (1, reset.message.as_str()));
+    let finalized = stmt.finalize().unwrap_err();
+    assert_eq!((finalized.extended_code, finalized.message), (2067, reset.message));
+
+    assert_eq!(db.query_row("SELECT count(*) FROM items", &[]).unwrap().unwrap().get_i64(0), Some(1));
+
+    let mut partial = db.prepare_v1(
+        "INSERT OR FAIL INTO items VALUES(2,'new'), (3,'present')",
+    ).unwrap();
+    let error = partial.step().unwrap_err();
+    assert_eq!(error.extended_code, 1);
+    assert_eq!(error.conflict_effect, sqliters::ConflictResolutionEffect::Fail);
+    assert_eq!(partial.finalize().unwrap_err().extended_code, 2067);
+    assert_eq!(db.query_row("SELECT count(*) FROM items", &[]).unwrap().unwrap().get_i64(0), Some(2));
+}
