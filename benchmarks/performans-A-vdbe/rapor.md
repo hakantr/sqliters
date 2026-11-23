@@ -2722,3 +2722,8 @@ Kip başına 156 API profili, 60 kontrollü iz ve 2.494.892 VFS olayı C ile eş
 ## V6b.483 — Hazır V1 olağan yazmada otomatik reset tanısı
 
 Otomatik reset önceki gerçek kısıt mesajını koruyor. Her kipte 42 C profili ve 21 önceki tanı farkı, sayaç, satır, işlem ve beş Group65 testi doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/plain-write-autoreset-candidate/sonuc.md) OFF 1352/0/325, ON 1352/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,267 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_483.md).
+
+
+## V6b.484 — İki işçide ilk satırdan sonra PMA mmap
+
+Sıfır başlangıçta iki işçi güncel limit ile sonraki PMA aralığını açıyor. Kip başına 144 C API profili, 96 kontrollü iz ve 3.830.224 VFS olayı eş. İlk satır öncesi iz, gerçek aktif işçi, FK ve 266 fallback denetimleri geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/two-worker-late-mmap-preflight/sonuc.md) OFF 1353/0/325, ON 1353/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,272 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_484.md).

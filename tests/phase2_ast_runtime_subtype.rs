@@ -3330,13 +3330,22 @@ fn group65_function_list_table_checks_inner_authorizer_on_each_filter() {
 
 #[test]
 fn group64_file_sorter_late_mmap_opt_in_with_one_worker() {
+    check_file_sorter_late_mmap_opt_in(1);
+}
+
+#[test]
+fn group64_file_sorter_late_mmap_opt_in_with_two_workers() {
+    check_file_sorter_late_mmap_opt_in(2);
+}
+
+fn check_file_sorter_late_mmap_opt_in(workers: u8) {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(
-        "PRAGMA page_size=512; PRAGMA temp_store=FILE; PRAGMA cache_size=1; PRAGMA threads=1;
+    db.execute_batch(&format!(
+        "PRAGMA page_size=512; PRAGMA temp_store=FILE; PRAGMA cache_size=1; PRAGMA threads={workers};
          CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);
          WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<53)
          INSERT INTO items SELECT i,printf('%03d%8190s',i,'x') FROM n;"
-    ).unwrap();
+    )).unwrap();
     let mut statement = db.prepare(
         "SELECT id FROM items ORDER BY v COLLATE BINARY NULLS LAST,id"
     ).unwrap();
