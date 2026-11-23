@@ -701,31 +701,34 @@ impl Btree {
                     // SQLITE_DIRECT_OVERFLOW_READ: (1) read (2) offset==0 (3,4,5) the pager
                     // allows it (6) at least 4 bytes have already been written to the buffer.
                     let direct = offset == 0 && out >= 4 && self.pager.direct_overflow_read_ok(next_page);
-                    let source = if direct {
-                        None
+                    if direct {
+                        // accessPayload reads a+4 bytes at the page start. Preserve
+                        // the preceding four payload bytes used for the link.
+                        let start = out - 4;
+                        let read_buf = &mut buf[start..out + a as usize];
+                        let saved = [read_buf[0], read_buf[1], read_buf[2], read_buf[3]];
+                        let result = self.pager.read_direct_overflow_prefix(next_page, read_buf);
+                        let link = get4(read_buf, 0);
+                        read_buf[..4].copy_from_slice(&saved);
+                        result?;
+                        next_page = link;
                     } else {
-                        Some(self.pager.pin_readonly_page(next_page)?)
-                    };
-                    let raw = match source {
-                        Some(source) => self.pager.pinned_page(next_page, source),
-                        None => self.pager.read_page_unchecked(next_page),
-                    };
-                    let res = match raw {
-                        Ok(d) => {
-                            let s = offset as usize + 4;
-                            if s + a as usize > d.len() {
-                                Err(corrupt())
-                            } else {
-                                buf[out..out + a as usize].copy_from_slice(&d[s..s + a as usize]);
-                                Ok(get4(d, 0))
+                        let source = self.pager.pin_readonly_page(next_page)?;
+                        let res = match self.pager.pinned_page(next_page, source) {
+                            Ok(d) => {
+                                let s = offset as usize + 4;
+                                if s + a as usize > d.len() {
+                                    Err(corrupt())
+                                } else {
+                                    buf[out..out + a as usize].copy_from_slice(&d[s..s + a as usize]);
+                                    Ok(get4(d, 0))
+                                }
                             }
-                        }
-                        Err(e) => Err(e),
-                    };
-                    if let Some(source) = source {
+                            Err(e) => Err(e),
+                        };
                         self.pager.unpin_page(next_page, source);
+                        next_page = res?;
                     }
-                    next_page = res?;
                     offset = 0;
                     amt -= a;
                     if amt == 0 {

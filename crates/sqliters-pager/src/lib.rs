@@ -1645,6 +1645,23 @@ impl Pager {
         true
     }
 
+    /// Read an overflow page prefix when direct_overflow_read_ok permits it.
+    #[doc(hidden)]
+    pub fn read_direct_overflow_prefix(&self, pgno: Pgno, buf: &mut [u8]) -> Result<()> {
+        self.ensure_not_closed()?;
+        if pgno == 0 || pgno > self.page_count || pgno == self.lock_byte_page() {
+            return Err(SqliteError::corrupt(format!("invalid overflow page {pgno}")));
+        }
+        let offset = u64::from(pgno - 1) * u64::from(self.page_size());
+        let read = self.db_file()?.read_at(buf, offset)?;
+        if read != buf.len() {
+            return Err(SqliteError::with_extended(
+                extended::SQLITE_IOERR_SHORT_READ, ErrorCode::IoErr.as_str(),
+            ));
+        }
+        Ok(())
+    }
+
     /// [`Self::page_ref`] for a page that is used as a b-tree page (`getAndInitPage` →
     /// `btreeInitPage`): with `PRAGMA cell_size_check` on, a page that has to be loaded is
     /// validated; a page that fails is not kept and the call fails with `SQLITE_CORRUPT`.
