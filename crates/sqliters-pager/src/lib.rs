@@ -3624,6 +3624,22 @@ impl Pager {
         Ok(true)
     }
 
+    // lockBtree uses the logical count in a current Page 1, bounded by
+    // the pager's readable extent (which may come from the WAL commit).
+    fn wal_logical_page_count(header: &DatabaseHeader, extent: Pgno, writable_schema: bool) -> Result<Pgno> {
+        let logical = header.database_size_pages;
+        if logical == 0 || header.change_counter != header.version_valid_for {
+            return Ok(extent.max(1));
+        }
+        if extent > 0 && logical > extent {
+            if writable_schema {
+                return Ok(extent);
+            }
+            return Err(SqliteError::corrupt("database header page count exceeds file size"));
+        }
+        Ok(logical)
+    }
+
     fn begin_read_under_shared_lock(&mut self, retained_reader: bool, snapshot_established: &mut bool) -> Result<()> {
         if (self.is_memdb_backing && self.header_loaded)
             || (self.db_kind == DatabaseKind::PrivateTemporary && self.file.is_none())
@@ -3845,13 +3861,14 @@ impl Pager {
             self.bump_data_version();
         }
 
+        let previous_extent = self.db_size;
         let wal_pages = self.wal.as_ref().unwrap().db_size();
         if wal_pages > 0 { self.db_size = wal_pages; }
         if !changed
             && self.header_loaded
             && self.page_size_fixed
             && wal_pages > 0
-            && self.page_count == wal_pages
+            && previous_extent == wal_pages
         {
             return Ok(());
         }
@@ -3895,27 +3912,12 @@ impl Pager {
             self.readonly = true;
         }
 
-        let effective_pages = if wal_pages > 0 {
+        let extent = if wal_pages > 0 {
             wal_pages
         } else {
-            let ps = u64::from(snap_hdr.page_size);
-            let file_pages = (file_len.div_ceil(ps)) as Pgno;
-            if snap_hdr.database_size_pages == 0
-                || snap_hdr.change_counter != snap_hdr.version_valid_for
-            {
-                file_pages.max(1)
-            } else if snap_hdr.database_size_pages > file_pages && file_pages > 0 {
-                if self.writable_schema {
-                    file_pages
-                } else {
-                    return Err(SqliteError::corrupt(
-                        "database header page count exceeds file size",
-                    ));
-                }
-            } else {
-                snap_hdr.database_size_pages
-            }
+            file_len.div_ceil(u64::from(snap_hdr.page_size)) as Pgno
         };
+        let effective_pages = Self::wal_logical_page_count(&snap_hdr, extent, self.writable_schema)?;
         snap_hdr.database_size_pages = effective_pages;
 
         let invalidate_cache = changed
@@ -5717,10 +5719,23 @@ impl Pager {
                 let ps = self.header.page_size;
                 let w_sync = self.wal_sync_flags();
                 let c_sync = self.ckpt_sync_flags();
-                let effective_n_truncate = if self.page_count == lock_byte_pgno {
-                    self.page_count - 1
+                // Keep the extent of an existing committed WAL snapshot
+                // when a logical header has fewer pages. Real shrink and raw
+                // image copies still publish their chosen image size.
+                let extent = if self.db_kind == DatabaseKind::NamedDisk
+                    && self.journal_mode == JournalMode::Wal
+                    && !self.image_truncated
+                    && !self.staged_raw_copy
+                    && self.page_count >= self.tx_orig_page_count
+                {
+                    self.page_count.max(self.wal.as_ref().expect("use_wal checked").db_size())
                 } else {
                     self.page_count
+                };
+                let effective_n_truncate = if extent == lock_byte_pgno {
+                    extent - 1
+                } else {
+                    extent
                 };
 
                 {
@@ -7823,6 +7838,29 @@ impl Drop for Pager {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn wal_logical_page_count_checks_page_one_against_commit_extent() {
+        let mut header = DatabaseHeader {
+            change_counter: 9,
+            version_valid_for: 9,
+            database_size_pages: 4,
+            ..DatabaseHeader::default()
+        };
+        assert_eq!(Pager::wal_logical_page_count(&header, 17, false).unwrap(), 4);
+        assert_eq!(Pager::wal_logical_page_count(&header, 4, false).unwrap(), 4);
+        assert_eq!(
+            Pager::wal_logical_page_count(&header, 3, false).unwrap_err().code,
+            ErrorCode::Corrupt,
+        );
+        assert_eq!(Pager::wal_logical_page_count(&header, 3, true).unwrap(), 3);
+        header.version_valid_for = 8;
+        assert_eq!(Pager::wal_logical_page_count(&header, 17, false).unwrap(), 17);
+        assert_eq!(Pager::wal_logical_page_count(&header, 3, false).unwrap(), 3);
+        header.version_valid_for = 9;
+        header.database_size_pages = 0;
+        assert_eq!(Pager::wal_logical_page_count(&header, 17, false).unwrap(), 17);
+    }
 
     #[test]
     fn test_pager_commit_rollback_and_savepoints() {
