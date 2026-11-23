@@ -2707,3 +2707,8 @@ Geçerli Page 1 sayısı ile WAL commit extent ayrıldı. 45 çapraz açılışt
 ## V6b.480 — WITHOUT ROWID BINARY PK sıralamasında işçi PMA
 
 Aynı tablonun packed fiziksel birincil anahtarı doğrulandı. Kip başına 144 profil, 73.944 C adımı, 72 ilk satır reseti ve 96.530 VFS olayı eş. Önceki 60 guard ve altı fiziksel FK kontrolü geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/worker-without-rowid-pk-rebased-candidate/sonuc.md) OFF 1350/0/325, ON 1350/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_480.md).
+
+
+## V6b.481 — Hazır V1 LIMIT/OFFSET tür uyuşmazlığı ve reset
+
+V1 hata adımı genel kodu, reset/finalize özgün 20 ve tanıyı veriyor. Açık ve otomatik tekrar dahil 1.536 API profili C ile eş. Dört Group65 testi iki kipte geçti ve altı dosya FK sağlığını korudu. [Bağımsız ölçüm](/github/sqliters/target/perf-work/prepared-limit-offset-lifecycle-candidate/sonuc.md) OFF 1351/0/325, ON 1351/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,271 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_481.md).

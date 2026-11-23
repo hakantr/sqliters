@@ -3982,3 +3982,33 @@ fn group64_file_sorter_worker_uses_without_rowid_physical_primary_key() {
         statement.reset().unwrap();
     }
 }
+
+#[test]
+fn group65_legacy_limit_mismatch_transfers_diagnostic_on_reset() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch("CREATE TABLE items(id INTEGER PRIMARY KEY); INSERT INTO items VALUES(1),(2);").unwrap();
+    let sql = "SELECT id FROM items ORDER BY id LIMIT ?1 OFFSET ?2";
+    let mut stmt = db.prepare_v1(sql).unwrap();
+    stmt.bind(1, 2).unwrap().bind(2, "bad offset").unwrap();
+
+    let first = stmt.step().unwrap_err();
+    assert_eq!((first.extended_code, first.message.as_str()), (1, "SQL logic error"));
+    let automatic = stmt.step().unwrap_err();
+    assert_eq!((automatic.extended_code, automatic.message.as_str()), (1, "datatype mismatch"));
+    let reset = stmt.reset().unwrap_err();
+    assert_eq!((reset.extended_code, reset.message.as_str()), (20, "datatype mismatch"));
+    let next = stmt.step().unwrap_err();
+    assert_eq!((next.extended_code, next.message.as_str()), (1, "datatype mismatch"));
+    assert_eq!(stmt.finalize().unwrap_err().extended_code, 20);
+
+    let mut stmt = db.prepare(sql).unwrap();
+    stmt.bind(1, 2).unwrap().bind(2, "bad offset").unwrap();
+    assert_eq!(stmt.step().unwrap_err().extended_code, 20);
+    assert_eq!(stmt.reset().unwrap_err().extended_code, 20);
+    stmt.bind(2, 1).unwrap();
+    let StepResult::Row(row) = stmt.step().unwrap() else {
+        panic!("expected row after rebinding OFFSET");
+    };
+    assert_eq!(row.get_i64(0), Some(2));
+    stmt.finalize().unwrap();
+}

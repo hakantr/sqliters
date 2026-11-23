@@ -9086,7 +9086,14 @@ impl Statement {
         !matches!(self.lifecycle, StatementLifecycle::Ready) && !self.c_v1_expired_before_run
     }
 
-    /// A legacy step can autoreset a previously run statement before checking expiry.
+    fn c_legacy_read_mismatch(&self, error: Option<&SqliteError>) -> bool {
+        self.mode == PrepareMode::V1
+            && self.category == Some(StmtCategory::Read)
+            && !self.read_io_during_prepare
+            && error.is_some_and(|error| error.code == ErrorCode::Mismatch)
+    }
+
+    /// A legacy step can autoreset a previously run statement and transfer its diagnostic.
     #[doc(hidden)]
     pub fn c_legacy_autoreset_transfers_diagnostic(&self) -> bool {
         let StatementLifecycle::Halted { last_error } = &self.lifecycle else {
@@ -9095,6 +9102,7 @@ impl Statement {
         self.mode == PrepareMode::V1
             && !self.c_v1_expired_before_run
             && (self.is_journal_mode_pragma()
+                || self.c_legacy_read_mismatch(last_error.as_ref())
                 || self.expired
                     && last_error.as_ref().is_some_and(|error| error.code == ErrorCode::Schema))
     }
@@ -9492,7 +9500,10 @@ impl Statement {
         ran: bool,
         result: &Result<()>,
     ) {
-        if ran && self.c_v1_write_constraint_diagnostic && let Err(error) = result {
+        if ran
+            && let Err(error) = result
+            && (self.c_v1_write_constraint_diagnostic || self.c_legacy_read_mismatch(Some(error)))
+        {
             inner.transfer_c_read_error(Some(error));
             return;
         }
@@ -10268,6 +10279,8 @@ impl Statement {
             && self.category == Some(StmtCategory::Read)
             && !self.expired
             && self.compiled_fast_read.is_some()
+            && !matches!(&self.lifecycle, StatementLifecycle::Halted { last_error }
+                if self.c_legacy_read_mismatch(last_error.as_ref()))
         {
             let mode = self.mode;
             let fast_read_res = {
@@ -10425,6 +10438,9 @@ impl Statement {
         mode: PrepareMode,
         error: SqliteError,
     ) -> SqliteError {
+        if mode == PrepareMode::V1 && error.code == ErrorCode::Mismatch {
+            return inner.legacy_c_step_error();
+        }
         if mode == PrepareMode::V1 && error.code == ErrorCode::Auth && inner.authorizer.is_some() {
             // A nested PRAGMA authorization failure is retained for reset/finalize.
             return inner.legacy_c_step_error();
@@ -10452,8 +10468,11 @@ impl Statement {
             return Err(SqliteError::misuse("statement already finalized"));
         };
 
-        // Autoreset if previously `Halted` (`Done` or post-error): internal rewind preserving `params`!
-        if matches!(self.lifecycle, StatementLifecycle::Halted { .. }) {
+        // Autoreset a completed execution while retaining its bindings.
+        if let StatementLifecycle::Halted { last_error } = &self.lifecycle {
+            if self.c_legacy_read_mismatch(last_error.as_ref()) {
+                inner.transfer_c_read_error(last_error.as_ref());
+            }
             self.lifecycle = StatementLifecycle::Ready;
         }
         self.c_v1_expired_before_run = false;
