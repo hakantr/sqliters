@@ -10409,6 +10409,10 @@ impl Statement {
             return Err(error);
         }
         if self.category == Some(StmtCategory::Write) {
+            if matches!(result, Ok(StepResult::Done)) && self.is_application_header_write() {
+                // A successful pragma.c HEADER_VALUE setter is run-only-once.
+                self.expired = true;
+            }
             self.c_v1_write_constraint_diagnostic = self.mode == PrepareMode::V1
                 && result.as_ref().is_err_and(|error| error.code == ErrorCode::Constraint);
             return result.map_err(|error| Self::write_step_error(inner, self.mode, error));
@@ -10432,6 +10436,11 @@ impl Statement {
         self.category == Some(StmtCategory::NoLockPragma)
             && self.c_machine.is_some()
             && is_function_list_pragma(self.stmt.as_ref())
+    }
+
+    fn is_application_header_write(&self) -> bool {
+        matches!(self.stmt.as_ref(), Some(Stmt::Pragma { name, value: Some(_), .. })
+            if name.eq_ignore_ascii_case("user_version") || name.eq_ignore_ascii_case("application_id"))
     }
 
     fn is_journal_mode_pragma(&self) -> bool {
@@ -10826,7 +10835,10 @@ impl Statement {
                     && inner.c_function_expire_seq.is_some_and(|seq| {
                         seq == inner.db_set.c_expire_seq() && self.compiled_c_expire_seq != seq
                     });
-                if expired_before_run && (prepared_function_list || flag_pragma_expired || function_expired) {
+                let header_write_expired = self.expired && self.is_application_header_write();
+                if expired_before_run
+                    && (prepared_function_list || flag_pragma_expired || function_expired || header_write_expired)
+                {
                     // Legacy step leaves the connection diagnostic unchanged.
                     // Reset and finalize still return the statement's SQLITE_SCHEMA.
                     self.c_v1_retained_expiry_diagnostic = true;

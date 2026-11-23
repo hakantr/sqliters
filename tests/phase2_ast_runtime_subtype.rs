@@ -4597,3 +4597,51 @@ fn group65_trim_and_case_preserve_text_register_bytes_after_reset() {
         assert!(matches!(statement.step().unwrap(), StepResult::Done));
     }
 }
+
+#[test]
+fn group65_application_header_writes_expire_but_header_reads_reuse() {
+    for name in ["user_version", "application_id"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE t(i INTEGER PRIMARY KEY);").unwrap();
+        let set = format!("PRAGMA main.{name}=65");
+        let read = format!("PRAGMA main.{name}");
+        let value = || db.query(&read, &[]).unwrap().rows[0].get_i64(0).unwrap();
+
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut legacy = db.prepare_v1(&set).unwrap();
+        legacy.reset().unwrap();
+        assert!(matches!(legacy.step().unwrap(), StepResult::Done));
+        legacy.reset().unwrap();
+        assert_eq!(value(), 65);
+        db.execute_batch("ROLLBACK; BEGIN IMMEDIATE").unwrap();
+        assert_eq!(value(), 0);
+        let expired = legacy.step().unwrap_err();
+        assert_eq!((expired.code, expired.c_offset()), (ErrorCode::Error, -1));
+        assert!(legacy.c_v1_expired_before_run());
+        let reset = legacy.reset().unwrap_err();
+        assert_eq!(
+            (reset.code, reset.message.as_str(), reset.c_offset()),
+            (ErrorCode::Schema, expired.message.as_str(), -1),
+        );
+        assert_eq!(value(), 0);
+        assert_eq!(legacy.step().unwrap_err().code, ErrorCode::Error);
+        assert_eq!(legacy.finalize().unwrap_err().code, ErrorCode::Schema);
+        db.execute_batch("ROLLBACK").unwrap();
+
+        let mut current = db.prepare(&set).unwrap();
+        assert!(matches!(current.step().unwrap(), StepResult::Done));
+        current.reset().unwrap();
+        assert_eq!(current.c_reprepare_status().0, 0);
+        assert!(matches!(current.step().unwrap(), StepResult::Done));
+        assert_eq!(current.c_reprepare_status().0, 1);
+        current.finalize().unwrap();
+
+        let mut reader = db.prepare_v1(&read).unwrap();
+        for _ in 0..2 {
+            let StepResult::Row(row) = reader.step().unwrap() else { panic!("expected header value") };
+            assert_eq!(row.get_i64(0), Some(65));
+            reader.reset().unwrap();
+        }
+        reader.finalize().unwrap();
+    }
+}
