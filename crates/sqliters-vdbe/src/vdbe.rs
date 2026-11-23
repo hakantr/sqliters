@@ -4100,15 +4100,16 @@ impl Vdbe {
 
                 OP_BeginSubrtn | OP_Null => {
                     let null_flag = if op.p1 != 0 { MEM_NULL | MEM_CLEARED } else { MEM_NULL };
-                    let mut cnt = op.p3 - op.p2;
-                    let mut i = op.p2 as usize;
-                    self.a_mem[i].set_null();
-                    self.a_mem[i].flags = null_flag;
-                    while cnt > 0 {
-                        i += 1;
+                    for i in op.p2 as usize..=op.p2.max(op.p3) as usize {
+                        if self.a_mem[i].flags & MEM_AGG != 0
+                            && let Some(AggCtx::Host(Some(id))) =
+                                self.a_agg.get_mut(i).and_then(Option::take)
+                        {
+                            // sqlite3VdbeMemSetNull releases the previous accumulator.
+                            let _ = host.agg_finalize(id);
+                        }
                         self.a_mem[i].set_null();
                         self.a_mem[i].flags = null_flag;
-                        cnt -= 1;
                     }
                 }
 

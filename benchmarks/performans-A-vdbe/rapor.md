@@ -2597,3 +2597,8 @@ Hazır SELECT fonksiyon değişikliğiyle süre dışı kalınca V1 adımı önc
 ## V6b.458 — Geç VACUUM truncate hatası ve aynı bağlantının yeniden kullanımı
 
 DELETE journal sonlandırıldıktan sonra geç fiziksel kısaltma hata verirse ilk hata korunur. Olağan pager toparlanması tamamlandığında C gibi aynı bağlantı yeniden kullanılabilir. FK, veri, şema ve hazır V2 yeniden hazırlama kontrolü geçti. Önceki hata, sıcak journal ve ikinci temizlik hatası denetimleri korundu. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v458-vacuum-late-truncate-candidate/sonuc.md) OFF 1335/0/325, ON 1335/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,276 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_458.md).
+
+
+## V6b.459 — Pencere bölmesi geçişinde xFinal
+
+UTF-8 makine yolunda bölme sonlandırması, ilk satırlar, kısmi reset ve finalize 12 C profili ve 136 olayda eşleşti. İki eski fark kapandı. OFF ve UTF-16 ON yollarında 60 önceki kayıt korundu. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v459-window-partition-cleanup-candidate/sonuc.md) OFF 1336/0/325, ON 1336/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,265 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_459.md).

@@ -3415,3 +3415,65 @@ fn group65_legacy_window_replacement_preserves_expiry_diagnostic() {
     assert_eq!(row.get_i64(0), Some(201));
     assert_eq!(modern.c_reprepare_status().0, 1);
 }
+
+#[test]
+fn group65_machine_window_finalizes_accumulator_before_next_partition() {
+    struct Window {
+        total: i64,
+        finalized: Arc<AtomicUsize>,
+    }
+
+    impl sqliters::WindowAggregateInstance for Window {
+        fn step(&mut self, args: &[RuntimeValue]) -> sqliters::Result<()> {
+            if let Value::Integer(value) = args[0].value {
+                self.total += value;
+            }
+            Ok(())
+        }
+
+        fn inverse(&mut self, args: &[RuntimeValue]) -> sqliters::Result<()> {
+            if let Value::Integer(value) = args[0].value {
+                self.total -= value;
+            }
+            Ok(())
+        }
+
+        fn value(&self) -> sqliters::Result<RuntimeValue> {
+            Ok(RuntimeValue::plain(Value::Integer(self.total)))
+        }
+
+        fn finalize(&mut self) -> sqliters::Result<RuntimeValue> {
+            self.finalized.fetch_add(1, AtomicOrdering::Relaxed);
+            self.value()
+        }
+    }
+
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch("CREATE TABLE v(i INTEGER PRIMARY KEY, a INTEGER);
+                      INSERT INTO v VALUES(1,1),(2,2),(3,3),(4,4),(5,5);").unwrap();
+    let finalized = Arc::new(AtomicUsize::new(0));
+    let counter = finalized.clone();
+    db.create_window_function("win", 1, FunctionFlags::NONE, move || Box::new(Window {
+        total: 0,
+        finalized: counter.clone(),
+    })).unwrap();
+    let mut stmt = db.prepare(
+        "SELECT win(a) OVER(PARTITION BY i%2 ORDER BY i
+                             ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM v"
+    ).unwrap();
+    let machine = stmt.c_program_for_testing().is_some();
+    if std::env::var_os("SQLITERS_VDBE_EXEC").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        assert!(machine);
+    }
+    for (position, expected) in [2, 6, 1].into_iter().enumerate() {
+        let StepResult::Row(row) = stmt.step().unwrap() else {
+            panic!("missing window result");
+        };
+        assert_eq!(row.get_i64(0), Some(expected));
+        if machine {
+            assert_eq!(finalized.load(AtomicOrdering::Relaxed), usize::from(position == 2));
+        }
+    }
+    stmt.finalize().unwrap();
+    assert_eq!(finalized.load(AtomicOrdering::Relaxed), 2);
+}
