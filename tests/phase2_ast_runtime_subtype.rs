@@ -695,6 +695,46 @@ fn group46_connection_disjoint_borrows_custom_functions_collations_progress_and_
 // ============================================================================
 
 #[test]
+fn group64_active_scalar_replacement_and_deletion_are_busy() {
+    use sqliters::{FunctionFlags, RuntimeValue, StepResult, Value};
+
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1), (2), (3)")
+        .unwrap();
+    let define = |name: &str, arity, value| {
+        conn.register_scalar_function(name, arity, FunctionFlags::NONE, move |_| {
+            Ok(RuntimeValue::plain(Value::Integer(value)))
+        })
+    };
+    for (name, arity) in [("held_fixed", 1), ("held_variadic", -1)] {
+        define(name, arity, 11).unwrap();
+        let sql = format!("SELECT {name}(id) FROM t ORDER BY id");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let read = |stmt: &mut sqliters::Statement, expected| {
+            let StepResult::Row(row) = stmt.step().unwrap() else { panic!("expected a row") };
+            assert_eq!(row.get_i64(0), Some(expected));
+        };
+        read(&mut stmt, 11);
+        let replace = define(&name.to_ascii_uppercase(), arity, 22).unwrap_err();
+        let remove = conn.unregister_scalar_function(name, arity).unwrap_err();
+        assert_eq!(replace.code, ErrorCode::Busy);
+        assert_eq!(remove, replace);
+        assert_eq!(replace.message, "unable to delete/modify user-function due to active statements");
+        read(&mut stmt, 11);
+        read(&mut stmt, 11);
+        assert!(matches!(stmt.step().unwrap(), StepResult::Done));
+
+        stmt.reset().unwrap();
+        read(&mut stmt, 11);
+        stmt.reset().unwrap();
+        define(name, arity, 22).unwrap();
+        read(&mut stmt, 22);
+        stmt.finalize().unwrap();
+        assert!(conn.unregister_scalar_function(name, arity).unwrap());
+    }
+}
+
+#[test]
 fn group64_ast_structural_qualified_names_and_attach_detach() {
     // 1. ATTACH / DETACH AST
     let (s_att, _) = parse_one("ATTACH DATABASE 'aux.db' AS aux KEY 'k1';").unwrap();

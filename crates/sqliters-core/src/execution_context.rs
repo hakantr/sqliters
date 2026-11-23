@@ -280,6 +280,12 @@ impl FunctionRegistry {
         removed
     }
 
+    /// Finds a registration by its declared arity, including a variadic declaration.
+    pub(crate) fn has_scalar_overload(&self, name: &str, arity: Option<usize>) -> bool {
+        with_ascii_upper_key(name, |key| self.scalars.get(key))
+            .is_some_and(|overloads| overloads.iter().any(|def| def.arity == arity))
+    }
+
     /// Returns `true` if any scalar overload with `name` (ASCII case-insensitive) is registered.
     #[inline]
     pub fn has_scalar_name(&self, name: &str) -> bool {

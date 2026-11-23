@@ -1729,6 +1729,17 @@ impl ConnectionInner {
         }
     }
 
+    fn check_active_scalar_change(&self, name: &str, arity: Option<usize>) -> Result<()> {
+        // sqlite3CreateFunc rejects a change to an existing definition while a VM is active.
+        if !self.activity.leases.is_empty() && self.functions.has_scalar_overload(name, arity) {
+            return Err(SqliteError::new(
+                ErrorCode::Busy,
+                "unable to delete/modify user-function due to active statements",
+            ));
+        }
+        Ok(())
+    }
+
     /// main.c:2940–2952: only replacing/removing an existing xCmp expires VMs.
     fn prepare_collation_change(&mut self, name: &str) -> Result<()> {
         if self.collations.has_registration_comparator(name) {
@@ -4660,6 +4671,7 @@ impl Connection {
         let mut session = self.shared.enter()?;
         let inner = session.inner_mut();
         inner.ensure_usable()?;
+        inner.check_active_scalar_change(name, arity)?;
         inner.functions.register_scalar(name, arity, flags, func);
         inner.schema_generation += 1;
         inner.v1_expire_generation += 1;
@@ -4690,6 +4702,7 @@ impl Connection {
         let mut session = self.shared.enter()?;
         let inner = session.inner_mut();
         inner.ensure_usable()?;
+        inner.check_active_scalar_change(name, arity)?;
         let removed = inner.functions.unregister_scalar(name, arity);
         if removed {
             inner.schema_generation += 1;
