@@ -4,7 +4,7 @@
 //! `std::panic::catch_unwind` isolation and reentrancy protection (`sqlite/src/auth.c`, `main.c`).
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::{cell::Cell, collections::HashMap, rc::Rc};
 
 use sqliters_syntax::{
     AlterTableAction, BinaryOp, ColumnRef, CommonTableExpr, CreateIndexStmt, CreateTableStmt,
@@ -263,6 +263,13 @@ impl AuthorizerSlot {
     }
 }
 
+#[derive(Debug)]
+struct PragmaReadUsage {
+    source_name: String,
+    schema: Option<String>,
+    columns_read: Cell<bool>,
+}
+
 #[derive(Clone, Debug)]
 struct AuthSourceTable {
     db_id: Option<DatabaseId>,
@@ -274,11 +281,18 @@ struct AuthSourceTable {
     ipk_column: Option<String>,
     /// `true` for physical tables and views (which fire `SQLITE_READ`), `false` for CTEs and subqueries.
     fires_read: bool,
+    pragma_read_usage: Option<Rc<PragmaReadUsage>>,
     /// `true` for `OLD` / `NEW` trigger pseudo-relations which only match qualified `OLD.x` / `NEW.x`.
     qualified_only: bool,
 }
 
 impl AuthSourceTable {
+    fn note_column_read(&self) {
+        if let Some(usage) = &self.pragma_read_usage {
+            usage.columns_read.set(true);
+        }
+    }
+
     fn matches_qualifier(&self, schema_q: Option<&str>, table_q: &str) -> bool {
         if let Some(sq) = schema_q {
             if self.alias.is_some() {
@@ -397,6 +411,7 @@ impl<'a> AuthWalkCtx<'a> {
                     has_rowid: false,
                     ipk_column: None,
                     fires_read: false,
+                    pragma_read_usage: None,
                     qualified_only: false,
                 },
                 None,
@@ -426,6 +441,7 @@ impl<'a> AuthWalkCtx<'a> {
                     has_rowid: true,
                     ipk_column: None,
                     fires_read: true,
+                    pragma_read_usage: None,
                     qualified_only: false,
                 },
                 None,
@@ -451,6 +467,7 @@ impl<'a> AuthWalkCtx<'a> {
                             has_rowid: !tbl.without_rowid,
                             ipk_column: ipk,
                             fires_read: true,
+                            pragma_read_usage: None,
                             qualified_only: false,
                         },
                         None,
@@ -491,6 +508,7 @@ impl<'a> AuthWalkCtx<'a> {
                             has_rowid: false,
                             ipk_column: None,
                             fires_read: true,
+                            pragma_read_usage: None,
                             qualified_only: false,
                         },
                         rewritten_view_select,
@@ -520,6 +538,11 @@ impl<'a> AuthWalkCtx<'a> {
                     has_rowid: !table.without_rowid,
                     ipk_column: None,
                     fires_read: true,
+                    pragma_read_usage: Some(Rc::new(PragmaReadUsage {
+                        source_name: qn.name.clone(),
+                        schema: qn.schema.clone(),
+                        columns_read: Cell::new(false),
+                    })),
                     qualified_only: false,
                 },
                 None,
@@ -542,6 +565,7 @@ impl<'a> AuthWalkCtx<'a> {
                 has_rowid: true,
                 ipk_column: None,
                 fires_read: true,
+                pragma_read_usage: None,
                 qualified_only: false,
             },
             None,
@@ -936,6 +960,7 @@ impl<'a> AuthWalkCtx<'a> {
             has_rowid: !ct.without_rowid,
             ipk_column: None,
             fires_read: false,
+            pragma_read_usage: None,
             qualified_only: false,
         }];
         for col_def in &mut ct.columns {
@@ -1139,6 +1164,19 @@ impl<'a> AuthWalkCtx<'a> {
                 self.authorize_expr(off, &local_ctes, outer_scopes)?;
             }
         }
+        if sel.body.compounds.is_empty()
+            && let Some([source]) = order_scopes.last().map(Vec::as_slice)
+            && let Some(usage) = &source.pragma_read_usage
+            && !usage.columns_read.get()
+        {
+            // select.c authorizes a FROM term with no referenced columns.
+            self.check(
+                AuthorizerAction::Read,
+                Some(&usage.source_name),
+                Some(""),
+                usage.schema.as_deref(),
+            )?;
+        }
         Ok(true)
     }
 
@@ -1292,6 +1330,7 @@ impl<'a> AuthWalkCtx<'a> {
                     has_rowid: false,
                     ipk_column: None,
                     fires_read: false,
+                    pragma_read_usage: None,
                     qualified_only: false,
                 })
             }
@@ -1317,6 +1356,7 @@ impl<'a> AuthWalkCtx<'a> {
                         }
                         let qual = src.alias.clone().unwrap_or_else(|| src.table_name.clone());
                         for col in &src.columns {
+                            src.note_column_read();
                             let mut is_ignored = false;
                             if src.fires_read
                                 && let (Some(db_id), Some(db_name)) =
@@ -1355,6 +1395,7 @@ impl<'a> AuthWalkCtx<'a> {
                         if src.matches_qualifier(schema.as_deref(), &tname) {
                             let qual = src.alias.clone().unwrap_or_else(|| src.table_name.clone());
                             for col in &src.columns {
+                                src.note_column_read();
                                 let mut is_ignored = false;
                                 if src.fires_read
                                     && let (Some(db_id), Some(db_name)) =
@@ -2283,6 +2324,7 @@ impl<'a> AuthWalkCtx<'a> {
                         if src.fires_read
                             && let (Some(db_id), Some(db_name)) = (src.db_id, &src.db_name)
                         {
+                            src.note_column_read();
                             return Some((db_id, db_name.clone(), src.table_name.clone(), canon));
                         }
                         return None;
@@ -2297,6 +2339,7 @@ impl<'a> AuthWalkCtx<'a> {
                         if src.fires_read
                             && let (Some(db_id), Some(db_name)) = (src.db_id, &src.db_name)
                         {
+                            src.note_column_read();
                             return Some((db_id, db_name.clone(), src.table_name.clone(), canon));
                         }
                         return None;

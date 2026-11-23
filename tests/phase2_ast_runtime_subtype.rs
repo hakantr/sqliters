@@ -3625,3 +3625,37 @@ fn group65_function_list_table_authorizes_named_columns() {
         assert_eq!(reads.load(AtomicOrdering::Relaxed), 1);
     }
 }
+
+#[test]
+fn group65_function_list_table_authorizes_a_read_without_columns() {
+    use sqliters::{AuthorizerAction, AuthorizerResult};
+
+    for decision in [AuthorizerResult::Deny, AuthorizerResult::Ignore] {
+        let db = Connection::open_in_memory().unwrap();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let observed = checks.clone();
+        db.set_authorizer(Some(Box::new(move |action, table, column, schema, context| {
+            if action == AuthorizerAction::Read && table == Some("pragma_function_list") {
+                assert_eq!((column, schema, context), (Some(""), None, None));
+                observed.fetch_add(1, AtomicOrdering::Relaxed);
+                return decision;
+            }
+            AuthorizerResult::Ok
+        }))).unwrap();
+        let result = db.prepare("SELECT count(*) FROM pragma_function_list()");
+        if decision == AuthorizerResult::Deny {
+            let Err(err) = result else {
+                panic!("denied registry scan prepared");
+            };
+            assert_eq!(err.code, ErrorCode::Auth);
+            assert_eq!(err.message, "not authorized");
+        } else {
+            let mut stmt = result.unwrap();
+            let StepResult::Row(row) = stmt.step().unwrap() else {
+                panic!("missing registry count");
+            };
+            assert!(row.get_i64(0).is_some_and(|count| count > 0));
+        }
+        assert_eq!(checks.load(AtomicOrdering::Relaxed), 1);
+    }
+}
