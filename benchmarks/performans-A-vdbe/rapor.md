@@ -2602,3 +2602,8 @@ DELETE journal sonlandırıldıktan sonra geç fiziksel kısaltma hata verirse i
 ## V6b.459 — Pencere bölmesi geçişinde xFinal
 
 UTF-8 makine yolunda bölme sonlandırması, ilk satırlar, kısmi reset ve finalize 12 C profili ve 136 olayda eşleşti. İki eski fark kapandı. OFF ve UTF-16 ON yollarında 60 önceki kayıt korundu. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v459-window-partition-cleanup-candidate/sonuc.md) OFF 1336/0/325, ON 1336/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,265 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_459.md).
+
+
+## V6b.460 — V1 aggregate callback adım, reset ve finalize hataları
+
+Pinli C ile 84 ON profili eşleşti. xStep, xInverse, xValue ve xFinal hatasının ilk veya sonraki adımda aktarılması, alttaki hata kodunun reset ve finalize için korunması, gerçek VFS BUSY ve callback SCHEMA deneme sayısı doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/window-v1-on-error-v457-preflight/sonuc.md) OFF 1337/0/325, ON 1337/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,284 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_460.md).

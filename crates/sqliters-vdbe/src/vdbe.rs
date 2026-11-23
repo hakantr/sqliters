@@ -872,6 +872,7 @@ pub struct Vdbe {
     rt_ready: bool,
     /// The first comparison failure from the checked application sort.
     sort_callback_error: Option<SortCallbackError>,
+    app_aggregate_callback_error: bool,
     /// Scratch buffers
     scratch: Vec<u8>,
     u_temp: Vec<u32>,
@@ -3268,6 +3269,7 @@ impl Vdbe {
             rt: vec![OpRt::None; n_op],
             rt_ready: false,
             sort_callback_error,
+            app_aggregate_callback_error: false,
             scratch: Vec::new(),
             u_temp: Vec::new(),
             min_write_file_format: mwf,
@@ -3713,6 +3715,7 @@ impl Vdbe {
         self.err_pc = usize::MAX;
         self.not_halted = false;
         self.halt_rc = None;
+        self.app_aggregate_callback_error = false;
         if let Some(error) = &self.sort_callback_error {
             *error.lock().unwrap() = None;
         }
@@ -3726,6 +3729,12 @@ impl Vdbe {
     #[doc(hidden)]
     pub fn has_sort_callback_error(&self) -> bool {
         self.sort_callback_error.as_ref().is_some_and(|error| error.lock().unwrap().is_some())
+    }
+
+    /// Whether this step stopped in an application aggregate/window callback.
+    #[doc(hidden)]
+    pub fn has_app_aggregate_callback_error(&self) -> bool {
+        self.app_aggregate_callback_error
     }
 
     /// `sqlite3_stmt_status(pStmt, op, resetFlag)` for the counters the machine keeps
@@ -3796,6 +3805,7 @@ impl Vdbe {
             return Ok(false);
         }
         self.not_halted = false;
+        self.app_aggregate_callback_error = false;
         self.unpark_cursors(host);
         // "if( db->xProgress ){ iPrior = p->aCounter[SQLITE_STMTSTATUS_VM_STEP];
         //   nProgressLimit = db->nProgressOps - (iPrior % db->nProgressOps); }"
@@ -6829,7 +6839,10 @@ impl Vdbe {
                         Some(AggCtx::Host(Some(a))) => {
                             let id = *a;
                             let args: Vec<RuntimeValue> = self.a_mem[p2..p2 + argc].iter().map(Mem::to_runtime_value).collect();
-                            if op.p1 != 0 { host.agg_inverse(id, &args)? } else { host.agg_step(id, &args)? }
+                            let result = if op.p1 != 0 { host.agg_inverse(id, &args) } else { host.agg_step(id, &args) };
+                            result.inspect_err(|_| {
+                                self.app_aggregate_callback_error = func.func_flags & SQLITE_FUNC_BUILTIN == 0;
+                            })?;
                         }
                         Some(AggCtx::Win(w)) => {
                             // (pCtx->isError: "sqlite3VdbeError(p, "%s", sqlite3_value_text(pCtx->pOut))")
@@ -6871,12 +6884,16 @@ impl Vdbe {
                         Some(AggCtx::Host(a)) => {
                             let v = if is_value {
                                 match *a {
-                                    Some(id) => host.agg_value(id)?,
+                                    Some(id) => host.agg_value(id).inspect_err(|_| {
+                                        self.app_aggregate_callback_error = func.func_flags & SQLITE_FUNC_BUILTIN == 0;
+                                    })?,
                                     None => RuntimeValue::plain(Value::Null),
                                 }
                             } else {
                                 match a.take() {
-                                    Some(id) => host.agg_finalize(id)?,
+                                    Some(id) => host.agg_finalize(id).inspect_err(|_| {
+                                        self.app_aggregate_callback_error = func.func_flags & SQLITE_FUNC_BUILTIN == 0;
+                                    })?,
                                     None => RuntimeValue::plain(Value::Null),
                                 }
                             };

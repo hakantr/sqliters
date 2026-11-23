@@ -5537,6 +5537,7 @@ pub struct Statement {
     expired: bool,
     c_v1_expired_before_run: bool,
     c_v1_retained_expiry_diagnostic: bool,
+    c_v1_app_aggregate_diagnostic: bool,
     // A bind-triggered generated reprepare may consider a scoped partial-index value.
     c_write_expired_by_binding: bool,
     c_reprepare_count: u32,
@@ -8246,7 +8247,9 @@ impl Statement {
                 };
                 MachineStart::Stepped(fin_res.map(|()| StepResult::Done))
             }
-            Err(e) if !no_lock && e.code == ErrorCode::Schema && !vm.has_sort_callback_error() => {
+            Err(e) if !no_lock && e.code == ErrorCode::Schema && !vm.has_sort_callback_error()
+                && !self.legacy_app_aggregate_error(&vm, &e) =>
+            {
                 // SQLITE_SCHEMA from OP_Transaction (the schema cookie or generation is not the
                 // one the program was generated for): sqlite3Reprepare, then run again — once.
                 let counters = vm.a_counter;
@@ -8283,13 +8286,21 @@ impl Statement {
                     ConnectionInner::machine_activity_finish(no_lock, true, lease_cursors, read_instances),
                     shared,
                 );
-                MachineStart::Stepped(Err(self.finish_read_machine_error(e, pragma_schema_error_offset)))
+                MachineStart::Stepped(Err(self.finish_read_machine_error(inner, e, pragma_schema_error_offset)))
             }
         }
     }
 
+    fn legacy_app_aggregate_error(&self, vm: &sqliters_vdbe::vdbe::Vdbe, error: &SqliteError) -> bool {
+        self.mode == PrepareMode::V1 && vdbe_host::exec_switch_on()
+            && self.category == Some(StmtCategory::Read) && !self.c_machine_fixed
+            && matches!(error.code, ErrorCode::Error | ErrorCode::Busy | ErrorCode::Schema)
+            && vm.has_app_aggregate_callback_error()
+    }
+
     fn finish_read_machine_error(
         &mut self,
+        inner: &mut ConnectionInner,
         mut error: SqliteError,
         pragma_schema_error_offset: Option<usize>,
     ) -> SqliteError {
@@ -8297,6 +8308,13 @@ impl Statement {
         self.lifecycle = StatementLifecycle::Halted {
             last_error: Some(error.clone()),
         };
+        if self.c_machine_vm.as_ref().is_some_and(|vm| self.legacy_app_aggregate_error(vm, &error)) {
+            // The V1 sqlite3_step boundary returns SQLITE_ERROR without
+            // transferring the retained execution diagnostic yet.
+            self.c_v1_app_aggregate_diagnostic = true;
+            inner.c_connection_diagnostic_code = ErrorCode::Error;
+            return inner.legacy_c_step_error();
+        }
         if self.mode == PrepareMode::V1 && let Some(offset) = pragma_schema_error_offset {
             error.offset = Some(offset);
         }
@@ -8344,7 +8362,7 @@ impl Statement {
                     ConnectionInner::machine_activity_finish(no_lock, true, lease_cursors, read_instances),
                     shared,
                 );
-                Err(self.finish_read_machine_error(e, pragma_schema_error_offset))
+                Err(self.finish_read_machine_error(inner, e, pragma_schema_error_offset))
             }
             _ => {
                 let fin_res = inner.finish_activity(
@@ -9011,6 +9029,7 @@ impl Statement {
             expired: false,
             c_v1_expired_before_run: false,
             c_v1_retained_expiry_diagnostic: false,
+            c_v1_app_aggregate_diagnostic: false,
             c_write_expired_by_binding: false,
             c_reprepare_count: 0,
             c_reprepare_after_schema_check: false,
@@ -9485,6 +9504,7 @@ impl Statement {
             Err(e)
                 if !self.read_io_during_prepare
                     && (matches!(e.code, ErrorCode::Error | ErrorCode::Interrupt)
+                        || self.c_v1_app_aggregate_diagnostic
                         || (self.legacy_ddl_rollback_reader(inner)
                             && e.extended_code == extended::SQLITE_ABORT_ROLLBACK)) =>
             {
@@ -9580,6 +9600,7 @@ impl Statement {
             StatementLifecycle::Running(run) => inner.finish_running_exec(hid, run, shared),
         };
         self.transfer_c_cleanup_diagnostic(inner, shared, ran, &result);
+        self.c_v1_app_aggregate_diagnostic = false;
         result
     }
 
@@ -10428,6 +10449,7 @@ impl Statement {
         }
         self.c_v1_expired_before_run = false;
         self.c_v1_retained_expiry_diagnostic = false;
+        self.c_v1_app_aggregate_diagnostic = false;
 
         // Empty / comment-only SQL (`stmt.is_none()` with no parsed statement)
         if self.stmt.is_none() && matches!(parse_one(&self.raw_sql), Ok((None, _))) {

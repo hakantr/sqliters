@@ -3477,3 +3477,116 @@ fn group65_machine_window_finalizes_accumulator_before_next_partition() {
     stmt.finalize().unwrap();
     assert_eq!(finalized.load(AtomicOrdering::Relaxed), 2);
 }
+
+#[test]
+fn group65_v1_machine_retains_application_aggregate_callback_error() {
+    use sqliters::WindowAggregateInstance;
+
+    if std::env::var_os("SQLITERS_VDBE_EXEC").is_none() {
+        return;
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Callback {
+        Step,
+        Value,
+        Final,
+    }
+
+    struct FailingAggregate {
+        count: Arc<AtomicUsize>,
+        stage: Callback,
+        fail_on: usize,
+        code: ErrorCode,
+        sum: i64,
+    }
+
+    impl FailingAggregate {
+        fn check(&self, stage: Callback) -> sqliters::Result<()> {
+            if self.stage == stage
+                && self.count.fetch_add(1, AtomicOrdering::Relaxed) + 1 == self.fail_on
+            {
+                return Err(SqliteError::new(self.code, "application callback fault"));
+            }
+            Ok(())
+        }
+    }
+
+    impl WindowAggregateInstance for FailingAggregate {
+        fn step(&mut self, args: &[RuntimeValue]) -> sqliters::Result<()> {
+            self.check(Callback::Step)?;
+            let Value::Integer(value) = args[0].value else { panic!("expected integer"); };
+            self.sum += value;
+            Ok(())
+        }
+
+        fn inverse(&mut self, args: &[RuntimeValue]) -> sqliters::Result<()> {
+            let Value::Integer(value) = args[0].value else { panic!("expected integer"); };
+            self.sum -= value;
+            Ok(())
+        }
+
+        fn value(&self) -> sqliters::Result<RuntimeValue> {
+            self.check(Callback::Value)?;
+            Ok(RuntimeValue::plain(Value::Integer(self.sum)))
+        }
+
+        fn finalize(&mut self) -> sqliters::Result<RuntimeValue> {
+            self.check(Callback::Final)?;
+            Ok(RuntimeValue::plain(Value::Integer(self.sum)))
+        }
+    }
+
+    let window = "SELECT app_sum(a) OVER(
+        ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM items ORDER BY i";
+    for (sql, stage, fail_on, visible_rows) in [
+        (window, Callback::Step, 1, 0),
+        (window, Callback::Value, 3, 2),
+        ("SELECT app_sum(a) FROM items", Callback::Final, 1, 0),
+        ("SELECT app_sum(a) FROM items GROUP BY i%2 ORDER BY i%2", Callback::Final, 2, 1),
+    ] {
+        for code in [ErrorCode::Error, ErrorCode::Busy, ErrorCode::Schema] {
+            for reset in [true, false] {
+                let db = Connection::open_in_memory().unwrap();
+                db.execute_batch(
+                    "CREATE TABLE items(i INTEGER PRIMARY KEY, a INTEGER);
+                     INSERT INTO items VALUES (1,1),(2,2),(3,3),(4,4),(5,5);",
+                ).unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let seen = Arc::clone(&calls);
+                let factory = move || {
+                    Box::new(FailingAggregate {
+                        count: Arc::clone(&seen), stage, fail_on, code, sum: 0,
+                    }) as Box<dyn WindowAggregateInstance>
+                };
+                if sql == window {
+                    db.create_window_function("app_sum", 1, FunctionFlags::NONE, factory).unwrap();
+                } else {
+                    db.create_aggregate_function("app_sum", 1, FunctionFlags::NONE, factory).unwrap();
+                }
+
+                let mut statement = db.prepare_v1(sql).unwrap();
+                assert!(statement.c_program_for_testing().is_some());
+                for _ in 0..visible_rows {
+                    assert!(matches!(statement.step().unwrap(), StepResult::Row(_)));
+                }
+                let step = statement.step().unwrap_err();
+                assert_eq!(step.code, ErrorCode::Error);
+                assert_eq!(step.message, "SQL logic error");
+                assert_eq!(calls.load(AtomicOrdering::Relaxed), fail_on);
+                assert_eq!(statement.c_reprepare_status().0, 0);
+                if reset {
+                    let error = statement.reset().unwrap_err();
+                    assert_eq!(error.code, code);
+                    assert_eq!(error.message, "application callback fault");
+                    assert!(matches!(statement.step().unwrap(), StepResult::Row(_)));
+                    statement.finalize().unwrap();
+                } else {
+                    let error = statement.finalize().unwrap_err();
+                    assert_eq!(error.code, code);
+                    assert_eq!(error.message, "application callback fault");
+                }
+            }
+        }
+    }
+}
