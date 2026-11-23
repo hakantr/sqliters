@@ -2497,3 +2497,8 @@ Pinli C ile 48 akış ve 852 API kaydında hazırlanmış view/trigger, tablo bi
 ## V6b.438 — Adlandırılmış sorter mmap
 
 Kararlı filtresiz Linux üzerinde adlandırılıp silinen sorter dosyasının eşlemesi aynı süreçten güvenli çekirdek kopyasıyla okunur. C ile 84 VFS izi, 48 önceki VFS izi ve 144 işçi kontrolü eş. Ek pread hatası kapandı. Sınır, mmap ve dosya kapanışı doğrulandı. OFF 1317/1/325, ON 1315/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,282 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_438.md).
+
+
+## V6b.439 — UTF-16LE ve UTF-16BE tek işçi PMA
+
+64 zorlanmış UTF-16 profili ve 305.818 VFS kaydı C ile eş. Gerçek işçide satır ve reset, açma, okuma ve yazma hata aşamaları doğrulandı. Tüm Rust işçileri birleştirildi. UTF-8 ve named mmap etkileşimi ile 180 olağan FK koşusu korundu. OFF 1318/1/325, ON 1316/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,275 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_439.md).

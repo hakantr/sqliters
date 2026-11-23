@@ -251,6 +251,31 @@ fn custom_file_sort_read_program(
     Some(Arc::new(*program))
 }
 
+/// The worker sorter admits only the complete native BINARY rowid order.
+pub(crate) fn utf16_worker_sort_read_program(
+    inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
+) -> Option<Arc<Program>> {
+    let Some(Stmt::Select(select)) = stmt else { return None };
+    let encoding = inner.effective_encoding();
+    if encoding == TextEncoding::Utf8 || !exec_switch_on()
+        || inner.db_set.worker_threads_limit != 1 || inner.db_set.temp_store().is_memory()
+        || inner.db_set.sorter_mmap_limit > 0 || inner.collations.get_custom("BINARY").is_some()
+        || select.order_by.len() != 2 || select.limit.is_some() || read_codegen_blocker(inner).is_some()
+    {
+        return None;
+    }
+    let PrepareResult::Program(program) = crate::cgen::c_prepare(inner, sql).0 else {
+        return None;
+    };
+    if program.explain != 0 || program.n_var as usize != n_param
+        || !sqliters_vdbe::vdbe::is_utf16_worker_sort(&program, encoding)
+    {
+        return None;
+    }
+    trace("machine: UTF-16 worker sorter", sql);
+    Some(Arc::new(*program))
+}
+
 /// A materialized legacy read cannot hold the page that C has at ResultRow. Use the
 /// streaming machine for a single mapped b-tree when its program uses only the
 /// cursor, projection, rowid-bound, count and binary sorter operations below.
@@ -1350,7 +1375,9 @@ macro_rules! host_common {
         }
 
         fn sorter_worker_threads(&mut self) -> i32 {
-            if self.colls().get_custom("BINARY").is_some() {
+            if self.colls().get_custom("BINARY").is_some()
+                || (self.text_encoding() != TextEncoding::Utf8 && !exec_switch_on())
+            {
                 return 0;
             }
             self.dbs().worker_threads_limit

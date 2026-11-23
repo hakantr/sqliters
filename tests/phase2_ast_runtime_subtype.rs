@@ -2687,3 +2687,39 @@ fn group65_prepared_scalar_selection_survives_overload_addition_and_reset() {
         }
     }
 }
+
+#[test]
+fn group64_file_sorter_worker_adopts_utf16_encoding_at_step() {
+    for (encoding, order) in [("UTF-16le", [1, 2, 0]), ("UTF-16be", [2, 0, 1])] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}';
+             PRAGMA temp_store=FILE; PRAGMA cache_size=1; PRAGMA threads=0;
+             CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);
+             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<18)
+             INSERT INTO items SELECT i, CASE i%3 WHEN 0 THEN 'À' WHEN 1 THEN 'ā' ELSE 'A' END
+               || printf('%20000s','x') FROM n;"
+        )).unwrap();
+        let mut statement = db
+            .prepare("SELECT id FROM items ORDER BY v COLLATE BINARY NULLS LAST,id")
+            .unwrap();
+        let expected: Vec<_> = order.into_iter()
+            .flat_map(|key| (1..=18).filter(move |id| id % 3 == key)).collect();
+
+        for threads in [1, 0, 1] {
+            db.execute_batch(&format!("PRAGMA threads={threads}")).unwrap();
+            statement.machine_stmt_status(4, true);
+            let mut rows = Vec::new();
+            while let StepResult::Row(row) = statement.step().unwrap() {
+                rows.push(row.get_i64(0).unwrap());
+            }
+            assert_eq!(rows, expected, "{encoding}, threads={threads}");
+            if std::env::var_os("SQLITERS_VDBE_EXEC").as_deref() == Some(std::ffi::OsStr::new("1"))
+                && threads == 1
+            {
+                assert!(statement.machine_stmt_status(4, false) > 0, "{encoding}");
+            }
+            statement.reset().unwrap();
+        }
+    }
+}

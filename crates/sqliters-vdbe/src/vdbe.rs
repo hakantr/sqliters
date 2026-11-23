@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use sqliters_btree::Btree;
 use sqliters_btree::btcursor::{BTREE_AUXDELETE, BTREE_SEEK_EQ, BcParked, BtCursor, CURSOR_REQUIRESEEK};
-use sqliters_types::{ConflictResolutionEffect, ErrorCode, KeySortOrder, Pgno, Result, RuntimeValue, SqliteError, Value};
+use sqliters_types::{ConflictResolutionEffect, ErrorCode, KeySortOrder, Pgno, Result, RuntimeValue, SqliteError, TextEncoding, Value};
 
 use crate::opcodes::*;
 use crate::vdbeaux::{
@@ -1626,7 +1626,7 @@ fn complete_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
 fn worker_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
     if !prog.read_only || prog.btree_mask != 1 || !prog.p_program.is_empty()
         || !builtin_order_sorter(prog, open, key)
-        || key.enc != 1 || key.n_key_field != 2
+        || !matches!(key.enc, 1..=3) || key.n_key_field != 2
         || key.a_coll.iter().flatten().any(|coll| !coll.name.eq_ignore_ascii_case("BINARY"))
     {
         return false;
@@ -1664,6 +1664,15 @@ fn worker_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
         && rowid.opcode == OP_Rowid && rowid.p1 == table.p1
         && rowid.p2.checked_sub(1) == Some(record.p1) && record.opcode == OP_MakeRecord
         && prog.a_op.iter().filter(|op| op.opcode == OP_SorterOpen).count() == 1
+}
+
+/// Check the same worker-sort shape before admitting UTF-16 statement execution.
+#[doc(hidden)]
+pub fn is_utf16_worker_sort(prog: &Program, encoding: TextEncoding) -> bool {
+    encoding != TextEncoding::Utf8 && prog.a_op.iter().any(|op| {
+        matches!(&op.p4, P4::KeyInfo(key)
+            if key.enc == encoding as u8 && worker_order_sorter(prog, op, key))
+    })
 }
 
 /// Find the single complete sorter that owns the application's first order key.
@@ -5578,6 +5587,7 @@ impl Vdbe {
                     let mut sorter = VdbeSorter::init(k, op.p3, pgsz, cache_size, temp_in_memory);
                     sorter.set_vfs(host.sorter_vfs());
                     if !temp_in_memory && self.prog.fallible_sort_open().is_none()
+                        && (k.enc == 1 || k.enc == host.text_encoding() as u8)
                         && host.sorter_worker_threads() == 1 && host.sorter_mmap_limit() <= 0
                         && matches!(&op.p4, P4::KeyInfo(key) if worker_order_sorter(&self.prog, op, key))
                         && k.a_coll.iter().flatten().all(|coll| coll.is_binary && coll.custom.is_none())

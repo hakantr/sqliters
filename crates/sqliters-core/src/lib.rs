@@ -10537,6 +10537,7 @@ impl Statement {
             return None;
         }
         vdbe_host::custom_sort_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len())
+            .or_else(|| vdbe_host::utf16_worker_sort_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len()))
             .or_else(|| {
                 let prepared_functions = inner.functions.scalar_registry_at(self.compiled_scalar_generation);
                 vdbe_host::mapped_table_read_program(
