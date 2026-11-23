@@ -1157,9 +1157,19 @@ fn test_bulgu_y1_failed_commit_partial_writes_rolled_back_atomically() {
     setup(&conn, "NONE");
     conn.execute_batch("DROP TABLE ballast").unwrap();
     let before_size = fs::metadata(tmp.path()).unwrap().len();
+    let mut held = conn.prepare(VALUES_SQL).unwrap();
     fault.lock().unwrap().fail_next_truncate = true;
     assert_eq!(conn.execute("VACUUM").unwrap_err().code, ErrorCode::IoErr);
     assert!(conn.is_autocommit());
+    assert_eq!(conn.execute("ROLLBACK").unwrap_err().code, ErrorCode::Error);
+    verify(&conn, [10, 10, 20, 0]);
+    let sqliters::StepResult::Row(row) = held.step().unwrap() else {
+        panic!("prepared read did not return a row after VACUUM");
+    };
+    assert_eq!(row.get_i64(0), Some(10));
+    assert_eq!(row.get_i64(1), Some(10));
+    assert_eq!(held.c_reprepare_status().0, 1);
+    held.finalize().unwrap();
     conn.try_close().unwrap();
     assert_eq!(fs::metadata(tmp.path()).unwrap().len(), before_size);
     verify_reopen(tmp.path(), [10, 10, 20, 0]);

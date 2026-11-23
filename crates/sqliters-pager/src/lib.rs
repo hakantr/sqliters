@@ -2859,7 +2859,7 @@ impl Pager {
                 // OP_JournalMode publishes WAL before the header commit is finalized.
                 // The rollback journal protects the page writes and is then removed.
                 let remove_transition_journal = self.locking_mode == LockingMode::Exclusive;
-                self.commit_phase_two_with_journal_cleanup(false, false, remove_transition_journal)
+                self.commit_phase_two_with_journal_cleanup(false, false, remove_transition_journal, None)
             })();
 
             if let Err(e) = step_res {
@@ -2959,6 +2959,7 @@ impl Pager {
                         false,
                         false,
                         remove_transition_journal,
+                        None,
                     )?;
                 } else {
                     self.end_read_if_unused()?;
@@ -5797,7 +5798,29 @@ impl Pager {
     ///   I/O error while cleaning up cold journals or unlocking is absorbed without rolling back
     ///   the already-committed database, and the pager still transitions cleanly out of `Write`.
     pub fn commit_phase_two(&mut self, retain_read: bool, cleanup_benign: bool) -> Result<()> {
-        self.commit_phase_two_with_journal_cleanup(retain_read, cleanup_benign, false)
+        self.commit_phase_two_with_journal_cleanup(retain_read, cleanup_benign, false, None)
+    }
+
+    /// The boolean identifies an error from physical shrink after the VACUUM
+    /// transaction's DELETE journal was successfully finalized.
+    pub fn commit_phase_two_for_vacuum(&mut self) -> (Result<()>, bool) {
+        let mut late_shrink_failure = false;
+        let result = self.commit_phase_two_with_journal_cleanup(
+            false, false, false, Some(&mut late_shrink_failure),
+        );
+        (result, late_shrink_failure)
+    }
+
+    /// Whether ordinary pager ERROR cleanup released the file and invalidated
+    /// cached pages after VACUUM's failed post-commit shrink.
+    pub fn vacuum_late_shrink_cleanup_completed(&self) -> bool {
+        !self.closed
+            && self.state == TransactionState::Open
+            && self.pager_error.is_none()
+            && !self.error_unlock_pending
+            && !self.error_lock_unknown
+            && self.journal_file.is_none()
+            && !self.reader_snapshot_held
     }
 
     fn commit_phase_two_with_journal_cleanup(
@@ -5805,12 +5828,13 @@ impl Pager {
         retain_read: bool,
         cleanup_benign: bool,
         remove_transition_journal: bool,
+        late_shrink_failure: Option<&mut bool>,
     ) -> Result<()> {
         let was_write = self.state == TransactionState::Write;
         let can_commit = self.ensure_not_closed();
         let count_failed_commit = was_write && !cleanup_benign && can_commit.is_ok();
         let result = can_commit.and_then(|()| {
-            self.commit_phase_two_inner(retain_read, remove_transition_journal)
+            self.commit_phase_two_inner(retain_read, remove_transition_journal, late_shrink_failure)
         });
         if let Err(ref error) = result {
             // btree.c:4447–4451 skips compensating iDataVersion when the
@@ -5838,6 +5862,7 @@ impl Pager {
         &mut self,
         retain_read: bool,
         remove_transition_journal: bool,
+        late_shrink_failure: Option<&mut bool>,
     ) -> Result<()> {
         match self.state {
             TransactionState::Open => Ok(()),
@@ -5897,7 +5922,9 @@ impl Pager {
                 let notify = normal_rollback
                     || (disk_rollback
                         && (self.journal_mode != JournalMode::Persist || self.cache_modified || self.db_file_modified));
-                let finalized = self.finalize_rollback_commit(remove_transition_journal);
+                let finalized = self.finalize_rollback_commit(
+                    remove_transition_journal, late_shrink_failure,
+                );
                 let notified = if notify && finalized.is_ok() {
                     self.notify_commit_phase_two()
                 } else {
@@ -5934,7 +5961,21 @@ impl Pager {
         }
     }
 
-    fn finalize_rollback_commit(&mut self, remove_transition_journal: bool) -> Result<()> {
+    fn finalize_rollback_commit(
+        &mut self,
+        remove_transition_journal: bool,
+        late_shrink_failure: Option<&mut bool>,
+    ) -> Result<()> {
+        let observe_delete_shrink = late_shrink_failure.is_some()
+            && self.db_kind == DatabaseKind::NamedDisk
+            && !self.uses_temp_file_semantics()
+            && self.journal_mode == JournalMode::Delete
+            && self.locking_mode == LockingMode::Normal
+            && self.pending_sql_journal_mode.is_none()
+            && !remove_transition_journal
+            && self.journal_started_in_tx
+            && self.journal_file.is_some()
+            && self.journal_path.is_some();
         if remove_transition_journal {
             self.remove_delete_journal()?;
         } else {
@@ -5965,8 +6006,15 @@ impl Pager {
                 u64::from(effective_disk_pages) * u64::from(self.header.page_size);
             if let Some(f) = self.file.as_deref()
                 && f.file_size().is_ok_and(|sz| sz > target_size)
+                && let Err(error) = f.truncate(target_size)
             {
-                f.truncate(target_size)?;
+                if let Some(failed) = late_shrink_failure
+                    && observe_delete_shrink
+                    && error.code == ErrorCode::IoErr
+                {
+                    *failed = true;
+                }
+                return Err(error);
             }
         }
         if let Some(pending) = self.pending_byte_copy.take() {

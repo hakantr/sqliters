@@ -2592,3 +2592,8 @@ Yazma, kalıcı yazma, sync ve journal silme hatası ile geç truncate pinli C v
 ## V6b.457 — Fonksiyon değişikliğinde V1 ilk adım ve reset tanısı
 
 Hazır SELECT fonksiyon değişikliğiyle süre dışı kalınca V1 adımı önceki bağlantı tanısıyla SQLITE_ERROR, reset ve finalize SQLITE_SCHEMA döndürüyor. V2 yeniden hazırlama ve canlı ifade sırasındaki SQLITE_BUSY korundu. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v457-window-function-expiry-candidate/sonuc.md) OFF 1335/0/325, ON 1335/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,267 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_457.md).
+
+
+## V6b.458 — Geç VACUUM truncate hatası ve aynı bağlantının yeniden kullanımı
+
+DELETE journal sonlandırıldıktan sonra geç fiziksel kısaltma hata verirse ilk hata korunur. Olağan pager toparlanması tamamlandığında C gibi aynı bağlantı yeniden kullanılabilir. FK, veri, şema ve hazır V2 yeniden hazırlama kontrolü geçti. Önceki hata, sıcak journal ve ikinci temizlik hatası denetimleri korundu. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v458-vacuum-late-truncate-candidate/sonuc.md) OFF 1335/0/325, ON 1335/0/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,276 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_458.md).

@@ -729,6 +729,15 @@ impl Btree {
         self.commit_phase_two(retain_read, false)
     }
 
+    /// In-place VACUUM commit, identifying a failed shrink after journal finalization.
+    pub fn commit_for_vacuum(&mut self) -> (Result<()>, bool) {
+        if let Err(error) = self.commit_phase_one_internal(None, false) {
+            return (Err(error), false);
+        }
+        self.has_content = None;
+        self.pager.commit_phase_two_for_vacuum()
+    }
+
     #[inline]
     pub fn commit(&mut self) -> Result<()> {
         self.commit_phase_one(None)?;
