@@ -3917,3 +3917,36 @@ fn group64_file_sorter_worker_uses_a_declared_not_null_unique_key() {
         assert_eq!(ids, (1..=12).rev().collect::<Vec<_>>());
     }
 }
+
+#[test]
+fn group64_file_sorter_initial_mmap_preserves_worker_reset() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}';
+             PRAGMA temp_store=FILE; PRAGMA cache_size=1; PRAGMA threads=1;
+             CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);
+             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<17)
+             INSERT INTO items SELECT i, printf('x%26000s','z') FROM n;"
+        )).unwrap();
+        for enable_before_prepare in [true, false] {
+            db.set_sorter_mmap_limit(if enable_before_prepare { i32::MAX } else { 0 }).unwrap();
+            let mut statement = db.prepare("SELECT id FROM items ORDER BY v,id DESC").unwrap();
+            db.set_sorter_mmap_limit(i32::MAX).unwrap();
+            let StepResult::Row(first) = statement.step().unwrap() else {
+                panic!("expected first row in {encoding}");
+            };
+            assert_eq!(first.get_i64(0), Some(17));
+            assert!(statement.machine_stmt_status(4, false) > 0, "{encoding}");
+            statement.reset().unwrap();
+            for id in (1..=17).rev() {
+                let StepResult::Row(row) = statement.step().unwrap() else {
+                    panic!("expected row {id} in {encoding}");
+                };
+                assert_eq!(row.get_i64(0), Some(id));
+            }
+            assert!(matches!(statement.step().unwrap(), StepResult::Done));
+            statement.reset().unwrap();
+        }
+    }
+}

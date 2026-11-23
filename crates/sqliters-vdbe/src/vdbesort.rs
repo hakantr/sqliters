@@ -147,9 +147,9 @@ impl PmaFile {
         Ok(())
     }
 
-    fn readers(&self, mmap_limit: i32) -> SqlResult<Vec<PmaReader>> {
+    fn readers(&self, map: PmaMap<'_>) -> SqlResult<Vec<PmaReader>> {
         self.runs.iter().map(|&start| {
-            let mut disk = PmaDiskReader::open(&self.handle, start, self.end, self.page_size, PmaMap::Serial(mmap_limit))?;
+            let mut disk = PmaDiskReader::open(&self.handle, start, self.end, self.page_size, map)?;
             let bytes = disk.varint()?;
             disk.end = disk.offset.checked_add(bytes).filter(|end| *end <= self.end).ok_or_else(pma_short_read)?;
             let mut reader = PmaReader { disk: Some(disk), ..PmaReader::default() };
@@ -248,6 +248,13 @@ enum PmaMap<'a> {
 impl<'a> PmaMap<'a> {
     fn worker(limit: Option<&'a AtomicI32>) -> Self {
         limit.map_or(Self::Serial(0), Self::Worker)
+    }
+
+    fn limit(self) -> i32 {
+        match self {
+            Self::Serial(limit) => limit,
+            Self::Worker(limit) => limit.load(Ordering::Relaxed),
+        }
     }
 
     fn fetch(self, file: &Arc<dyn VfsFile>, length: u64) -> SqlResult<Option<FetchRange>> {
@@ -399,7 +406,9 @@ impl PmaIntermediate<'_> {
             Some(file) => Arc::clone(file),
             None => {
                 let opened = open_pma_file(self.vfs)?;
-                extend_pma_file(&opened, self.allocation, self.mmap_limit);
+                if self.allocation > 0 {
+                    extend_pma_file(&opened, self.allocation, self.mmap_limit);
+                }
                 self.file = Some(Arc::clone(&opened));
                 opened
             }
@@ -520,15 +529,16 @@ impl MergeWork {
     fn initialize(
         &mut self, vfs: &dyn Vfs, retained: &std::sync::Mutex<Option<Arc<dyn VfsFile>>>,
     ) -> SqlResult<()> {
+        let map = PmaMap::worker(self.mmap_limit.as_deref());
         let mut intermediate = PmaIntermediate {
             vfs,
             file: None,
             next_offset: 0,
             page_size: self.page_size,
-            allocation: 0,
-            mmap_limit: 0,
+            allocation: (self.capacity as u64).saturating_mul(self.merge.intermediate_readers()),
+            mmap_limit: map.limit(),
         };
-        let result = self.merge.initialize(&self.key, self.capacity, 0, Some(&mut intermediate));
+        let result = self.merge.initialize(&self.key, self.capacity, map, Some(&mut intermediate));
         *retained.lock().unwrap() = intermediate.file;
         result
     }
@@ -547,8 +557,11 @@ struct DoubleBuffer {
 impl DoubleBuffer {
     fn initialize(&mut self, vfs: &dyn Vfs) -> SqlResult<Option<u64>> {
         for file in &mut self.files {
+            let opened = open_pma_file(vfs)?;
+            let map = PmaMap::worker(self.work.mmap_limit.as_deref());
+            extend_pma_file(&opened, self.work.capacity as u64, map.limit());
             *file = Some(PmaChunk {
-                file: open_pma_file(vfs)?,
+                file: opened,
                 start: 0,
                 page_size: self.work.page_size,
             });
@@ -721,15 +734,15 @@ impl PmaMerge {
             .map(|child| 1 + child.intermediate_readers()).sum()
     }
 
-    fn initialize(&mut self, key: &SorterComparator, refill_bytes: usize, mmap_limit: i32,
+    fn initialize(&mut self, key: &SorterComparator, refill_bytes: usize, map: PmaMap<'_>,
         mut intermediate: Option<&mut PmaIntermediate<'_>>) -> SqlResult<()> {
         for reader in &mut self.readers {
             if let Some(child) = &mut reader.child {
-                child.initialize(key, refill_bytes, mmap_limit, intermediate.as_deref_mut())?;
+                child.initialize(key, refill_bytes, map, intermediate.as_deref_mut())?;
                 if let Some(intermediate) = intermediate.as_deref_mut() {
                     reader.chunk = Some(intermediate.reserve(refill_bytes)?);
                 }
-                reader.refill(key, refill_bytes, PmaMap::Serial(mmap_limit))?;
+                reader.refill(key, refill_bytes, map)?;
             }
         }
         self.choose_initial(key)
@@ -988,6 +1001,7 @@ impl VdbeSorter {
             let key = self.comparator.clone();
             let page_size = self.page_size;
             let bytes = self.sz_pma as u64;
+            let mmap_limit = self.worker_mmap_limit.clone();
             let list = std::mem::take(&mut self.list);
             let mut file = worker.file.take();
             worker.job = Some(SorterJob::start(move || {
@@ -996,6 +1010,7 @@ impl VdbeSorter {
                         file = Some(PmaFile::open(vfs.as_ref(), page_size)?);
                     }
                     let output = file.as_mut().expect("PMA file open");
+                    output.prepare_run(bytes, PmaMap::worker(mmap_limit.as_deref()).limit());
                     let sorted = sort_memory_runs(list, |left, right| Self::merge(&key, left, right))?;
                     output.write_run(bytes, sorted)
                 })();
@@ -1076,7 +1091,7 @@ impl VdbeSorter {
         }
         flush?;
         let readers = if let Some(file) = &self.pma_file {
-            file.readers(self.mmap_limit)?
+            file.readers(PmaMap::Serial(self.mmap_limit))?
         } else {
             std::mem::take(&mut self.pmas).into_iter().map(|run| PmaReader {
                 records: run.into(),
@@ -1090,7 +1105,7 @@ impl VdbeSorter {
                 .saturating_mul(merge.intermediate_readers()) } else { 0 },
             mmap_limit: self.mmap_limit,
         });
-        let init = merge.initialize(&self.comparator, self.refill_bytes, self.mmap_limit, intermediate.as_mut());
+        let init = merge.initialize(&self.comparator, self.refill_bytes, PmaMap::Serial(self.mmap_limit), intermediate.as_mut());
         self.intermediate_file = intermediate.and_then(|files| files.file);
         init?;
         let empty = merge.current().is_none();
@@ -1104,11 +1119,12 @@ impl VdbeSorter {
         let page_size = self.page_size;
         let capacity = self.refill_bytes;
         let key = &self.comparator;
+        let map = PmaMap::worker(self.worker_mmap_limit.as_deref());
         let files = self.auxiliary_tasks.iter().map(|task| task.file.as_ref())
             .chain(std::iter::once(self.pma_file.as_ref()));
         // Load the level-zero trees in task order before starting any reader.
         let readers: Vec<PmaReader> = files.map(|file| {
-            let child = file.map(|file| file.readers(0).map(PmaMerge::from_readers).map(Box::new))
+            let child = file.map(|file| file.readers(map).map(PmaMerge::from_readers).map(Box::new))
                 .transpose()?;
             Ok(PmaReader { child, ..PmaReader::default() })
         }).collect::<SqlResult<_>>()?;
@@ -1149,16 +1165,17 @@ impl VdbeSorter {
             if let Some(merge) = &mut foreground.child {
                 let mut intermediate = PmaIntermediate {
                     vfs: vfs.as_ref(), file: None, next_offset: 0, page_size,
-                    allocation: 0, mmap_limit: 0,
+                    allocation: (capacity as u64).saturating_mul(1 + merge.intermediate_readers()),
+                    mmap_limit: map.limit(),
                 };
-                let init = merge.initialize(key, capacity, 0, Some(&mut intermediate))
+                let init = merge.initialize(key, capacity, map, Some(&mut intermediate))
                     .and_then(|_| intermediate.reserve(capacity));
                 self.intermediate_file = intermediate.file;
                 foreground.chunk = Some(init?);
             }
             // C warms the foreground reader before joining the reader tasks.
             for reader in root.readers.iter_mut().rev() {
-                reader.refill(key, capacity, PmaMap::Serial(0))?;
+                reader.refill(key, capacity, map)?;
             }
             root.choose_initial(key)?;
             buffer.initialize(vfs.as_ref())
@@ -1172,7 +1189,7 @@ impl VdbeSorter {
             parallel: Some(Box::new(ParallelReader { active: None, finished: Some((buffer, Ok(end))) })),
             ..PmaReader::default()
         };
-        let first = error.map_or_else(|| output.refill(key, capacity, PmaMap::Serial(0)), Err);
+        let first = error.map_or_else(|| output.refill(key, capacity, map), Err);
         let empty = output.records.is_empty();
         // Keep every still-live reader for the root-first cleanup path,
         // including when initial merge setup failed.
