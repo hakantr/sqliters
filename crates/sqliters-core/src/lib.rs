@@ -1082,6 +1082,7 @@ pub(crate) struct ConnectionInner {
     c_retained_error_message: Option<String>,
     c_connection_diagnostic_code: ErrorCode,
     c_flag_pragma_expire_seq: Option<u64>,
+    c_function_expire_seq: Option<u64>,
     pub(crate) default_locking_mode: LockingMode,
     pub(crate) writable_schema: bool,
     pub(crate) working_dir: Option<PathBuf>,
@@ -1744,6 +1745,7 @@ impl ConnectionInner {
                 ));
             }
             self.db_set.c_expire_all();
+            self.c_function_expire_seq = Some(self.db_set.c_expire_seq());
         }
         Ok(())
     }
@@ -3691,6 +3693,7 @@ impl Connection {
             c_retained_error_message: None,
             c_connection_diagnostic_code: ErrorCode::Ok,
             c_flag_pragma_expire_seq: None,
+            c_function_expire_seq: None,
             default_locking_mode: LockingMode::Normal,
             writable_schema: false,
             working_dir: None,
@@ -10741,7 +10744,11 @@ impl Statement {
                 let flag_pragma_expired = matches!(self.category, Some(StmtCategory::Read | StmtCategory::Write))
                     && inner.c_flag_pragma_expiry()
                         .is_some_and(|seq| self.compiled_c_expire_seq != seq);
-                if expired_before_run && (prepared_function_list || flag_pragma_expired) {
+                let function_expired = self.category == Some(StmtCategory::Read)
+                    && inner.c_function_expire_seq.is_some_and(|seq| {
+                        seq == inner.db_set.c_expire_seq() && self.compiled_c_expire_seq != seq
+                    });
+                if expired_before_run && (prepared_function_list || flag_pragma_expired || function_expired) {
                     // Legacy step leaves the connection diagnostic unchanged.
                     // Reset and finalize still return the statement's SQLITE_SCHEMA.
                     self.c_v1_retained_expiry_diagnostic = true;

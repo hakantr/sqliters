@@ -3360,3 +3360,58 @@ fn group64_file_sorter_late_mmap_opt_in_with_one_worker() {
         statement.reset().unwrap();
     }
 }
+
+#[test]
+fn group65_legacy_window_replacement_preserves_expiry_diagnostic() {
+    struct Window(i64);
+
+    impl sqliters::WindowAggregateInstance for Window {
+        fn step(&mut self, args: &[RuntimeValue]) -> sqliters::Result<()> {
+            if let Value::Integer(value) = args[0].value {
+                self.0 += value;
+            }
+            Ok(())
+        }
+
+        fn inverse(&mut self, args: &[RuntimeValue]) -> sqliters::Result<()> {
+            if let Value::Integer(value) = args[0].value {
+                self.0 -= value;
+            }
+            Ok(())
+        }
+
+        fn value(&self) -> sqliters::Result<RuntimeValue> {
+            Ok(RuntimeValue::plain(Value::Integer(self.0)))
+        }
+
+        fn finalize(&mut self) -> sqliters::Result<RuntimeValue> {
+            self.value()
+        }
+    }
+
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch("CREATE TABLE vals(i INTEGER PRIMARY KEY,v INTEGER);
+                      INSERT INTO vals VALUES (1,1),(2,2),(3,3);").unwrap();
+    let sql = "SELECT sum(v) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+               FROM vals ORDER BY i";
+    let mut legacy = db.prepare_v1(sql).unwrap();
+    let mut modern = db.prepare(sql).unwrap();
+
+    db.create_window_function("sum", 1, FunctionFlags::NONE, || Box::new(Window(200)))
+        .unwrap();
+
+    let err = legacy.step().unwrap_err();
+    assert_eq!(err.code, ErrorCode::Error);
+    assert_eq!(err.message, "not an error");
+    let err = legacy.reset().unwrap_err();
+    assert_eq!(err.code, ErrorCode::Schema);
+    assert_eq!(err.message, "not an error");
+    assert_eq!(legacy.step().unwrap_err().code, ErrorCode::Error);
+    assert_eq!(legacy.finalize().unwrap_err().code, ErrorCode::Schema);
+
+    let StepResult::Row(row) = modern.step().unwrap() else {
+        panic!("missing automatically reprepared window row");
+    };
+    assert_eq!(row.get_i64(0), Some(201));
+    assert_eq!(modern.c_reprepare_status().0, 1);
+}
