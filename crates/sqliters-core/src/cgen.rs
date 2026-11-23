@@ -663,7 +663,7 @@ pub(crate) fn text_register_read(program: &sqliters_vdbe::vdbeaux::Program) -> b
                     has_text_observer = true;
                 } else if func.name.eq_ignore_ascii_case("unistr") || func.name.eq_ignore_ascii_case("char") {
                     has_text_producer = true;
-                } else if !["substr", "substring", "replace", "concat", "concat_ws"].iter()
+                } else if !["substr", "substring", "replace", "concat", "concat_ws", "trim", "ltrim", "rtrim", "lower", "upper"].iter()
                     .any(|name| func.name.eq_ignore_ascii_case(name))
                 {
                     return false;

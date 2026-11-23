@@ -321,6 +321,52 @@ fn concat_text_bytes<'a>(
     Ok(output)
 }
 
+fn is_trim(name: &str) -> bool {
+    ["trim", "ltrim", "rtrim"].iter().any(|kind| name.eq_ignore_ascii_case(kind))
+}
+
+/// trimFunc splits the character set at SQLite UTF-8 boundaries.
+fn trim_text_bytes<'a>(
+    mut input: &'a [u8], set: Option<&[u8]>, name: &str, limit: usize,
+) -> Result<&'a [u8]> {
+    let default: &[&[u8]] = &[b" "];
+    let mut chars = Vec::new();
+    if let Some(set) = set {
+        let set = cstr(set);
+        let max_chars = limit / (size_of::<usize>() + size_of::<u32>());
+        let mut offset = 0;
+        while offset < set.len() {
+            if chars.len() == max_chars {
+                return Err(too_big());
+            }
+            let next = offset + skip_utf8(set, offset);
+            chars.push(&set[offset..next]);
+            offset = next;
+        }
+    }
+    let chars = if set.is_some() { chars.as_slice() } else { default };
+    if !name.eq_ignore_ascii_case("rtrim") {
+        while let Some(prefix) = chars.iter().find(|bytes| input.starts_with(bytes)) {
+            input = &input[prefix.len()..];
+        }
+    }
+    if !name.eq_ignore_ascii_case("ltrim") {
+        while let Some(suffix) = chars.iter().find(|bytes| input.ends_with(bytes)) {
+            input = &input[..input.len() - suffix.len()];
+        }
+    }
+    Ok(input)
+}
+
+fn ascii_case_bytes(mut input: Vec<u8>, lowercase: bool) -> Vec<u8> {
+    if lowercase {
+        input.make_ascii_lowercase();
+    } else {
+        input.make_ascii_uppercase();
+    }
+    input
+}
+
 /// Evaluate built-ins which observe or produce the raw bytes of a TEXT register.
 pub(crate) fn eval_text_register(
     name: &str,
@@ -386,6 +432,26 @@ pub(crate) fn eval_text_register(
         out.change_encoding(encoding as u8);
         return Some(Ok(out));
     }
+    if is_trim(name) && let [input, set @ ..] = args && set.len() <= 1
+        && input.value_type() == 3
+        && !set.iter().any(|arg| arg.value_type() == 4)
+    {
+        let Some(input) = value_text_register(input) else { return Some(Ok(out)); };
+        let set = match set.first() {
+            None => None,
+            Some(set) => match value_text_register(set) {
+                Some(bytes) => Some(bytes),
+                None => return Some(Ok(out)),
+            },
+        };
+        let span = match trim_text_bytes(&input, set.as_deref(), name, limit_length.max(0) as usize) {
+            Ok(span) => span,
+            Err(error) => return Some(Err(error)),
+        };
+        out.set_str(span);
+        out.change_encoding(encoding as u8);
+        return Some(Ok(out));
+    }
     let [arg] = args else { return None; };
     if name.eq_ignore_ascii_case("unistr") {
         let Some(input) = value_text_register(arg) else { return Some(Ok(out)); };
@@ -413,7 +479,15 @@ pub(crate) fn eval_text_register(
         out.z = hex_bytes(&input.z[..count]).into_bytes();
         out.flags = MEM_STR;
     } else if arg.value_type() == 3 {
-        if name.eq_ignore_ascii_case("quote") || name.eq_ignore_ascii_case("unistr_quote") {
+        if name.eq_ignore_ascii_case("lower") || name.eq_ignore_ascii_case("upper") {
+            let Some(bytes) = value_text_register(arg) else { return Some(Ok(out)); };
+            // C's contextMalloc includes the terminating byte in the size check.
+            if bytes.len() >= limit_length.max(0) as usize {
+                return Some(Err(too_big()));
+            }
+            out.z = ascii_case_bytes(bytes.into_owned(), name.eq_ignore_ascii_case("lower"));
+            out.flags = MEM_STR;
+        } else if name.eq_ignore_ascii_case("quote") || name.eq_ignore_ascii_case("unistr_quote") {
             let Some(bytes) = value_text_register(arg) else { return Some(Ok(out)); };
             out.z = crate::printf::quote_text_bytes(&bytes, name.eq_ignore_ascii_case("unistr_quote"));
             out.flags = MEM_STR;
@@ -799,69 +873,19 @@ pub(crate) fn eval(upper: &str, args: &[Value], ctx: &VmRuntimeContext) -> Optio
             Ok(Value::Integer(pos))
         }
         "TRIM" | "LTRIM" | "RTRIM" if args.len() == 1 || args.len() == 2 => {
-            if args[0].is_null() {
-                return Some(Ok(Value::Null));
-            }
-            let Some(input) = value_text(&args[0], enc) else {
-                return Some(Ok(Value::Null));
-            };
-            let set_holder;
-            let mut chars: Vec<&[u8]> = Vec::new();
-            if args.len() == 1 {
-                chars.push(b" ");
-            } else {
-                match value_text(&args[1], enc) {
+            let Some(input) = value_text(&args[0], enc) else { return Some(Ok(Value::Null)); };
+            let set = match args.get(1) {
+                None => None,
+                Some(set) => match value_text(set, enc) {
+                    Some(bytes) => Some(bytes),
                     None => return Some(Ok(Value::Null)),
-                    Some(t) => {
-                        set_holder = t;
-                        let z = cstr(&set_holder);
-                        let mut i = 0;
-                        while i < z.len() {
-                            let n = skip_utf8(z, i);
-                            chars.push(&z[i..i + n]);
-                            i += n;
-                        }
-                    }
-                }
-            }
-            let mut z: &[u8] = &input;
-            if !chars.is_empty() {
-                if upper != "RTRIM" {
-                    'l: while !z.is_empty() {
-                        for c in &chars {
-                            if c.len() <= z.len() && &z[..c.len()] == *c {
-                                z = &z[c.len()..];
-                                continue 'l;
-                            }
-                        }
-                        break;
-                    }
-                }
-                if upper != "LTRIM" {
-                    'r: while !z.is_empty() {
-                        for c in &chars {
-                            if c.len() <= z.len() && &z[z.len() - c.len()..] == *c {
-                                z = &z[..z.len() - c.len()];
-                                continue 'r;
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-            Ok(text_value(z.to_vec()))
+                },
+            };
+            trim_text_bytes(&input, set.as_deref(), upper, usize::MAX).map(|bytes| text_value(bytes.to_vec()))
         }
         "LOWER" | "UPPER" if args.len() == 1 => {
-            let Some(z) = value_text(&args[0], enc) else {
-                return Some(Ok(Value::Null));
-            };
-            let mut out = z.into_owned();
-            if upper == "LOWER" {
-                out.make_ascii_lowercase();
-            } else {
-                out.make_ascii_uppercase();
-            }
-            Ok(text_value(out))
+            let Some(bytes) = value_text(&args[0], enc) else { return Some(Ok(Value::Null)); };
+            Ok(text_value(ascii_case_bytes(bytes.into_owned(), upper == "LOWER")))
         }
         "LIKE" | "GLOB" if args.len() == 2 || (upper == "LIKE" && args.len() == 3) => {
             // likeFunc: the ESCAPE argument is examined first; all three are C strings.

@@ -2807,3 +2807,8 @@ UTF-8 OFF dosya farkı kapandı. Üç kodlama ile 12 yeniden açılış ve kip b
 ## V6b.500 — Sade UPDATE eşitliğinde kayıtlı NOCASE ve RTRIM
 
 Dört COLLATE yerleşimi, iki journal ve üç kodlamada ilk adım, reset, callback argüman sırası ve dosyalar C ile eş. Geniş kanıt 1.536 karşılaştırma. Birleşik V500 kaynağında 192 karşılaştırma, 288 sağlıklı C açılışı ve Group65 her kipte 36/36. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v500-update-collation-rebase/sonuc.md) OFF 1370/0/324, ON 1370/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,281 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_500.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.501 — Hazırlanmış TRIM, LTRIM, RTRIM, LOWER ve UPPER
+
+Üç kodlama, iki journal ve V1/V2 ile kip başına 12 API profili C ile eş. Kip başına 120 olağan ve 12 odaklı sonuç eş. Group65 her kipte 37/37. [Bağımsız ölçüm](/github/sqliters/target/perf-work/builtin-trim-case-text-register-candidate/sonuc.md) OFF 1371/0/324, ON 1371/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,290 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_501.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
