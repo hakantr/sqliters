@@ -4386,3 +4386,53 @@ fn group65_text_register_write_honors_mutation_trace_enabled_after_prepare() {
     assert!(matches!(stmt.step().unwrap(), StepResult::Done));
     assert_eq!(db.take_mutation_trace().unwrap().len(), 1);
 }
+
+#[test]
+fn group64_limit_sort_uses_registered_nocase_and_rtrim_slots_on_reset() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for mode in ["FILE", "DEFAULT", "MEMORY"] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}'; PRAGMA temp_store={mode}; PRAGMA threads=0;
+                 CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO items VALUES (1,'A'),(2,'a'),(3,'B'),(4,'b'),(5,NULL),(6,'A ');"
+            )).unwrap();
+            for collation in ["NOCASE", "RTRIM"] {
+                let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let seen = Arc::clone(&calls);
+                db.register_collation(collation, move |left, right| {
+                    seen.lock().unwrap().push((left.to_owned(), right.to_owned()));
+                    right.cmp(left)
+                }).unwrap();
+                let sql = format!(
+                    "SELECT id FROM items ORDER BY v COLLATE {collation} NULLS LAST,id LIMIT ?1 OFFSET ?2"
+                );
+                let mut stmt = db.prepare(&sql).unwrap();
+                stmt.bind(1, 3i64).unwrap().bind(2, 1i64).unwrap();
+                assert!(calls.lock().unwrap().is_empty());
+                let StepResult::Row(first) = stmt.step().unwrap() else { panic!("missing first row"); };
+                assert_eq!(first.get_i64(0), Some(2));
+                assert!(stmt.machine_stmt_status(4, false) > 0, "{encoding}/{mode}/{collation}");
+                let expected = [
+                    ("A", "a"), ("a", "B"), ("A", "B"), ("B", "b"),
+                    ("a", "b"), ("A", "A "), ("a", "A "), ("B", "A "),
+                ].map(|(left, right)| (left.to_owned(), right.to_owned()));
+                assert_eq!(std::mem::take(&mut *calls.lock().unwrap()), expected);
+                stmt.reset().unwrap();
+
+                stmt.bind(1, 2i64).unwrap().bind(2, 0i64).unwrap();
+                for id in [4, 2] {
+                    let StepResult::Row(row) = stmt.step().unwrap() else { panic!("missing row {id}"); };
+                    assert_eq!(row.get_i64(0), Some(id));
+                }
+                assert!(matches!(stmt.step().unwrap(), StepResult::Done));
+                let expected = [
+                    ("A", "a"), ("A", "B"), ("a", "B"), ("B", "b"),
+                    ("a", "b"), ("a", "b"), ("a", "A "),
+                ].map(|(left, right)| (left.to_owned(), right.to_owned()));
+                assert_eq!(std::mem::take(&mut *calls.lock().unwrap()), expected);
+                stmt.reset().unwrap();
+            }
+        }
+    }
+}

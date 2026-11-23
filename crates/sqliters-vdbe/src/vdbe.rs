@@ -1549,6 +1549,17 @@ fn ordered_limit_index(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
         && prog.a_op.iter().any(|op| op.opcode == OP_Sort && op.p1 == cursor)
 }
 
+fn matches_application_order_collation(coll: &CollSeq, name: &str, key_encoding: u8) -> bool {
+    // NOCASE and RTRIM have a UTF-8 slot even when the key is UTF-16.
+    // Other application collations are tagged with the key encoding by the generator.
+    let encoding = if name.eq_ignore_ascii_case("NOCASE") || name.eq_ignore_ascii_case("RTRIM") {
+        crate::vdbeaux::SQLITE_UTF8
+    } else {
+        key_encoding
+    };
+    coll.name.eq_ignore_ascii_case(name) && coll.enc == encoding
+}
+
 /// Validate the cursor and key that can call an application comparator.
 #[doc(hidden)]
 pub fn custom_limit_sort_open(prog: &Program, name: &str, enc: u8) -> Option<usize> {
@@ -1557,9 +1568,7 @@ pub fn custom_limit_sort_open(prog: &Program, name: &str, enc: u8) -> Option<usi
     let P4::KeyInfo(key) = &op.p4 else { return None };
     (opens.next().is_none() && key.enc == enc && ordered_limit_index(prog, op, key)
         && key.a_coll.first().and_then(Option::as_deref).is_some_and(|coll| {
-            // The generator tags an application CollSeq with the key encoding.
-            // The bound runtime uses the encoding of the registered callback (UTF-8).
-            coll.name.eq_ignore_ascii_case(name) && coll.enc == key.enc
+            matches_application_order_collation(coll, name, key.enc)
         })
         && key.a_coll[1..].iter().flatten().all(|coll| {
             coll.name.eq_ignore_ascii_case("BINARY") && coll.enc == key.enc
@@ -1788,12 +1797,7 @@ pub fn custom_file_sort_open(prog: &Program, name: &str, enc: u8) -> Option<usiz
     (opens.next().is_none() && key.enc == enc && key.n_key_field <= 2
         && ordinary_order_key(key, |index, coll| {
             let name = if index == 0 { name } else { "BINARY" };
-            let collation_enc = if name.eq_ignore_ascii_case("NOCASE") || name.eq_ignore_ascii_case("RTRIM") {
-                crate::vdbeaux::SQLITE_UTF8
-            } else {
-                enc
-            };
-            coll.name.eq_ignore_ascii_case(name) && coll.enc == collation_enc
+            matches_application_order_collation(coll, name, enc)
         })
         && complete_order_sorter(prog, op, key))
         .then_some(pc)
