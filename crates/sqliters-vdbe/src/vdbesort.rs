@@ -132,7 +132,7 @@ impl PmaFile {
     }
 
     fn prepare_run(&self, bytes: u64, mmap_limit: i32) {
-        extend_pma_file(self.handle.as_ref(), self.end.saturating_add(bytes).saturating_add(9), mmap_limit);
+        extend_pma_file(&self.handle, self.end.saturating_add(bytes).saturating_add(9), mmap_limit);
     }
 
     fn write_run(&mut self, bytes: u64, run: Vec<Vec<u8>>) -> SqlResult<()> {
@@ -168,12 +168,12 @@ fn open_pma_file(vfs: &dyn Vfs) -> SqlResult<Arc<dyn VfsFile>> {
     Ok(Arc::from(file))
 }
 
-fn extend_pma_file(file: &dyn VfsFile, size: u64, mmap_limit: i32) {
-    if mmap_limit > 0 && size <= mmap_limit as u64 && file.supports_fetch_range() {
-        let _ = file.set_chunk_size(4096);
+fn extend_pma_file(file: &Arc<dyn VfsFile>, size: u64, mmap_limit: i32) {
+    if mmap_limit > 0 && size <= mmap_limit as u64 && file.supports_sorter_range() {
+        let _ = file.set_sorter_chunk_size(4096);
         let _ = file.size_hint(size);
         // The preallocation probe is best effort and immediately unpins.
-        let _ = file.fetch_range(0, size as usize);
+        let _ = Arc::clone(file).fetch_sorter_range(0, size as usize);
     }
 }
 
@@ -253,8 +253,8 @@ struct PmaDiskReader {
 
 impl PmaDiskReader {
     fn open(file: &Arc<dyn VfsFile>, start: u64, end: u64, page_size: usize, mmap_limit: i32) -> SqlResult<Self> {
-        let mapping = if mmap_limit > 0 && end <= mmap_limit as u64 && file.supports_fetch_range() {
-            file.fetch_range(0, end as usize)?
+        let mapping = if mmap_limit > 0 && end <= mmap_limit as u64 && file.supports_sorter_range() {
+            Arc::clone(file).fetch_sorter_range(0, end as usize)?
         } else {
             None
         };
@@ -364,7 +364,7 @@ impl PmaIntermediate<'_> {
             Some(file) => Arc::clone(file),
             None => {
                 let opened = open_pma_file(self.vfs)?;
-                extend_pma_file(opened.as_ref(), self.allocation, self.mmap_limit);
+                extend_pma_file(&opened, self.allocation, self.mmap_limit);
                 self.file = Some(Arc::clone(&opened));
                 opened
             }

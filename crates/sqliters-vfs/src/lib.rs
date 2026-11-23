@@ -193,6 +193,9 @@ enum FetchRangeSource {
     Bytes(FetchPage),
     #[cfg(unix)]
     Unix(fetch::RangeLease),
+    // Release the fetch lease before the last reference can close the original descriptor.
+    #[cfg(target_os = "linux")]
+    KernelCopy(fetch::RangeLease, Arc<OsFile>),
 }
 
 impl FetchRange {
@@ -212,6 +215,11 @@ impl FetchRange {
             }
             #[cfg(unix)]
             FetchRangeSource::Unix(range) => range.copy_into(offset, output),
+            #[cfg(target_os = "linux")]
+            FetchRangeSource::KernelCopy(range, owner) => {
+                owner.file_ref()?;
+                range.copy_through_kernel(offset, output)
+            }
         }
     }
 }
@@ -332,6 +340,23 @@ pub trait VfsFile: Send + Sync {
     #[doc(hidden)]
     fn fetch_range(&self, offset: u64, amount: usize) -> Result<Option<FetchRange>> {
         self.fetch(offset, amount).map(|page| page.map(FetchRange::from_page))
+    }
+
+    /// Sorter-specific range support. The default preserves existing custom VFS hooks.
+    #[doc(hidden)]
+    fn supports_sorter_range(&self) -> bool {
+        self.supports_fetch_range()
+    }
+
+    #[doc(hidden)]
+    fn set_sorter_chunk_size(&self, size: u32) -> Result<()> {
+        self.set_chunk_size(size)
+    }
+
+    /// A sorter may retain its already-open VFS handle with the range.
+    #[doc(hidden)]
+    fn fetch_sorter_range(self: Arc<Self>, offset: u64, amount: usize) -> Result<Option<FetchRange>> {
+        self.fetch_range(offset, amount)
     }
 
     /// `xUnfetch(fd, 0, NULL)`: invalidate the mapping after all leases return.
@@ -2239,6 +2264,8 @@ struct OsFile {
     fetch_state: Arc<Mutex<fetch::FetchState>>,
     #[cfg(unix)]
     private_sorter_inode: bool,
+    #[cfg(unix)]
+    unlinked_sorter_file: bool,
     lock_geometry: LockGeometry,
     min_shm_granularity: usize,
     lock_level: Mutex<LockLevel>,
@@ -2442,6 +2469,36 @@ impl VfsFile for OsFile {
         { let _ = (file, offset, amount); Ok(None) }
     }
 
+    fn supports_sorter_range(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if self.unlinked_sorter_file {
+            return sys::unix::can_copy_self_bytes();
+        }
+        self.supports_fetch_range()
+    }
+
+    fn set_sorter_chunk_size(&self, size: u32) -> Result<()> {
+        #[cfg(unix)]
+        if self.unlinked_sorter_file {
+            self.file_ref()?;
+            return fetch::set_chunk_size(&self.fetch_state, size);
+        }
+        self.set_chunk_size(size)
+    }
+
+    fn fetch_sorter_range(self: Arc<Self>, offset: u64, amount: usize) -> Result<Option<FetchRange>> {
+        #[cfg(target_os = "linux")]
+        if self.unlinked_sorter_file {
+            if !sys::unix::can_copy_self_bytes() {
+                return Ok(None);
+            }
+            // Keep the named mapping lease but copy only through the kernel.
+            let range = fetch::fetch_range(&self.fetch_state, self.file_ref()?, offset, amount)?;
+            return Ok(range.map(|range| FetchRange(FetchRangeSource::KernelCopy(range, self))));
+        }
+        self.fetch_range(offset, amount)
+    }
+
     fn unfetch_all(&self) -> Result<()> {
         self.file_ref()?;
         #[cfg(unix)]
@@ -2467,7 +2524,7 @@ impl VfsFile for OsFile {
         let file = self.file_ref()?;
         #[cfg(unix)]
         {
-            if self.private_sorter_inode {
+            if self.private_sorter_inode || self.unlinked_sorter_file {
                 fetch::write_private_sorter(&self.fetch_state, file, buf, offset)
             } else {
                 sys::unix::pwrite_all(file, buf, offset, extended::SQLITE_IOERR_WRITE)
@@ -3873,6 +3930,9 @@ impl Vfs for OsVfs {
             fetch_state: Arc::new(Mutex::new(fetch::FetchState::default())),
             #[cfg(unix)]
             private_sorter_inode: has_unnamed_inode && flags.contains(OpenFlags::TEMP_JOURNAL),
+            #[cfg(unix)]
+            unlinked_sorter_file: cfg!(target_os = "linux") && anonymous_temp && !has_unnamed_inode && !linked
+                && flags.contains(OpenFlags::TEMP_JOURNAL),
             lock_geometry: self.lock_geometry,
             min_shm_granularity: self.min_shm_granularity,
             lock_level: Mutex::new(LockLevel::NoLock),
@@ -4660,6 +4720,33 @@ mod tests {
         drop(mapping);
         file.unfetch_all().unwrap();
         file.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_unlinked_sorter_kernel_copy_keeps_open_handle_and_current_bytes() {
+        let flags = OpenFlags::TEMP_JOURNAL | OpenFlags::READWRITE | OpenFlags::CREATE
+            | OpenFlags::EXCLUSIVE | OpenFlags::DELETEONCLOSE;
+        let file: Arc<dyn VfsFile> = Arc::from(OsVfs::default().open(None, flags).unwrap());
+        if !file.supports_sorter_range() || file.supports_fetch_range() {
+            return;
+        }
+        file.mmap_size(8192).unwrap();
+        file.set_sorter_chunk_size(4096).unwrap();
+        file.size_hint(2000).unwrap();
+        assert_eq!(file.file_size().unwrap(), 4096);
+        assert!(file.fetch_range(0, 1024).unwrap().is_none());
+        let range = Arc::clone(&file).fetch_sorter_range(0, 1024).unwrap().unwrap();
+        file.write_at(&[57; 16], 500).unwrap();
+        let mut bytes = [0; 16];
+        range.copy_into(500, &mut bytes).unwrap();
+        assert_eq!(bytes, [57; 16]);
+        file.truncate(508).unwrap();
+        assert!(range.copy_into(500, &mut bytes).is_err());
+        assert!(file.unfetch_all().is_err());
+        drop(file);
+        range.copy_into(500, &mut bytes[..8]).unwrap();
+        assert_eq!(bytes, [57; 16]);
     }
 
     #[test]

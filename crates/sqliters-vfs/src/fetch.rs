@@ -106,15 +106,27 @@ pub(crate) struct RangeLease {
 }
 
 impl RangeLease {
-    pub(crate) fn copy_into(&self, offset: usize, output: &mut [u8]) -> Result<()> {
-        let state = lock(&self.lease.0)?;
-        if offset > self.len || output.len() > self.len - offset
-            || (self.offset + offset + output.len()) as u64 > state.usable_len
+    fn copy_offset(&self, offset: usize, amount: usize, usable_len: u64) -> Result<usize> {
+        if offset > self.len || amount > self.len - offset
+            || (self.offset + offset + amount) as u64 > usable_len
         {
             return Err(SqliteError::misuse("fetch range out of bounds"));
         }
-        state.mapping.as_ref().unwrap().copy_into(self.offset + offset, output);
+        Ok(self.offset + offset)
+    }
+
+    pub(crate) fn copy_into(&self, offset: usize, output: &mut [u8]) -> Result<()> {
+        let state = lock(&self.lease.0)?;
+        let at = self.copy_offset(offset, output.len(), state.usable_len)?;
+        state.mapping.as_ref().unwrap().copy_into(at, output);
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn copy_through_kernel(&self, offset: usize, output: &mut [u8]) -> Result<()> {
+        let state = lock(&self.lease.0)?;
+        let at = self.copy_offset(offset, output.len(), state.usable_len)?;
+        state.mapping.as_ref().unwrap().copy_through_kernel(at, output)
     }
 }
 
@@ -181,7 +193,7 @@ pub(crate) fn write_private_sorter(
     buf: &[u8],
     offset: u64,
 ) -> Result<()> {
-    // A range copy and this write must not access the mapped bytes concurrently.
+    // Serialize owned sorter reads with same-handle writes, including mapped range copies.
     let _guard = lock(shared)?;
     sys::unix::pwrite_all(file, buf, offset, extended::SQLITE_IOERR_WRITE)
 }

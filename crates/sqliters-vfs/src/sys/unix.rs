@@ -269,7 +269,25 @@ const MAP_FAILED_ADDR: usize = usize::MAX;
 #[repr(C, align(8))]
 struct LinuxStatfsBuf([usize; 32]);
 
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct ProcessIoVec {
+    base: *mut core::ffi::c_void,
+    len: usize,
+}
+
 unsafe extern "C" {
+    #[cfg(target_os = "linux")]
+    fn getpid() -> i32;
+    #[cfg(target_os = "linux")]
+    fn process_vm_readv(
+        pid: i32,
+        local: *const ProcessIoVec,
+        local_count: usize,
+        remote: *const ProcessIoVec,
+        remote_count: usize,
+        flags: usize,
+    ) -> isize;
     fn access(path: *const c_char, mode: i32) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn ftruncate(fd: i32, length: i64) -> i32;
@@ -910,6 +928,53 @@ pub(crate) struct ReadMapping {
 // mutex. No reference into mapped memory is exposed to Rust callers.
 unsafe impl Send for ReadMapping {}
 
+#[cfg(target_os = "linux")]
+fn copy_self_bytes(mut from: *const u8, mut output: &mut [u8]) -> Result<()> {
+    while !output.is_empty() {
+        let local = ProcessIoVec { base: output.as_mut_ptr().cast(), len: output.len() };
+        let remote = ProcessIoVec { base: from.cast_mut().cast(), len: output.len() };
+        // SAFETY: both iovec structs and the writable output are live for the call.
+        // The source address is never dereferenced in Rust. The kernel checks its
+        // range in this process; access failure is reported as a short copy or error.
+        let read = unsafe { process_vm_readv(getpid(), &local, 1, &remote, 1, 0) };
+        if read < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(SqliteError::with_extended(extended::SQLITE_IOERR_READ, error.to_string()));
+        }
+        let read = read as usize;
+        if read == 0 || read > output.len() {
+            return Err(SqliteError::with_extended(extended::SQLITE_IOERR_SHORT_READ, ErrorCode::IoErr.as_str()));
+        }
+        from = from.wrapping_add(read);
+        output = &mut output[read..];
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn self_copy_syscall_unfiltered() -> bool {
+    // A syscall filter may terminate the thread instead of returning an error.
+    // Decline this optional operation on filtered or unverifiable threads.
+    fs::read("/proc/thread-self/status").is_ok_and(|status| {
+        status.split(|&byte| byte == b'\n').any(|line| {
+            line.strip_prefix(b"Seccomp:").is_some_and(|value| value.trim_ascii() == b"0")
+        })
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn can_copy_self_bytes() -> bool {
+    if !self_copy_syscall_unfiltered() {
+        return false;
+    }
+    let input = [57u8];
+    let mut output = [0u8];
+    copy_self_bytes(input.as_ptr(), &mut output).is_ok() && input == output
+}
+
 impl ReadMapping {
     pub(crate) fn map(file: &File, len: usize) -> Option<Self> {
         debug_assert!(len > 0 && len <= 0x7fff0000);
@@ -949,6 +1014,17 @@ impl ReadMapping {
         for (index, byte) in output.iter_mut().enumerate() {
             *byte = self.byte(offset + index);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn copy_through_kernel(&self, offset: usize, output: &mut [u8]) -> Result<()> {
+        if offset > self.len || output.len() > self.len - offset {
+            return Err(SqliteError::misuse("fetch range out of bounds"));
+        }
+        if !output.is_empty() && !self_copy_syscall_unfiltered() {
+            return Err(SqliteError::with_extended(extended::SQLITE_IOERR_READ, "kernel range copy unavailable"));
+        }
+        copy_self_bytes(self.ptr.as_ptr().wrapping_add(offset), output)
     }
 
     pub(crate) fn copy(&self, offset: usize, amount: usize) -> Vec<u8> {

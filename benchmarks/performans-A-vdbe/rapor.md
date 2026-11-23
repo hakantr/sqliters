@@ -2492,3 +2492,8 @@ Pinli C ile 132 akış ve 972 API kaydı eş. Mevcut doğru ariteyi değiştirme
 ## V6b.437 — Hazırlanmış scalar seçimi ve ilk adım/reset
 
 Pinli C ile 48 akış ve 852 API kaydında hazırlanmış view/trigger, tablo biçiminde function_list, reset ve reprepare davranışı sınandı. Taze AST view callback zamanlamasındaki 20 önceki kayıt farkı kaydedildi. Diğer ölçümler eş. 12 arite geri yükleme ve 180 değişmeyen kapsam dışı kontrol doğrulandı. OFF 1316/1/325, ON 1314/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,270 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_437.md).
+
+
+## V6b.438 — Adlandırılmış sorter mmap
+
+Kararlı filtresiz Linux üzerinde adlandırılıp silinen sorter dosyasının eşlemesi aynı süreçten güvenli çekirdek kopyasıyla okunur. C ile 84 VFS izi, 48 önceki VFS izi ve 144 işçi kontrolü eş. Ek pread hatası kapandı. Sınır, mmap ve dosya kapanışı doğrulandı. OFF 1317/1/325, ON 1315/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,282 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_438.md).
