@@ -3600,6 +3600,30 @@ impl Pager {
         Ok(())
     }
 
+    // pager.c:5452–5488: warm rollback readers compare only these
+    // sixteen bytes. Reading the complete header can fail in regions C
+    // never touches during its file-version check.
+    fn refresh_rollback_read_version(&mut self, retained_reader: bool) -> Result<bool> {
+        if retained_reader || self.uses_temp_file_semantics() || !self.has_held_shared_lock {
+            return Ok(false);
+        }
+        let mut version = [0u8; 16];
+        match self.db_file()?.read_at(&mut version, 24) {
+            Ok(16) => {}
+            Ok(_) => version.fill(0),
+            Err(e) if e.extended_code == extended::SQLITE_IOERR_SHORT_READ => version.fill(0),
+            Err(e) => return Err(e),
+        }
+        if version == self.db_file_vers {
+            return Ok(false);
+        }
+        self.notify_backup_restart();
+        self.bump_data_version();
+        self.pcache_reset();
+        self.invalidate_mapping();
+        Ok(true)
+    }
+
     fn begin_read_under_shared_lock(&mut self, retained_reader: bool, snapshot_established: &mut bool) -> Result<()> {
         if (self.is_memdb_backing && self.header_loaded)
             || (self.db_kind == DatabaseKind::PrivateTemporary && self.file.is_none())
@@ -3615,17 +3639,22 @@ impl Pager {
             }
         }
 
-        // A VACUUM lock error requires an explicit EXCLUSIVE success even
-        // if the OS shows NO_LOCK or another connection removed the journal.
-        // This precedes WAL discovery and every file-content read.
-        let vacuum_recovered = if self.vacuum_lock_error.is_some() && self.error_lock_unknown {
-            Some(self.recover_hot_journal_under_shared_lock()?)
+        // The first successful read after a VACUUM lock error resolves the
+        // journal and compares the file version before WAL discovery.
+        // While the lock is unknown, recovery requires EXCLUSIVE first.
+        let (vacuum_recovered, vacuum_version_changed) = if self.vacuum_lock_error.is_some()
+            && self.wal.is_none()
+            && !retained_reader
+        {
+            let recovered = self.recover_hot_journal_under_shared_lock()?;
+            let version_changed = self.refresh_rollback_read_version(retained_reader)?;
+            (Some(recovered), Some(version_changed))
         } else {
-            None
+            (None, None)
         };
 
         // Pass 1 (`pagerOpenWalIfPresent`, `pager.c:3393-3421`):
-        // Check `<db>-wal` under `.db` `SHARED` lock BEFORE touching Page 1 or `<db>-journal`.
+        // Check `<db>-wal` under the database's `SHARED` lock before Page 1.
         if self.wal.is_none() && self.db_kind == DatabaseKind::NamedDisk && !self.suppress_auto_wal
         {
             let wpath = self.wal_path.clone().expect("NamedDisk has wal_path");
@@ -3652,28 +3681,11 @@ impl Pager {
             } else {
                 self.recover_hot_journal_under_shared_lock()?
             };
-            // pager.c:5452–5488: warm rollback readers compare only these
-            // sixteen bytes. Reading the complete header here introduces I/O
-            // failures in regions C never touches (D117).
-            let version_changed = if !retained_reader
-                && !self.uses_temp_file_semantics()
-                && self.has_held_shared_lock
-            {
-                let mut version = [0u8; 16];
-                match self.db_file()?.read_at(&mut version, 24) {
-                    Ok(16) => {}
-                    Ok(_) => version.fill(0),
-                    Err(e) if e.extended_code == sqliters_types::error::extended::SQLITE_IOERR_SHORT_READ => version.fill(0),
-                    Err(e) => return Err(e),
-                }
-                version != self.db_file_vers
-            } else { false };
-            if version_changed {
-                self.notify_backup_restart();
-                self.bump_data_version();
-                self.pcache_reset();
-                self.invalidate_mapping();
-            }
+            let version_changed = if let Some(changed) = vacuum_version_changed {
+                changed
+            } else {
+                self.refresh_rollback_read_version(retained_reader)?
+            };
             let cached_header = !recovered && !version_changed && self.header_loaded && self.page_size_fixed
                 && self.cache.slot_of(1).is_some()
                 && (self.suppress_auto_wal

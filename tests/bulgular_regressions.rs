@@ -889,6 +889,8 @@ struct FaultState {
     persist_main_write_fault: bool,
     fail_next_truncate: bool,
     fail_unlock_after_truncate: bool,
+    fail_next_version_read: bool,
+    wal_accesses: usize,
     fail_next_main_sync: bool,
     fail_next_main_sync_notification: bool,
     fail_next_journal_delete: bool,
@@ -920,6 +922,15 @@ struct FaultFile {
 
 impl VfsFile for FaultFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> sqliters::Result<usize> {
+        if self.is_main_db && offset == 24 && buf.len() == 16 {
+            let mut state = self.state.lock().unwrap();
+            if std::mem::take(&mut state.fail_next_version_read) {
+                return Err(SqliteError::with_extended(
+                    extended::SQLITE_IOERR_READ,
+                    "injected main DB version read error",
+                ));
+            }
+        }
         self.inner.read_at(buf, offset)
     }
 
@@ -1056,6 +1067,9 @@ impl Vfs for FaultVfs {
     }
 
     fn exists(&self, path: &Path) -> sqliters::Result<bool> {
+        if path.to_string_lossy().ends_with("-wal") {
+            self.state.lock().unwrap().wal_accesses += 1;
+        }
         self.inner.exists(path)
     }
 
@@ -1374,6 +1388,14 @@ fn test_bulgu_y1_failed_commit_partial_writes_rolled_back_atomically() {
     peer.execute_batch("ROLLBACK").unwrap();
     peer.try_close().unwrap();
 
+    {
+        let mut state = fault.lock().unwrap();
+        state.fail_next_version_read = true;
+        state.wal_accesses = 0;
+    }
+    assert_eq!(conn.query(VALUES_SQL, &[]).unwrap_err().extended_code, extended::SQLITE_IOERR_READ);
+    assert_eq!(fault.lock().unwrap().wal_accesses, 0);
+    assert_eq!(fs::read(tmp.path()).unwrap(), before_busy);
     verify(&conn, [10, 10, 20, 0]);
     conn.try_close().unwrap();
     verify_reopen(tmp.path(), [10, 10, 20, 0]);
