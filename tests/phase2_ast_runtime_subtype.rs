@@ -3173,3 +3173,41 @@ fn group65_function_list_application_hash_and_overload_order() {
     let output = db.query("PRAGMA function_list", &[]).unwrap();
     assert!(output.rows.iter().any(|row| row.get_str(0) == Some(rust_only.as_str())));
 }
+
+#[test]
+fn group64_file_sorter_worker_count_follows_build_limit() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}';
+             PRAGMA temp_store=DEFAULT; PRAGMA cache_size=1;
+             CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);
+             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<24)
+             INSERT INTO items SELECT i, printf('%02d%70000s',24-i,'x') FROM n;"
+        )).unwrap();
+        let mut statement = db.prepare(
+            "SELECT id FROM items ORDER BY v COLLATE BINARY NULLS LAST,id"
+        ).unwrap();
+        for (request, expected_threads) in [(0, 0), (3, 3), (8, 8), (9, 8), (1, 1), (0, 0)] {
+            let setting = db.query(&format!("PRAGMA threads={request}"), &[]).unwrap();
+            assert_eq!(setting.rows[0].get_i64(0), Some(expected_threads));
+            statement.machine_stmt_status(4, true);
+            for id in (1..=24).rev() {
+                let StepResult::Row(row) = statement.step().unwrap() else {
+                    panic!("expected row in {encoding}, threads={request}");
+                };
+                assert_eq!(row.get_i64(0), Some(id));
+                if request == 3 {
+                    break;
+                }
+            }
+            if request != 3 {
+                assert!(matches!(statement.step().unwrap(), StepResult::Done));
+            }
+            if request > 0 {
+                assert!(statement.machine_stmt_status(4, false) > 0, "{encoding}");
+            }
+            statement.reset().unwrap();
+        }
+    }
+}

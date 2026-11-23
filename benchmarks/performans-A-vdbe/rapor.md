@@ -2552,3 +2552,8 @@ Yeni uygulama aggregate aritesi eski hazırlanmış seçimi değiştirmez. Taze 
 ## V6b.449 — Kayıtlı görünüm MATCH güvenilir şema kararı
 
 Güvenilmeyen şemadaki kayıtlı görünüm MATCH ifadesi C gibi reddedildi. Doğrudan okuma, güvenilir görünüm, VACUUM sonrası yeniden açılış ve bütünlük kontrolleri korundu. FTS dosyasındaki 14 test iki kipte geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v449-trusted-match-defense-candidate/sonuc.md) OFF 1328/1/325, ON 1327/2/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,273 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_449.md).
+
+
+## V6b.450 — Derleme sınırına kadar FILE PMA işçileri
+
+Üç ila sekiz işçi, sekiz üzerindeki isteklerin sınırı, BINARY toplam sırası, üç kodlama ve iki yürütme kipinde 10.111.938 VFS olayı ile değerlendirildi. Gerçek işçi kapanışı ve FK açık 180 sağlıklı koşu doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v450-worker-limit-rebased-candidate/sonuc.md) OFF 1329/1/325, ON 1328/2/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,276 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_450.md).

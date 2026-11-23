@@ -5589,7 +5589,7 @@ impl Vdbe {
                     let worker_count = host.sorter_worker_threads();
                     if !temp_in_memory && self.prog.fallible_sort_open().is_none()
                         && (k.enc == 1 || k.enc == host.text_encoding() as u8)
-                        && matches!(worker_count, 1 | 2) && host.sorter_mmap_limit() <= 0
+                        && worker_count > 0 && host.sorter_mmap_limit() <= 0
                         && matches!(&op.p4, P4::KeyInfo(key) if worker_order_sorter(&self.prog, op, key))
                         && k.a_coll.iter().flatten().all(|coll| coll.is_binary && coll.custom.is_none())
                     {

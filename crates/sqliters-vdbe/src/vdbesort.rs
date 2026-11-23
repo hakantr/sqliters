@@ -824,6 +824,8 @@ impl VdbeSorter {
 
     pub(crate) fn enable_workers(&mut self, count: usize) {
         if self.use_a_memory && self.vfs.is_some() {
+            // The foreground task also occupies one reader in the merge root.
+            let count = count.min(PMA_FANOUT - 1);
             self.auxiliary_tasks.resize_with(count, || RunWriter {
                 file: None,
                 intermediate: Arc::new(std::sync::Mutex::new(None)),
