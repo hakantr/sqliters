@@ -21,6 +21,13 @@ pub(super) struct PragmaName {
     arg: u64,
 }
 
+/// The result of the host's prepare-time authorization of a direct function_list.
+#[derive(Clone, Copy)]
+pub enum FunctionListAuthorization {
+    Allow,
+    Ignore,
+}
+
 /// Changes pragma.c makes while preparing (before sqlite3_step).
 #[derive(Debug, Clone)]
 pub enum PrepareEffect {
@@ -269,8 +276,20 @@ pub fn sqlite3_pragma(
     };
     let right = right.as_deref();
     if p.db.x_auth {
-        p.not_supported("PRAGMA with an authorizer (V6b)");
-        return;
+        let authorization = if name.eq_ignore_ascii_case("function_list") {
+            p.db.host.pragma_function_list_authorization()
+        } else {
+            None
+        };
+        match authorization {
+            Some(FunctionListAuthorization::Allow) => {}
+            // SQLITE_IGNORE returns before file control, result columns or rows.
+            Some(FunctionListAuthorization::Ignore) => return,
+            None => {
+                p.not_supported("PRAGMA with an authorizer (V6b)");
+                return;
+            }
+        }
     }
     // pragma.c:484–504 -> main.c:4224: file_control returns SQLITE_ERROR when
     // the named btree is absent. EXPLAIN does not open an unopened temp btree.

@@ -3211,3 +3211,72 @@ fn group64_file_sorter_worker_count_follows_build_limit() {
         }
     }
 }
+
+#[test]
+fn group65_function_list_authorized_machine_progress_and_reauthorization() {
+    use sqliters::{AuthorizerAction, AuthorizerResult};
+
+    let db = Connection::open_in_memory().unwrap();
+    let policy = Arc::new(AtomicUsize::new(0));
+    let auth_calls = Arc::new(AtomicUsize::new(0));
+    let decision = policy.clone();
+    let observed = auth_calls.clone();
+    db.set_authorizer(Some(Box::new(move |action, name, value, schema, inner| {
+        assert_eq!(action, AuthorizerAction::Pragma);
+        assert_eq!((name, value, schema, inner), (Some("function_list"), None, None, None));
+        observed.fetch_add(1, AtomicOrdering::Relaxed);
+        match decision.load(AtomicOrdering::Relaxed) {
+            0 => AuthorizerResult::Ok,
+            1 => AuthorizerResult::Ignore,
+            _ => AuthorizerResult::Deny,
+        }
+    }))).unwrap();
+    let progress_calls = Arc::new(AtomicUsize::new(0));
+    let progressed = progress_calls.clone();
+    db.progress_handler(1, Some(Box::new(move || {
+        progressed.fetch_add(1, AtomicOrdering::Relaxed);
+        false
+    }))).unwrap();
+
+    let mut stmt = db.prepare("PRAGMA function_list").unwrap();
+    assert_eq!(auth_calls.load(AtomicOrdering::Relaxed), 1);
+    assert!(matches!(stmt.step().unwrap(), StepResult::Row(_)));
+    assert_eq!(auth_calls.load(AtomicOrdering::Relaxed), 1);
+    assert_eq!(stmt.machine_stmt_status(4, false), 10);
+    assert_eq!(progress_calls.load(AtomicOrdering::Relaxed), 10);
+
+    stmt.reset().unwrap();
+    policy.store(1, AtomicOrdering::Relaxed);
+    assert!(matches!(stmt.step().unwrap(), StepResult::Done));
+    assert_eq!(auth_calls.load(AtomicOrdering::Relaxed), 2);
+    assert_eq!(stmt.column_count(), 0);
+    assert_eq!(stmt.c_reprepare_status().0, 1);
+    assert_eq!(stmt.machine_stmt_status(4, false), 14);
+    assert_eq!(progress_calls.load(AtomicOrdering::Relaxed), 14);
+
+    stmt.reset().unwrap();
+    policy.store(2, AtomicOrdering::Relaxed);
+    assert_eq!(stmt.step().unwrap_err().code, ErrorCode::Auth);
+    assert_eq!(auth_calls.load(AtomicOrdering::Relaxed), 3);
+    assert_eq!(progress_calls.load(AtomicOrdering::Relaxed), 14);
+    assert_eq!(stmt.finalize().unwrap_err().code, ErrorCode::Auth);
+
+    const RUST_NAME: &str = "Enabled\0callback";
+    db.register_scalar_function(RUST_NAME, 0, FunctionFlags::NONE, |_| {
+        Ok(RuntimeValue::plain(Value::Null))
+    }).unwrap();
+    policy.store(0, AtomicOrdering::Relaxed);
+    let mut retained = db.prepare("PRAGMA function_list").unwrap();
+    let mut found = false;
+    while let StepResult::Row(row) = retained.step().unwrap() {
+        found |= row.get_str(0) == Some(RUST_NAME);
+    }
+    assert!(found);
+    assert_eq!(retained.machine_stmt_status(4, false), 0);
+
+    policy.store(1, AtomicOrdering::Relaxed);
+    let mut ignored = db.prepare("PRAGMA function_list").unwrap();
+    assert!(matches!(ignored.step().unwrap(), StepResult::Done));
+    assert_eq!(ignored.column_count(), 0);
+    assert_eq!(ignored.machine_stmt_status(4, false), 4);
+}

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use sqliters_codegen::builtin_funcs::{BUILTIN_FUNCS, BuiltinFunc, CONNECTION_FUNCS};
 use sqliters_codegen::build_tab::SchemaRow;
 use sqliters_codegen::consts::{SQLITE_DqsDML, SQLITE_TrustedSchema};
+use sqliters_codegen::pragma::FunctionListAuthorization;
 use sqliters_codegen::sqliteint::{PartialIndexBinding, VTable, VtabConnect, VtabModule};
 use sqliters_codegen::vtab::{IndexInfo, IndexInfoHidden};
 use sqliters_codegen::{Db, DbInfo, Host, PrepareResult};
@@ -35,6 +36,7 @@ enum PrepareBindings<'a> {
 
 struct EngineHost<'a> {
     bindings: PrepareBindings<'a>,
+    function_list_authorization: Option<FunctionListAuthorization>,
     functions: &'a FunctionRegistry,
     collations: &'a CollationRegistry,
     db_set: &'a crate::db_set::DatabaseSet,
@@ -167,6 +169,9 @@ impl Host for EngineHost<'_> {
     }
     fn pragma_module_names(&self) -> Option<Vec<String>> {
         Some(self.db_set.vtab_registry().module_names_in_hash_order())
+    }
+    fn pragma_function_list_authorization(&self) -> Option<FunctionListAuthorization> {
+        self.function_list_authorization
     }
     fn pragma_function_list(&self) -> Option<Vec<Vec<Value>>> {
         Some(crate::engine::pragma_function_list(self.functions).rows)
@@ -551,12 +556,25 @@ pub(crate) fn c_prepare_quiet(inner: &ConnectionInner, sql: &str) -> (PrepareRes
 /// Run C's parser and code generator over one statement (`sqlite3Prepare`).
 /// The third value: C's `sqlite3Init()` loaded the schemas during this prepare.
 pub(crate) fn c_prepare(inner: &ConnectionInner, sql: &str) -> (PrepareResult, usize, bool) {
-    c_prepare_impl(inner, sql, false, PrepareBindings::Unbound, None, false, None, &inner.functions)
+    c_prepare_impl(inner, sql, false, PrepareBindings::Unbound, None, false, None, &inner.functions, None)
+}
+
+/// Compile only after the engine's direct PRAGMA authorization returned its decision.
+pub(crate) fn c_prepare_authorized_function_list(
+    inner: &ConnectionInner, sql: &str, authorization: FunctionListAuthorization,
+) -> PrepareResult {
+    let quiet = C_QUIET.with(|c| c.replace(true));
+    let result = c_prepare_impl(
+        inner, sql, false, PrepareBindings::Unbound, None, false, None, &inner.functions,
+        Some(authorization),
+    ).0;
+    C_QUIET.with(|c| c.set(quiet));
+    result
 }
 
 /// Recompile with the old statement's parameter values (pParse->pReprepare).
 pub(crate) fn c_prepare_bound(inner: &ConnectionInner, sql: &str, values: &[Value]) -> (PrepareResult, usize, bool) {
-    c_prepare_impl(inner, sql, false, PrepareBindings::Read(values), None, false, None, &inner.functions)
+    c_prepare_impl(inner, sql, false, PrepareBindings::Read(values), None, false, None, &inner.functions, None)
 }
 
 pub(crate) fn c_prepare_bound_partial_index(
@@ -565,14 +583,14 @@ pub(crate) fn c_prepare_bound_partial_index(
     root: u32,
     binding: PartialIndexBinding<'_>,
 ) -> (PrepareResult, usize, bool) {
-    c_prepare_impl(inner, sql, false, PrepareBindings::PartialIndex { root, binding }, None, false, None, &inner.functions)
+    c_prepare_impl(inner, sql, false, PrepareBindings::PartialIndex { root, binding }, None, false, None, &inner.functions, None)
 }
 
 pub(crate) fn c_prepare_table_scan(
     inner: &ConnectionInner, sql: &str, values: Option<&[Value]>, root: u32,
 ) -> PrepareResult {
     let bindings = values.map_or(PrepareBindings::Unbound, PrepareBindings::Read);
-    c_prepare_impl(inner, sql, false, bindings, None, false, Some(root), &inner.functions).0
+    c_prepare_impl(inner, sql, false, bindings, None, false, Some(root), &inner.functions, None).0
 }
 
 pub(crate) fn c_explain_bound(inner: &ConnectionInner, sql: &str, values: &[Value]) -> CExplain {
@@ -674,7 +692,7 @@ fn c_prepare_probe(
     let rowest = take_c_rowest_clamped();
     let quiet = C_QUIET.with(|c| c.replace(true));
     let (result, _, reads_schema) = c_prepare_impl(
-        inner, sql, schema_probe, PrepareBindings::Unbound, deferred_vtab_connect, true, None, functions,
+        inner, sql, schema_probe, PrepareBindings::Unbound, deferred_vtab_connect, true, None, functions, None,
     );
     C_QUIET.with(|c| c.set(quiet));
     C_PRAGMA_EFFECTS.with(|c| *c.borrow_mut() = effects);
@@ -692,10 +710,12 @@ fn c_prepare_impl(
     suppress_vtab_callbacks: bool,
     table_scan_root: Option<u32>,
     functions: &FunctionRegistry,
+    function_list_authorization: Option<FunctionListAuthorization>,
 ) -> (PrepareResult, usize, bool) {
     let interrupted = deferred_vtab_connect.is_some();
     let host = EngineHost {
         bindings,
+        function_list_authorization,
         functions,
         collations: &inner.collations,
         db_set: &inner.db_set,

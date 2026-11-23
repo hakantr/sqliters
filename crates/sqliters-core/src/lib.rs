@@ -937,6 +937,7 @@ pub(crate) enum RunningExec {
     /// the port of C's virtual machine (`sqlite3_step` returned `SQLITE_ROW`).
     Machine {
         vm: Box<sqliters_vdbe::vdbe::Vdbe>,
+        no_lock: bool,
         lease_cursors: Vec<(SchemaInstanceId, CursorId)>,
         read_instances: SmallInstVec,
         function_generation: u64,
@@ -3089,6 +3090,22 @@ impl ConnectionInner {
         }
     }
 
+    fn machine_activity_finish(
+        no_lock: bool,
+        aborted: bool,
+        lease_cursors: Vec<(SchemaInstanceId, CursorId)>,
+        read_instances: SmallInstVec,
+    ) -> ActivityFinish {
+        if no_lock {
+            debug_assert!(lease_cursors.is_empty() && read_instances.is_empty());
+            ActivityFinish::NoLock
+        } else if aborted {
+            ActivityFinish::ReadAborted { lease_cursors, read_instances }
+        } else {
+            ActivityFinish::ReadDone { lease_cursors, read_instances }
+        }
+    }
+
     fn finish_running_exec(
         &mut self,
         hid: HandleId,
@@ -3113,6 +3130,7 @@ impl ConnectionInner {
             }
             RunningExec::Machine {
                 mut vm,
+                no_lock,
                 lease_cursors,
                 read_instances,
                 ..
@@ -3120,10 +3138,7 @@ impl ConnectionInner {
                 vdbe_host::halt(self, &mut vm);
                 self.finish_activity(
                     hid,
-                    ActivityFinish::ReadDone {
-                        lease_cursors,
-                        read_instances,
-                    },
+                    Self::machine_activity_finish(no_lock, false, lease_cursors, read_instances),
                     shared,
                 )
             }
@@ -6703,6 +6718,12 @@ fn check_create_generated_column_errors(
 
 fn prepare_pragma_program(inner: &mut ConnectionInner, sql: &str) -> Result<Option<Box<sqliters_vdbe::vdbeaux::Program>>> {
     let (result, _, _) = cgen::c_prepare_quiet(inner, sql);
+    finish_pragma_prepare(inner, result)
+}
+
+fn finish_pragma_prepare(
+    inner: &mut ConnectionInner, result: sqliters_codegen::PrepareResult,
+) -> Result<Option<Box<sqliters_vdbe::vdbeaux::Program>>> {
     apply_codegen_pragma_effects(inner)?;
     let program = match result {
         sqliters_codegen::PrepareResult::Program(program) => program,
@@ -6723,6 +6744,10 @@ fn prepare_default_cache_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>
         .find(|op| op.opcode == sqliters_vdbe::opcodes::OP_SetCookie && op.p2 == 3).map(|op| op.p3)))
 }
 
+fn is_function_list_pragma(stmt: Option<&Stmt>) -> bool {
+    matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("function_list"))
+}
+
 /// A data-free PRAGMA with multiple frozen rows runs on the C machine in both
 /// diagnostic switch states; execution owns progress and runOnlyOnce expiry.
 fn prepare_row_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str)
@@ -6730,8 +6755,7 @@ fn prepare_row_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &st
 {
     let defer_query = matches!(stmt, Some(Stmt::Pragma { name, value: None, .. })
         if name.eq_ignore_ascii_case("defer_foreign_keys"));
-    let function_list_query = !inner.authorizer.is_some()
-        && matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("function_list"));
+    let function_list_query = !inner.authorizer.is_some() && is_function_list_pragma(stmt);
     if !defer_query && !function_list_query
         && !matches!(stmt, Some(Stmt::Pragma { name, .. }) if name.eq_ignore_ascii_case("database_list") || name.eq_ignore_ascii_case("collation_list") || name.eq_ignore_ascii_case("module_list") || name.eq_ignore_ascii_case("compile_options") || name.eq_ignore_ascii_case("case_sensitive_like") || name.eq_ignore_ascii_case("mmap_size")) {
         return Ok(None);
@@ -6803,6 +6827,9 @@ fn prepare_constant_pragma(
             // Resolve the qualifier before authorization and preserve its SQL error offset.
             let _ = prepare_pragma_program(inner, sql)?;
         }
+        if inner.authorizer.is_some() {
+            return Ok(None);
+        }
         // pragmaFunclistLine emits literal rows as the direct statement is prepared.
         return Ok(Some(Box::new(engine::pragma_function_list(&inner.functions))));
     }
@@ -6832,6 +6859,51 @@ fn prepare_constant_pragma(
         rows.push(vec![value]);
     }
     Ok(Some(Box::new(QueryOutput { column_names: columns, rows })))
+}
+
+/// Called only after the engine has authorized this direct PRAGMA. A denied
+/// compilation returned its error already; an absent AST here is SQLITE_IGNORE.
+fn prepare_authorized_function_list(
+    inner: &mut ConnectionInner,
+    original: Option<&Stmt>,
+    sql: &str,
+    artifacts: &mut CompiledArtifacts,
+    prepared: &mut Option<Box<QueryOutput>>,
+) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
+    use sqliters_codegen::pragma::FunctionListAuthorization;
+    if !inner.authorizer.is_some() || !is_function_list_pragma(original) {
+        return Ok(None);
+    }
+    let decision = match artifacts.stmt.as_ref() {
+        Some(stmt) if is_function_list_pragma(Some(stmt)) => FunctionListAuthorization::Allow,
+        None => FunctionListAuthorization::Ignore,
+        Some(_) => return Ok(None),
+    };
+    let result = cgen::c_prepare_authorized_function_list(inner, sql, decision);
+    let expected_columns = match decision {
+        FunctionListAuthorization::Allow => 6,
+        FunctionListAuthorization::Ignore => 0,
+    };
+    let program = finish_pragma_prepare(inner, result)?.filter(|program| {
+        program.read_only && !program.b_is_reader && program.btree_mask == 0
+            && program.n_res_column == expected_columns
+            && sqliters_vdbe::vdbe::unsupported_reason(program).is_none()
+    });
+    if let Some(program) = program {
+        // Preserve the original identity for reset diagnostics, even when the
+        // authorized program is the empty SQLITE_IGNORE program.
+        if artifacts.stmt.is_none() {
+            artifacts.stmt = original.cloned();
+        }
+        apply_data_free_program(artifacts, &program);
+        artifacts.category = Some(StmtCategory::NoLockPragma);
+        return Ok(Some(Arc::new(*program)));
+    }
+    *prepared = Some(Box::new(match decision {
+        FunctionListAuthorization::Allow => engine::pragma_function_list(&inner.functions),
+        FunctionListAuthorization::Ignore => QueryOutput::default(),
+    }));
+    Ok(None)
 }
 
 fn apply_prepared_pragma(
@@ -8135,6 +8207,7 @@ impl Statement {
             None => Box::new(sqliters_vdbe::vdbe::Vdbe::new(prog)),
         };
 
+        let no_lock = self.category == Some(StmtCategory::NoLockPragma);
         let function_generation = self.compiled_function_generation;
         let (result, pragma_schema_error_offset) =
             vdbe_host::step(inner, shared, hid, &mut vm, &self.params, true, &self.raw_sql, function_generation);
@@ -8147,6 +8220,7 @@ impl Statement {
                 }
                 self.lifecycle = StatementLifecycle::Running(RunningExec::Machine {
                     vm,
+                    no_lock,
                     lease_cursors,
                     read_instances,
                     function_generation,
@@ -8157,10 +8231,7 @@ impl Statement {
                 self.c_machine_vm = Some(vm);
                 let fin_res = inner.finish_activity(
                     hid,
-                    ActivityFinish::ReadDone {
-                        lease_cursors,
-                        read_instances,
-                    },
+                    ConnectionInner::machine_activity_finish(no_lock, false, lease_cursors, read_instances),
                     shared,
                 );
                 self.lifecycle = StatementLifecycle::Halted {
@@ -8168,7 +8239,7 @@ impl Statement {
                 };
                 MachineStart::Stepped(fin_res.map(|()| StepResult::Done))
             }
-            Err(e) if e.code == ErrorCode::Schema && !vm.has_sort_callback_error() => {
+            Err(e) if !no_lock && e.code == ErrorCode::Schema && !vm.has_sort_callback_error() => {
                 // SQLITE_SCHEMA from OP_Transaction (the schema cookie or generation is not the
                 // one the program was generated for): sqlite3Reprepare, then run again — once.
                 let counters = vm.a_counter;
@@ -8177,10 +8248,7 @@ impl Statement {
                 if self.c_machine_fixed {
                     let _ = inner.finish_activity(
                         hid,
-                        ActivityFinish::ReadAborted {
-                            lease_cursors,
-                            read_instances,
-                        },
+                        ConnectionInner::machine_activity_finish(no_lock, true, lease_cursors, read_instances),
                         shared,
                     );
                     self.lifecycle = StatementLifecycle::Halted {
@@ -8205,10 +8273,7 @@ impl Statement {
                 self.c_machine_vm = Some(vm);
                 let _ = inner.finish_activity(
                     hid,
-                    ActivityFinish::ReadAborted {
-                        lease_cursors,
-                        read_instances,
-                    },
+                    ConnectionInner::machine_activity_finish(no_lock, true, lease_cursors, read_instances),
                     shared,
                 );
                 MachineStart::Stepped(Err(self.finish_read_machine_error(e, pragma_schema_error_offset)))
@@ -8256,6 +8321,7 @@ impl Statement {
         let prev = std::mem::replace(&mut self.lifecycle, StatementLifecycle::Halted { last_error: None });
         let StatementLifecycle::Running(RunningExec::Machine {
             vm,
+            no_lock,
             lease_cursors,
             read_instances,
             ..
@@ -8268,10 +8334,7 @@ impl Statement {
             Err(e) => {
                 let _ = inner.finish_activity(
                     hid,
-                    ActivityFinish::ReadAborted {
-                        lease_cursors,
-                        read_instances,
-                    },
+                    ConnectionInner::machine_activity_finish(no_lock, true, lease_cursors, read_instances),
                     shared,
                 );
                 Err(self.finish_read_machine_error(e, pragma_schema_error_offset))
@@ -8279,10 +8342,7 @@ impl Statement {
             _ => {
                 let fin_res = inner.finish_activity(
                     hid,
-                    ActivityFinish::ReadDone {
-                        lease_cursors,
-                        read_instances,
-                    },
+                    ConnectionInner::machine_activity_finish(no_lock, false, lease_cursors, read_instances),
                     shared,
                 );
                 self.lifecycle = StatementLifecycle::Halted {
@@ -8649,7 +8709,9 @@ impl Statement {
         let mut c_prepared_pragma = prepare_constant_pragma(
             inner, stmt_opt.as_ref(), &raw_sql, c_row_pragma.is_some(),
         )?;
-        let authorized_pragma = if inner.authorizer.is_some() && c_prepared_pragma.is_some() {
+        let authorized_pragma = if inner.authorizer.is_some()
+            && (c_prepared_pragma.is_some() || is_function_list_pragma(stmt_opt.as_ref()))
+        {
             stmt_opt.clone()
         } else {
             None
@@ -8875,7 +8937,12 @@ impl Statement {
             }
         }
 
-        let c_machine = if let Some(program) = c_row_pragma.or(c_integer_collation.filter(|p| p.n_var as usize == artifacts.max_param)) {
+        let authorized_program = prepare_authorized_function_list(
+            inner, authorized_pragma.as_ref(), &raw_sql, &mut artifacts, &mut c_prepared_pragma,
+        )?;
+        let c_machine = if authorized_program.is_some() {
+            authorized_program
+        } else if let Some(program) = c_row_pragma.or(c_integer_collation.filter(|p| p.n_var as usize == artifacts.max_param)) {
             apply_data_free_program(&mut artifacts, &program);
             Some(program)
         } else if let Some(program) = row_case_fallback.into_inner() {
@@ -9485,6 +9552,7 @@ impl Statement {
             }
             StatementLifecycle::Running(RunningExec::Machine {
                 mut vm,
+                no_lock,
                 lease_cursors,
                 read_instances,
                 ..
@@ -9494,10 +9562,7 @@ impl Statement {
                 self.c_machine_vm = Some(vm);
                 inner.finish_activity(
                     hid,
-                    ActivityFinish::ReadDone {
-                        lease_cursors,
-                        read_instances,
-                    },
+                    ConnectionInner::machine_activity_finish(no_lock, false, lease_cursors, read_instances),
                     shared,
                 )
             }
@@ -9764,6 +9829,9 @@ impl Statement {
                 Err(err) => recover_row_case(inner, err)?,
             };
             apply_prepare_auto_vacuum_pragma(inner, &mut artifacts, c_prepared_auto_vacuum);
+            let authorized_program = prepare_authorized_function_list(
+                inner, parsed_stmt.as_ref(), &self.raw_sql, &mut artifacts, &mut c_prepared_pragma,
+            )?;
             apply_prepared_pragma(&mut artifacts, &mut c_prepared_pragma, parsed_stmt.as_ref());
             self.c_prepared_pragma = c_prepared_pragma;
             if let Some(prog) = &c_explain {
@@ -9771,7 +9839,9 @@ impl Statement {
                 artifacts.requires_schema = false;
                 artifacts.column_names = explain_column_names(prog.explain);
             }
-            let c_machine = if let Some(program) = c_row_pragma.or(c_integer_collation.filter(|p| p.n_var as usize == artifacts.max_param)) {
+            let c_machine = if authorized_program.is_some() {
+                authorized_program
+            } else if let Some(program) = c_row_pragma.or(c_integer_collation.filter(|p| p.n_var as usize == artifacts.max_param)) {
                 apply_data_free_program(&mut artifacts, &program);
                 Some(program)
             } else if let Some(program) = row_case_fallback {
@@ -10275,7 +10345,9 @@ impl Statement {
         if self.category == Some(StmtCategory::Write) {
             return result.map_err(|error| Self::write_step_error(inner, self.mode, error));
         }
-        if self.category == Some(StmtCategory::Read) && !self.read_io_during_prepare {
+        if (self.category == Some(StmtCategory::Read) || self.has_function_list_no_lock_program())
+            && !self.read_io_during_prepare
+        {
             return result.map_err(|e| Self::read_step_error(inner, shared, self.mode, e));
         }
         result
@@ -10286,6 +10358,12 @@ impl Statement {
             && self.category == Some(StmtCategory::Read)
             && inner.db_set.c_ddl_rollback_expiry()
                 .is_some_and(|generation| self.compiled_c_expire_seq != generation)
+    }
+
+    fn has_function_list_no_lock_program(&self) -> bool {
+        self.category == Some(StmtCategory::NoLockPragma)
+            && self.c_machine.is_some()
+            && is_function_list_pragma(self.stmt.as_ref())
     }
 
     fn is_journal_mode_pragma(&self) -> bool {
@@ -10647,8 +10725,7 @@ impl Statement {
                     last_error: Some(err.clone()),
                 };
                 let prepared_function_list = (self.c_prepared_pragma.is_some() || self.c_machine.is_some())
-                    && matches!(self.stmt.as_ref(), Some(Stmt::Pragma { name, .. })
-                        if name.eq_ignore_ascii_case("function_list"));
+                    && is_function_list_pragma(self.stmt.as_ref());
                 let flag_pragma_expired = matches!(self.category, Some(StmtCategory::Read | StmtCategory::Write))
                     && inner.c_flag_pragma_expiry()
                         .is_some_and(|seq| self.compiled_c_expire_seq != seq);
@@ -10755,6 +10832,13 @@ impl Statement {
                 }
             }
 
+            StmtCategory::NoLockPragma if self.has_function_list_no_lock_program() => {
+                inner.activity.start(hid, self.c_is_reader, false);
+                match self.machine_start(hid, shared, inner, Vec::new(), SmallInstVec::new(), None) {
+                    MachineStart::Stepped(result) => result,
+                    MachineStart::Fallback(..) => unreachable!("prepared function_list program"),
+                }
+            }
             StmtCategory::NoLockPragma => {
                 if self.mode == PrepareMode::V1 && self.is_journal_mode_pragma() {
                     // pragma.c emits OP_Expire before OP_JournalMode, even when

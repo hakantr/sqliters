@@ -1186,6 +1186,10 @@ pub trait Host {
     fn pragma_text(&self, _i_db: usize, _name: &str) -> Option<String> { None }
     /// C's live aCollSeq hash order, including entries whose comparator was removed.
     fn pragma_module_names(&self) -> Option<Vec<String>> { None }
+    /// An explicit decision already returned by the authorizer for this direct pragma.
+    fn pragma_function_list_authorization(&self) -> Option<crate::pragma::FunctionListAuthorization> {
+        None
+    }
     /// Visible six-column rows of the connection's function registry at prepare.
     fn pragma_function_list(&self) -> Option<Vec<Vec<sqliters_types::Value>>> { None }
     fn pragma_collations(&self) -> Option<Vec<String>> { None }
