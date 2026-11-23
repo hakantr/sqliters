@@ -2847,3 +2847,8 @@ Kip başına 96 C eş hedef, 384 taban kontrolü ve dokuz snapshot profili. Kü�
 ## V6b.508 — Hazır TEXT bağının encoding bilgisini koruma
 
 UTF-8, UTF-16LE/BE, iki slot ve limitli/varsayılan yürütmede 116 native C eş. V507’nin 24 rota ve 12 bind kontrolü, Group65 45/45, Group64 36/36. Bağlama ayarı tek atomik görüntü olarak yayımlanır. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v508-bind-encoding-exact/sonuc.md) OFF 1381/0/324, ON 1381/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,280 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_508.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.509 — Yabancı anahtar action için TEXT karşılaştırması
+
+DELETE ve UPDATE için CASCADE, SET NULL ve SET DEFAULT. 288 action profili ve 192 önceki profil C ile eş. Reddedilen yazmalarda dosya başlangıçla aynı. Tüm FK ve bütünlük kontrolleri temiz. [Bağımsız ölçüm](/github/sqliters/target/perf-work/fk-parent-action-text-affinity-v506-candidate/sonuc.md) OFF 1382/0/324, ON 1382/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,284 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_509.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)

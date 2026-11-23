@@ -4929,3 +4929,53 @@ fn group65_bound_byte_observers_keep_each_slots_encoding_across_reset() {
         assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
     }
 }
+
+#[test]
+fn group65_foreign_key_actions_use_child_text_affinity_for_old_parent_parameters() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for (event, action, expected) in [
+            ("DELETE", "CASCADE", None),
+            ("UPDATE", "CASCADE", Some((Some("East"), Some("8")))),
+            ("DELETE", "SET NULL", Some((None, None))),
+            ("UPDATE", "SET NULL", Some((None, None))),
+            ("DELETE", "SET DEFAULT", Some((Some("South"), Some("9")))),
+            ("UPDATE", "SET DEFAULT", Some((Some("South"), Some("9")))),
+        ] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}';
+                 PRAGMA foreign_keys=ON;
+                 CREATE TABLE parent(a TEXT COLLATE NOCASE,b INTEGER,
+                     PRIMARY KEY(a,b)) WITHOUT ROWID;
+                 CREATE TABLE child(id INTEGER PRIMARY KEY,
+                     a TEXT DEFAULT 'South',b TEXT DEFAULT '9',
+                     FOREIGN KEY(a,b) REFERENCES parent(a,b) ON {event} {action});
+                 INSERT INTO parent VALUES('North',7),('South',9);
+                 INSERT INTO child VALUES(1,'north','007'),(2,'NORTH','7'),(3,'south','9');",
+            ))
+            .unwrap();
+            let statement = if event == "DELETE" {
+                "DELETE FROM parent WHERE a='north' AND b=7"
+            } else {
+                "UPDATE parent SET a='East',b=8 WHERE a='north' AND b=7"
+            };
+            let error = db.execute(statement).expect_err(action);
+            assert_eq!(error.extended_code, sqliters::types::extended::SQLITE_CONSTRAINT_FOREIGNKEY);
+            let rows = db.query("SELECT a,b FROM child ORDER BY id", &[]).unwrap();
+            assert_eq!(rows.rows[0].values(), &[Value::Text("north".into()), Value::Text("007".into())]);
+            assert_eq!(rows.rows[1].values(), &[Value::Text("NORTH".into()), Value::Text("7".into())]);
+            assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+
+            db.execute("UPDATE child SET b='7' WHERE id=1").unwrap();
+            db.execute(statement).unwrap();
+            let rows = db.query("SELECT a,b FROM child WHERE id=1", &[]).unwrap();
+            if let Some((a, b)) = expected {
+                let value = |text: Option<&str>| text.map_or(Value::Null, |s| Value::Text(s.into()));
+                assert_eq!(rows.rows[0].values(), &[value(a), value(b)]);
+            } else {
+                assert!(rows.rows.is_empty());
+            }
+            assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+        }
+    }
+}

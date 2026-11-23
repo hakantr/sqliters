@@ -24727,6 +24727,36 @@ fn child_row_matches_parent_key(
         })
 }
 
+// The action trigger compares OLD parameters with the child columns. A numeric non-rowid
+// parent parameter has no affinity in that comparison (fkActionTrigger/OP_Param), so the
+// TEXT child controls the comparison. Parent lookup and FK counters still use parent affinity.
+fn fk_action_matches_parent_key(
+    parent: &TableSchema,
+    parent_cols: &[usize],
+    parent_values: &[Value],
+    child: &TableSchema,
+    child_cols: &[usize],
+    child_values: &[Value],
+    encoding: TextEncoding,
+) -> bool {
+    parent_cols.iter().zip(child_cols).all(|(&parent_col, &child_col)| {
+        let column = &parent.columns[parent_col];
+        let use_child_text_affinity = parent.rowid_alias_col != Some(parent_col)
+            && child.columns[child_col].affinity == TypeAffinity::Text
+            && matches!(column.affinity, TypeAffinity::Integer | TypeAffinity::Numeric | TypeAffinity::Real);
+        !use_child_text_affinity
+            || eval_comparison_with_affinity(
+                Opcode::Eq,
+                &parent_values[parent_col],
+                &child_values[child_col],
+                TypeAffinity::Text,
+                column.collation,
+                encoding,
+            )
+            .truthiness() == Some(true)
+    })
+}
+
 fn register_child_fk_checks(
     ctx: &mut ExecContext<'_>,
     db_id: DatabaseId,
@@ -24984,6 +25014,7 @@ fn apply_parent_delete_fk_actions(
             continue;
         }
         let crows = scan_table_raw_entries(ctx, db_id, &ctbl)?;
+        let changes_child = matches!(fk.on_delete, FkAction::Cascade | FkAction::SetNull | FkAction::SetDefault);
         let mut matching_children = Vec::new();
         for (ckey, cpayload) in crows {
             let cvals = decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload, params)?;
@@ -24995,7 +25026,10 @@ fn apply_parent_delete_fk_actions(
                 &fk.from_cols,
                 enc,
             ) {
-                matching_children.push(ckey);
+                let apply_action = changes_child && fk_action_matches_parent_key(
+                    ptbl, &parent_col_idxs, old_parent_vals, &ctbl, &fk.from_cols, &cvals, enc,
+                );
+                matching_children.push((ckey, apply_action));
             }
         }
         if matching_children.is_empty() {
@@ -25012,7 +25046,7 @@ fn apply_parent_delete_fk_actions(
         // Register all matching child rows as FK suspects BEFORE running the action (`fkey.c`
         // `OP_FkCounter`), so if a child `BEFORE` trigger suppresses the delete/update via
         // `RAISE(IGNORE)`, statement-end / commit-time FK verification catches the remaining child!
-        for ckey in &matching_children {
+        for (ckey, _) in &matching_children {
             if fk.deferred || ctx.db_set.c_defer_foreign_keys() {
                 ctx.deferred_fk_suspects
                     .push((inst_id, ctbl.name.clone(), ckey.clone(), fk.id));
@@ -25026,6 +25060,7 @@ fn apply_parent_delete_fk_actions(
             }
         }
 
+        let action_children = matching_children.into_iter().filter_map(|(ckey, apply)| apply.then_some(ckey));
         match fk.on_delete {
             FkAction::Restrict => { debug_assert!(ctx.prepared_defer_fks()); }
             FkAction::NoAction => {}
@@ -25033,7 +25068,7 @@ fn apply_parent_delete_fk_actions(
                 let cindexes = slot_schema.indexes_for_table(&ctbl.name);
                 run_in_fk_subprogram(ctx, |ctx| {
                     let mut sub_changes: u64 = 0;
-                    for ckey in matching_children {
+                    for ckey in action_children {
                         let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
                             continue;
                         };
@@ -25104,7 +25139,7 @@ fn apply_parent_delete_fk_actions(
                 let (mod_mask, mod_names) = build_fk_modified_col_info(&ctbl, &fk.from_cols);
                 run_in_fk_subprogram(ctx, |ctx| {
                     let mut sub_changes: u64 = 0;
-                    for ckey in matching_children {
+                    for ckey in action_children {
                         let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
                             continue;
                         };
@@ -25156,7 +25191,7 @@ fn apply_parent_delete_fk_actions(
                 let (mod_mask, mod_names) = build_fk_modified_col_info(&ctbl, &fk.from_cols);
                 run_in_fk_subprogram(ctx, |ctx| {
                     let mut sub_changes: u64 = 0;
-                    for ckey in matching_children {
+                    for ckey in action_children {
                         let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
                             continue;
                         };
@@ -25261,6 +25296,7 @@ fn apply_parent_update_fk_actions(
             continue;
         }
         let crows = scan_table_raw_entries(ctx, db_id, &ctbl)?;
+        let changes_child = matches!(fk.on_update, FkAction::Cascade | FkAction::SetNull | FkAction::SetDefault);
         let mut matching_children = Vec::new();
         for (ckey, cpayload) in crows {
             let cvals = decode_table_logical_row(ctx, db_id, &ctbl, &ckey, &cpayload, params)?;
@@ -25272,7 +25308,10 @@ fn apply_parent_update_fk_actions(
                 &fk.from_cols,
                 enc,
             ) {
-                matching_children.push(ckey);
+                let apply_action = changes_child && fk_action_matches_parent_key(
+                    ptbl, &parent_col_idxs, old_parent_vals, &ctbl, &fk.from_cols, &cvals, enc,
+                );
+                matching_children.push((ckey, apply_action));
             }
         }
         if matching_children.is_empty() {
@@ -25286,7 +25325,7 @@ fn apply_parent_update_fk_actions(
             return Err(fk_restrict_err());
         }
 
-        for ckey in &matching_children {
+        for (ckey, _) in &matching_children {
             if fk.deferred || ctx.db_set.c_defer_foreign_keys() {
                 ctx.deferred_fk_suspects
                     .push((inst_id, ctbl.name.clone(), ckey.clone(), fk.id));
@@ -25300,6 +25339,7 @@ fn apply_parent_update_fk_actions(
             }
         }
 
+        let action_children = matching_children.into_iter().filter_map(|(ckey, apply)| apply.then_some(ckey));
         match fk.on_update {
             FkAction::Restrict => { debug_assert!(ctx.prepared_defer_fks()); }
             FkAction::NoAction => {}
@@ -25308,7 +25348,7 @@ fn apply_parent_update_fk_actions(
                 let (mod_mask, mod_names) = build_fk_modified_col_info(&ctbl, &fk.from_cols);
                 run_in_fk_subprogram(ctx, |ctx| {
                     let mut sub_changes: u64 = 0;
-                    for ckey in matching_children {
+                    for ckey in action_children {
                         let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
                             continue;
                         };
@@ -25364,7 +25404,7 @@ fn apply_parent_update_fk_actions(
                 let (mod_mask, mod_names) = build_fk_modified_col_info(&ctbl, &fk.from_cols);
                 run_in_fk_subprogram(ctx, |ctx| {
                     let mut sub_changes: u64 = 0;
-                    for ckey in matching_children {
+                    for ckey in action_children {
                         let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
                             continue;
                         };
@@ -25416,7 +25456,7 @@ fn apply_parent_update_fk_actions(
                 let (mod_mask, mod_names) = build_fk_modified_col_info(&ctbl, &fk.from_cols);
                 run_in_fk_subprogram(ctx, |ctx| {
                     let mut sub_changes: u64 = 0;
-                    for ckey in matching_children {
+                    for ckey in action_children {
                         let Some(cpayload) = seek_table_raw_entry(ctx, db_id, &ctbl, &ckey)? else {
                             continue;
                         };
