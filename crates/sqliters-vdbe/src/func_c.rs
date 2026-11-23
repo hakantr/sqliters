@@ -214,16 +214,34 @@ fn text_register_length(bytes: &[u8]) -> i64 {
     length
 }
 
+/// charFunc applies the SQLite integer conversion before encoding each code point.
+fn char_bytes(chars: impl ExactSizeIterator<Item = i64>, preserve_non_scalars: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(chars.len() * 4);
+    for value in chars {
+        let scalar = if (0..=0x10_ffff).contains(&value) { value as u32 } else { 0xfffd };
+        let scalar = if !preserve_non_scalars && (0xd800..0xe000).contains(&scalar) { 0xfffd } else { scalar };
+        append_utf8(&mut out, scalar);
+    }
+    out
+}
+
 /// Evaluate built-ins which observe or produce the raw bytes of a TEXT register.
 pub(crate) fn eval_text_register(
     name: &str,
-    arg: &crate::vdbemem::Mem,
+    args: &[crate::vdbemem::Mem],
     encoding: TextEncoding,
     limit_length: i32,
 ) -> Option<Result<crate::vdbemem::Mem>> {
     use crate::vdbemem::{MEM_BLOB, MEM_NULL, MEM_STR, MEM_ZERO, Mem};
 
     let mut out = Mem::null();
+    if name.eq_ignore_ascii_case("char") {
+        out.z = char_bytes(args.iter().map(Mem::int_value), true);
+        out.flags = MEM_STR;
+        out.change_encoding(encoding as u8);
+        return Some(Ok(out));
+    }
+    let [arg] = args else { return None; };
     if name.eq_ignore_ascii_case("unistr") {
         let Some(input) = value_text_register(arg) else { return Some(Ok(out)); };
         match unistr_bytes(&input, true) {
@@ -563,23 +581,7 @@ pub(crate) fn eval(upper: &str, args: &[Value], ctx: &VmRuntimeContext) -> Optio
                 Ok(Value::Integer(i64::from(utf8_read(&z).0)))
             }
         }
-        "CHAR" => {
-            let mut out = Vec::with_capacity(args.len() * 4);
-            for a in args {
-                let mut x = a.to_integer_lossy();
-                if !(0..=0x10_ffff).contains(&x) {
-                    x = 0xfffd;
-                }
-                let c = (x & 0x1f_ffff) as u32;
-                // A surrogate cannot live in a Rust string: U+FFFD stands in for it.
-                if (0xd800..0xe000).contains(&c) {
-                    append_utf8(&mut out, 0xfffd);
-                } else {
-                    append_utf8(&mut out, c);
-                }
-            }
-            Ok(text_value(out))
-        }
+        "CHAR" => Ok(text_value(char_bytes(args.iter().map(Value::to_integer_lossy), false))),
         "SUBSTR" | "SUBSTRING" if args.len() == 2 || args.len() == 3 => {
             let is_blob = matches!(args[0], Value::Blob(_));
             let mut p1 = args[1].to_integer_lossy();

@@ -609,7 +609,7 @@ pub(crate) struct SelectSchemaUse {
     pub btree_mask: Option<u32>,
     pub is_reader: Option<bool>,
     pub has_like: bool,
-    pub has_unistr_register_read: bool,
+    pub has_text_register_read: bool,
     pub sorter_owns_rows: bool,
 }
 
@@ -621,16 +621,16 @@ pub(crate) fn program_has_like(p: &sqliters_vdbe::vdbeaux::Program) -> bool {
     })
 }
 
-/// Scope that can keep UNISTR output in Mem without passing it through a Rust String.
+/// A scalar program that can retain the bytes of SQLite text registers.
 #[allow(non_upper_case_globals)]
-pub(crate) fn unistr_register_read(program: &sqliters_vdbe::vdbeaux::Program) -> bool {
+pub(crate) fn text_register_read(program: &sqliters_vdbe::vdbeaux::Program) -> bool {
     use sqliters_codegen::consts::SQLITE_FUNC_BUILTIN;
     use sqliters_vdbe::{opcodes::*, vdbeaux::P4};
 
     if program.btree_mask != 0 || program.explain != 0 || !program.read_only {
         return false;
     }
-    let mut has_unistr = false;
+    let mut has_text_producer = false;
     for op in &program.a_op {
         match op.opcode {
             OP_Function | OP_PureFunc => {
@@ -639,8 +639,8 @@ pub(crate) fn unistr_register_read(program: &sqliters_vdbe::vdbeaux::Program) ->
                 if func.func_flags & SQLITE_FUNC_BUILTIN == 0 {
                     return false;
                 }
-                if func.name.eq_ignore_ascii_case("unistr") {
-                    has_unistr = true;
+                if func.name.eq_ignore_ascii_case("unistr") || func.name.eq_ignore_ascii_case("char") {
+                    has_text_producer = true;
                 } else if !["hex", "length", "octet_length", "unicode", "quote", "unistr_quote"].iter()
                     .any(|name| func.name.eq_ignore_ascii_case(name))
                 {
@@ -653,7 +653,7 @@ pub(crate) fn unistr_register_read(program: &sqliters_vdbe::vdbeaux::Program) ->
             _ => return false,
         }
     }
-    has_unistr
+    has_text_producer
 }
 
 pub(crate) fn select_schema_use(inner: &ConnectionInner, sql: &str) -> Option<SelectSchemaUse> {
@@ -664,7 +664,7 @@ pub(crate) fn select_schema_use(inner: &ConnectionInner, sql: &str) -> Option<Se
             btree_mask: Some(p.btree_mask),
             is_reader: Some(p.b_is_reader),
             has_like: program_has_like(&p),
-            has_unistr_register_read: unistr_register_read(&p),
+            has_text_register_read: text_register_read(&p),
             sorter_owns_rows: p.group_sorter_owns_rows && p.explain == 0
                 && !inner.authorizer.is_some()
                 && inner.collations.get_custom("BINARY").is_none()
@@ -676,7 +676,7 @@ pub(crate) fn select_schema_use(inner: &ConnectionInner, sql: &str) -> Option<Se
             btree_mask: None,
             is_reader: None,
             has_like: false,
-            has_unistr_register_read: false,
+            has_text_register_read: false,
             sorter_owns_rows: false,
         }),
         PrepareResult::Unsupported(_) => None,

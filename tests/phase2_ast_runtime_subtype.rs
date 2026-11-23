@@ -4218,3 +4218,33 @@ fn group65_unistr_quote_preserves_text_register_bytes_on_reset() {
         assert!(matches!(statement.step().unwrap(), StepResult::Done));
     }
 }
+
+#[test]
+fn group65_char_preserves_text_register_bytes_after_reset() {
+    for (encoding, first_hex, rebound_hex) in [
+        ("UTF-8", "41C3BC", "EDA08042"),
+        ("UTF-16le", "4100FC00", "FDFF4200"),
+        ("UTF-16be", "004100FC", "FFFD0042"),
+    ] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!("PRAGMA encoding='{encoding}'; CREATE TABLE t(i);"))
+            .unwrap();
+        let mut statement = db.prepare("SELECT hex(char(?1,?2)), length(char(?1,?2))").unwrap();
+        statement.bind(1, 65i64).unwrap();
+        statement.bind(2, 252.75f64).unwrap();
+        let StepResult::Row(first) = statement.step().unwrap() else {
+            panic!("expected a row in {encoding}");
+        };
+        assert_eq!(first.get_str(0), Some(first_hex));
+        assert_eq!(first.get_i64(1), Some(2));
+        statement.reset().unwrap();
+        statement.bind(1, 55_296i64).unwrap();
+        statement.bind(2, 66i64).unwrap();
+        let StepResult::Row(reused) = statement.step().unwrap() else {
+            panic!("expected a row after reset in {encoding}");
+        };
+        assert_eq!(reused.get_str(0), Some(rebound_hex));
+        assert_eq!(reused.get_i64(1), Some(2));
+        assert!(matches!(statement.step().unwrap(), StepResult::Done));
+    }
+}

@@ -8405,8 +8405,8 @@ impl Statement {
             inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param,
         ) {
             Ok(Some(point_read))
-        } else if schema_use.is_some_and(|usage| usage.has_unistr_register_read)
-            && let Some(program) = vdbe_host::unistr_register_read_program(
+        } else if schema_use.is_some_and(|usage| usage.has_text_register_read)
+            && let Some(program) = vdbe_host::text_register_read_program(
                 inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param,
             )
         {
