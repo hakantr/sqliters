@@ -4463,3 +4463,39 @@ fn group65_concat_register_keeps_separators_and_text_bytes_after_reset() {
         assert!(matches!(statement.step().unwrap(), StepResult::Done));
     }
 }
+
+#[test]
+fn group65_table_text_observers_keep_bytes_after_rebind() {
+    for (encoding, initial_hex, stored_hex, bytes, first_scalar) in [
+        ("UTF-8", "47C3A4737465", "F7BFBFBF5A", 5, 2_097_151),
+        ("UTF-16le", "4700E400730074006500", "BFDBFFDF5A00", 6, 1_048_575),
+        ("UTF-16be", "004700E4007300740065", "DBBFDFFF005A", 6, 1_048_575),
+    ] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}'; PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY, p INTEGER REFERENCES parent(id), memo TEXT);
+             INSERT INTO parent VALUES(1);
+             INSERT INTO child VALUES(10,1,'Gäste'),(11,1,unistr('\\UFFFFFFFFZ'));",
+        )).unwrap();
+        let sql = "SELECT hex(memo),length(memo),octet_length(memo),unicode(memo) FROM child WHERE id=?1";
+        let mut prepared = db.prepare(sql).unwrap();
+        prepared.bind(1, 10_i64).unwrap();
+        let StepResult::Row(first) = prepared.step().unwrap() else {
+            panic!("expected an initial row for {encoding}");
+        };
+        assert_eq!(first.get_str(0), Some(initial_hex));
+        prepared.reset().unwrap();
+        prepared.bind(1, 11_i64).unwrap();
+        let StepResult::Row(raw) = prepared.step().unwrap() else {
+            panic!("expected a rebound row for {encoding}");
+        };
+        assert_eq!(raw.get_str(0), Some(stored_hex));
+        assert_eq!(raw.get_i64(1), Some(2));
+        assert_eq!(raw.get_i64(2), Some(bytes));
+        assert_eq!(raw.get_i64(3), Some(first_scalar));
+        assert!(matches!(prepared.step().unwrap(), StepResult::Done));
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+    }
+}

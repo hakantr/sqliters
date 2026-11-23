@@ -8405,7 +8405,9 @@ impl Statement {
             inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param,
         ) {
             Ok(Some(point_read))
-        } else if schema_use.is_some_and(|usage| usage.has_text_register_read)
+        } else if (schema_use.is_some_and(|usage| usage.has_text_register_read)
+            || (schema_use.is_none_or(|usage| usage.btree_mask.is_none())
+                && cgen::has_table_text_register_projection(artifacts.stmt.as_ref())))
             && let Some(program) = vdbe_host::text_register_read_program(
                 inner, artifacts.stmt.as_ref(), raw_sql, artifacts.max_param,
             )

@@ -621,16 +621,36 @@ pub(crate) fn program_has_like(p: &sqliters_vdbe::vdbeaux::Program) -> bool {
     })
 }
 
+fn is_text_register_observer(name: &str) -> bool {
+    ["hex", "length", "octet_length", "unicode", "quote", "unistr_quote"].iter()
+        .any(|builtin| name.eq_ignore_ascii_case(builtin))
+}
+
+/// The initial schema probe can run before the table catalog is loaded.
+pub(crate) fn has_table_text_register_projection(stmt: Option<&sqliters_syntax::Stmt>) -> bool {
+    use sqliters_syntax::{Expr, ResultColumn, SelectCore, Stmt};
+    let Some(Stmt::Select(select)) = stmt else { return false; };
+    let SelectCore::Select { projection, from: Some(_), .. } = &select.body.head else { return false; };
+    projection.iter().any(|column| matches!(column,
+        ResultColumn::Expr { expr: Expr::FunctionCall { name, .. }, .. }
+            if is_text_register_observer(name.as_str())))
+}
+
 /// A scalar program that can retain the bytes of SQLite text registers.
 #[allow(non_upper_case_globals)]
 pub(crate) fn text_register_read(program: &sqliters_vdbe::vdbeaux::Program) -> bool {
     use sqliters_codegen::consts::SQLITE_FUNC_BUILTIN;
     use sqliters_vdbe::{opcodes::*, vdbeaux::P4};
 
-    if program.btree_mask != 0 || program.explain != 0 || !program.read_only {
+    if !matches!(program.btree_mask, 0 | 1) || program.explain != 0 || !program.read_only
+        || !program.p_program.is_empty()
+    {
         return false;
     }
+    let table_read = program.btree_mask == 1;
+    let mut table_cursor = None;
     let mut has_text_producer = false;
+    let mut has_text_observer = false;
     for op in &program.a_op {
         match op.opcode {
             OP_Function | OP_PureFunc => {
@@ -639,9 +659,11 @@ pub(crate) fn text_register_read(program: &sqliters_vdbe::vdbeaux::Program) -> b
                 if func.func_flags & SQLITE_FUNC_BUILTIN == 0 {
                     return false;
                 }
-                if func.name.eq_ignore_ascii_case("unistr") || func.name.eq_ignore_ascii_case("char") {
+                if is_text_register_observer(&func.name) {
+                    has_text_observer = true;
+                } else if func.name.eq_ignore_ascii_case("unistr") || func.name.eq_ignore_ascii_case("char") {
                     has_text_producer = true;
-                } else if !["hex", "length", "octet_length", "unicode", "quote", "unistr_quote", "substr", "substring", "replace", "concat", "concat_ws"].iter()
+                } else if !["substr", "substring", "replace", "concat", "concat_ws"].iter()
                     .any(|name| func.name.eq_ignore_ascii_case(name))
                 {
                     return false;
@@ -650,10 +672,22 @@ pub(crate) fn text_register_read(program: &sqliters_vdbe::vdbeaux::Program) -> b
             OP_Init | OP_Goto | OP_Halt | OP_Once | OP_ResultRow | OP_String8 | OP_String
             | OP_Blob | OP_Integer | OP_Int64 | OP_Real | OP_Null | OP_Variable | OP_Copy
             | OP_SCopy | OP_Move | OP_Concat => {}
+            OP_OpenRead if table_read && op.p2 > 1 && op.p3 == 0
+                && matches!(&op.p4, P4::Int32(_)) && table_cursor.is_none() => {
+                table_cursor = Some(op.p1);
+            }
+            OP_Transaction if table_read && op.p1 == 0 && op.p2 == 0 => {}
+            OP_Column | OP_Rowid | OP_SeekRowid | OP_NotExists | OP_Rewind | OP_Last | OP_Next | OP_Prev
+                if table_cursor == Some(op.p1) => {}
+            OP_Close | OP_RealAffinity | OP_Noop if table_read => {}
             _ => return false,
         }
     }
-    has_text_producer
+    if table_read {
+        table_cursor.is_some() && has_text_observer
+    } else {
+        has_text_producer
+    }
 }
 
 pub(crate) fn select_schema_use(inner: &ConnectionInner, sql: &str) -> Option<SelectSchemaUse> {
