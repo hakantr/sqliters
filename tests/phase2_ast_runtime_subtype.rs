@@ -4187,3 +4187,34 @@ fn group64_file_sort_uses_registered_nocase_and_rtrim_utf8_slots() {
         }
     }
 }
+
+#[test]
+fn group65_unistr_quote_preserves_text_register_bytes_on_reset() {
+    for (encoding, initial, quoted, escaped) in [
+        ("UTF-8", "274127274227", "27F7BFBFBF27", "756E697374722827615C7530303061F7BFBFBF2729"),
+        ("UTF-16le", "270041002700270042002700", "2700BFDBFFDF2700", "75006E0069007300740072002800270061005C0075003000300030006100BFDBFFDF27002900"),
+        ("UTF-16be", "002700410027002700420027", "0027DBBFDFFF0027", "0075006E0069007300740072002800270061005C00750030003000300061DBBFDFFF00270029"),
+    ] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!("PRAGMA encoding='{encoding}'; CREATE TABLE t(i);"))
+            .unwrap();
+        let sql = "SELECT hex(quote(unistr(?1))), hex(unistr_quote(unistr(?2)))";
+        let mut statement = db.prepare(sql).unwrap();
+        statement.bind_text(1, r"A\u0027B\u0000C").unwrap();
+        statement.bind_text(2, r"A\u0027B\u0000C").unwrap();
+        let StepResult::Row(first) = statement.step().unwrap() else {
+            panic!("expected a row in {encoding}");
+        };
+        assert_eq!(first.get_str(0), Some(initial));
+        assert_eq!(first.get_str(1), Some(initial));
+        statement.reset().unwrap();
+        statement.bind_text(1, r"\UFFFFFFFF").unwrap();
+        statement.bind_text(2, r"a\u000A\UFFFFFFFF").unwrap();
+        let StepResult::Row(reused) = statement.step().unwrap() else {
+            panic!("expected a row after reset in {encoding}");
+        };
+        assert_eq!(reused.get_str(0), Some(quoted));
+        assert_eq!(reused.get_str(1), Some(escaped));
+        assert!(matches!(statement.step().unwrap(), StepResult::Done));
+    }
+}

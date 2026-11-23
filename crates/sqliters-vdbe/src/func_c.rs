@@ -250,7 +250,11 @@ pub(crate) fn eval_text_register(
         out.z = hex_bytes(&input.z[..count]).into_bytes();
         out.flags = MEM_STR;
     } else if arg.value_type() == 3 {
-        if name.eq_ignore_ascii_case("octet_length") {
+        if name.eq_ignore_ascii_case("quote") || name.eq_ignore_ascii_case("unistr_quote") {
+            let Some(bytes) = value_text_register(arg) else { return Some(Ok(out)); };
+            out.z = crate::printf::quote_text_bytes(&bytes, name.eq_ignore_ascii_case("unistr_quote"));
+            out.flags = MEM_STR;
+        } else if name.eq_ignore_ascii_case("octet_length") {
             let zeroes = if arg.flags & MEM_ZERO != 0 { arg.n_zero.max(0) } else { 0 };
             out.set_int64(i64::from(arg.n()) + i64::from(zeroes));
         } else if name.eq_ignore_ascii_case("length") || name.eq_ignore_ascii_case("unicode") {

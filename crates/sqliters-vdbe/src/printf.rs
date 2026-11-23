@@ -167,6 +167,46 @@ fn adjust_width_for_utf8(altform2: bool, width: &mut i64, z: &[u8]) {
     }
 }
 
+fn escape_sql_bytes(input: &[u8], q: u8, need_quote: u8, alternate: bool) -> Vec<u8> {
+    const DIGITS_LOWER: &[u8; 16] = b"0123456789abcdef";
+    let mut z: Vec<u8> = Vec::with_capacity(input.len() + 16);
+    if need_quote == 2 {
+        z.extend_from_slice(b"unistr('");
+    } else if need_quote == 1 {
+        z.push(b'\'');
+    }
+    for &ch in input {
+        z.push(ch);
+        if ch == q {
+            z.push(ch);
+        } else if alternate {
+            if ch == b'\\' {
+                z.push(b'\\');
+            } else if ch <= 0x1f {
+                z.pop();
+                z.extend_from_slice(b"\\u00");
+                z.push(if ch >= 0x10 { b'1' } else { b'0' });
+                z.push(DIGITS_LOWER[(ch & 0xf) as usize]);
+            }
+        }
+    }
+    if need_quote != 0 {
+        z.push(b'\'');
+        if need_quote == 2 {
+            z.push(b')');
+        }
+    }
+    z
+}
+
+/// printf's %Q / %#Q conversion of a TEXT buffer, before its first NUL byte.
+pub(crate) fn quote_text_bytes(text: &[u8], escape_controls: bool) -> Vec<u8> {
+    let len = text.iter().position(|&byte| byte == 0).unwrap_or(text.len());
+    let text = &text[..len];
+    let alternate = escape_controls && text.iter().any(|&byte| byte <= 0x1f);
+    escape_sql_bytes(text, b'\'', if alternate { 2 } else { 1 }, alternate)
+}
+
 /// Renders `fmt` with `args` exactly as the `printf()` SQL function of C SQLite does.
 /// `fmt` ends at its first NUL byte.
 pub fn sqlite_printf(fmt: &[u8], args: &[Value]) -> Result<Vec<u8>, PrintfTooBig> {
@@ -783,33 +823,7 @@ pub fn sqlite_printf(fmt: &[u8], args: &[Value]) -> Result<Vec<u8>, PrintfTooBig
                         alternate = false;
                     }
                 }
-                let mut z: Vec<u8> = Vec::with_capacity(used + 16);
-                if need_quote == 2 {
-                    z.extend_from_slice(b"unistr('");
-                } else if need_quote == 1 {
-                    z.push(b'\'');
-                }
-                for &ch in &esc[..used] {
-                    z.push(ch);
-                    if ch == q {
-                        z.push(ch);
-                    } else if alternate {
-                        if ch == b'\\' {
-                            z.push(b'\\');
-                        } else if ch <= 0x1f {
-                            z.pop();
-                            z.extend_from_slice(b"\\u00");
-                            z.push(if ch >= 0x10 { b'1' } else { b'0' });
-                            z.push(DIGITS_LOWER[(ch & 0xf) as usize]);
-                        }
-                    }
-                }
-                if need_quote != 0 {
-                    z.push(b'\'');
-                    if need_quote == 2 {
-                        z.push(b')');
-                    }
-                }
+                let z = escape_sql_bytes(&esc[..used], q, need_quote, alternate);
                 adjust_width_for_utf8(altform2, &mut width, &z);
                 body = z;
             }
