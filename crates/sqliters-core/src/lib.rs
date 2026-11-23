@@ -174,10 +174,26 @@ fn register_builtin_extension_functions(
     functions: &mut FunctionRegistry,
     fts5_aux: Arc<Fts5AuxRegistry>,
 ) {
+    // Register MATCH, FTS5 and R-Tree functions in openDatabase's order so
+    // later application functions enter the same aFunc hash as in C.
+    // `sqlite3_overload_function(db, "MATCH", 2)`: the MATCH operator on anything but a
+    // virtual table that implements it.
+    functions.register_scalar_shared(
+        "match",
+        Some(2),
+        FunctionFlags::NONE,
+        Arc::new(|_args: &[RuntimeValue]| {
+            Err(SqliteError::new(
+                ErrorCode::Error,
+                "unable to use function MATCH in the requested context",
+            ))
+        }),
+    );
+
     // The auxiliary functions of FTS5 (`sqlite3_overload_function`): called with a column
     // of an FTS5 table as first argument they run on that table's cursor (the engine
     // dispatches those calls, `fts5ApiCallback`); anywhere else they are not usable.
-    for name in ["bm25", "highlight", "snippet", "fts5_get_locale"] {
+    for name in ["snippet", "highlight", "bm25", "fts5_get_locale"] {
         functions.register_scalar(name, None, FunctionFlags::NONE, move |_args| {
             Err(SqliteError::new(
                 ErrorCode::Error,
@@ -185,6 +201,12 @@ fn register_builtin_extension_functions(
             ))
         });
     }
+
+    functions.register_scalar("fts5", Some(1), FunctionFlags::NONE, |args| {
+        Ok(RuntimeValue::plain(Fts5AuxRegistry::eval_fts5_ptr_func(
+            &args[0].value,
+        )))
+    });
 
     functions.register_scalar(
         "fts5_source_id",
@@ -218,37 +240,6 @@ fn register_builtin_extension_functions(
         }),
     );
 
-    // `sqlite3_overload_function(db, "MATCH", 2)`: the MATCH operator on anything but a
-    // virtual table that implements it.
-    functions.register_scalar_shared(
-        "match",
-        Some(2),
-        FunctionFlags::NONE,
-        Arc::new(|_args: &[RuntimeValue]| {
-            Err(SqliteError::new(
-                ErrorCode::Error,
-                "unable to use function MATCH in the requested context",
-            ))
-        }),
-    );
-
-    functions.register_scalar("fts5", Some(1), FunctionFlags::NONE, |args| {
-        Ok(RuntimeValue::plain(Fts5AuxRegistry::eval_fts5_ptr_func(
-            &args[0].value,
-        )))
-    });
-
-    functions.register_scalar(
-        "rtreedepth",
-        Some(1),
-        FunctionFlags::NONE,
-        |args| {
-            Ok(RuntimeValue::plain(sqliters_ext::eval_rtreedepth(
-                &args[0].value,
-            )?))
-        },
-    );
-
     functions.register_scalar(
         "rtreenode",
         Some(2),
@@ -265,6 +256,17 @@ fn register_builtin_extension_functions(
                         out.push_str(&String::from_utf8_lossy(&bytes));
                     }
                 },
+            )?))
+        },
+    );
+
+    functions.register_scalar(
+        "rtreedepth",
+        Some(1),
+        FunctionFlags::NONE,
+        |args| {
+            Ok(RuntimeValue::plain(sqliters_ext::eval_rtreedepth(
+                &args[0].value,
             )?))
         },
     );

@@ -189,6 +189,8 @@ pub struct FunctionRegistry {
     function_generation: u64,
     deleted_scalar_arities: BTreeMap<String, Vec<Option<usize>>>,
     aggregates: BTreeMap<String, Vec<RegisteredAggregate>>,
+    c_function_hash: sqliters_codegen::trigger::CHash<()>,
+    c_function_arities: BTreeMap<String, Vec<i64>>,
     user_modified: bool,
     c_like_flags: BTreeMap<Option<usize>, u32>,
     c_like_modes: BTreeMap<Option<usize>, bool>,
@@ -229,6 +231,7 @@ impl FunctionRegistry {
         self.user_modified = true;
         let key = name.to_ascii_uppercase();
         let registered_name = if key == "LIKE" { "like".to_owned() } else { name.to_owned() };
+        self.note_c_function_definition(&key, arity);
         self.clear_c_like_metadata(&key, arity);
         self.clear_scalar_mask(&key, arity);
         self.remove_aggregate_overload(&key, arity);
@@ -307,6 +310,7 @@ impl FunctionRegistry {
     /// sqlite3CreateFunc keeps a callback-free FuncDef at the selected UTF-8 arity.
     pub(crate) fn mask_scalar_definition(&mut self, name: &str, arity: Option<usize>) {
         let key = name.to_ascii_uppercase();
+        self.note_c_function_definition(&key, arity);
         self.remove_aggregate_overload(&key, arity);
         self.deleted_scalar_arities.entry(key).or_default().push(arity);
     }
@@ -508,6 +512,7 @@ impl FunctionRegistry {
         self.user_modified = true;
         let name = name.into();
         let key = name.to_ascii_uppercase();
+        self.note_c_function_definition(&key, arity);
         self.clear_scalar_mask(&key, arity);
         self.unregister_scalar(&name, arity);
         let name = if key == "LIKE" { "like".to_owned() } else { name };
@@ -657,6 +662,50 @@ impl FunctionRegistry {
             }
             Err(err) => Err(err),
         }
+    }
+
+    fn c_function_name_is_representable(name: &str) -> bool {
+        name.len() <= 255 && !name.as_bytes().contains(&0)
+    }
+
+    fn note_c_function_definition(&mut self, name: &str, arity: Option<usize>) {
+        if !Self::c_function_name_is_representable(name) {
+            return;
+        }
+        let name = name.to_ascii_lowercase();
+        let arities = self.c_function_arities.entry(name.clone()).or_default();
+        if arities.is_empty() {
+            self.c_function_hash.insert(&name, ());
+        }
+        let narg = arity.map_or(-1, |argc| argc as i64);
+        if !arities.contains(&narg) {
+            // sqlite3FindFunction prepends a fresh FuncDef for a new arity.
+            // Replacement and removal leave that definition at the same position.
+            arities.push(narg);
+        }
+    }
+
+    /// Visible per-connection rows in sqlite3HashFirst/Next and FuncDef.pNext order.
+    pub(crate) fn pragma_function_entries(&self) -> Vec<(String, &'static str, i64, i64)> {
+        let mut entries = self.custom_function_entries();
+        if entries.iter().any(|(name, ..)| !Self::c_function_name_is_representable(name)) {
+            // The Rust API also accepts names outside sqlite3CreateFunc's input domain.
+            return entries;
+        }
+        let name_order: BTreeMap<_, _> = self.c_function_hash.keys().into_iter().enumerate()
+            .map(|(index, name)| (name, index))
+            .collect();
+        for (name, ..) in &mut entries {
+            name.make_ascii_lowercase();
+        }
+        entries.sort_by_cached_key(|(name, _, arity, _)| {
+            let name_index = name_order.get(name).copied().unwrap_or(usize::MAX);
+            let arity_index = self.c_function_arities.get(name)
+                .and_then(|arities| arities.iter().rev().position(|narg| narg == arity))
+                .unwrap_or(usize::MAX);
+            (name_index, arity_index)
+        });
+        entries
     }
 
     /// Returns metadata `(name, type_str, narg, flags)` for all registered custom functions.

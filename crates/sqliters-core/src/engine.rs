@@ -47884,18 +47884,7 @@ pub(crate) fn pragma_function_list(functions: &FunctionRegistry) -> QueryOutput 
             Value::Integer(flags),
         ]);
     }
-    let mut custom_functions = functions.custom_function_entries();
-    if !functions.has_user_functions() {
-        use sqliters_codegen::builtin_funcs::CONNECTION_FUNCS;
-
-        // The reference order applies to the initial registry. An application
-        // registration can change the SQLite hash traversal.
-        custom_functions.sort_by_key(|(name, ..)| {
-            CONNECTION_FUNCS.iter().position(|entry| entry.0 == name)
-                .unwrap_or(CONNECTION_FUNCS.len())
-        });
-    }
-    for (fname, ftype, narg, flags) in custom_functions {
+    for (fname, ftype, narg, flags) in functions.pragma_function_entries() {
         rows.push(vec![
             Value::Text(fname),
             Value::Integer(0),

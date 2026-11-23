@@ -3103,3 +3103,73 @@ fn group64_file_sorter_two_worker_order_and_reset() {
         }
     }
 }
+
+#[test]
+fn group65_function_list_application_hash_and_overload_order() {
+    struct Total;
+    impl sqliters::WindowAggregateInstance for Total {
+        fn step(&mut self, _: &[RuntimeValue]) -> Result<()> {
+            Ok(())
+        }
+
+        fn finalize(&mut self) -> Result<RuntimeValue> {
+            Ok(RuntimeValue::plain(Value::Integer(0)))
+        }
+    }
+
+    let db = Connection::open_in_memory().unwrap();
+    let scalar = |name, arity| {
+        db.register_scalar_function(name, arity, FunctionFlags::NONE, |_| {
+            Ok(RuntimeValue::plain(Value::Integer(11)))
+        }).unwrap();
+    };
+    let aggregate = |name, arity| {
+        db.create_aggregate_function(name, arity, FunctionFlags::NONE, || Box::new(Total))
+            .unwrap();
+    };
+    let listed = || {
+        let mut stmt = db.prepare("PRAGMA function_list").unwrap();
+        let mut rows = Vec::new();
+        while let StepResult::Row(row) = stmt.step().unwrap() {
+            let name = row.get_str(0).unwrap();
+            if name.eq_ignore_ascii_case("ZEBRA")
+                || name.eq_ignore_ascii_case("APP_ALPHA")
+                || name.eq_ignore_ascii_case("SHADOW_MIXED")
+                || name.eq_ignore_ascii_case("OO_ORDER")
+            {
+                rows.push((
+                    name.to_owned(),
+                    row.get_str(2).unwrap().to_owned(),
+                    row.get_i64(4).unwrap(),
+                ));
+            }
+        }
+        rows
+    };
+
+    scalar("ZEBRA", 1);
+    scalar("aPp_AlPhA", 0);
+    scalar("Shadow_MiXeD", 2);
+    aggregate("shADow_mixed", 1);
+    aggregate("SHADOW_MIXED", -1);
+    let before = listed();
+    assert_eq!(before, [
+        ("shadow_mixed".to_owned(), "a".to_owned(), -1),
+        ("shadow_mixed".to_owned(), "a".to_owned(), 1),
+        ("shadow_mixed".to_owned(), "s".to_owned(), 2),
+        ("app_alpha".to_owned(), "s".to_owned(), 0),
+        ("zebra".to_owned(), "s".to_owned(), 1),
+    ]);
+
+    assert!(db.unregister_scalar_function("SHADOW_MIXED", 2).unwrap());
+    scalar("Oo_Order", 1);
+    scalar("SHADOW_MIXED", 2);
+    aggregate("Shadow_Mixed", 1);
+    assert_eq!(&listed()[..5], before.as_slice());
+    assert_eq!(db.query("SELECT zEbRa(1)", &[]).unwrap().rows[0].get_i64(0), Some(11));
+
+    let rust_only = "ExtraName".repeat(30);
+    scalar(rust_only.as_str(), 0);
+    let output = db.query("PRAGMA function_list", &[]).unwrap();
+    assert!(output.rows.iter().any(|row| row.get_str(0) == Some(rust_only.as_str())));
+}
