@@ -4436,3 +4436,30 @@ fn group64_limit_sort_uses_registered_nocase_and_rtrim_slots_on_reset() {
         }
     }
 }
+
+#[test]
+fn group65_concat_register_keeps_separators_and_text_bytes_after_reset() {
+    for (encoding, ordinary, combined, separated) in [
+        ("UTF-8", "412D5A", "41F7BFBFBF5A", "41F7BFBFBF2D5A"),
+        ("UTF-16le", "41002D005A00", "4100BFDBFFDF5A00", "4100BFDBFFDF2D005A00"),
+        ("UTF-16be", "0041002D005A", "0041DBBFDFFF005A", "0041DBBFDFFF002D005A"),
+    ] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!("PRAGMA encoding='{encoding}';")).unwrap();
+        let sql = "SELECT hex(concat(unistr(?1),NULL,'Z')), hex(concat_ws('-',unistr(?1),NULL,'Z'))";
+        let mut statement = db.prepare(sql).unwrap();
+        statement.bind_text(1, "A").unwrap();
+        let StepResult::Row(first) = statement.step().unwrap() else {
+            panic!("expected a row in {encoding}");
+        };
+        assert_eq!(first.get_str(1), Some(ordinary));
+        statement.reset().unwrap();
+        statement.bind_text(1, r"A\UFFFFFFFF").unwrap();
+        let StepResult::Row(reused) = statement.step().unwrap() else {
+            panic!("expected a row after reset in {encoding}");
+        };
+        assert_eq!(reused.get_str(0), Some(combined));
+        assert_eq!(reused.get_str(1), Some(separated));
+        assert!(matches!(statement.step().unwrap(), StepResult::Done));
+    }
+}

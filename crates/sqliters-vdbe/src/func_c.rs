@@ -302,6 +302,25 @@ fn replace_bytes(input: &[u8], pattern: &[u8], replacement: &[u8], limit: usize)
     Ok(out)
 }
 
+/// CONCAT and CONCAT_WS insert separators only between non-NULL values.
+fn concat_text_bytes<'a>(
+    mut values: impl Iterator<Item = Cow<'a, [u8]>>, separator: &[u8], limit: usize,
+) -> Result<Vec<u8>> {
+    let Some(first) = values.next() else { return Ok(Vec::new()); };
+    if first.len() > limit {
+        return Err(too_big());
+    }
+    let mut output = first.into_owned();
+    for value in values {
+        if output.len().saturating_add(separator.len()).saturating_add(value.len()) > limit {
+            return Err(too_big());
+        }
+        output.extend_from_slice(separator);
+        output.extend_from_slice(&value);
+    }
+    Ok(output)
+}
+
 /// Evaluate built-ins which observe or produce the raw bytes of a TEXT register.
 pub(crate) fn eval_text_register(
     name: &str,
@@ -345,6 +364,24 @@ pub(crate) fn eval_text_register(
                 Err(error) => return Some(Err(error)),
             }
         };
+        out.flags = MEM_STR;
+        out.change_encoding(encoding as u8);
+        return Some(Ok(out));
+    }
+    let concat_ws = name.eq_ignore_ascii_case("concat_ws");
+    if ((concat_ws && args.len() >= 2) || (name.eq_ignore_ascii_case("concat") && !args.is_empty()))
+        && args.iter().all(|arg| arg.value_type() != 4)
+    {
+        let (separator, values) = if concat_ws {
+            let Some(separator) = value_text_register(&args[0]) else { return Some(Ok(out)); };
+            (separator, &args[1..])
+        } else {
+            (Cow::Borrowed(&[][..]), args)
+        };
+        match concat_text_bytes(values.iter().filter_map(value_text_register), &separator, limit_length.max(0) as usize) {
+            Ok(bytes) => out.z = bytes,
+            Err(error) => return Some(Err(error)),
+        }
         out.flags = MEM_STR;
         out.change_encoding(encoding as u8);
         return Some(Ok(out));
@@ -941,18 +978,7 @@ pub(crate) fn eval(upper: &str, args: &[Value], ctx: &VmRuntimeContext) -> Optio
                 }
                 (Cow::Borrowed(&[][..]), args)
             };
-            let mut out = Vec::new();
-            let mut not_null = false;
-            for a in rest {
-                if let Some(t) = value_text(a, enc) {
-                    if not_null && !sep.is_empty() {
-                        out.extend_from_slice(&sep);
-                    }
-                    out.extend_from_slice(&t);
-                    not_null = true;
-                }
-            }
-            Ok(text_value(out))
+            concat_text_bytes(rest.iter().filter_map(|arg| value_text(arg, enc)), &sep, usize::MAX).map(text_value)
         }
         "UNISTR" if args.len() == 1 => {
             let Some(full) = value_text(&args[0], enc) else {
