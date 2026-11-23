@@ -6786,10 +6786,11 @@ fn prepare_auto_vacuum_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, 
 fn prepare_constant_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql: &str) -> Result<Option<Box<QueryOutput>>> {
     use sqliters_vdbe::opcodes::{OP_Int64, OP_Integer, OP_String8};
     let Some(Stmt::Pragma { schema, name, value }) = stmt else { return Ok(None); };
-    if name.eq_ignore_ascii_case("function_list")
-        && !inner.authorizer.is_some()
-        && schema.as_deref().is_none_or(|schema| inner.db_set.find_db_id(schema).is_some())
-    {
+    if name.eq_ignore_ascii_case("function_list") {
+        if schema.is_some() {
+            // Resolve the qualifier before authorization and preserve its SQL error offset.
+            let _ = prepare_pragma_program(inner, sql)?;
+        }
         // pragmaFunclistLine emits literal rows as the direct statement is prepared.
         return Ok(Some(Box::new(engine::pragma_function_list(&inner.functions))));
     }
@@ -6819,6 +6820,21 @@ fn prepare_constant_pragma(inner: &mut ConnectionInner, stmt: Option<&Stmt>, sql
         rows.push(vec![value]);
     }
     Ok(Some(Box::new(QueryOutput { column_names: columns, rows })))
+}
+
+fn apply_prepared_pragma(
+    artifacts: &mut CompiledArtifacts,
+    prepared: &mut Option<Box<QueryOutput>>,
+    original: Option<&Stmt>,
+) {
+    let Some(out) = prepared else { return; };
+    if artifacts.stmt.is_none() {
+        // SQLITE_IGNORE retains the PRAGMA's run-once lifecycle with an empty program.
+        artifacts.stmt = original.cloned();
+        **out = QueryOutput::default();
+    }
+    artifacts.category = Some(StmtCategory::NoLockPragma);
+    artifacts.column_names = out.column_names.clone();
 }
 
 fn apply_prepare_auto_vacuum_pragma(
@@ -8617,7 +8633,12 @@ impl Statement {
                 result?
             }
         };
-        let c_prepared_pragma = prepare_constant_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
+        let mut c_prepared_pragma = prepare_constant_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
+        let authorized_pragma = if inner.authorizer.is_some() && c_prepared_pragma.is_some() {
+            stmt_opt.clone()
+        } else {
+            None
+        };
         let c_row_pragma = prepare_row_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
         let c_integer_collation = prepare_integer_collation_select(inner, stmt_opt.as_ref(), select_schema_use.as_ref(), &raw_sql)?;
         let c_prepared_default_cache = prepare_default_cache_pragma(inner, stmt_opt.as_ref(), &raw_sql)?;
@@ -8849,10 +8870,7 @@ impl Statement {
             Self::c_machine_of(inner, &mut artifacts, &raw_sql, c_explain.is_some(), select_schema_use.as_ref().is_some_and(|u| u.has_like), None, prepared_vtab)?
                 .or_else(|| schema_free_fallback.into_inner())
         };
-        if let Some(out) = &c_prepared_pragma {
-            artifacts.category = Some(StmtCategory::NoLockPragma);
-            artifacts.column_names = out.column_names.clone();
-        }
+        apply_prepared_pragma(&mut artifacts, &mut c_prepared_pragma, authorized_pragma.as_ref());
         if let Some(prog) = &c_write
             && artifacts.category != Some(StmtCategory::Control)
         {
@@ -9621,7 +9639,7 @@ impl Statement {
                 }
             };
             apply_codegen_pragma_effects(inner)?;
-            let c_prepared_pragma = prepare_constant_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
+            let mut c_prepared_pragma = prepare_constant_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
             let c_row_pragma = prepare_row_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
             let c_integer_collation = prepare_integer_collation_select(inner, parsed_stmt.as_ref(), select_schema_use.as_ref(), &self.raw_sql)?;
             self.c_prepared_default_cache = prepare_default_cache_pragma(inner, parsed_stmt.as_ref(), &self.raw_sql)?;
@@ -9730,10 +9748,7 @@ impl Statement {
                 Err(err) => recover_row_case(inner, err)?,
             };
             apply_prepare_auto_vacuum_pragma(inner, &mut artifacts, c_prepared_auto_vacuum);
-            if let Some(out) = &c_prepared_pragma {
-                artifacts.category = Some(StmtCategory::NoLockPragma);
-                artifacts.column_names = out.column_names.clone();
-            }
+            apply_prepared_pragma(&mut artifacts, &mut c_prepared_pragma, parsed_stmt.as_ref());
             self.c_prepared_pragma = c_prepared_pragma;
             if let Some(prog) = &c_explain {
                 artifacts.category = Some(StmtCategory::NoLockPragma);

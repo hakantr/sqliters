@@ -737,7 +737,8 @@ impl<'a> AuthWalkCtx<'a> {
                     .as_deref()
                     .and_then(|s| self.db_set.find_db_id(s))
                     .unwrap_or(DatabaseId::MAIN);
-                let db_name = self.slot_name(db_id);
+                let db_name = (schema.is_some() || !name.eq_ignore_ascii_case("function_list"))
+                    .then(|| self.slot_name(db_id));
                 let val_str = value.as_ref().map(|pv| match pv {
                     PragmaValue::Ident(s) | PragmaValue::String(s) => s.clone(),
                     PragmaValue::Integer(i) => i.to_string(),
@@ -746,7 +747,7 @@ impl<'a> AuthWalkCtx<'a> {
                     AuthorizerAction::Pragma,
                     Some(name),
                     val_str.as_deref(),
-                    Some(&db_name),
+                    db_name.as_deref(),
                 )? != AuthorizerResult::Ignore)
             }
             Stmt::Begin { .. } => {

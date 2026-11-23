@@ -2903,3 +2903,54 @@ fn group64_file_sorter_worker_runs_in_both_execution_modes() {
         }
     }
 }
+
+#[test]
+fn group65_direct_function_list_honors_prepare_authorizer_and_reset() {
+    use sqliters::{AuthorizerAction, AuthorizerResult};
+
+    for decision in [AuthorizerResult::Ok, AuthorizerResult::Ignore, AuthorizerResult::Deny] {
+        let db = Connection::open_in_memory().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        db.set_authorizer(Some(Box::new(move |action, name, _, database, _| {
+            if action != AuthorizerAction::Pragma {
+                return AuthorizerResult::Ok;
+            }
+            assert_eq!(name, Some("function_list"));
+            assert_eq!(database, None);
+            observed.fetch_add(1, AtomicOrdering::Relaxed);
+            decision
+        }))).unwrap();
+
+        let Err(unknown) = db.prepare("PRAGMA absent.function_list") else {
+            panic!("undefined schema accepted")
+        };
+        assert_eq!((unknown.code, unknown.offset), (ErrorCode::Error, Some(7)));
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 0);
+
+        let result = db.prepare("PRAGMA function_list");
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+        if decision == AuthorizerResult::Deny {
+            let Err(error) = result else { panic!("denied PRAGMA prepared") };
+            assert_eq!(error.code, ErrorCode::Auth);
+            continue;
+        }
+        let mut statement = result.unwrap();
+        let allow = decision == AuthorizerResult::Ok;
+        assert_eq!(statement.column_count(), if allow { 6 } else { 0 });
+        db.register_scalar_function("app_auth_marker", 0, FunctionFlags::NONE, |_| {
+            Ok(RuntimeValue::plain(Value::Integer(1)))
+        }).unwrap();
+
+        for expected in [false, allow] {
+            let mut found = false;
+            while let StepResult::Row(row) = statement.step().unwrap() {
+                found |= row.get_str(0) == Some("app_auth_marker");
+            }
+            assert_eq!(found, expected);
+            statement.reset().unwrap();
+        }
+        assert_eq!(statement.c_reprepare_status().0, 1);
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 2);
+    }
+}

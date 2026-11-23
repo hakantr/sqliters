@@ -2522,3 +2522,8 @@ Etkin ifadede aynı fonksiyon tanımı üzerine kayıt SQLITE_BUSY verir. Boşta
 ## V6b.443 — OFF ve ON tek işçi PMA
 
 Üç kodlama ve DELETE/WAL için zorlanmış koşulda 890.408 VFS kaydı eş. Gerçek işçilerde satır, adım, dosya ve hata sonucu eş. 18 okuyucu kilidi ve 180 olağan FK koşusu ile son imajlar doğrulandı. OFF 1322/1/325, ON 1320/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,272 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_443.md).
+
+
+## V6b.444 — Doğrudan function_list yetkilendirme ve şema tanısı
+
+Altı şema biçimi, dört yetkilendirme seçimi, üç kodlama ve V1/V2 üzerinden 288 akış ve 1.248 API kaydı C ile eş. Geçersiz şema, callback öncesi SQL ofsetiyle reddedilir. IGNORE sıfır satır ve sütunla reset yaşam döngüsünü korur. OFF 1323/1/325, ON 1321/3/325. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Açık L6 kayıtları doğrulandı. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,272 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_444.md).
