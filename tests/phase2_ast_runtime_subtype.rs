@@ -8033,3 +8033,72 @@ fn group65_six_table_left_join_preserves_unmatched_row_until_main_shadow_rebinds
         assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
     }
 }
+
+#[test]
+fn group64_binary_sort_uses_a_separate_text_key_in_strict_without_rowid() {
+    use sqliters_vdbe::vdbe::SQLITE_STMTSTATUS_SORT;
+
+    for (encoding, width) in [("UTF-8", 3100), ("UTF-16le", 1550), ("UTF-16be", 1550)] {
+        let path = std::env::temp_dir().join(format!("sqliters-strict-binary-{encoding}-{}.db", std::process::id()));
+        let fixture = Command::new(c_p2a_helper()).arg(&path).arg(format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}'; PRAGMA foreign_keys=ON;
+             CREATE TABLE parents(id INTEGER PRIMARY KEY) STRICT;
+             INSERT INTO parents VALUES(1),(2);
+             CREATE TABLE items(v TEXT, p INTEGER REFERENCES parents(id), id INTEGER, bucket INT,
+                                PRIMARY KEY(bucket DESC,id)) WITHOUT ROWID, STRICT;
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<52)
+             INSERT INTO items SELECT printf('%02d',x%4)||substr(hex(zeroblob(1600)),1,{width}-2),1+x%2,x,x%5 FROM n;
+             PRAGMA foreign_key_check; PRAGMA integrity_check;"
+        )).output().unwrap();
+        assert!(fixture.status.success(), "{}", String::from_utf8_lossy(&fixture.stderr));
+        assert_eq!(fixture.stdout, b"ok\n");
+        let before = std::fs::read(&path).unwrap();
+
+        let db = Connection::open_with_flags(&path, sqliters::vfs::OpenFlags::READONLY).unwrap();
+        db.execute_batch("PRAGMA cache_size=1; PRAGMA temp_store=FILE; PRAGMA threads=2;").unwrap();
+        let sql = "SELECT id FROM items ORDER BY v COLLATE BINARY NULLS LAST,bucket DESC,id DESC";
+        let mut legacy = db.prepare_v1(sql).unwrap();
+        let mut held = db.prepare(sql).unwrap();
+        let caller = std::thread::current().id();
+        let worker_calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&worker_calls);
+        db.register_collation("BINARY", move |left, right| {
+            if std::thread::current().id() != caller {
+                observed.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            right.cmp(left)
+        }).unwrap();
+
+        let expired = legacy.step().unwrap_err();
+        assert_eq!((expired.extended_code, expired.message.as_str()), (1, "not an error"));
+        assert_eq!(legacy.finalize().unwrap_err().extended_code, 17);
+        let overridden = encoding == "UTF-8";
+        let mut expected: Vec<i64> = (1..=52).collect();
+        expected.sort_by_key(|&id| (if overridden { -(id % 4) } else { id % 4 }, -(id % 5), -id));
+        for &id in &expected {
+            let StepResult::Row(row) = held.step().unwrap() else { panic!("missing sorted row"); };
+            assert_eq!(row.get_i64(0), Some(id));
+        }
+        assert!(matches!(held.step().unwrap(), StepResult::Done));
+        assert_eq!(held.machine_stmt_status(SQLITE_STMTSTATUS_SORT, true), 1);
+        held.reset().unwrap();
+        let workers = worker_calls.load(AtomicOrdering::Relaxed);
+        assert_eq!(workers > 0, overridden);
+
+        let mut topn = db.prepare(&format!("{sql} LIMIT ?1 OFFSET ?2")).unwrap();
+        topn.bind(1, Value::Integer(7)).unwrap();
+        topn.bind(2, Value::Integer(2)).unwrap();
+        for &id in &expected[2..9] {
+            let StepResult::Row(row) = topn.step().unwrap() else { panic!("missing top-N row"); };
+            assert_eq!(row.get_i64(0), Some(id));
+        }
+        assert!(matches!(topn.step().unwrap(), StepResult::Done));
+        assert_eq!(topn.machine_stmt_status(SQLITE_STMTSTATUS_SORT, true), 1);
+        assert_eq!(worker_calls.load(AtomicOrdering::Relaxed), workers);
+        topn.finalize().unwrap();
+        held.finalize().unwrap();
+        drop(db);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(path).unwrap();
+    }
+}

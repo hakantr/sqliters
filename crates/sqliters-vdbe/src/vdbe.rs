@@ -150,9 +150,9 @@ pub trait VdbeHost {
         0
     }
 
-    /// Worker limit for a sorter over a verified native rowid scan with a private BINARY override.
+    /// Worker limit for a verified private BINARY sorter over a native integer table key.
     #[doc(hidden)]
-    fn binary_rowid_sorter_worker_threads(&mut self) -> i32 {
+    fn binary_sorter_worker_threads(&mut self) -> i32 {
         self.sorter_worker_threads()
     }
     /// Whether these direct main-table columns contain a complete binary UNIQUE key.
@@ -1836,7 +1836,7 @@ fn worker_order_sorter(
             width >= 2 && matches!(table.p4, P4::Int32(_)) && (binary_order || index == width - 1)
         } else {
             verified_schema && record.p5 == 0 && keys.iter().all(|op| op.p5 == 0)
-                && (if binary_order {
+                && (if binary_order && application_collations.is_none() {
                     has_table_key(table, keys)
                 } else {
                     application_collations.is_some() && matches!(table.p4, P4::KeyInfo(_))
@@ -1886,7 +1886,7 @@ pub fn is_worker_sort_with_collations(
     })
 }
 
-/// Validate a named application sort with the rowid or the primary key as its tie breaker.
+/// Validate a private application sort with the rowid or primary key as its tie breaker.
 #[doc(hidden)]
 pub fn is_worker_sort_with_named_collation(
     prog: &Program,
@@ -3601,7 +3601,7 @@ impl Vdbe {
         let prog = Arc::clone(&self.prog);
         self.rt = Self::bind_ops(&prog.a_op, host,
             prog.fallible_sort_open().zip(self.sort_callback_error.as_ref())
-                .map(|(pc, error)| (pc, error, prog.worker_file_sort, prog.binary_rowid_sort_column)))?;
+                .map(|(pc, error)| (pc, error, prog.worker_file_sort, prog.binary_sort_column)))?;
         self.rt_ready = true;
         Ok(())
     }
@@ -5908,9 +5908,9 @@ impl Vdbe {
                     let mut sorter = VdbeSorter::init(k, op.p3, pgsz, cache_size, temp_in_memory);
                     sorter.set_vfs(host.sorter_vfs());
                     let worker_count = if self.prog.read_only && self.prog.worker_file_sort
-                        && self.prog.fallible_file_sort_open == Some(pc) && self.prog.binary_rowid_sort_column.is_some()
+                        && self.prog.fallible_file_sort_open == Some(pc) && self.prog.binary_sort_column.is_some()
                     {
-                        host.binary_rowid_sorter_worker_threads()
+                        host.binary_sorter_worker_threads()
                     } else {
                         host.sorter_worker_threads()
                     };

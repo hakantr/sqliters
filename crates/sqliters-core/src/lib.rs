@@ -8587,8 +8587,8 @@ impl Statement {
         };
         let mut vm = match self.c_machine_vm.take() {
             Some(vm) if Arc::ptr_eq(&vm.prog, &prog) => vm,
-            Some(previous) if previous.prog.binary_rowid_sort_column.is_some()
-                || prog.binary_rowid_sort_column.is_some()
+            Some(previous) if previous.prog.binary_sort_column.is_some()
+                || prog.binary_sort_column.is_some()
                 || (vdbe_host::registered_worker_file_sort(inner, self.stmt.as_ref(), false)
                     && (previous.prog.fallible_file_sort_open.is_some() || prog.fallible_file_sort_open.is_some())) =>
             {
@@ -11204,7 +11204,7 @@ impl Statement {
         self.category == Some(StmtCategory::Read)
             && !self.c_machine_fixed
             && !matches!(&self.stmt, Some(Stmt::Select(select))
-                if engine::binary_rowid_order_collation(select, &inner.db_set, &inner.collations).is_some())
+                if engine::binary_sort_order_collation(select, &inner.db_set, &inner.collations).is_some())
             && engine::registered_builtin_memory_sort(
                 self.stmt.as_ref(), &inner.db_set, &inner.collations, inner.effective_encoding(),
             )
@@ -11220,7 +11220,7 @@ impl Statement {
             return Some(program);
         }
         let binary_serial_policy_changed = !self.c_machine_fixed && self.c_machine.as_ref().is_some_and(|program| {
-            program.binary_rowid_sort_column.is_some() && program.fallible_file_sort_open.is_some()
+            program.binary_sort_column.is_some() && program.fallible_file_sort_open.is_some()
                 && !vdbe_host::custom_sort_policy_matches(inner, program, self.stmt.as_ref(), true)
         });
         if let Some(program) = &self.c_machine && !binary_serial_policy_changed {
@@ -11280,7 +11280,7 @@ impl Statement {
         }
         // TEMP may change without expiring a held statement when the TEMP schema
         // is unopened. The private sort must still use the active storage policy.
-        if self.c_machine_vm.as_ref().is_some_and(|vm| vm.prog.binary_rowid_sort_column.is_none()
+        if self.c_machine_vm.as_ref().is_some_and(|vm| vm.prog.binary_sort_column.is_none()
             && !vdbe_host::custom_sort_policy_matches(inner, &vm.prog, self.stmt.as_ref(), false))
         {
             self.c_machine_vm = None;

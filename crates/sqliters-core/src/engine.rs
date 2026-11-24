@@ -7620,8 +7620,8 @@ fn main_rowid_order_collation<'a>(
         .map(|(names, table, _)| (names.first, table.root_pgno))
 }
 
-/// A private BINARY TEXT sort key over a native rowid scan.
-pub(crate) fn binary_rowid_order_collation<'a>(
+/// A private BINARY TEXT sort field over a table with a native integer key.
+pub(crate) fn binary_sort_order_collation<'a>(
     select: &'a SelectStmt,
     db_set: &'a DatabaseSet,
     collations: &CollationRegistry,
@@ -7632,8 +7632,17 @@ pub(crate) fn binary_rowid_order_collation<'a>(
     {
         return None;
     }
-    let (names, table, total) = main_table_order_collation(db_set, &select.body.head, &select.order_by, false)?;
-    let alias = table.rowid_alias_col?;
+    let include_without_rowid = collations.get_custom("BINARY").is_some();
+    let (names, table, total) =
+        main_table_order_collation(db_set, &select.body.head, &select.order_by, include_without_rowid)?;
+    let integer_key = if table.without_rowid {
+        table.has_strict_integer_without_rowid_key()
+    } else {
+        table.rowid_alias_col.is_some()
+    };
+    if !integer_key {
+        return None;
+    }
     let (slot, name) = match (names.stock, names.second) {
         (Some(stock), Some(second)) if [names.first, second].into_iter()
             .all(|name| collations.has_infallible_registration(name)) => stock,
@@ -7647,8 +7656,8 @@ pub(crate) fn binary_rowid_order_collation<'a>(
         Expr::Collate { expr, .. } => expr.as_ref(),
         expr => expr,
     }) else { return None };
-    let (index, field) = table.find_column(&column.column)?;
-    (index != alias && field.affinity == TypeAffinity::Text).then_some((names, table, total, slot))
+    let (_, field) = table.find_column(&column.column)?;
+    (field.affinity == TypeAffinity::Text).then_some((names, table, total, slot))
 }
 
 fn complete_order_sort_collation<'a>(

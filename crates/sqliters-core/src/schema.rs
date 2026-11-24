@@ -518,6 +518,17 @@ pub struct TableSchema {
 }
 
 impl TableSchema {
+    /// A valid STRICT table stores these WITHOUT ROWID key fields as integers.
+    pub(crate) fn has_strict_integer_without_rowid_key(&self) -> bool {
+        self.strict && self.without_rowid && !self.without_rowid_pk_cols.is_empty()
+            && self.without_rowid_pk_cols.iter().all(|part| {
+                part.col_idx.and_then(|index| self.columns.get(index)).is_some_and(|column| {
+                    let declared = column.type_name.trim();
+                    declared.eq_ignore_ascii_case("INT") || declared.eq_ignore_ascii_case("INTEGER")
+                })
+            })
+    }
+
     /// Whether any column has REAL affinity (C stores integral values of such columns as
     /// integers in some statements and converts them back when the column is read).
     #[inline]
