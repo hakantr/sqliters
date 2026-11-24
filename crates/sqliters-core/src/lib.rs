@@ -5985,6 +5985,7 @@ impl PreparedReadSchemas {
                 (JoinType::Inner, JoinType::Inner | JoinType::Left) | (JoinType::Left, JoinType::Inner)),
             [_, _, _] => from.joins.iter().all(|join| matches!(join.join_type, JoinType::Inner | JoinType::Left))
                 && from.joins.iter().any(|join| join.join_type == JoinType::Inner),
+            [_, _, _, _] => from.joins.iter().all(|join| join.join_type == JoinType::Inner),
             _ => false,
         };
         if !supported_types
@@ -6001,18 +6002,19 @@ impl PreparedReadSchemas {
             let (db, db_set::RelationRef::Table(table)) = db_set.find_relation_ref_in_set(name).ok()?? else {
                 return None;
             };
-            if (db.is_temp() && from.joins.len() != 3) || table.without_rowid {
+            if (db.is_temp() && from.joins.len() < 3) || table.without_rowid {
                 return None;
             }
             PreparedReadSchema::snapshot(db_set, db)
         };
         let left = read_schema(&from.head)?;
-        let mut sources = [left; 4];
+        let mut sources = [left; 5];
         for (source, join) in sources[1..].iter_mut().zip(&from.joins) {
             *source = read_schema(&join.right)?;
         }
+        let sources = &sources[..=from.joins.len()];
         let mask = sources.iter().fold(0u32, |mask, schema| mask | (1 << schema.db_id.index()));
-        if usage?.btree_mask != Some(mask) {
+        if (from.joins.len() == 4 && mask.count_ones() > 3) || usage?.btree_mask != Some(mask) {
             return None;
         }
         // An interpreter join uses these same cursor roots when it starts the reads.
@@ -6037,7 +6039,7 @@ impl PreparedReadSchemas {
             }
         }
         if mask.count_ones() == 4 {
-            return Some(Self::Four(sources));
+            return Some(Self::Four(sources.try_into().ok()?));
         }
         let mut additional = sources[1..].iter().copied().filter(|schema| schema.db_id != left.db_id);
         let Some(second) = additional.next() else {
