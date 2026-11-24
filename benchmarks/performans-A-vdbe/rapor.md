@@ -3027,3 +3027,8 @@ Her kipte 1.296 tam sıralama, 1.296 LIMIT/OFFSET, 324 işçi izi tekrarı, 108 
 ## V6b.544 — Ayrı ertelenmiş FK başvurusunun işlem sayacı
 
 3.648 yeni karşılaştırma ve 5.184 önceki kontrol C SQL sonucu, ana dosya, C yeniden açılışı ve FK denetiminde eş. Açık işlemde COMMIT ve ROLLBACK C ile aynı. Group64 40/40, Group65 64/64 iki kipte. [Bağımsız ölçüm](/github/sqliters/target/perf-work/fk-child-deferred-reference-candidate/sonuc.md) OFF 1416/0/324, ON 1416/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,283 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_544.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.545 — ORDER BY CTE ve LEFT JOIN Tcl kontrolünü etkinleştirme
+
+Üç sorgunun satır sonuçları ve ham EXPLAIN QUERY PLAN çıktıları iki kipte C ile eş. Ignore işareti kaldırılan Tcl testi varsayılan seçimde iki kipte başarılı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/orderbyb-test-enable-candidate/sonuc.md) OFF 1417/0/323, ON 1417/0/323. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,290 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_545.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
