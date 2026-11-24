@@ -5983,7 +5983,8 @@ impl PreparedReadSchemas {
             [join] => matches!(join.join_type, JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full),
             [first, second] => matches!((first.join_type, second.join_type),
                 (JoinType::Inner, JoinType::Inner | JoinType::Left) | (JoinType::Left, JoinType::Inner)),
-            [_, _, _] => from.joins.iter().all(|join| join.join_type == JoinType::Inner),
+            [_, _, _] => from.joins.iter().all(|join| matches!(join.join_type, JoinType::Inner | JoinType::Left))
+                && from.joins.iter().any(|join| join.join_type == JoinType::Inner),
             _ => false,
         };
         if !supported_types

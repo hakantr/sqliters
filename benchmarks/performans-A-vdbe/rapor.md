@@ -3067,3 +3067,8 @@ Her kipte RTRIM ve önceki NOCASE için 1.728 tam sıralama, 1.728 top-N, 54 fiz
 ## V6b.552 — ORDER BY indeksli JOIN Tcl denetimi
 
 Test tanılama özelliği altında varsayılan, kapalı ve geri yüklenen plan ile altı sonuç satırı C ile eş. Aynı dosyadaki ayrı bağlantı varsayılan planını koruyor. Normal CLI derleme denetimi geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/orderby1-test-control-v547.065ms6bv/sonuc.md) OFF 1426/0/320, ON 1426/0/320. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,294 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_552.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.553 — Dört kaynaklı LEFT ve INNER JOIN hazırlanmış bağlaması
+
+174 hedef fark kapandı ve 102 doğru kontrol korundu. C yaşam döngüsü 276/276, gerçek Tcl V1 138/138, 4.320 C disk açılışı ve 744 önceki ham kayıt eş. [Bağımsız ölçüm](/github/sqliters/target/perf-work/four-table-left-inner-reprepare-candidate/sonuc.md) OFF 1427/0/320, ON 1427/0/320. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,297 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_553.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)

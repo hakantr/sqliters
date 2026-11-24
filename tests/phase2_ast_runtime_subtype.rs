@@ -7162,3 +7162,76 @@ fn group65_four_table_inner_join_keeps_four_distinct_schema_bindings() {
         assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
     }
 }
+
+#[test]
+fn group65_four_table_left_inner_join_preserves_nulls_across_schema_changes() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}'; PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent);
+             INSERT INTO parent VALUES(1); INSERT INTO child VALUES(1,1);
+             ATTACH ':memory:' AS aux; ATTACH ':memory:' AS other;
+             ATTACH ':memory:' AS third; ATTACH ':memory:' AS spare;"
+        )).unwrap();
+        for (schema, table, marker, has_second) in [
+            ("aux", "ta", 201, true), ("other", "tb", 302, false),
+            ("third", "tc", 403, true), ("spare", "td", 804, false),
+        ] {
+            db.execute_batch(&format!(
+                "CREATE TABLE {schema}.{table}(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+                 INSERT INTO {schema}.{table} VALUES(1,1,{marker});"
+            )).unwrap();
+            if has_second {
+                db.execute_batch(&format!("INSERT INTO {schema}.{table} VALUES(2,2,{})", 1000 + marker)).unwrap();
+            }
+        }
+        let sql = "SELECT a.marker,b.marker AS second_marker,c.marker AS third_marker,d.marker+length(?1) AS fourth_marker
+                   FROM aux.ta AS a LEFT JOIN tb AS b ON a.p=b.id
+                   JOIN third.tc AS c ON a.p=c.id LEFT JOIN spare.td AS d ON a.p=d.id";
+        let mut legacy = db.prepare_v1(sql).unwrap();
+        let mut modern = db.prepare(sql).unwrap();
+        for stmt in [&mut legacy, &mut modern] {
+            stmt.bind_text(1, "猫").unwrap();
+        }
+        let read = |stmt: &mut sqliters::Statement, first, second, reprepares| {
+            let mut rows = Vec::new();
+            while let StepResult::Row(row) = stmt.step().unwrap() {
+                rows.push(row.values().to_vec());
+            }
+            rows.sort_by_key(|row| match row[0] {
+                Value::Integer(marker) => marker,
+                _ => panic!("expected an integer row marker"),
+            });
+            assert_eq!(rows, [
+                vec![Value::Integer(201), Value::Integer(first), Value::Integer(403), Value::Integer(805)],
+                vec![Value::Integer(1201), second, Value::Integer(1403), Value::Null],
+            ]);
+            stmt.reset().unwrap();
+            assert_eq!(stmt.c_reprepare_status().0, reprepares);
+            assert_eq!(stmt.column_names(), ["marker", "second_marker", "third_marker", "fourth_marker"]);
+            assert_eq!(stmt.sql(), sql);
+        };
+
+        db.execute_batch("CREATE TABLE main.extra(id INTEGER PRIMARY KEY)").unwrap();
+        read(&mut legacy, 302, Value::Null, 0);
+        read(&mut modern, 302, Value::Null, 0);
+
+        db.execute_batch(
+            "CREATE TEMP TABLE tb(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+             INSERT INTO temp.tb VALUES(1,1,602),(2,2,1602);"
+        ).unwrap();
+        assert_eq!(legacy.step().unwrap_err().code, ErrorCode::Schema);
+        assert_eq!(legacy.reset().unwrap_err().code, ErrorCode::Schema);
+        legacy.finalize().unwrap();
+        read(&mut modern, 602, Value::Integer(1602), 1);
+
+        db.execute_batch("CREATE TABLE other.extra(id INTEGER PRIMARY KEY)").unwrap();
+        read(&mut modern, 602, Value::Integer(1602), 1);
+        db.execute_batch("ALTER TABLE third.tc ADD COLUMN note TEXT").unwrap();
+        read(&mut modern, 602, Value::Integer(1602), 2);
+        modern.finalize().unwrap();
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+    }
+}
