@@ -153,7 +153,7 @@ pub(crate) fn custom_sort_policy_matches(
         let collation = key.a_coll.first().and_then(Option::as_deref).map(|coll| coll.name.as_str());
         let has_named_pair = has_two_named_sort_collations(op);
         if has_named_pair && !program.worker_file_sort {
-            return matches!(stmt, Some(Stmt::Select(select)) if serial_nocase_sort_order(inner, select).is_some());
+            return matches!(stmt, Some(Stmt::Select(select)) if serial_builtin_sort_order(inner, select).is_some());
         }
         (!has_named_pair && file_sort_policy(inner, collation))
             || (op.p3 == 0
@@ -176,16 +176,20 @@ fn file_sort_policy(inner: &ConnectionInner, collation: Option<&str>) -> bool {
         }
 }
 
-fn serial_nocase_sort_order<'a>(
+fn serial_builtin_sort_order<'a>(
     inner: &'a ConnectionInner, select: &'a SelectStmt,
 ) -> Option<(ApplicationSortCollations<'a>, &'a TableSchema, bool)> {
-    if inner.authorizer.is_some()
-        || (inner.db_set.worker_threads_limit > 0 && !inner.db_set.temp_store().is_memory()
-            && inner.collations.has_infallible_registration("NOCASE"))
+    if inner.authorizer.is_some() {
+        return None;
+    }
+    let order = crate::engine::registered_file_order_collation(select, &inner.db_set, &inner.collations, false)?;
+    let (_, name) = order.0.stock?;
+    if inner.db_set.worker_threads_limit > 0 && !inner.db_set.temp_store().is_memory()
+        && inner.collations.has_infallible_registration(name)
     {
         return None;
     }
-    crate::engine::registered_file_order_collation(select, &inner.db_set, &inner.collations, false)
+    Some(order)
 }
 
 pub(crate) fn registered_worker_file_sort(
@@ -284,7 +288,7 @@ fn file_sort_read_program(
         let (names, table, total) =
             crate::engine::registered_file_order_collation(select, &inner.db_set, &inner.collations, true)?;
         (names, table.root_pgno, table.without_rowid, total)
-    } else if let Some((names, table, total)) = serial_nocase_sort_order(inner, select) {
+    } else if let Some((names, table, total)) = serial_builtin_sort_order(inner, select) {
         (names, table.root_pgno, table.without_rowid, total)
     } else {
         let (name, root) =

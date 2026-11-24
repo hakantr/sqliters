@@ -7711,7 +7711,8 @@ fn named_integer_order_scan(
     collations.get_custom("BINARY").is_none() && registered(names.first)
         && names.second.is_none_or(|name| filter.is_none() && registered(name))
         && names.stock.is_none_or(|(_, name)| {
-            collations.get_custom(name).is_none() || (name.eq_ignore_ascii_case("NOCASE")
+            collations.get_custom(name).is_none() || (matches!(
+                Collation::from_name(name), Some(Collation::NoCase | Collation::RTrim))
                 && (!with_workers || collations.has_infallible_registration(name)))
         })
         && filter.is_none_or(|filter| order_integer_filter(filter, table))
@@ -7731,7 +7732,8 @@ pub(crate) fn registered_file_order_collation<'a>(
     let (names, table, total) = main_table_order_collation(db_set, &select.body.head, &select.order_by, true)?;
     let max_fields = (if table.without_rowid { 4 } else { 3 }) + names.count() - 1;
     let registered = if !with_workers {
-        names.stock.is_some_and(|(_, name)| name.eq_ignore_ascii_case("NOCASE")
+        names.stock.is_some_and(|(_, name)| matches!(
+            Collation::from_name(name), Some(Collation::NoCase | Collation::RTrim))
             && collations.get_custom(name).is_some())
             && named_integer_order_scan(names, table, selection.as_ref(), collations, false)
     } else if table.without_rowid || selection.is_some() || names.second.is_some() {

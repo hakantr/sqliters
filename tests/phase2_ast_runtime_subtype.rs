@@ -6962,6 +6962,15 @@ fn group65_four_table_inner_join_tracks_the_fourth_table_schema() {
 
 #[test]
 fn group64_nocase_replacement_preserves_legacy_expiry_and_clears_sort_error() {
+    check_builtin_replacement_expiry_and_sort_error("NOCASE");
+}
+
+#[test]
+fn group64_rtrim_replacement_preserves_legacy_expiry_and_clears_sort_error() {
+    check_builtin_replacement_expiry_and_sort_error("RTRIM");
+}
+
+fn check_builtin_replacement_expiry_and_sort_error(collation: &str) {
     use sqliters_vdbe::vdbe::SQLITE_STMTSTATUS_SORT;
 
     for (encoding, width) in [("UTF-8", 1550), ("UTF-16le", 775), ("UTF-16be", 775)] {
@@ -6977,16 +6986,18 @@ fn group64_nocase_replacement_preserves_legacy_expiry_and_clears_sort_error() {
                 printf('%02d',(x/4)%3)||substr(hex(zeroblob(900)),1,{width}-2),
                 printf('%02d',x%5),x,x%5 FROM n;"
         )).unwrap();
+        let other = if collation == "NOCASE" { "RTRIM" } else { "NOCASE" };
+        db.register_collation(other, |left, right| left.cmp(right)).unwrap();
         db.register_collation("app_first", |left, right| right.cmp(left)).unwrap();
         db.register_collation("app_second", |left, right| left.cmp(right)).unwrap();
-        let sql = "SELECT id FROM items ORDER BY s COLLATE NOCASE NULLS LAST,
-                   v COLLATE APP_FIRST NULLS LAST,w COLLATE APP_SECOND DESC NULLS FIRST,bucket DESC,id DESC";
-        let mut legacy = db.prepare_v1(sql).unwrap();
-        let mut statement = db.prepare(sql).unwrap();
+        let sql = format!("SELECT id FROM items ORDER BY s COLLATE {collation} NULLS LAST,
+                   v COLLATE APP_FIRST NULLS LAST,w COLLATE APP_SECOND DESC NULLS FIRST,bucket DESC,id DESC");
+        let mut legacy = db.prepare_v1(&sql).unwrap();
+        let mut statement = db.prepare(&sql).unwrap();
         let original_thread = std::thread::current().id();
         let worker_calls = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&worker_calls);
-        db.register_collation("NOCASE", move |left, right| {
+        db.register_collation(collation, move |left, right| {
             if std::thread::current().id() != original_thread {
                 observed.fetch_add(1, AtomicOrdering::Relaxed);
             }
@@ -7006,10 +7017,10 @@ fn group64_nocase_replacement_preserves_legacy_expiry_and_clears_sort_error() {
         let worker_calls_before_error = worker_calls.load(AtomicOrdering::Relaxed);
         assert!(worker_calls_before_error > 0);
 
-        let failure = SqliteError::new(ErrorCode::Error, "ordinary NOCASE comparator error");
+        let failure = SqliteError::new(ErrorCode::Error, format!("ordinary {collation} comparator error"));
         let returned = failure.clone();
         let seen = AtomicUsize::new(0);
-        db.register_fallible_collation("nocase", move |left, right| {
+        db.register_fallible_collation(&collation.to_ascii_lowercase(), move |left, right| {
             assert_eq!(std::thread::current().id(), original_thread);
             if seen.fetch_add(1, AtomicOrdering::Relaxed) == 1 { Err(returned.clone()) }
             else { Ok(right.cmp(left)) }

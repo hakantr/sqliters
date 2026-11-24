@@ -1083,7 +1083,7 @@ pub(crate) struct ConnectionInner {
     c_connection_diagnostic_code: ErrorCode,
     c_flag_pragma_expire_seq: Option<u64>,
     c_function_expire_seq: Option<u64>,
-    c_nocase_expire_seq: Option<u64>,
+    c_builtin_collation_expire_seq: Option<u64>,
     pub(crate) default_locking_mode: LockingMode,
     pub(crate) writable_schema: bool,
     pub(crate) working_dir: Option<PathBuf>,
@@ -1804,8 +1804,8 @@ impl ConnectionInner {
                     "unable to delete/modify collation sequence due to active statements"));
             }
             self.db_set.c_expire_all();
-            if name.eq_ignore_ascii_case("NOCASE") {
-                self.c_nocase_expire_seq = Some(self.db_set.c_expire_seq());
+            if name.eq_ignore_ascii_case("NOCASE") || name.eq_ignore_ascii_case("RTRIM") {
+                self.c_builtin_collation_expire_seq = Some(self.db_set.c_expire_seq());
             }
         }
         Ok(())
@@ -3756,7 +3756,7 @@ impl Connection {
             c_connection_diagnostic_code: ErrorCode::Ok,
             c_flag_pragma_expire_seq: None,
             c_function_expire_seq: None,
-            c_nocase_expire_seq: None,
+            c_builtin_collation_expire_seq: None,
             default_locking_mode: LockingMode::Normal,
             writable_schema: false,
             working_dir: None,
@@ -11288,14 +11288,14 @@ impl Statement {
                     && inner.c_function_expire_seq.is_some_and(|seq| {
                         seq == inner.db_set.c_expire_seq() && self.compiled_c_expire_seq != seq
                     });
-                let nocase_expired = self.category == Some(StmtCategory::Read)
-                    && inner.c_nocase_expire_seq.is_some_and(|seq| {
+                let builtin_collation_expired = self.category == Some(StmtCategory::Read)
+                    && inner.c_builtin_collation_expire_seq.is_some_and(|seq| {
                         seq == inner.db_set.c_expire_seq() && self.compiled_c_expire_seq != seq
                     });
                 let header_write_expired = self.expired && self.is_application_header_write();
                 if expired_before_run
                     && (prepared_function_list || flag_pragma_expired || function_expired
-                        || nocase_expired || header_write_expired)
+                        || builtin_collation_expired || header_write_expired)
                 {
                     // Legacy step leaves the connection diagnostic unchanged.
                     // Reset and finalize still return the statement's SQLITE_SCHEMA.
