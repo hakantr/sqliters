@@ -5953,7 +5953,7 @@ impl PreparedReadSchemas {
         let [join] = from.joins.as_slice() else {
             return None;
         };
-        if join.natural || join.join_type != JoinType::Inner
+        if join.natural || !matches!(join.join_type, JoinType::Inner | JoinType::Left)
             || !matches!(join.constraint, Some(JoinConstraint::On(_)))
             || !select.ctes.is_empty() || !select.body.compounds.is_empty()
             || !PreparedReadSchema::can_pin_source(select)
