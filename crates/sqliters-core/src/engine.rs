@@ -32,6 +32,7 @@ use sqliters_types::{
     fallible_sort_by,
 };
 use sqliters_vdbe::vdbemem::Mem;
+use sqliters_vdbe::vdbe::ApplicationSortCollations;
 use sqliters_vdbe::{
     AggregateAccumulator, AggregateKind, Opcode, VmRuntimeContext, builtin_window_arity,
     eval_cast_rt_with_encoding, eval_comparison_with_affinity, eval_comparison_with_encoding,
@@ -7488,7 +7489,7 @@ fn main_table_order_collation<'a>(
     core: &SelectCore,
     order_by: &'a [OrderByTerm],
     include_without_rowid: bool,
-) -> Option<(&'a str, &'a TableSchema, bool)> {
+) -> Option<(ApplicationSortCollations<'a>, &'a TableSchema, bool)> {
     if db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0 {
         return None;
     }
@@ -7530,10 +7531,24 @@ fn main_table_order_collation<'a>(
         expr => (expr, None),
     };
     let key_index = column_index(key)?;
+    let name = explicit.unwrap_or_else(|| table.columns[key_index].collation_name());
+    let (second_name, second_index, trailing) = match trailing {
+        [OrderByTerm { expr: Expr::Collate { expr, collation }, .. }, trailing @ ..] => {
+            let index = column_index(expr)?;
+            if index == key_index || name.eq_ignore_ascii_case(collation)
+                || table.columns[key_index].affinity != TypeAffinity::Text
+                || table.columns[index].affinity != TypeAffinity::Text
+            {
+                return None;
+            }
+            (Some(collation.as_str()), Some(index), trailing)
+        }
+        _ => (None, None, trailing),
+    };
     let total = if table.without_rowid {
         let primary = &table.without_rowid_pk_cols;
         let is_primary = |index| primary.iter().any(|part| part.col_idx == Some(index));
-        if !(1..=2).contains(&primary.len()) || is_primary(key_index) {
+        if !(1..=2).contains(&primary.len()) || is_primary(key_index) || second_index.is_some_and(is_primary) {
             return None;
         }
         match trailing {
@@ -7541,11 +7556,14 @@ fn main_table_order_collation<'a>(
             terms if terms.len() == primary.len() && terms.iter().zip(primary).all(|(term, part)| {
                 column_index(&term.expr).is_some_and(|index| part.col_idx == Some(index))
             }) => true,
-            [term] if column_index(&term.expr).is_some_and(|index| index != key_index && !is_primary(index)) => false,
+            [term] if second_index.is_none()
+                && column_index(&term.expr).is_some_and(|index| index != key_index && !is_primary(index)) => false,
             _ => return None,
         }
     } else {
-        if Some(key_index) == table.rowid_alias_col {
+        if Some(key_index) == table.rowid_alias_col
+            || second_index.is_some_and(|index| Some(index) == table.rowid_alias_col)
+        {
             return None;
         }
         match trailing {
@@ -7554,7 +7572,7 @@ fn main_table_order_collation<'a>(
             _ => return None,
         }
     };
-    Some((explicit.unwrap_or_else(|| table.columns[key_index].collation_name()), table, total))
+    Some((ApplicationSortCollations { first: name, second: second_name }, table, total))
 }
 
 fn main_rowid_order_collation<'a>(
@@ -7566,7 +7584,8 @@ fn main_rowid_order_collation<'a>(
         return None;
     }
     main_table_order_collation(db_set, core, order_by, false)
-        .map(|(name, table, _)| (name, table.root_pgno))
+        .filter(|(names, _, _)| names.second.is_none())
+        .map(|(names, table, _)| (names.first, table.root_pgno))
 }
 
 fn complete_order_sort_collation<'a>(
@@ -7585,31 +7604,33 @@ pub(crate) fn custom_limit_order_collation<'a>(
     select: &'a SelectStmt,
     db_set: &'a DatabaseSet,
     collations: &CollationRegistry,
-) -> Option<(&'a str, &'a TableSchema)> {
+) -> Option<(ApplicationSortCollations<'a>, &'a TableSchema)> {
     let limit = select.limit.as_ref()?;
     let SelectCore::Select { projection, selection, .. } = &select.body.head else { return None };
+    if !select.ctes.is_empty() || !select.body.compounds.is_empty() {
+        return None;
+    }
+    let (names, table, _) = main_table_order_collation(db_set, &select.body.head, &select.order_by, true)?;
+    let expanded = selection.is_some() || names.second.is_some();
     let simple_bound = |expr: &Expr| match expr {
         Expr::Integer(_) | Expr::Bind(_) => true,
-        Expr::Null => selection.is_some(),
+        Expr::Null => expanded,
         Expr::Unary { op: UnaryOp::Negate | UnaryOp::Plus, expr } => matches!(expr.as_ref(), Expr::Integer(_)),
         _ => false,
     };
-    if !select.ctes.is_empty() || !select.body.compounds.is_empty()
-        || !simple_bound(&limit.limit) || limit.offset.as_ref().is_some_and(|expr| !simple_bound(expr))
+    if !simple_bound(&limit.limit) || limit.offset.as_ref().is_some_and(|expr| !simple_bound(expr))
     {
         return None;
     }
-    let filtered = selection.is_some();
-    let (name, table, _) = main_table_order_collation(db_set, &select.body.head, &select.order_by, filtered)?;
-    let admitted = if let Some(filter) = selection {
-        let max_fields = if table.without_rowid { 4 } else { 3 };
-        named_integer_order_scan(name, table, Some(filter), collations)
+    let admitted = if expanded {
+        let max_fields = (if table.without_rowid { 4 } else { 3 }) + usize::from(names.second.is_some());
+        named_integer_order_scan(names, table, selection.as_ref(), collations)
             && projection.len() + select.order_by.len() <= max_fields
             && table.columns.iter().all(|column| column.default_expr.is_none())
     } else {
-        registered_order_collation(name, collations)
+        !table.without_rowid && registered_order_collation(names.first, collations)
     };
-    admitted.then_some((name, table))
+    admitted.then_some((names, table))
 }
 
 pub(crate) fn custom_file_order_collation<'a>(
@@ -7651,10 +7672,11 @@ fn order_integer_filter(selection: &Expr, table: &TableSchema) -> bool {
 }
 
 fn named_integer_order_scan(
-    name: &str, table: &TableSchema, filter: Option<&Expr>, collations: &CollationRegistry,
+    names: ApplicationSortCollations<'_>, table: &TableSchema, filter: Option<&Expr>, collations: &CollationRegistry,
 ) -> bool {
-    collations.get_custom("BINARY").is_none() && Collation::from_name(name).is_none()
-        && collations.has_infallible_registration(name)
+    let registered = |name| Collation::from_name(name).is_none() && collations.has_infallible_registration(name);
+    collations.get_custom("BINARY").is_none() && registered(names.first)
+        && names.second.is_none_or(|name| filter.is_none() && registered(name))
         && filter.is_none_or(|filter| order_integer_filter(filter, table))
 }
 
@@ -7662,22 +7684,22 @@ pub(crate) fn worker_file_order_collation<'a>(
     select: &'a SelectStmt,
     db_set: &'a DatabaseSet,
     collations: &CollationRegistry,
-) -> Option<(&'a str, &'a TableSchema, bool)> {
+) -> Option<(ApplicationSortCollations<'a>, &'a TableSchema, bool)> {
     if select.limit.is_some() || !select.ctes.is_empty() || !select.body.compounds.is_empty() {
         return None;
     }
     let SelectCore::Select { projection, selection, .. } = &select.body.head else { return None };
     let fields = projection.len() + select.order_by.len();
-    let (name, table, total) = main_table_order_collation(db_set, &select.body.head, &select.order_by, true)?;
-    let max_fields = if table.without_rowid { 4 } else { 3 };
-    let registered = if table.without_rowid || selection.is_some() {
-        named_integer_order_scan(name, table, selection.as_ref(), collations)
+    let (names, table, total) = main_table_order_collation(db_set, &select.body.head, &select.order_by, true)?;
+    let max_fields = (if table.without_rowid { 4 } else { 3 }) + usize::from(names.second.is_some());
+    let registered = if table.without_rowid || selection.is_some() || names.second.is_some() {
+        named_integer_order_scan(names, table, selection.as_ref(), collations)
     } else {
-        registered_worker_order_collation(name, collations)
+        registered_worker_order_collation(names.first, collations)
     };
     // A default for a column absent in an older record uses no space on its page.
     (fields <= max_fields && registered && !table.columns.iter().any(|column| column.default_expr.is_some()))
-        .then_some((name, table, total))
+        .then_some((names, table, total))
 }
 
 /// A direct registered FILE sort can defer its route until MAIN is pinned.

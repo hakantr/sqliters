@@ -23,7 +23,7 @@ use sqliters_types::{
 };
 use sqliters_vdbe::functions::VmRuntimeContext;
 use sqliters_vdbe::vdbe::{
-    COLTYPE_ANY, COLTYPE_BLOB, COLTYPE_CUSTOM, COLTYPE_INT, COLTYPE_INTEGER, COLTYPE_REAL, COLTYPE_TEXT, TableColRt, TableRt, Vdbe,
+    ApplicationSortCollations, COLTYPE_ANY, COLTYPE_BLOB, COLTYPE_CUSTOM, COLTYPE_INT, COLTYPE_INTEGER, COLTYPE_REAL, COLTYPE_TEXT, TableColRt, TableRt, Vdbe,
     VdbeHost, unsupported_reason,
 };
 use sqliters_vdbe::vdbeaux::{COLNAME_NAME, FuncDef, KEYINFO_ORDER_DESC, Program, VdbeOp};
@@ -136,18 +136,19 @@ pub(crate) fn custom_sort_policy_matches(
     if program.fallible_limit_sort_open.is_some() {
         !inner.authorizer.is_some() && match stmt {
             Some(Stmt::Select(select)) if matches!(&select.body.head,
-                sqliters_syntax::SelectCore::Select { selection: Some(_), .. }) => {
+                sqliters_syntax::SelectCore::Select { selection: Some(_), .. })
+                || select.order_by.get(1).is_some_and(|term| matches!(term.expr, sqliters_syntax::Expr::Collate { .. })) => {
                 crate::engine::custom_limit_order_collation(select, &inner.db_set, &inner.collations).is_some()
             }
             _ => true,
         }
     } else if let Some(open) = program.fallible_file_sort_open {
         let Some(op) = program.a_op.get(open) else { return false };
-        let collation = match &op.p4 {
-            P4::KeyInfo(key) => key.a_coll.first().and_then(Option::as_deref).map(|coll| coll.name.as_str()),
-            _ => None,
-        };
-        file_sort_policy(inner, collation)
+        let P4::KeyInfo(key) = &op.p4 else { return false };
+        let collation = key.a_coll.first().and_then(Option::as_deref).map(|coll| coll.name.as_str());
+        let second_named = key.a_coll.get(1).and_then(Option::as_deref)
+            .is_some_and(|coll| Collation::from_name(&coll.name).is_none());
+        (!second_named && file_sort_policy(inner, collation))
             || (op.p3 == 0
                 && collation.is_some_and(|name| crate::engine::registered_worker_order_collation(name, &inner.collations))
                 && registered_worker_file_sort(inner, stmt, require_snapshot))
@@ -192,8 +193,9 @@ fn custom_limit_sort_read_program(
     if inner.authorizer.is_some() {
         return None;
     }
-    let (name, table) = crate::engine::custom_limit_order_collation(select, &inner.db_set, &inner.collations)?;
+    let (names, table) = crate::engine::custom_limit_order_collation(select, &inner.db_set, &inner.collations)?;
     let filtered = matches!(&select.body.head, sqliters_syntax::SelectCore::Select { selection: Some(_), .. });
+    let expanded = filtered || names.second.is_some();
     let PrepareResult::Program(mut program) = crate::cgen::c_prepare(inner, sql).0 else {
         return None;
     };
@@ -203,12 +205,12 @@ fn custom_limit_sort_read_program(
         return None;
     }
     let encoding = inner.effective_encoding();
-    let open = sqliters_vdbe::vdbe::custom_limit_sort_open(&program, name, encoding as u8)?;
+    let open = sqliters_vdbe::vdbe::custom_limit_sort_open(&program, names, encoding as u8)?;
     let mut reads = program.a_op.iter().filter(|op| op.opcode == OP_OpenRead);
     let read = reads.next()?;
     let sort = &program.a_op[open];
     if reads.next().is_some() || read.p1 == sort.p1 || read.p2 != table.root_pgno as i32 || read.p3 != 0
-        || (filtered && !matches!(&sort.p4, P4::KeyInfo(key) if usize::from(key.n_key_field) == select.order_by.len()))
+        || (expanded && !matches!(&sort.p4, P4::KeyInfo(key) if usize::from(key.n_key_field) == select.order_by.len()))
     {
         return None;
     }
@@ -226,7 +228,7 @@ fn custom_limit_sort_read_program(
         OP_Rewind | OP_Rowid => op.p1 == read.p1,
         OP_Column | OP_Next => op.p1 == read.p1 || op.p1 == sort.p1,
         OP_Sequence | OP_Last | OP_IdxLE | OP_Delete | OP_IdxInsert | OP_Sort => op.p1 == sort.p1,
-        OP_Null => filtered && op.p1 == 0 && op.p2 > 0 && op.p3 == 0 && op.p5 == 0,
+        OP_Null => expanded && op.p1 == 0 && op.p2 > 0 && op.p3 == 0 && op.p5 == 0,
         _ => filtered && sqliters_vdbe::vdbe::is_integer_order_filter_op(op, read, encoding as u8),
     }) {
         return None;
@@ -257,16 +259,16 @@ fn file_sort_read_program(
         return None;
     }
     let Some(Stmt::Select(select)) = stmt else { return None };
-    let (name, root, without_rowid, total) = if with_workers {
-        let (name, table, total) =
+    let (names, root, without_rowid, total) = if with_workers {
+        let (names, table, total) =
             crate::engine::worker_file_order_collation(select, &inner.db_set, &inner.collations)?;
-        (name, table.root_pgno, table.without_rowid, total)
+        (names, table.root_pgno, table.without_rowid, total)
     } else {
         let (name, root) =
             crate::engine::custom_file_order_collation(select, &inner.db_set, &inner.collations)?;
-        (name, root, false, false)
+        (ApplicationSortCollations { first: name, second: None }, root, false, false)
     };
-    if !with_workers && !file_sort_policy(inner, Some(name)) {
+    if !with_workers && !file_sort_policy(inner, Some(names.first)) {
         return None;
     }
     let PrepareResult::Program(mut program) = crate::cgen::c_prepare(inner, sql).0 else {
@@ -278,8 +280,8 @@ fn file_sort_read_program(
         return None;
     }
     let encoding = inner.effective_encoding();
-    let max_key_fields = if without_rowid { 3 } else { 2 };
-    let open = sqliters_vdbe::vdbe::custom_file_sort_open(&program, name, encoding as u8, max_key_fields)?;
+    let max_key_fields = (if without_rowid { 3 } else { 2 }) + u16::from(names.second.is_some());
+    let open = sqliters_vdbe::vdbe::custom_file_sort_open(&program, names, encoding as u8, max_key_fields)?;
     let mut reads = program.a_op.iter().filter(|op| op.opcode == OP_OpenRead);
     let mut pseudos = program.a_op.iter().filter(|op| op.opcode == OP_OpenPseudo);
     let read = reads.next()?;
@@ -319,14 +321,14 @@ fn file_sort_read_program(
             return None;
         }
         if total {
-            let eligible = if Collation::from_name(name).is_none() {
+            let eligible = if Collation::from_name(names.first).is_none() {
                 sqliters_vdbe::vdbe::is_worker_sort_with_named_collation(
-                    &program, open, encoding, name, has_integer_filter,
+                    &program, open, encoding, names, has_integer_filter,
                     |read, keys| has_worker_sort_table_key(&inner.db_set, encoding, read, keys),
                 )
             } else {
                 sqliters_vdbe::vdbe::is_worker_sort_with_collations(
-                    &program, encoding, |_, _| false, |collation| collation.eq_ignore_ascii_case(name),
+                    &program, encoding, |_, _| false, |collation| collation.eq_ignore_ascii_case(names.first),
                 )
             };
             if !eligible {

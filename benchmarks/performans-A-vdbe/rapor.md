@@ -2992,3 +2992,8 @@ Her iki türde 192 hedef fark kapandı. 528/528 C sözleşmesi, 264/264 Tcl V1, 
 ## V6b.537 — Doğrudan child RESTRICT ve ertelenmiş kontrol seçimi
 
 Normal ve ertelenmiş kontrol toplam 1.728/1.728 C sonucu ve dosya bütünlüğü eş. Group64 40/40 ve Group65 62/62 iki kipte. [Bağımsız ölçüm](/github/sqliters/target/perf-work/fk-sibling-restrict-counter-candidate/sonuc.md) OFF 1409/0/324, ON 1409/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,295 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_537.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.538 — İki adlandırılmış kolasyonun işçili ve top-N sıralaması
+
+Her kipte 288 tam sıralama, 864 seri top-N, 216 iki-PMA tekrar ve 576 fallible sözleşme kontrolü eş. Fiziksel PMA ve callback sırası gerçek iş atamasında doğrulandı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/dual-collation-worker-v510-candidate/sonuc.md) OFF 1410/0/324, ON 1410/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,287 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_538.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)

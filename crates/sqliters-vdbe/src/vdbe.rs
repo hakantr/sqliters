@@ -1568,17 +1568,41 @@ fn matches_application_order_collation(coll: &CollSeq, name: &str, key_encoding:
     coll.name.eq_ignore_ascii_case(name) && coll.enc == encoding
 }
 
+/// Application collations at the beginning of a verified ORDER BY key.
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub struct ApplicationSortCollations<'a> {
+    pub first: &'a str,
+    pub second: Option<&'a str>,
+}
+
+impl<'a> ApplicationSortCollations<'a> {
+    fn count(self) -> usize {
+        1 + usize::from(self.second.is_some())
+    }
+
+    fn at(self, index: usize) -> &'a str {
+        match index {
+            0 => self.first,
+            1 => self.second.unwrap_or("BINARY"),
+            _ => "BINARY",
+        }
+    }
+}
+
 /// Validate the cursor and key that can call an application comparator.
 #[doc(hidden)]
-pub fn custom_limit_sort_open(prog: &Program, name: &str, enc: u8) -> Option<usize> {
+pub fn custom_limit_sort_open(prog: &Program, collations: ApplicationSortCollations<'_>, enc: u8) -> Option<usize> {
     let mut opens = prog.a_op.iter().enumerate().filter(|(_, op)| op.opcode == OP_OpenEphemeral);
     let (pc, op) = opens.next()?;
     let P4::KeyInfo(key) = &op.p4 else { return None };
+    let count = collations.count();
     (opens.next().is_none() && key.enc == enc && ordered_limit_index(prog, op, key)
-        && key.a_coll.first().and_then(Option::as_deref).is_some_and(|coll| {
-            matches_application_order_collation(coll, name, key.enc)
-        })
-        && key.a_coll[1..].iter().flatten().all(|coll| {
+        && usize::from(key.n_key_field) >= count
+        && key.a_coll[..count].iter().enumerate().all(|(index, field)| field.as_deref().is_some_and(|coll| {
+            matches_application_order_collation(coll, collations.at(index), key.enc)
+        }))
+        && key.a_coll[count..].iter().flatten().all(|coll| {
             coll.name.eq_ignore_ascii_case("BINARY") && coll.enc == key.enc
         }))
         .then_some(pc)
@@ -1618,11 +1642,11 @@ fn builtin_order_key(key: &KeyInfo) -> bool {
     ordinary_order_key(key, |_, coll| builtin_read_key_collation(coll, key.enc))
 }
 
-fn application_order_key(key: &KeyInfo, name: &str) -> bool {
-    ordinary_order_key(key, |index, coll| {
-        let name = if index == 0 { name } else { "BINARY" };
-        matches_application_order_collation(coll, name, key.enc)
-    })
+fn application_order_key(key: &KeyInfo, collations: ApplicationSortCollations<'_>) -> bool {
+    usize::from(key.n_key_field) >= collations.count()
+        && ordinary_order_key(key, |index, coll| {
+            matches_application_order_collation(coll, collations.at(index), key.enc)
+        })
 }
 
 fn ordinary_order_key(key: &KeyInfo, collation: impl Fn(usize, &CollSeq) -> bool) -> bool {
@@ -1709,14 +1733,14 @@ fn worker_order_sorter(
     open: &VdbeOp,
     key: &KeyInfo,
     encoding: u8,
-    application_name: Option<&str>,
+    application_collations: Option<ApplicationSortCollations<'_>>,
     has_integer_filter: bool,
     has_table_key: impl FnOnce(&VdbeOp, &[VdbeOp]) -> bool,
     has_collation: impl FnOnce(&str) -> bool,
 ) -> bool {
-    let valid_order = application_name.map_or_else(
+    let valid_order = application_collations.map_or_else(
         || builtin_order_sorter(prog, open, key),
-        |name| application_order_key(key, name) && complete_order_sorter(prog, open, key),
+        |names| application_order_key(key, names) && complete_order_sorter(prog, open, key),
     );
     if !prog.read_only || prog.btree_mask != 1 || !prog.p_program.is_empty()
         || !valid_order
@@ -1725,15 +1749,17 @@ fn worker_order_sorter(
         return false;
     }
     let binary_order = key.a_coll.iter().flatten().all(|coll| coll.name.eq_ignore_ascii_case("BINARY"));
+    let application_count = application_collations.map_or(1, ApplicationSortCollations::count);
     if !binary_order {
-        // The application comparator precedes the native BINARY tie breaker.
-        let [Some(first), tail @ ..] = &key.a_coll[..usize::from(key.n_key_field)] else {
+        // The application comparators precede the native BINARY tie breaker.
+        let Some((prefix, tail)) = key.a_coll[..usize::from(key.n_key_field)].split_at_checked(application_count) else {
             return false;
         };
-        if key.enc != encoding || first.name.eq_ignore_ascii_case("BINARY")
-            || tail.is_empty() || (application_name.is_none() && tail.len() != 1)
+        if key.enc != encoding || tail.is_empty() || (application_collations.is_none() && tail.len() != 1)
+            || !prefix.iter().all(|field| field.as_deref().is_some_and(|coll| !coll.name.eq_ignore_ascii_case("BINARY")))
             || !tail.iter().all(|field| field.as_deref().is_some_and(|coll| coll.name.eq_ignore_ascii_case("BINARY")))
-            || !has_collation(&first.name)
+            || (application_collations.is_none()
+                && !prefix[0].as_deref().is_some_and(|coll| has_collation(&coll.name)))
         {
             return false;
         }
@@ -1800,8 +1826,8 @@ fn worker_order_sorter(
                 && (if binary_order {
                     has_table_key(table, keys)
                 } else {
-                    application_name.is_some() && matches!(table.p4, P4::KeyInfo(_))
-                        && has_table_key(table, &keys[1..])
+                    application_collations.is_some() && matches!(table.p4, P4::KeyInfo(_))
+                        && has_table_key(table, &keys[application_count..])
                 })
         }
 }
@@ -1853,24 +1879,25 @@ pub fn is_worker_sort_with_named_collation(
     prog: &Program,
     open: usize,
     encoding: TextEncoding,
-    name: &str,
+    collations: ApplicationSortCollations<'_>,
     has_integer_filter: bool,
     has_table_key: impl FnOnce(&VdbeOp, &[VdbeOp]) -> bool,
 ) -> bool {
     let Some(op) = prog.a_op.get(open) else { return false };
     let P4::KeyInfo(key) = &op.p4 else { return false };
-    worker_order_sorter(prog, op, key, encoding as u8, Some(name), has_integer_filter, has_table_key,
-        |collation| collation.eq_ignore_ascii_case(name))
+    worker_order_sorter(prog, op, key, encoding as u8, Some(collations), has_integer_filter, has_table_key, |_| false)
 }
 
 /// Find the single complete sorter that owns the application's first order key.
 #[doc(hidden)]
-pub fn custom_file_sort_open(prog: &Program, name: &str, enc: u8, max_key_fields: u16) -> Option<usize> {
+pub fn custom_file_sort_open(
+    prog: &Program, collations: ApplicationSortCollations<'_>, enc: u8, max_key_fields: u16,
+) -> Option<usize> {
     let mut opens = prog.a_op.iter().enumerate().filter(|(_, op)| op.opcode == OP_SorterOpen);
     let (pc, op) = opens.next()?;
     let P4::KeyInfo(key) = &op.p4 else { return None };
     (opens.next().is_none() && key.enc == enc && key.n_key_field <= max_key_fields
-        && application_order_key(key, name)
+        && application_order_key(key, collations)
         && complete_order_sorter(prog, op, key))
         .then_some(pc)
 }
@@ -3594,7 +3621,8 @@ impl Vdbe {
                     let mut a_coll = Vec::with_capacity(k.a_coll.len());
                     for (field, c) in k.a_coll.iter().enumerate() {
                         a_coll.push(match c {
-                            Some(c) if field == 0 && scoped_sort.is_some_and(|(pc, _, _)| i == pc) => {
+                            Some(c) if scoped_sort.is_some_and(|(pc, _, _)| i == pc)
+                                && (field == 0 || field == 1 && sqliters_types::Collation::from_name(&c.name).is_none()) => {
                                 let (_, error, workers) = scoped_sort.expect("checked sort address");
                                 let registered = find_registered(&c.name, host, workers)?;
                                 Some(Arc::new(fallible_sort_collation(registered, error)?))

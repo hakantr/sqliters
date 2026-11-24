@@ -6435,3 +6435,77 @@ fn group65_fk_sibling_restrict_uses_defer_foreign_keys_at_prepare() {
         }
     }
 }
+
+#[test]
+fn group64_two_named_sort_collations_follow_worker_and_topn_lifecycle() {
+    use sqliters_vdbe::vdbe::SQLITE_STMTSTATUS_SORT;
+
+    for (encoding, width) in [("UTF-8", 1550), ("UTF-16le", 775), ("UTF-16be", 775)] {
+        for (table, order) in [
+            ("(id INTEGER PRIMARY KEY,v TEXT,w TEXT,bucket INTEGER)", "id DESC"),
+            ("(v TEXT,w TEXT,id INTEGER,bucket INTEGER,PRIMARY KEY(id DESC)) WITHOUT ROWID", "id DESC"),
+            ("(v TEXT,w TEXT,id INTEGER,bucket INTEGER,PRIMARY KEY(bucket DESC,id)) WITHOUT ROWID", "bucket DESC,id DESC"),
+        ] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA page_size=512; PRAGMA encoding='{encoding}'; PRAGMA cache_size=1;
+                 PRAGMA temp_store=FILE; PRAGMA threads=2; CREATE TABLE items{table};
+                 WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<52)
+                 INSERT INTO items(id,v,w,bucket) SELECT x,
+                    printf('%02d',x%4)||substr(hex(zeroblob(900)),1,{width}-2),
+                    printf('%02d',(x/4)%3)||substr(hex(zeroblob(900)),1,{width}-2),x%5 FROM n;"
+            )).unwrap();
+            let caller = std::thread::current().id();
+            let worker_calls = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+            for (slot, name) in ["app_first", "app_second"].into_iter().enumerate() {
+                let observed = Arc::clone(&worker_calls);
+                db.register_collation(name, move |left, right| {
+                    if std::thread::current().id() != caller {
+                        observed[slot].fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    if slot == 0 { right.cmp(left) } else { left.cmp(right) }
+                }).unwrap();
+            }
+            let sql = format!(
+                "SELECT id FROM items ORDER BY v COLLATE APP_FIRST NULLS LAST,w COLLATE APP_SECOND DESC NULLS FIRST,{order}"
+            );
+            let mut expected: Vec<_> = (1..=52).collect();
+            expected.sort_by_key(|&id| std::cmp::Reverse((
+                id % 4, (id / 4) % 3, if order.starts_with("bucket") { id % 5 } else { 0 }, id,
+            )));
+            let mut full = db.prepare(&sql).unwrap();
+            let StepResult::Row(first) = full.step().unwrap() else { panic!("missing sorted row"); };
+            assert_eq!(first.get_i64(0), Some(expected[0]));
+            assert_eq!(full.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), 1);
+            full.reset().unwrap();
+            let workers = worker_calls.each_ref().map(|count| count.load(AtomicOrdering::Relaxed));
+            assert!(workers.into_iter().all(|count| count > 0), "{encoding}/{order}/{workers:?}");
+
+            let mut topn = db.prepare(&format!("{sql} LIMIT ?1 OFFSET ?2")).unwrap();
+            topn.bind(1, 0).unwrap().bind(2, Value::Null).unwrap();
+            assert!(matches!(topn.step().unwrap(), StepResult::Done));
+            assert_eq!(topn.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), 0);
+            topn.reset().unwrap();
+            topn.bind(1, 7).unwrap().bind(2, 2).unwrap();
+            for &id in &expected[2..9] {
+                let StepResult::Row(row) = topn.step().unwrap() else { panic!("missing top-N row"); };
+                assert_eq!(row.get_i64(0), Some(id));
+            }
+            assert!(matches!(topn.step().unwrap(), StepResult::Done));
+            assert_eq!(topn.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), 1);
+            assert_eq!(worker_calls.each_ref().map(|count| count.load(AtomicOrdering::Relaxed)), workers);
+            topn.reset().unwrap();
+
+            let failure = SqliteError::new(ErrorCode::Error, "ordinary second sort collation error");
+            let returned = failure.clone();
+            db.register_fallible_collation("APP_SECOND", move |_, _| {
+                assert_eq!(std::thread::current().id(), caller);
+                Err(returned.clone())
+            }).unwrap();
+            assert_eq!(full.step().unwrap_err(), failure);
+            assert_eq!(full.reset().unwrap_err(), failure);
+            assert_eq!(topn.step().unwrap_err(), failure);
+            assert_eq!(topn.reset().unwrap_err(), failure);
+        }
+    }
+}
