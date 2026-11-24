@@ -1694,13 +1694,14 @@ fn worker_order_sorter(
     }
     let binary_order = key.a_coll.iter().flatten().all(|coll| coll.name.eq_ignore_ascii_case("BINARY"));
     if !binary_order {
-        // The first comparator uses its validated slot, with a native BINARY
-        // rowid as the final tie breaker.
-        let [Some(first), Some(last)] = &key.a_coll[..usize::from(key.n_key_field)] else {
+        // The application comparator precedes the native BINARY tie breaker.
+        let [Some(first), tail @ ..] = &key.a_coll[..usize::from(key.n_key_field)] else {
             return false;
         };
         if key.enc != encoding || first.name.eq_ignore_ascii_case("BINARY")
-            || !last.name.eq_ignore_ascii_case("BINARY") || !has_collation(&first.name)
+            || tail.is_empty() || (application_name.is_none() && tail.len() != 1)
+            || !tail.iter().all(|field| field.as_deref().is_some_and(|coll| coll.name.eq_ignore_ascii_case("BINARY")))
+            || !has_collation(&first.name)
         {
             return false;
         }
@@ -1763,8 +1764,13 @@ fn worker_order_sorter(
         && if let Some(index) = rowid_index {
             width >= 2 && matches!(table.p4, P4::Int32(_)) && (binary_order || index == width - 1)
         } else {
-            binary_order && verified_schema && record.p5 == 0 && keys.iter().all(|op| op.p5 == 0)
-                && has_table_key(table, keys)
+            verified_schema && record.p5 == 0 && keys.iter().all(|op| op.p5 == 0)
+                && (if binary_order {
+                    has_table_key(table, keys)
+                } else {
+                    application_name.is_some() && matches!(table.p4, P4::KeyInfo(_))
+                        && has_table_key(table, &keys[1..])
+                })
         }
 }
 
@@ -1809,22 +1815,28 @@ pub fn is_worker_sort_with_collations(
     })
 }
 
-/// Validate a named application sort with an explicit rowid tie breaker.
+/// Validate a named application sort with the rowid or the primary key as its tie breaker.
 #[doc(hidden)]
-pub fn is_worker_sort_with_named_collation(prog: &Program, open: usize, encoding: TextEncoding, name: &str) -> bool {
+pub fn is_worker_sort_with_named_collation(
+    prog: &Program,
+    open: usize,
+    encoding: TextEncoding,
+    name: &str,
+    has_table_key: impl FnOnce(&VdbeOp, &[VdbeOp]) -> bool,
+) -> bool {
     let Some(op) = prog.a_op.get(open) else { return false };
     let P4::KeyInfo(key) = &op.p4 else { return false };
-    worker_order_sorter(prog, op, key, encoding as u8, Some(name), |_, _| false,
+    worker_order_sorter(prog, op, key, encoding as u8, Some(name), has_table_key,
         |collation| collation.eq_ignore_ascii_case(name))
 }
 
 /// Find the single complete sorter that owns the application's first order key.
 #[doc(hidden)]
-pub fn custom_file_sort_open(prog: &Program, name: &str, enc: u8) -> Option<usize> {
+pub fn custom_file_sort_open(prog: &Program, name: &str, enc: u8, max_key_fields: u16) -> Option<usize> {
     let mut opens = prog.a_op.iter().enumerate().filter(|(_, op)| op.opcode == OP_SorterOpen);
     let (pc, op) = opens.next()?;
     let P4::KeyInfo(key) = &op.p4 else { return None };
-    (opens.next().is_none() && key.enc == enc && key.n_key_field <= 2
+    (opens.next().is_none() && key.enc == enc && key.n_key_field <= max_key_fields
         && application_order_key(key, name)
         && complete_order_sorter(prog, op, key))
         .then_some(pc)

@@ -5706,3 +5706,75 @@ fn group65_fk_numeric_child_action_preserves_two_hop_constraint_counter() {
         );
     }
 }
+
+#[test]
+fn group64_named_worker_sort_uses_without_rowid_primary_key_and_preserves_ties() {
+    use sqliters_vdbe::vdbe::SQLITE_STMTSTATUS_SORT;
+
+    for (encoding, width) in [("UTF-8", 3100), ("UTF-16le", 1550), ("UTF-16be", 1550)] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}'; PRAGMA cache_size=1;
+             PRAGMA foreign_keys=ON;
+             CREATE TABLE parents(id INTEGER PRIMARY KEY);
+             INSERT INTO parents VALUES(1),(2);
+             CREATE TABLE items(v TEXT,p INTEGER NOT NULL REFERENCES parents(id),id INTEGER NOT NULL,
+                                bucket INTEGER NOT NULL,PRIMARY KEY(bucket DESC,id)) WITHOUT ROWID;
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<52)
+             INSERT INTO items SELECT printf('%02d',x%17)||substr(hex(zeroblob(1600)),1,{width}-2),
+                                      1+x%2,x,x%5 FROM n;"
+        )).unwrap();
+        let caller = std::thread::current().id();
+        let worker_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&worker_calls);
+        db.register_collation("app_nocase", move |left, right| {
+            if std::thread::current().id() != caller {
+                calls.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            right.cmp(left)
+        }).unwrap();
+        for store in ["FILE", "DEFAULT"] {
+            for workers in [1, 2, 8] {
+                db.execute_batch(&format!("PRAGMA temp_store={store}; PRAGMA threads={workers};")).unwrap();
+                for (suffix, total) in [(",bucket DESC,id DESC", true), (",p DESC", false), ("", false)] {
+                    let mut expected: Vec<i64> = (1..=52).collect();
+                    let key = |id: i64| match suffix {
+                        ",bucket DESC,id DESC" => (id % 17, id % 5, id),
+                        ",p DESC" => (id % 17, 1 + id % 2, 0),
+                        _ => (id % 17, 0, 0),
+                    };
+                    expected.sort_by_key(|&id| std::cmp::Reverse(key(id)));
+                    let sql = format!("SELECT id FROM items ORDER BY v COLLATE APP_NOCASE NULLS LAST{suffix}");
+                    let mut statement = db.prepare(&sql).unwrap();
+                    assert_eq!(statement.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), 0);
+                    let before = worker_calls.load(AtomicOrdering::Relaxed);
+                    let StepResult::Row(first) = statement.step().unwrap() else {
+                        panic!("expected first sorted row for {encoding}/{store}/{workers}/{suffix}");
+                    };
+                    assert_eq!(key(first.get_i64(0).unwrap()), key(expected[0]));
+                    assert!(worker_calls.load(AtomicOrdering::Relaxed) > before);
+                    assert_eq!(statement.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), 1);
+                    statement.reset().unwrap();
+                    assert_eq!(statement.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), 1);
+
+                    let mut seen = [false; 52];
+                    for &id in &expected {
+                        let StepResult::Row(row) = statement.step().unwrap() else {
+                            panic!("expected sorted row for {encoding}/{store}/{workers}/{suffix}");
+                        };
+                        let actual = row.get_i64(0).unwrap();
+                        assert_eq!(key(actual), key(id));
+                        assert!(!total || actual == id);
+                        assert!(!std::mem::replace(&mut seen[(actual - 1) as usize], true));
+                    }
+                    assert!(seen.into_iter().all(|present| present));
+                    assert!(matches!(statement.step().unwrap(), StepResult::Done));
+                    assert_eq!(statement.machine_stmt_status(SQLITE_STMTSTATUS_SORT, true), 2);
+                    assert_eq!(statement.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), 0);
+                }
+            }
+        }
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+        assert_eq!(db.query("PRAGMA integrity_check", &[]).unwrap().rows[0].get_str(0), Some("ok"));
+    }
+}

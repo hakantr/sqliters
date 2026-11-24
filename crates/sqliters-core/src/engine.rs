@@ -7482,12 +7482,13 @@ fn exec_single_select_core(
     res
 }
 
-/// A full ORDER BY can receive rows directly from one main rowid scan.
-fn main_rowid_order_collation<'a>(
+/// A full ORDER BY can receive rows directly from one MAIN table scan.
+fn main_table_order_collation<'a>(
     db_set: &'a DatabaseSet,
     core: &SelectCore,
     order_by: &'a [OrderByTerm],
-) -> Option<(&'a str, u32)> {
+    include_without_rowid: bool,
+) -> Option<(&'a str, &'a TableSchema, bool)> {
     if db_set.c_flags_toggled() & sqliters_codegen::consts::SQLITE_ReverseOrder != 0 {
         return None;
     }
@@ -7504,7 +7505,7 @@ fn main_rowid_order_collation<'a>(
     let Some((DatabaseId::MAIN, table)) = db_set.find_user_table_in_set(name) else {
         return None;
     };
-    if table.without_rowid || table.root_pgno <= 1
+    if (table.without_rowid && !include_without_rowid) || table.root_pgno <= 1
         || table.columns.iter().any(|column| column.generated.is_some())
         || db_set.slots()[DatabaseId::MAIN.index()].schema.indexes.iter()
             .any(|index| index.table_name.eq_ignore_ascii_case(&table.name))
@@ -7529,15 +7530,40 @@ fn main_rowid_order_collation<'a>(
         expr => (expr, None),
     };
     let key_index = column_index(key)?;
-    let rowid_tail = match trailing {
-        [] => true,
-        [last] => column_index(&last.expr).is_some_and(|index| Some(index) == table.rowid_alias_col),
-        _ => false,
+    let total = if table.without_rowid {
+        let primary = &table.without_rowid_pk_cols;
+        let is_primary = |index| primary.iter().any(|part| part.col_idx == Some(index));
+        if !(1..=2).contains(&primary.len()) || is_primary(key_index) {
+            return None;
+        }
+        match trailing {
+            [] => false,
+            terms if terms.len() == primary.len() && terms.iter().zip(primary).all(|(term, part)| {
+                column_index(&term.expr).is_some_and(|index| part.col_idx == Some(index))
+            }) => true,
+            [term] if column_index(&term.expr).is_some_and(|index| index != key_index && !is_primary(index)) => false,
+            _ => return None,
+        }
+    } else {
+        if Some(key_index) == table.rowid_alias_col {
+            return None;
+        }
+        match trailing {
+            [] => false,
+            [last] if column_index(&last.expr).is_some_and(|index| Some(index) == table.rowid_alias_col) => true,
+            _ => return None,
+        }
     };
-    if Some(key_index) == table.rowid_alias_col || !rowid_tail {
-        return None;
-    }
-    Some((explicit.unwrap_or_else(|| table.columns[key_index].collation_name()), table.root_pgno))
+    Some((explicit.unwrap_or_else(|| table.columns[key_index].collation_name()), table, total))
+}
+
+fn main_rowid_order_collation<'a>(
+    db_set: &'a DatabaseSet,
+    core: &SelectCore,
+    order_by: &'a [OrderByTerm],
+) -> Option<(&'a str, u32)> {
+    main_table_order_collation(db_set, core, order_by, false)
+        .map(|(name, table, _)| (name, table.root_pgno))
 }
 
 fn complete_order_sort_collation<'a>(
@@ -7589,6 +7615,28 @@ pub(crate) fn registered_worker_order_collation(name: &str, collations: &Collati
         || (Collation::from_name(name).is_none() && collations.has_infallible_registration(name))
 }
 
+pub(crate) fn worker_file_order_collation<'a>(
+    select: &'a SelectStmt,
+    db_set: &'a DatabaseSet,
+    collations: &CollationRegistry,
+) -> Option<(&'a str, &'a TableSchema, bool)> {
+    if select.limit.is_some() || !select.ctes.is_empty() || !select.body.compounds.is_empty() {
+        return None;
+    }
+    let SelectCore::Select { projection, .. } = &select.body.head else { return None };
+    let fields = projection.len() + select.order_by.len();
+    let (name, table, total) = main_table_order_collation(db_set, &select.body.head, &select.order_by, true)?;
+    let registered = if table.without_rowid {
+        fields <= 4 && collations.get_custom("BINARY").is_none()
+            && Collation::from_name(name).is_none() && collations.has_infallible_registration(name)
+    } else {
+        fields <= 3 && registered_worker_order_collation(name, collations)
+    };
+    // A default for a column absent in an older record uses no space on its page.
+    (registered && !table.columns.iter().any(|column| column.default_expr.is_some()))
+        .then_some((name, table, total))
+}
+
 /// A direct registered FILE sort can defer its route until MAIN is pinned.
 pub(crate) fn registered_worker_file_sort(
     stmt: Option<&Stmt>, db_set: &DatabaseSet, collations: &CollationRegistry,
@@ -7600,19 +7648,7 @@ pub(crate) fn registered_worker_file_sort(
         return false;
     }
     let Some(Stmt::Select(select)) = stmt else { return false; };
-    let Some((name, _)) = custom_file_order_collation(select, db_set, collations) else { return false; };
-    if !registered_worker_order_collation(name, collations) {
-        return false;
-    }
-    let SelectCore::Select { projection, from: Some(from), .. } = &select.body.head else { return false; };
-    let fields = projection.len() + select.order_by.len();
-    if fields > 3 {
-        return false;
-    }
-    let TableOrSubquery::Table { name, .. } = &from.head else { return false; };
-    let Some((DatabaseId::MAIN, table)) = db_set.find_user_table_in_set(name) else { return false; };
-    // A default for a column absent in an older record uses no space on its page.
-    if table.columns.iter().any(|column| column.default_expr.is_some()) {
+    if worker_file_order_collation(select, db_set, collations).is_none() {
         return false;
     }
     if !require_snapshot {

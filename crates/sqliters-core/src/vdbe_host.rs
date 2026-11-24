@@ -34,6 +34,7 @@ use crate::ConnectionInner;
 use crate::engine::ExecContext;
 use crate::db_set::{DatabaseSet, TempStoreMode};
 use crate::execution_context::{CollationRegistry, ExecutionContext, FunctionRegistry, ProgressTracker};
+use crate::schema::TableSchema;
 
 /// True if the environment variable `SQLITERS_VDBE_EXEC` is set: statements the generator and
 /// the machine support completely are executed by the machine.
@@ -244,7 +245,15 @@ fn file_sort_read_program(
         return None;
     }
     let Some(Stmt::Select(select)) = stmt else { return None };
-    let (name, root) = crate::engine::custom_file_order_collation(select, &inner.db_set, &inner.collations)?;
+    let (name, root, without_rowid, total) = if with_workers {
+        let (name, table, total) =
+            crate::engine::worker_file_order_collation(select, &inner.db_set, &inner.collations)?;
+        (name, table.root_pgno, table.without_rowid, total)
+    } else {
+        let (name, root) =
+            crate::engine::custom_file_order_collation(select, &inner.db_set, &inner.collations)?;
+        (name, root, false, false)
+    };
     if !with_workers && !file_sort_policy(inner, Some(name)) {
         return None;
     }
@@ -256,9 +265,9 @@ fn file_sort_read_program(
     {
         return None;
     }
-    let open = sqliters_vdbe::vdbe::custom_file_sort_open(
-        &program, name, inner.effective_encoding() as u8,
-    )?;
+    let encoding = inner.effective_encoding();
+    let max_key_fields = if without_rowid { 3 } else { 2 };
+    let open = sqliters_vdbe::vdbe::custom_file_sort_open(&program, name, encoding as u8, max_key_fields)?;
     let mut reads = program.a_op.iter().filter(|op| op.opcode == OP_OpenRead);
     let mut pseudos = program.a_op.iter().filter(|op| op.opcode == OP_OpenPseudo);
     let read = reads.next()?;
@@ -266,9 +275,14 @@ fn file_sort_read_program(
     let sort = &program.a_op[open];
     if reads.next().is_some() || pseudos.next().is_some()
         || read.p1 == sort.p1 || pseudo.p1 == read.p1 || pseudo.p1 == sort.p1
-        || read.p2 != root as i32 || read.p3 != 0 || !matches!(read.p4, P4::Int32(_))
+        || read.p2 != root as i32 || read.p3 != 0
         || (with_workers && sort.p3 != 0)
     {
+        return None;
+    }
+    if without_rowid {
+        worker_without_rowid_table(&inner.db_set, encoding, read)?;
+    } else if !matches!(read.p4, P4::Int32(_)) {
         return None;
     }
     if !program.a_op.iter().enumerate().all(|(pc, op)| match op.opcode {
@@ -290,10 +304,12 @@ fn file_sort_read_program(
         {
             return None;
         }
-        if select.order_by.len() == 2 {
-            let encoding = inner.effective_encoding();
+        if total {
             let eligible = if Collation::from_name(name).is_none() {
-                sqliters_vdbe::vdbe::is_worker_sort_with_named_collation(&program, open, encoding, name)
+                sqliters_vdbe::vdbe::is_worker_sort_with_named_collation(
+                    &program, open, encoding, name,
+                    |read, keys| has_worker_sort_table_key(&inner.db_set, encoding, read, keys),
+                )
             } else {
                 sqliters_vdbe::vdbe::is_worker_sort_with_collations(
                     &program, encoding, |_, _| false, |collation| collation.eq_ignore_ascii_case(name),
@@ -339,39 +355,53 @@ fn has_declared_unique_sort_key(db_set: &DatabaseSet, root: u32, keys: &[VdbeOp]
 
 fn has_worker_sort_table_key(db_set: &DatabaseSet, encoding: TextEncoding, read: &VdbeOp, keys: &[VdbeOp]) -> bool {
     let Ok(root) = u32::try_from(read.p2) else { return false };
-    let P4::KeyInfo(primary) = &read.p4 else {
-        return matches!(read.p4, P4::Int32(_)) && has_declared_unique_sort_key(db_set, root, keys);
-    };
+    if matches!(read.p4, P4::Int32(_)) {
+        return has_declared_unique_sort_key(db_set, root, keys);
+    }
+    worker_without_rowid_table(db_set, encoding, read).is_some_and(|table| {
+        let count = table.without_rowid_pk_cols.len();
+        count == keys.len() && (0..count).all(|slot| {
+            keys.iter().any(|key| usize::try_from(key.p2).ok() == Some(slot))
+        })
+    })
+}
+
+fn worker_without_rowid_table<'a>(
+    db_set: &'a DatabaseSet,
+    encoding: TextEncoding,
+    read: &VdbeOp,
+) -> Option<&'a TableSchema> {
+    let root = u32::try_from(read.p2).ok()?;
+    let P4::KeyInfo(primary) = &read.p4 else { return None };
     let schema = &db_set.main_slot().schema;
     if !schema.loaded || db_set.writable_schema_effective() {
-        return false;
+        return None;
     }
-    let Some(table) = schema.tables.iter().find(|table| table.root_pgno == root && table.without_rowid) else {
-        return false;
-    };
+    let table = schema.tables.iter().find(|table| table.root_pgno == root && table.without_rowid)?;
     let fields = &table.without_rowid_pk_cols;
     let n_cols = table.columns.len();
-    if fields.len() != keys.len() || usize::from(primary.n_key_field) != fields.len()
+    if usize::from(primary.n_key_field) != fields.len()
         || usize::from(primary.n_all_field) != n_cols || primary.enc != encoding as u8
         || primary.a_sort_flags.len() != n_cols || primary.a_coll.len() != n_cols
+        || fields.len() > n_cols
         || primary.a_coll.iter().flatten().any(|coll| {
             !coll.name.eq_ignore_ascii_case("BINARY") || coll.enc != primary.enc
         })
         || table.columns.iter().any(|column| column.generated.is_some())
         || primary.a_sort_flags[fields.len()..].iter().any(|&flag| flag != 0)
     {
-        return false;
+        return None;
     }
-    fields.iter().enumerate().all(|(slot, part)| {
+    let binary_primary_key = fields.iter().enumerate().all(|(slot, part)| {
         let flags = if part.sort_order.desc { KEYINFO_ORDER_DESC } else { 0 };
         part.expr.is_none() && part.sort_order.collation == Collation::Binary
             && part.sort_order.custom_collation.is_none() && primary.a_sort_flags[slot] == flags
             && part.col_idx.is_some_and(|column| {
                 table.columns.get(column).is_some_and(|column| column.not_null.is_some())
                     && table.physical_record_slot(column) == slot
-                    && keys.iter().any(|key| usize::try_from(key.p2).ok() == Some(slot))
             })
-    })
+    });
+    binary_primary_key.then_some(table)
 }
 
 fn has_stock_sorter_collation(collations: &CollationRegistry, name: &str) -> bool {

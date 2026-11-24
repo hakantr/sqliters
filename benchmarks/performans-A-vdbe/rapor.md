@@ -2927,3 +2927,8 @@ Her kipte 384/384 C satır, SORT, reset ve callback. İki PMA için 120/120, sto
 ## V6b.524 — İki basamaklı FK zincirinde yazma, COMMIT ve rollback
 
 Birleşik kaynakta her kipte 864 açık işlem ve 1.728 autocommit/rollback C eş. Group64 39/39, Group65 57/57 ve ertelenmiş FK 2/2. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v524-fk-two-hop-exact/sonuc.md) OFF 1396/0/324, ON 1396/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,302 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_524.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.525 — WITHOUT ROWID fiziksel PK ile adlandırılmış FILE sıralaması
+
+Her kipte 1.152 named ve 192 stock profil geçti. Eş görev dağılımında 1.440 writer/reader/callback karşılaştırması C eş. Geriye dönük stock ve fallible sözleşmesi geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/named-without-rowid-worker-v510-candidate/sonuc.md) OFF 1397/0/324, ON 1397/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,309 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_525.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
