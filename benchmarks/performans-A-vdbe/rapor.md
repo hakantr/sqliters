@@ -3137,3 +3137,8 @@ Kip başına 28 önceki SORT farkı kapandı. 66 stok, 72 dinamik işçi geçiş
 ## V6b.566 — EXCLUSIVE MEMORY ve WAL geçişinin sonuç satırı sınırı
 
 72 C ve her kipte 36 Rust yaşam döngüsü doğrulandı. 96 geçişte SQL, C yeniden açılışı, ana dosya ve journal açma sayısı eş. 48 disk journal kontrolü ve altı aktif okuyucu ile yeniden deneme geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/e28-exclusive-memory-wal-staged-candidate/sonuc.md) OFF 1440/0/319, ON 1440/0/319. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,297 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_566.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.567 — Özgün collate8 testinin çalışma alanı kapısına dönüşü
+
+Özgün Tcl testinin 23 alt testi sabit C ve iki Rust kipinde geçti. Çalışma alanı kapısında collate8 etkinleştirildi. [Bağımsız ölçüm](/github/sqliters/target/perf-work/collate8-enable-v567.oW79qbah/sonuc.md) OFF 1441/0/318, ON 1441/0/318. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,298 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_567.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)

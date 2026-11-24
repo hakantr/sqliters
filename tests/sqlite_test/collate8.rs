@@ -1,5 +1,4 @@
 #[test]
-#[ignore = "7/23 subtests passed; pending: collate8 edge cases"]
 fn test_collate8() {
     sqliters_tcltest::run_test_script(
         "collate8",
