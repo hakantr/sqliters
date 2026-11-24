@@ -7620,14 +7620,14 @@ fn main_rowid_order_collation<'a>(
         .map(|(names, table, _)| (names.first, table.root_pgno))
 }
 
-/// The BINARY override is safe for a private TEXT sort key over a native rowid scan.
+/// A private BINARY TEXT sort key over a native rowid scan.
 pub(crate) fn binary_rowid_order_collation<'a>(
     select: &'a SelectStmt,
     db_set: &'a DatabaseSet,
     collations: &CollationRegistry,
 ) -> Option<(ApplicationSortCollations<'a>, &'a TableSchema, bool, usize)> {
     if !select.ctes.is_empty() || !select.body.compounds.is_empty()
-        || db_set.writable_schema_effective() || collations.get_custom("BINARY").is_none()
+        || db_set.writable_schema_effective() || !collations.has_registration_comparator("BINARY")
         || !matches!(select.body.head, SelectCore::Select { selection: None, .. })
     {
         return None;

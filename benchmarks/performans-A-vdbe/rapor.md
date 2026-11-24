@@ -3117,3 +3117,8 @@ Her kipte 774 doğrudan C profili, 300 hata/reset ve gerçek PMA geçti. UTF-8 k
 ## V6b.562 — Altı fiziksel INNER JOIN kaynağının hazırlanmış bağlaması
 
 174 hedef fark kapandı ve 90 doğru kontrol korundu. 264/264 C yaşam döngüsü, 132/132 gerçek Tcl V1, 4.032 C yeniden açılışı ve önceki 1.092 ham kayıt eş. [Bağımsız ölçüm](/github/sqliters/target/perf-work/six-table-inner-reprepare-candidate/sonuc.md) OFF 1436/0/319, ON 1436/0/319. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,285 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_562.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.563 — Hazırlanmış rowid sıralamasında SORT sayacı ve işçi geçişi
+
+Kip başına 28 önceki SORT farkı kapandı. 66 stok, 72 dinamik işçi geçişi ve 774 BINARY karşılaştırması C ile eş. Fiziksel PMA ve önceki kolasyon kontrolleri geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/binary-rowid-stock-sort-v510-candidate/sonuc.md) OFF 1437/0/319, ON 1437/0/319. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,299 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_563.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)

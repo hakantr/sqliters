@@ -143,7 +143,7 @@ pub(crate) fn custom_sort_policy_matches(
         return !inner.authorizer.is_some()
             && crate::engine::binary_rowid_order_collation(select, &inner.db_set, &inner.collations).is_some()
             && (program.fallible_limit_sort_open.is_some()
-                || program.worker_file_sort == binary_rowid_sort_uses_workers(inner));
+                || binary_rowid_file_sort_policy(inner, program.worker_file_sort));
     }
     if let Some(open) = program.fallible_limit_sort_open {
         !inner.authorizer.is_some() && match stmt {
@@ -176,7 +176,16 @@ pub(crate) fn custom_sort_policy_matches(
 fn binary_rowid_sort_uses_workers(inner: &ConnectionInner) -> bool {
     (1..=sqliters_codegen::consts::SQLITE_MAX_WORKER_THREADS).contains(&inner.db_set.worker_threads_limit)
         && !inner.db_set.temp_store().is_memory()
+        && inner.collations.get_custom("BINARY").is_some()
         && (inner.effective_encoding() != TextEncoding::Utf8 || inner.collations.has_infallible_registration("BINARY"))
+}
+
+fn binary_rowid_file_sort_policy(inner: &ConnectionInner, with_workers: bool) -> bool {
+    if inner.collations.get_custom("BINARY").is_some() {
+        with_workers == binary_rowid_sort_uses_workers(inner)
+    } else {
+        !with_workers && file_sort_policy(inner, Some("BINARY"))
+    }
 }
 
 fn file_sort_policy(inner: &ConnectionInner, collation: Option<&str>) -> bool {
@@ -313,8 +322,9 @@ fn file_sort_read_program(
     let Some(Stmt::Select(select)) = stmt else { return None };
     let (names, root, without_rowid, total, binary_slot) = if let Some((names, table, total, slot)) =
         crate::engine::binary_rowid_order_collation(select, &inner.db_set, &inner.collations)
+            .filter(|_| binary_rowid_file_sort_policy(inner, with_workers))
     {
-        if inner.authorizer.is_some() || select.limit.is_some() || with_workers != binary_rowid_sort_uses_workers(inner) {
+        if inner.authorizer.is_some() || select.limit.is_some() {
             return None;
         }
         (names, table.root_pgno, false, total, Some(slot))
@@ -488,12 +498,13 @@ fn has_stock_sorter_collation(collations: &CollationRegistry, name: &str) -> boo
 
 /// Admit only native table scans with a total ORDER BY key and stock collations.
 pub(crate) fn worker_sort_read_program(
-    inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize,
+    inner: &ConnectionInner, stmt: Option<&Stmt>, sql: &str, n_param: usize, binary_serial_policy_changed: bool,
 ) -> Option<Arc<Program>> {
     let Some(Stmt::Select(select)) = stmt else { return None };
     let encoding = inner.effective_encoding();
-    // The standard machine prepare already handles the UTF-8 ON case.
-    if (encoding == TextEncoding::Utf8 && exec_switch_on())
+    // The standard prepare handles UTF-8 ON unless a verified serial sort was
+    // prepared before the connection enabled sorter workers.
+    if (encoding == TextEncoding::Utf8 && exec_switch_on() && !binary_serial_policy_changed)
         || inner.db_set.worker_threads_limit <= 0 || inner.db_set.temp_store().is_memory()
         || (inner.db_set.worker_threads_limit > sqliters_codegen::consts::SQLITE_MAX_WORKER_THREADS
             && inner.db_set.sorter_mmap_limit() > 0)

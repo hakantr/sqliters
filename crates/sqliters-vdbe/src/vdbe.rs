@@ -3640,11 +3640,16 @@ impl Vdbe {
                             Some(c) if sort.is_some_and(|(_, _, _, binary_slot)| binary_slot == Some(field))
                                 && c.name.eq_ignore_ascii_case("BINARY") => {
                                 let (_, error, workers, _) = sort.expect("checked sort address");
-                                Some(if c.enc == crate::vdbeaux::SQLITE_UTF8 {
-                                    let registered = find_registered(&c.name, host, workers)?;
-                                    Arc::new(fallible_sort_collation(registered, error)?)
+                                let registered = if c.enc != crate::vdbeaux::SQLITE_UTF8 {
+                                    None
+                                } else if workers {
+                                    Some(find_registered(&c.name, host, true)?)
                                 } else {
-                                    find(c, host)?
+                                    host.find_collation(&c.name).map(Arc::new)
+                                };
+                                Some(match registered {
+                                    Some(collation) => Arc::new(fallible_sort_collation(collation, error)?),
+                                    None => find(c, host)?,
                                 })
                             }
                             Some(c) if has_named && matches!(sqliters_types::Collation::from_name(&c.name),

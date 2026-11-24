@@ -7766,3 +7766,62 @@ fn group65_six_table_inner_join_tracks_the_sixth_source_schema() {
         assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
     }
 }
+
+#[test]
+fn group64_stock_binary_rowid_counts_only_executed_sort_ops() {
+    use sqliters_vdbe::vdbe::SQLITE_STMTSTATUS_SORT;
+
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let path = std::env::temp_dir().join(format!("sqliters-stock-binary-rowid-{encoding}-{}.db", std::process::id()));
+        let fixture = Connection::open(&path).unwrap();
+        fixture.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}';
+             CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT, w TEXT, s TEXT);
+             INSERT INTO items VALUES (1,'b','x','b'), (2,'a','z','a'), (3,'a','y','a');"
+        )).unwrap();
+        drop(fixture);
+        let before = std::fs::read(&path).unwrap();
+        let db = Connection::open_with_flags(&path, sqliters::vfs::OpenFlags::READONLY).unwrap();
+        db.execute_batch("PRAGMA temp_store=FILE; PRAGMA threads=0;").unwrap();
+        db.register_collation("app_first", |a, b| b.cmp(a)).unwrap();
+        db.register_collation("app_second", |a, b| a.cmp(b)).unwrap();
+        let ranked = "SELECT id FROM items ORDER BY s COLLATE BINARY, v COLLATE app_first, w COLLATE app_second DESC, id DESC";
+        let topn = "SELECT id FROM items ORDER BY v COLLATE BINARY, id DESC LIMIT 2 OFFSET 1";
+        for prepare_v1 in [false, true] {
+            for (sql, first) in [(ranked, 2), (topn, 2)] {
+                let mut stmt = if prepare_v1 { db.prepare_v1(sql).unwrap() } else { db.prepare(sql).unwrap() };
+                assert_eq!(stmt.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), 0);
+                let StepResult::Row(row) = stmt.step().unwrap() else { panic!("expected first sorted row"); };
+                assert_eq!(row.get_i64(0), Some(first));
+                assert_eq!(stmt.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), 1);
+                stmt.reset().unwrap();
+                assert_eq!(stmt.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), 1);
+                while matches!(stmt.step().unwrap(), StepResult::Row(_)) {}
+                assert_eq!(stmt.machine_stmt_status(SQLITE_STMTSTATUS_SORT, true), 2);
+                assert_eq!(stmt.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), 0);
+                stmt.finalize().unwrap();
+            }
+        }
+        let mut moving = db.prepare("SELECT id FROM items ORDER BY v COLLATE BINARY,id DESC").unwrap();
+        for (count, threads) in [(1, 0), (2, 2), (3, 0)] {
+            db.execute_batch(&format!("PRAGMA threads={threads}")).unwrap();
+            let StepResult::Row(row) = moving.step().unwrap() else { panic!("expected sorted row after thread change"); };
+            assert_eq!(row.get_i64(0), Some(3));
+            moving.reset().unwrap();
+            assert_eq!(moving.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), count);
+        }
+        moving.finalize().unwrap();
+        for sql in [
+            "SELECT id FROM items ORDER BY v COLLATE BINARY LIMIT 0",
+            "SELECT id FROM items ORDER BY id DESC",
+        ] {
+            let mut stmt = db.prepare(sql).unwrap();
+            while matches!(stmt.step().unwrap(), StepResult::Row(_)) {}
+            assert_eq!(stmt.machine_stmt_status(SQLITE_STMTSTATUS_SORT, true), 0);
+            stmt.finalize().unwrap();
+        }
+        drop(db);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(path).unwrap();
+    }
+}

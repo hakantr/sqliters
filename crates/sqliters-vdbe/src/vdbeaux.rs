@@ -827,7 +827,7 @@ pub struct Program {
     pub fallible_file_sort_open: Option<usize>,
     /// The validated private full sorter may use PMA workers.
     pub worker_file_sort: bool,
-    /// The private UTF-8 BINARY ordering field of a verified native rowid scan.
+    /// The private BINARY ordering field of a verified native rowid scan.
     pub binary_rowid_sort_column: Option<usize>,
     /// `usesStmtJournal`
     pub uses_stmt_journal: bool,

@@ -8587,8 +8587,10 @@ impl Statement {
         };
         let mut vm = match self.c_machine_vm.take() {
             Some(vm) if Arc::ptr_eq(&vm.prog, &prog) => vm,
-            Some(previous) if vdbe_host::registered_worker_file_sort(inner, self.stmt.as_ref(), false)
-                && (previous.prog.fallible_file_sort_open.is_some() || prog.fallible_file_sort_open.is_some()) =>
+            Some(previous) if previous.prog.binary_rowid_sort_column.is_some()
+                || prog.binary_rowid_sort_column.is_some()
+                || (vdbe_host::registered_worker_file_sort(inner, self.stmt.as_ref(), false)
+                    && (previous.prog.fallible_file_sort_open.is_some() || prog.fallible_file_sort_open.is_some())) =>
             {
                 // Both programs execute this prepared statement on successive snapshots.
                 let mut vm = Box::new(sqliters_vdbe::vdbe::Vdbe::new(prog));
@@ -11217,7 +11219,11 @@ impl Statement {
         if let Some(program) = self.registered_worker_file_sort_program(inner) {
             return Some(program);
         }
-        if let Some(program) = &self.c_machine {
+        let binary_serial_policy_changed = !self.c_machine_fixed && self.c_machine.as_ref().is_some_and(|program| {
+            program.binary_rowid_sort_column.is_some() && program.fallible_file_sort_open.is_some()
+                && !vdbe_host::custom_sort_policy_matches(inner, program, self.stmt.as_ref(), true)
+        });
+        if let Some(program) = &self.c_machine && !binary_serial_policy_changed {
             // TEMP storage can change after prepare without expiring the standard
             // program. A validated DEFAULT sorter must use the registered callback.
             return if !self.c_machine_fixed && program.fallible_sort_open().is_none()
@@ -11232,7 +11238,9 @@ impl Statement {
         }
         vdbe_host::custom_sort_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len())
             .or_else(|| {
-                let program = vdbe_host::worker_sort_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len())?;
+                let program = vdbe_host::worker_sort_read_program(
+                    inner, self.stmt.as_ref(), &self.raw_sql, self.params.len(), binary_serial_policy_changed,
+                )?;
                 // Retain the statement's VM and counters when the validated stock sorter is unchanged.
                 Some(self.c_machine_vm.as_ref().filter(|vm| vm.prog == program)
                     .map_or(program, |vm| Arc::clone(&vm.prog)))
@@ -11272,9 +11280,9 @@ impl Statement {
         }
         // TEMP may change without expiring a held statement when the TEMP schema
         // is unopened. The private sort must still use the active storage policy.
-        if self.c_machine_vm.as_ref().is_some_and(|vm| !vdbe_host::custom_sort_policy_matches(
-            inner, &vm.prog, self.stmt.as_ref(), false,
-        )) {
+        if self.c_machine_vm.as_ref().is_some_and(|vm| vm.prog.binary_rowid_sort_column.is_none()
+            && !vdbe_host::custom_sort_policy_matches(inner, &vm.prog, self.stmt.as_ref(), false))
+        {
             self.c_machine_vm = None;
         }
         let mut mapped_program = self.mapped_read_program(inner);
