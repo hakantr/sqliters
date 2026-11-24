@@ -5932,6 +5932,7 @@ enum PreparedReadSchemas {
     One(PreparedReadSchema),
     Two(PreparedReadSchema, PreparedReadSchema),
     Three([PreparedReadSchema; 3]),
+    Four([PreparedReadSchema; 4]),
 }
 
 impl PreparedReadSchemas {
@@ -5940,6 +5941,7 @@ impl PreparedReadSchemas {
             Self::One(schema) => schema.changed(db_set),
             Self::Two(left, right) => left.changed(db_set) || right.changed(db_set),
             Self::Three(schemas) => schemas.into_iter().any(|schema| schema.changed(db_set)),
+            Self::Four(schemas) => schemas.into_iter().any(|schema| schema.changed(db_set)),
         }
     }
 
@@ -5978,7 +5980,7 @@ impl PreparedReadSchemas {
             let (db, db_set::RelationRef::Table(table)) = db_set.find_relation_ref_in_set(name).ok()?? else {
                 return None;
             };
-            if db.is_temp() || table.without_rowid {
+            if (db.is_temp() && from.joins.len() != 3) || table.without_rowid {
                 return None;
             }
             PreparedReadSchema::snapshot(db_set, db)
@@ -5989,7 +5991,7 @@ impl PreparedReadSchemas {
             *source = read_schema(&join.right)?;
         }
         let mask = sources.iter().fold(0u32, |mask, schema| mask | (1 << schema.db_id.index()));
-        if mask.count_ones() > 3 || usage?.btree_mask != Some(mask) {
+        if usage?.btree_mask != Some(mask) {
             return None;
         }
         // An interpreter join uses these same cursor roots when it starts the reads.
@@ -6012,6 +6014,9 @@ impl PreparedReadSchemas {
             for (join, schema) in from.joins.iter_mut().zip(&sources[1..]) {
                 schema.pin_table(&mut join.right, db_set);
             }
+        }
+        if mask.count_ones() == 4 {
+            return Some(Self::Four(sources));
         }
         let mut additional = sources[1..].iter().copied().filter(|schema| schema.db_id != left.db_id);
         let Some(second) = additional.next() else {

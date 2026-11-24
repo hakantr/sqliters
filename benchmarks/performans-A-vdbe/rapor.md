@@ -3052,3 +3052,8 @@ Kip başına 1.728 tam sıralama, 1.728 top-N, 486 seri sıra, 54 fiziksel PMA v
 ## V6b.549 — Üç ORDER BY Tcl kontrolünü varsayılan kapıya ekleme
 
 orderby2, orderby5 ve orderbyA iki kipte önce seçili, ardından varsayılan çalışma ile geçti. İki kipte beklenen üç ek başarılı ve üç eksik ignore kaydı. [Bağımsız ölçüm](/github/sqliters/target/perf-work/orderby-coverage-tcl-candidate/sonuc.md) OFF 1423/0/320, ON 1423/0/320. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,290 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_549.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.550 — Dört ayrı şemalı hazırlanmış INNER JOIN
+
+144 gerçek fark kapandı, 72 doğru kontrol korundu. C yaşam döngüsü 216/216, Tcl V1 108/108, 3.384 C disk açılışı ve 960 önceki ham kayıt eş. [Bağımsız ölçüm](/github/sqliters/target/perf-work/four-schema-inner-reprepare-candidate/sonuc.md) OFF 1424/0/320, ON 1424/0/320. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,286 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_550.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
