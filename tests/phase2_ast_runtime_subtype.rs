@@ -5930,3 +5930,55 @@ fn group65_qualified_join_reprepares_only_for_its_schemas_or_temp_expiry() {
         }
     }
 }
+
+#[test]
+fn group65_fk_two_direct_actions_and_one_nested_action_match_sqlite_counter() {
+    let branch_a = "CREATE TABLE branch_a(k INTEGER UNIQUE
+        REFERENCES parent(k) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED);";
+    let branch_b = "CREATE TABLE branch_b(k INTEGER
+        REFERENCES parent(k) ON UPDATE SET NULL DEFERRABLE INITIALLY DEFERRED);";
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for (first, second) in [(branch_a, branch_b), (branch_b, branch_a)] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}';
+                 PRAGMA foreign_keys=ON;
+                 CREATE TABLE parent(k TEXT PRIMARY KEY) WITHOUT ROWID;
+                 {first}
+                 {second}
+                 CREATE TABLE grandchild(k INTEGER DEFAULT 9
+                     REFERENCES branch_a(k) ON UPDATE SET DEFAULT);
+                 INSERT INTO parent VALUES('007'),('7'),('9');
+                 INSERT INTO branch_a VALUES(7),(9);
+                 INSERT INTO branch_b VALUES(7);
+                 INSERT INTO grandchild VALUES(7);",
+            ))
+            .unwrap();
+            let count = |sql| db.query(sql, &[]).unwrap().rows[0].get_i64(0).unwrap();
+
+            db.execute_batch("BEGIN; UPDATE parent SET k='6' WHERE k='007'").unwrap();
+            assert_eq!(count("SELECT count(*) FROM branch_a WHERE k=6"), 1);
+            assert_eq!(count("SELECT count(*) FROM branch_b WHERE k IS NULL"), 1);
+            assert_eq!(count("SELECT count(*) FROM grandchild WHERE k=9"), 1);
+            assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+            let error = db.execute("COMMIT").unwrap_err();
+            assert_eq!(error.extended_code, sqliters::types::extended::SQLITE_CONSTRAINT_FOREIGNKEY);
+            assert!(!db.is_autocommit());
+            db.execute_batch("ROLLBACK").unwrap();
+            assert_eq!(count("SELECT count(*) FROM parent WHERE k='007'"), 1);
+            assert_eq!(count("SELECT count(*) FROM branch_a WHERE k=7"), 1);
+            assert_eq!(count("SELECT count(*) FROM branch_b WHERE k=7"), 1);
+            assert_eq!(count("SELECT count(*) FROM grandchild WHERE k=7"), 1);
+
+            db.execute("UPDATE parent SET k='6' WHERE k='7'").unwrap();
+            assert_eq!(count("SELECT count(*) FROM branch_a WHERE k=6"), 1);
+            assert_eq!(count("SELECT count(*) FROM branch_b WHERE k IS NULL"), 1);
+            assert_eq!(count("SELECT count(*) FROM grandchild WHERE k=9"), 1);
+            assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+            assert_eq!(
+                db.query("PRAGMA integrity_check", &[]).unwrap().rows[0].get_str(0),
+                Some("ok"),
+            );
+        }
+    }
+}

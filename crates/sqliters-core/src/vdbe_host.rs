@@ -1291,6 +1291,43 @@ fn plain_fk_action_chain(program: &Program) -> bool {
 }
 
 #[allow(non_upper_case_globals)]
+fn fk_actions_with_one_nested_branch(program: &Program) -> bool {
+    use sqliters_vdbe::opcodes::{OP_Init, OP_Program};
+
+    let mut entries = program.a_op.iter().filter(|op| op.opcode == OP_Program);
+    let (Some(first), Some(second), None) = (entries.next(), entries.next(), entries.next()) else {
+        return false;
+    };
+    let mut expected = program.p_program.iter().rev();
+    let mut action_of = |call: &VdbeOp| {
+        let P4::SubProgram(callee) = &call.p4 else {
+            return None;
+        };
+        let action = expected.next()?;
+        (Arc::ptr_eq(action, callee)
+            && action.a_op.first().is_some_and(|op| op.opcode == OP_Init && !op.p4.is_used()))
+            .then_some(action)
+    };
+    // The root has two direct actions. Exactly one consumes the third
+    // registered subprogram, and that nested action is terminal.
+    for entry in [first, second] {
+        let Some(action) = action_of(entry) else {
+            return false;
+        };
+        let mut calls = action.a_op.iter().filter(|op| op.opcode == OP_Program);
+        if let Some(call) = calls.next() {
+            let Some(nested) = action_of(call) else {
+                return false;
+            };
+            if calls.next().is_some() || nested.a_op.iter().any(|op| op.opcode == OP_Program) {
+                return false;
+            }
+        }
+    }
+    expected.next().is_none()
+}
+
+#[allow(non_upper_case_globals)]
 fn parent_fk_counter_program(
     program: &Program,
     collations: &CollationRegistry,
@@ -1301,7 +1338,8 @@ fn parent_fk_counter_program(
     let action_count = program.p_program.len();
     let matches_scope = match scope {
         ParentFkProgramScope::SingleRelation => action_count <= 1 || plain_fk_action_chain(program),
-        ParentFkProgramScope::SiblingActions(count) => action_count == count,
+        ParentFkProgramScope::SiblingActions(count) => action_count == count
+            || (count == 2 && action_count == 3 && fk_actions_with_one_nested_branch(program)),
     };
     if program.read_only || program.btree_mask != 1 || program.n_res_column != 0 || !matches_scope {
         return false;
