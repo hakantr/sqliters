@@ -6846,3 +6846,57 @@ fn group65_three_table_left_inner_join_preserves_null_extension_until_reprepare(
         }
     }
 }
+
+#[test]
+fn group65_fk_action_preserves_a_separate_deferred_owner_repair() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}';
+             PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(k TEXT PRIMARY KEY) WITHOUT ROWID;
+             CREATE TABLE owner(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY,
+                 k INTEGER REFERENCES parent(k) ON DELETE CASCADE ON UPDATE CASCADE
+                     DEFERRABLE INITIALLY DEFERRED,
+                 owner_id INTEGER REFERENCES owner(id) DEFERRABLE INITIALLY DEFERRED);
+             INSERT INTO parent VALUES('007'),('7');
+             INSERT INTO owner VALUES(1);
+             INSERT INTO child VALUES(1,7,1);",
+        ))
+        .unwrap();
+        db.execute_batch(
+            "BEGIN;
+             UPDATE owner SET id=2 WHERE id=1;
+             UPDATE parent SET k='8' WHERE k='7';
+             UPDATE owner SET id=1 WHERE id=2;
+             COMMIT;",
+        )
+        .unwrap();
+        let rows = db.query("SELECT k,owner_id FROM child", &[]).unwrap().rows;
+        assert_eq!(rows[0].get_i64(0), Some(8));
+        assert_eq!(rows[0].get_i64(1), Some(1));
+        db.execute_batch(
+            "INSERT INTO parent VALUES('7');
+             INSERT INTO child VALUES(2,7,1),(3,7,1);
+             BEGIN;
+             UPDATE owner SET id=2 WHERE id=1;
+             DELETE FROM parent WHERE k='007';
+             UPDATE owner SET id=1 WHERE id=2;",
+        )
+        .unwrap();
+        assert_eq!(db.execute_batch("COMMIT").unwrap_err().extended_code, 787);
+        db.execute_batch("ROLLBACK").unwrap();
+        let rows = db.query("SELECT k FROM child ORDER BY id", &[]).unwrap().rows;
+        assert_eq!(
+            rows.iter().map(|row| row.get_i64(0)).collect::<Vec<_>>(),
+            [Some(8), Some(7), Some(7)]
+        );
+        assert!(
+            db.query("PRAGMA foreign_key_check", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+}

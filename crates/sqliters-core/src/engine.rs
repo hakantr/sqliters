@@ -25130,18 +25130,40 @@ pub(crate) fn parent_fk_counter_program_scope(
         {
             continue;
         }
-        let extra_reference = !child_write && !inserting && child.foreign_keys.len() == 2
-            && child.foreign_keys.iter().any(|other| {
-                !other.ref_table.eq_ignore_ascii_case(&parent.name)
-                    && !other.ref_table.eq_ignore_ascii_case(&child.name)
-                    && !other.deferred
-                    && matches!((other.on_delete, other.on_update), (FkAction::NoAction, FkAction::NoAction))
-                    && other.from_cols.iter().all(|column| !fk.from_cols.contains(column))
-            })
+        let separate_reference = if !child_write && !inserting && child.foreign_keys.len() == 2
             && !main.schema.tables.iter().any(|table| {
                 table.foreign_keys.iter().any(|other| other.ref_table.eq_ignore_ascii_case(&child.name))
+            })
+        {
+            child.foreign_keys.iter().find(|other| {
+                !other.ref_table.eq_ignore_ascii_case(&parent.name)
+                    && !other.ref_table.eq_ignore_ascii_case(&child.name)
+                    && other.from_cols.iter().all(|column| !fk.from_cols.contains(column))
+            })
+        } else {
+            None
+        };
+        let no_actions = |fk: &ForeignKeySchema| {
+            matches!((fk.on_delete, fk.on_update), (FkAction::NoAction, FkAction::NoAction))
+        };
+        let mixed_affinity = |parent: &TableSchema, parent_cols: &[usize], fk: &ForeignKeySchema| {
+            parent_cols.iter().zip(&fk.from_cols).any(|(&pi, &ci)| {
+                parent.columns[pi].affinity == TypeAffinity::Text
+                    && matches!(child.columns[ci].affinity, TypeAffinity::Integer | TypeAffinity::Numeric | TypeAffinity::Real)
+            })
+        };
+        let extra_reference = separate_reference.is_some_and(no_actions);
+        // The owner UPDATE and the separate DELETE CASCADE share the deferred
+        // count when the child row's TEXT lookup differs from its action.
+        let deferred_owner_update = fk.deferred && update.is_some() && no_actions(fk)
+            && separate_reference.is_some_and(|other| {
+                other.on_delete == FkAction::Cascade
+                    && resolve_fk_parent_cols(&main.schema, &main.name, &child.name, other)
+                        .is_ok_and(|(other_parent, columns)| {
+                            mixed_affinity(&other_parent, &columns, other)
+                        })
             });
-        if (child.foreign_keys.len() != 1 && !extra_reference)
+        if (child.foreign_keys.len() != 1 && !extra_reference && !deferred_owner_update)
             || child.name.eq_ignore_ascii_case(&parent.name)
             || !db_set.triggers_for_relation(DatabaseId::MAIN, &child.name).is_empty()
         {
@@ -25163,10 +25185,7 @@ pub(crate) fn parent_fk_counter_program_scope(
                 }
             }
         }
-        needs_fk_counter |= parent_cols.iter().zip(&fk.from_cols).any(|(&pi, &ci)| {
-            parent.columns[pi].affinity == TypeAffinity::Text
-                && matches!(child.columns[ci].affinity, TypeAffinity::Integer | TypeAffinity::Numeric | TypeAffinity::Real)
-        });
+        needs_fk_counter |= deferred_owner_update || mixed_affinity(parent, &parent_cols, fk);
     }
     needs_fk_counter.then_some(if siblings {
         ParentFkProgramScope::SiblingActions(action_count)
