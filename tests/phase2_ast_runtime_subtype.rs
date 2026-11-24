@@ -5182,3 +5182,48 @@ fn group65_legacy_reads_check_each_bound_text_slots_encoding() {
         }
     }
 }
+
+#[test]
+fn group65_qualified_temp_reads_keep_their_program_after_unrelated_main_ddl() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}'; PRAGMA foreign_keys=ON;
+             CREATE TEMP TABLE sample(id INTEGER PRIMARY KEY);
+             INSERT INTO sample VALUES(1);",
+        )).unwrap();
+        let sql = "SELECT id,length(?1) FROM temp.sample WHERE id=1";
+        let mut legacy = db.prepare_v1(sql).unwrap();
+        let mut modern = db.prepare(sql).unwrap();
+        for stmt in [&mut legacy, &mut modern] {
+            stmt.bind_text(1, "猫").unwrap();
+        }
+        let read = |stmt: &mut sqliters::Statement| {
+            let StepResult::Row(row) = stmt.step().unwrap() else {
+                panic!("expected TEMP row");
+            };
+            assert_eq!(row.values(), [Value::Integer(1), Value::Integer(1)]);
+            stmt.reset().unwrap();
+        };
+
+        for ddl in [
+            "CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent);
+             INSERT INTO parent VALUES(1); INSERT INTO child VALUES(1,1);",
+            "CREATE TABLE extra(id INTEGER PRIMARY KEY);",
+        ] {
+            db.execute_batch(ddl).unwrap();
+            for stmt in [&mut legacy, &mut modern] {
+                read(stmt);
+                assert_eq!(stmt.c_reprepare_status().0, 0);
+            }
+        }
+        legacy.finalize().unwrap();
+
+        db.execute_batch("ALTER TABLE temp.sample ADD COLUMN memo TEXT").unwrap();
+        read(&mut modern);
+        assert_eq!(modern.c_reprepare_status().0, 1);
+        modern.finalize().unwrap();
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+    }
+}

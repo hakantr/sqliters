@@ -5612,6 +5612,7 @@ pub struct Statement {
     compiled_advisory_expire_generation: u64,
     compiled_c_expire_seq: u64,
     compiled_slot_cookies: Vec<(SchemaInstanceId, u32, bool)>,
+    compiled_temp_read_schema: Option<PreparedTempReadSchema>,
     expired: bool,
     c_v1_expired_before_run: bool,
     c_v1_retained_expiry_diagnostic: bool,
@@ -5905,6 +5906,55 @@ fn apply_select_schema_use(artifacts: &mut CompiledArtifacts, usage: Option<&cge
             artifacts.compiled_vdbe = None;
         }
         artifacts.compiled_fast_read = None;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PreparedTempReadSchema {
+    instance: SchemaInstanceId,
+    cookie: u32,
+    generation: i32,
+}
+
+impl PreparedTempReadSchema {
+    fn snapshot(db_set: &DatabaseSet) -> Option<Self> {
+        let slot = db_set.slot(DatabaseId::TEMP).filter(|slot| slot.btree.is_some())?;
+        Some(Self {
+            instance: slot.schema_instance_id,
+            cookie: slot.schema.schema_cookie,
+            generation: slot.c_generation,
+        })
+    }
+
+    fn for_read(
+        artifacts: &CompiledArtifacts,
+        usage: Option<&cgen::SelectSchemaUse>,
+        machine: Option<&sqliters_vdbe::vdbeaux::Program>,
+        db_set: &DatabaseSet,
+    ) -> Option<Self> {
+        let temp_mask = 1 << DatabaseId::TEMP.index();
+        let Some(Stmt::Select(select)) = &artifacts.stmt else {
+            return None;
+        };
+        // Scope cookie checks when the C probe and selected execution plan agree.
+        let execution_mask = machine.map(|program| program.btree_mask).or_else(|| {
+            artifacts.compiled_vdbe.as_ref().map(|program| u32::from(program.referenced_db_mask()))
+        });
+        if usage?.btree_mask != Some(temp_mask) || execution_mask != Some(temp_mask) {
+            return None;
+        }
+        let SelectCore::Select { from: Some(from), .. } = &select.body.head else {
+            return None;
+        };
+        let TableOrSubquery::Table { name, table_args: None, .. } = &from.head else {
+            return None;
+        };
+        if !name.schema.as_deref().is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+            || !from.joins.is_empty()
+        {
+            return None;
+        }
+        Self::snapshot(db_set)
     }
 }
 
@@ -8237,6 +8287,7 @@ impl Statement {
         }
         self.compiled_vdbe = None;
         self.compiled_fast_read = None;
+        self.compiled_temp_read_schema = None;
         self.c_machine_vm = None;
         if write {
             self.c_machine = None;
@@ -9101,6 +9152,9 @@ impl Statement {
 
         let hid = inner.register_handle(HandleKind::Statement);
         apply_select_schema_use(&mut artifacts, select_schema_use.as_ref());
+        let compiled_temp_read_schema = PreparedTempReadSchema::for_read(
+            &artifacts, select_schema_use.as_ref(), c_machine.as_deref(), &inner.db_set,
+        );
         let preserve_prepared_column_names =
             apply_select_column_names(inner, &mut artifacts, &raw_sql, c_machine.as_deref());
         let c_is_reader = c_explain.as_ref().or(c_machine.as_ref()).or(c_write.as_ref())
@@ -9138,6 +9192,7 @@ impl Statement {
             compiled_advisory_expire_generation: inner.advisory_expire_generation,
             compiled_c_expire_seq: inner.db_set.c_expire_seq(),
             compiled_slot_cookies: inner.snapshot_slot_cookies(),
+            compiled_temp_read_schema,
             expired: false,
             c_v1_expired_before_run: false,
             c_v1_retained_expiry_diagnostic: false,
@@ -9815,6 +9870,9 @@ impl Statement {
 
     #[inline]
     fn slot_cookies_changed(&self, inner: &ConnectionInner) -> bool {
+        if let Some(schema) = self.compiled_temp_read_schema {
+            return Some(schema) != PreparedTempReadSchema::snapshot(&inner.db_set);
+        }
         if let [(inst, cookie, had_pages)] = *self.compiled_slot_cookies.as_slice() {
             let main_slot = inner.db_set.main_slot();
             if main_slot.schema_instance_id == inst && main_slot.btree.is_some() {
@@ -9836,6 +9894,10 @@ impl Statement {
         // has no such check and keeps its prepared result when TEMP closes.
         if !self.requires_schema {
             return false;
+        }
+        // OP_Transaction tests the cookie and generation for its own database.
+        if self.compiled_temp_read_schema.is_some() {
+            return self.slot_cookies_changed(inner);
         }
         if self.category != Some(StmtCategory::Control) && self.has_detached_slot(inner) {
             return true;
@@ -10041,6 +10103,13 @@ impl Statement {
             }
             let mut transferred = vec![Value::Null; artifacts.max_param];
             apply_select_schema_use(&mut artifacts, select_schema_use.as_ref());
+            self.compiled_temp_read_schema = if self.c_machine_fixed {
+                None
+            } else {
+                PreparedTempReadSchema::for_read(
+                    &artifacts, select_schema_use.as_ref(), c_machine.as_deref(), &inner.db_set,
+                )
+            };
             self.preserve_prepared_column_names =
                 apply_select_column_names(inner, &mut artifacts, &self.raw_sql, c_machine.as_deref());
             let copy_len = self.params.len().min(artifacts.max_param);

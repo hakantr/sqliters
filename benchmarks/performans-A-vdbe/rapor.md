@@ -2867,3 +2867,8 @@ Tek ve toplam anahtar iki-PMA profillerinde her kipte 240 C callback dağılım�
 ## V6b.512 — Legacy TEXT okumalarında her bağlama yuvasının kodlaması
 
 120/120 native değer, adım ve reset karşılaştırması eş. Önceki native bağlama ve dosya sınır kontrolleri ile Group64 ve Group65 iki kipte geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/legacy-bind-encoding-v508-candidate/sonuc.md) OFF 1386/0/324, ON 1386/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,289 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_512.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.513 — İlgisiz MAIN DDL sonrasında nitelikli TEMP prepared okuma
+
+Yeni 24/24 hedef native kontrolü C ile eş; 240 geri kontrol önceki Rust ham iziyle birebir. Legacy bağlama ve reprepare 120/120, byte observer 116/116. [Bağımsız ölçüm](/github/sqliters/target/perf-work/temp-main-schema-reprepare-candidate/sonuc.md) OFF 1387/0/324, ON 1387/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,289 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_513.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
