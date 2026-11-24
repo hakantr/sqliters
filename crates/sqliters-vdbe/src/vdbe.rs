@@ -5738,20 +5738,21 @@ impl Vdbe {
                     sorter.set_vfs(host.sorter_vfs());
                     let worker_count = host.sorter_worker_threads();
                     let encoding = host.text_encoding() as u8;
+                    let within_worker_limit = worker_count <= 8;
                     let registered_workers = self.prog.worker_file_sort
                         && self.prog.fallible_file_sort_open == Some(pc)
-                        && matches!(worker_count, 1 | 2) && k.enc == encoding;
+                        && within_worker_limit && k.enc == encoding;
                     if !temp_in_memory && worker_count > 0
                         && (registered_workers || (self.prog.fallible_sort_open().is_none()
                             && (k.enc == 1 || k.enc == encoding)
-                            && (worker_count <= 8 || host.sorter_mmap_limit() <= 0)
+                            && (within_worker_limit || host.sorter_mmap_limit() <= 0)
                             && matches!(&op.p4, P4::KeyInfo(key) if worker_order_sorter(&self.prog, op, key,
                                 encoding, |read, keys| host.sorter_has_worker_table_key(read, keys),
                                 |name| host.sorter_has_stock_collation(name)))
                             && k.a_coll.iter().flatten().all(|coll| coll.custom.is_none())))
                     {
                         sorter.enable_workers(worker_count as usize);
-                        if worker_count <= 8 {
+                        if within_worker_limit {
                             sorter.set_worker_mmap_limit(host.share_sorter_mmap_limit());
                         }
                     }

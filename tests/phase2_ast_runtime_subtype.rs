@@ -4995,7 +4995,7 @@ fn group64_registered_builtin_file_sort_calls_comparator_on_worker() {
         )).unwrap();
         let mut expected: Vec<i64> = (1..=52).collect();
         expected.sort_by_key(|id| std::cmp::Reverse((id % 9, *id)));
-        for workers in [1, 2] {
+        for workers in [1, 2, 3, 8] {
             db.execute_batch(&format!("PRAGMA threads={workers}")).unwrap();
             for name in ["NOCASE", "RTRIM"] {
                 let worker_calls = Arc::new(AtomicUsize::new(0));
@@ -5041,7 +5041,7 @@ fn group64_registered_builtin_worker_sort_preserves_tied_key_groups() {
         )).unwrap();
         for store in ["FILE", "DEFAULT"] {
             db.execute_batch(&format!("PRAGMA temp_store={store}")).unwrap();
-            for workers in [1, 2] {
+            for workers in [1, 2, 3, 8] {
                 db.execute_batch(&format!("PRAGMA threads={workers}")).unwrap();
                 for name in ["NOCASE", "RTRIM"] {
                     let worker_calls = Arc::new(AtomicUsize::new(0));

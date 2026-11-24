@@ -7581,7 +7581,9 @@ pub(crate) fn registered_worker_file_sort(
     stmt: Option<&Stmt>, db_set: &DatabaseSet, collations: &CollationRegistry,
     require_snapshot: bool,
 ) -> bool {
-    if !matches!(db_set.worker_threads_limit, 1 | 2) || db_set.temp_store().is_memory() {
+    if !(1..=sqliters_codegen::consts::SQLITE_MAX_WORKER_THREADS).contains(&db_set.worker_threads_limit)
+        || db_set.temp_store().is_memory()
+    {
         return false;
     }
     let Some(Stmt::Select(select)) = stmt else { return false; };

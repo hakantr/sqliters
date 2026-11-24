@@ -2872,3 +2872,8 @@ Tek ve toplam anahtar iki-PMA profillerinde her kipte 240 C callback dağılım�
 ## V6b.513 — İlgisiz MAIN DDL sonrasında nitelikli TEMP prepared okuma
 
 Yeni 24/24 hedef native kontrolü C ile eş; 240 geri kontrol önceki Rust ham iziyle birebir. Legacy bağlama ve reprepare 120/120, byte observer 116/116. [Bağımsız ölçüm](/github/sqliters/target/perf-work/temp-main-schema-reprepare-candidate/sonuc.md) OFF 1387/0/324, ON 1387/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,289 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_513.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.514 — Kayıtlı FILE ve DEFAULT sıralamasında 3–8 gerçek işçi
+
+3–8 işçi, 288 profil ve üç tekrar. Her kipte 864/864 C satır, callback, SORT ve reset sonucu eş. Sınır clamp 24/24 ve küçük sorgu 96/96. Aynı PMA ataması görülen 145/145 callback dağılımı eş. [Bağımsız ölçüm](/github/sqliters/target/perf-work/registered-collation-worker-limit-v510-candidate/sonuc.md) OFF 1387/0/324, ON 1387/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,287 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_514.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
