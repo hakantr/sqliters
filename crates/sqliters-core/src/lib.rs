@@ -5937,7 +5937,7 @@ impl PreparedReadSchemas {
     }
 
     fn prepare_join(
-        artifacts: &CompiledArtifacts,
+        artifacts: &mut CompiledArtifacts,
         usage: Option<&cgen::SelectSchemaUse>,
         machine: Option<&sqliters_vdbe::vdbeaux::Program>,
         db_set: &DatabaseSet,
@@ -5964,7 +5964,6 @@ impl PreparedReadSchemas {
             let TableOrSubquery::Table { name, table_args: None, .. } = source else {
                 return None;
             };
-            name.schema.as_ref()?;
             let (db, db_set::RelationRef::Table(table)) = db_set.find_relation_ref_in_set(name).ok()?? else {
                 return None;
             };
@@ -5990,6 +5989,14 @@ impl PreparedReadSchemas {
         });
         if execution_mask != mask {
             return None;
+        }
+        // Keep each independently resolved source when the interpreter resolves the AST again.
+        if let Some(Stmt::Select(select)) = &mut artifacts.stmt
+            && let SelectCore::Select { from: Some(from), .. } = &mut select.body.head
+            && let [join] = from.joins.as_mut_slice()
+        {
+            left.pin_table(&mut from.head, db_set);
+            right.pin_table(&mut join.right, db_set);
         }
         Some(if left.db_id == right.db_id { Self::One(left) } else { Self::Two(left, right) })
     }
@@ -6017,6 +6024,16 @@ impl PreparedReadSchema {
 
     fn changed(self, db_set: &DatabaseSet) -> bool {
         Some(self) != Self::snapshot(db_set, self.db_id)
+    }
+
+    fn pin_table(self, source: &mut TableOrSubquery, db_set: &DatabaseSet) {
+        // C's open opcodes keep the resolved source until a reprepare.
+        if let TableOrSubquery::Table { name, .. } = source
+            && name.schema.is_none()
+            && let Some(slot) = db_set.slot(self.db_id)
+        {
+            name.schema = Some(slot.name.clone());
+        }
     }
 
     fn prepare_read(
@@ -6072,12 +6089,8 @@ impl PreparedReadSchema {
             if !Self::can_pin_source(select) {
                 return None;
             }
-            // C's open opcodes keep the resolved source until a reprepare. Keep the same
-            // binding when the Rust executor resolves the stored AST again on step.
-            if let SelectCore::Select { from: Some(from), .. } = &mut select.body.head
-                && let TableOrSubquery::Table { name, .. } = &mut from.head
-            {
-                name.schema = Some(db_set.slot(db_id)?.name.clone());
+            if let SelectCore::Select { from: Some(from), .. } = &mut select.body.head {
+                schema.pin_table(&mut from.head, db_set);
             }
         }
         Some(PreparedReadSchemas::One(schema))
