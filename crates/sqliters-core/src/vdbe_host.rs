@@ -130,14 +130,19 @@ pub(crate) fn machine_program_with_prepare(
     read_machine_program(inner, stmt, raw_sql, n_param, ReadMachineScope::Standard, None, prepared)
 }
 
+fn has_two_named_sort_collations(op: &VdbeOp) -> bool {
+    matches!(&op.p4, P4::KeyInfo(key) if key.a_coll.iter().flatten()
+        .filter(|coll| Collation::from_name(&coll.name).is_none()).nth(1).is_some())
+}
+
 pub(crate) fn custom_sort_policy_matches(
     inner: &ConnectionInner, program: &Program, stmt: Option<&Stmt>, require_snapshot: bool,
 ) -> bool {
-    if program.fallible_limit_sort_open.is_some() {
+    if let Some(open) = program.fallible_limit_sort_open {
         !inner.authorizer.is_some() && match stmt {
             Some(Stmt::Select(select)) if matches!(&select.body.head,
                 sqliters_syntax::SelectCore::Select { selection: Some(_), .. })
-                || select.order_by.get(1).is_some_and(|term| matches!(term.expr, sqliters_syntax::Expr::Collate { .. })) => {
+                || program.a_op.get(open).is_some_and(has_two_named_sort_collations) => {
                 crate::engine::custom_limit_order_collation(select, &inner.db_set, &inner.collations).is_some()
             }
             _ => true,
@@ -146,11 +151,12 @@ pub(crate) fn custom_sort_policy_matches(
         let Some(op) = program.a_op.get(open) else { return false };
         let P4::KeyInfo(key) = &op.p4 else { return false };
         let collation = key.a_coll.first().and_then(Option::as_deref).map(|coll| coll.name.as_str());
-        let second_named = key.a_coll.get(1).and_then(Option::as_deref)
-            .is_some_and(|coll| Collation::from_name(&coll.name).is_none());
-        (!second_named && file_sort_policy(inner, collation))
+        let has_named_pair = has_two_named_sort_collations(op);
+        (!has_named_pair && file_sort_policy(inner, collation))
             || (op.p3 == 0
-                && collation.is_some_and(|name| crate::engine::registered_worker_order_collation(name, &inner.collations))
+                && (has_named_pair || collation.is_some_and(|name| {
+                    crate::engine::registered_worker_order_collation(name, &inner.collations)
+                }))
                 && registered_worker_file_sort(inner, stmt, require_snapshot))
     } else {
         true
@@ -266,7 +272,7 @@ fn file_sort_read_program(
     } else {
         let (name, root) =
             crate::engine::custom_file_order_collation(select, &inner.db_set, &inner.collations)?;
-        (ApplicationSortCollations { first: name, second: None }, root, false, false)
+        (ApplicationSortCollations { first: name, second: None, stock: None }, root, false, false)
     };
     if !with_workers && !file_sort_policy(inner, Some(names.first)) {
         return None;
@@ -280,7 +286,7 @@ fn file_sort_read_program(
         return None;
     }
     let encoding = inner.effective_encoding();
-    let max_key_fields = (if without_rowid { 3 } else { 2 }) + u16::from(names.second.is_some());
+    let max_key_fields = (if without_rowid { 3 } else { 2 }) + names.count() as u16 - 1;
     let open = sqliters_vdbe::vdbe::custom_file_sort_open(&program, names, encoding as u8, max_key_fields)?;
     let mut reads = program.a_op.iter().filter(|op| op.opcode == OP_OpenRead);
     let mut pseudos = program.a_op.iter().filter(|op| op.opcode == OP_OpenPseudo);

@@ -1568,20 +1568,26 @@ fn matches_application_order_collation(coll: &CollSeq, name: &str, key_encoding:
     coll.name.eq_ignore_ascii_case(name) && coll.enc == encoding
 }
 
-/// Application collations at the beginning of a verified ORDER BY key.
+/// The collations before the primary-key terms in a verified ORDER BY.
 #[derive(Clone, Copy)]
 #[doc(hidden)]
 pub struct ApplicationSortCollations<'a> {
     pub first: &'a str,
     pub second: Option<&'a str>,
+    pub stock: Option<(usize, &'a str)>,
 }
 
 impl<'a> ApplicationSortCollations<'a> {
-    fn count(self) -> usize {
-        1 + usize::from(self.second.is_some())
+    pub fn count(self) -> usize {
+        1 + usize::from(self.second.is_some()) + usize::from(self.stock.is_some())
     }
 
     fn at(self, index: usize) -> &'a str {
+        let index = match self.stock {
+            Some((slot, name)) if slot == index => return name,
+            Some((slot, _)) if slot < index => index - 1,
+            _ => index,
+        };
         match index {
             0 => self.first,
             1 => self.second.unwrap_or("BINARY"),
@@ -1751,15 +1757,16 @@ fn worker_order_sorter(
     let binary_order = key.a_coll.iter().flatten().all(|coll| coll.name.eq_ignore_ascii_case("BINARY"));
     let application_count = application_collations.map_or(1, ApplicationSortCollations::count);
     if !binary_order {
-        // The application comparators precede the native BINARY tie breaker.
+        // The verified ordering fields precede the native BINARY tie breaker.
         let Some((prefix, tail)) = key.a_coll[..usize::from(key.n_key_field)].split_at_checked(application_count) else {
             return false;
         };
-        if key.enc != encoding || tail.is_empty() || (application_collations.is_none() && tail.len() != 1)
-            || !prefix.iter().all(|field| field.as_deref().is_some_and(|coll| !coll.name.eq_ignore_ascii_case("BINARY")))
+        if key.enc != encoding || tail.is_empty()
             || !tail.iter().all(|field| field.as_deref().is_some_and(|coll| coll.name.eq_ignore_ascii_case("BINARY")))
             || (application_collations.is_none()
-                && !prefix[0].as_deref().is_some_and(|coll| has_collation(&coll.name)))
+                && (tail.len() != 1 || !prefix[0].as_deref().is_some_and(|coll| {
+                    !coll.name.eq_ignore_ascii_case("BINARY") && has_collation(&coll.name)
+                })))
         {
             return false;
         }
@@ -3618,12 +3625,15 @@ impl Vdbe {
                 P4::CollSeq(c) => rt[i] = OpRt::Coll(find(c, host)?),
                 P4::KeyInfo(k) => {
                     let k: &KeyInfo = k;
+                    let sort = scoped_sort.filter(|(pc, _, _)| i == *pc);
+                    let has_named = sort.is_some() && k.a_coll.iter().flatten()
+                        .any(|coll| sqliters_types::Collation::from_name(&coll.name).is_none());
                     let mut a_coll = Vec::with_capacity(k.a_coll.len());
                     for (field, c) in k.a_coll.iter().enumerate() {
                         a_coll.push(match c {
-                            Some(c) if scoped_sort.is_some_and(|(pc, _, _)| i == pc)
-                                && (field == 0 || field == 1 && sqliters_types::Collation::from_name(&c.name).is_none()) => {
-                                let (_, error, workers) = scoped_sort.expect("checked sort address");
+                            Some(c) if sort.is_some()
+                                && if has_named { sqliters_types::Collation::from_name(&c.name).is_none() } else { field == 0 } => {
+                                let (_, error, workers) = sort.expect("checked sort address");
                                 let registered = find_registered(&c.name, host, workers)?;
                                 Some(Arc::new(fallible_sort_collation(registered, error)?))
                             }

@@ -6688,3 +6688,83 @@ fn group65_three_table_inner_join_preserves_three_schema_bindings() {
         assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
     }
 }
+
+#[test]
+fn group64_mixed_sort_keeps_stock_and_named_comparators_in_their_slots() {
+    use sqliters_vdbe::vdbe::SQLITE_STMTSTATUS_SORT;
+
+    for (encoding, width) in [("UTF-8", 1550), ("UTF-16le", 775), ("UTF-16be", 775)] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}'; PRAGMA cache_size=1;
+             PRAGMA temp_store=FILE; PRAGMA threads=2;
+             CREATE TABLE items(v TEXT,w TEXT,s TEXT,id INTEGER,bucket INTEGER,
+                                PRIMARY KEY(bucket DESC,id)) WITHOUT ROWID;
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<52)
+             INSERT INTO items SELECT
+                printf('%02d',x%4)||substr(hex(zeroblob(900)),1,{width}-2),
+                printf('%02d',(x/4)%3)||substr(hex(zeroblob(900)),1,{width}-2),
+                CASE (x/12)%4 WHEN 0 THEN 'A' WHEN 1 THEN 'a' WHEN 2 THEN 'A ' ELSE 'b' END,
+                x,x%5 FROM n;"
+        )).unwrap();
+        let caller = std::thread::current().id();
+        let worker_calls = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        for (slot, name) in ["app_first", "app_second"].into_iter().enumerate() {
+            let observed = Arc::clone(&worker_calls);
+            db.register_collation(name, move |left, right| {
+                if std::thread::current().id() != caller {
+                    observed[slot].fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                if slot == 0 { right.cmp(left) } else { left.cmp(right) }
+            }).unwrap();
+        }
+        let calls = || worker_calls.each_ref().map(|count| count.load(AtomicOrdering::Relaxed));
+        let mut last_sql = String::new();
+        for position in 0..3 {
+            let mut fields = vec!["v COLLATE APP_FIRST NULLS LAST", "w COLLATE APP_SECOND DESC NULLS FIRST"];
+            fields.insert(position, "s COLLATE NOCASE NULLS LAST");
+            let sql = format!("SELECT id FROM items ORDER BY {},bucket DESC,id DESC", fields.join(","));
+            let mut expected: Vec<i64> = (1..=52).collect();
+            expected.sort_by_key(|&id| {
+                let stock = match (id / 12) % 4 { 0 | 1 => 0, 2 => 1, _ => 2 };
+                let first = -(id % 4);
+                let second = -((id / 4) % 3);
+                let prefix = match position {
+                    0 => [stock, first, second],
+                    1 => [first, stock, second],
+                    _ => [first, second, stock],
+                };
+                (prefix, -(id % 5), -id)
+            });
+            let before_workers = calls();
+            let mut full = db.prepare(&sql).unwrap();
+            let StepResult::Row(first) = full.step().unwrap() else { panic!("missing mixed sorted row"); };
+            assert_eq!(first.get_i64(0), Some(expected[0]));
+            assert_eq!(full.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), 1);
+            full.reset().unwrap();
+            let after_workers = calls();
+            assert!(after_workers.into_iter().zip(before_workers).all(|(after, before)| after > before));
+
+            let mut topn = db.prepare(&format!("{sql} LIMIT 7 OFFSET 2")).unwrap();
+            for &id in &expected[2..9] {
+                let StepResult::Row(row) = topn.step().unwrap() else { panic!("missing mixed top-N row"); };
+                assert_eq!(row.get_i64(0), Some(id));
+            }
+            assert!(matches!(topn.step().unwrap(), StepResult::Done));
+            assert_eq!(topn.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), 1);
+            assert_eq!(calls(), after_workers);
+            last_sql = sql;
+        }
+        let mut held = db.prepare(&last_sql).unwrap();
+        assert!(matches!(held.step().unwrap(), StepResult::Row(_)));
+        held.reset().unwrap();
+        let workers_before_replacement = calls();
+        db.register_collation("NOCASE", move |left, right| {
+            assert_eq!(std::thread::current().id(), caller);
+            right.cmp(left)
+        }).unwrap();
+        assert!(matches!(held.step().unwrap(), StepResult::Row(_)));
+        held.reset().unwrap();
+        assert_eq!(calls(), workers_before_replacement);
+    }
+}
