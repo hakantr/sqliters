@@ -5606,3 +5606,61 @@ fn group65_unqualified_temp_reads_ignore_lower_priority_schema_changes() {
         assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
     }
 }
+
+#[test]
+fn group65_unqualified_aux_reads_keep_their_source_until_reprepare() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}'; PRAGMA foreign_keys=ON;
+             CREATE TABLE main.parent(id INTEGER PRIMARY KEY);
+             INSERT INTO main.parent VALUES(1);
+             ATTACH ':memory:' AS aux;
+             CREATE TABLE aux.parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE aux.sample(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent,marker INTEGER);
+             INSERT INTO aux.parent VALUES(1); INSERT INTO aux.sample VALUES(1,1,201);",
+        )).unwrap();
+        let sql = "SELECT src.marker,length(?1) FROM sample AS src WHERE src.id=1";
+        let mut legacy = db.prepare_v1(sql).unwrap();
+        let mut modern = db.prepare(sql).unwrap();
+        for stmt in [&mut legacy, &mut modern] {
+            stmt.bind_text(1, "猫").unwrap();
+            assert_eq!(stmt.sql(), sql);
+        }
+        let read = |stmt: &mut sqliters::Statement, marker, reprepares| {
+            let StepResult::Row(row) = stmt.step().unwrap() else {
+                panic!("expected row for the prepared source");
+            };
+            assert_eq!(row.values(), [Value::Integer(marker), Value::Integer(1)]);
+            stmt.reset().unwrap();
+            assert_eq!(stmt.c_reprepare_status().0, reprepares);
+        };
+
+        db.execute_batch(
+            "CREATE TABLE main.sample(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent,marker INTEGER);
+             INSERT INTO main.sample VALUES(1,1,105);",
+        ).unwrap();
+        read(&mut legacy, 201, 0);
+        read(&mut modern, 201, 0);
+        assert_eq!(db.query(sql, &[Value::Text("猫".to_owned())]).unwrap().rows[0].get_i64(0), Some(105));
+
+        db.execute_batch("ALTER TABLE main.sample ADD COLUMN note TEXT;").unwrap();
+        read(&mut legacy, 201, 0);
+        read(&mut modern, 201, 0);
+
+        db.execute_batch("CREATE TABLE aux.bump(id INTEGER PRIMARY KEY);").unwrap();
+        assert_eq!(legacy.step().unwrap_err().code, ErrorCode::Schema);
+        assert_eq!(legacy.reset().unwrap_err().code, ErrorCode::Schema);
+        read(&mut modern, 105, 1);
+        legacy.finalize().unwrap();
+
+        db.execute_batch(
+            "CREATE TEMP TABLE sample(id INTEGER PRIMARY KEY,marker INTEGER);
+             INSERT INTO temp.sample VALUES(1,401);",
+        ).unwrap();
+        read(&mut modern, 401, 2);
+        modern.finalize().unwrap();
+        assert!(db.query("PRAGMA main.foreign_key_check", &[]).unwrap().rows.is_empty());
+        assert!(db.query("PRAGMA aux.foreign_key_check", &[]).unwrap().rows.is_empty());
+    }
+}

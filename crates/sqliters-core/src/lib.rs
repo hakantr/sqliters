@@ -5933,13 +5933,13 @@ impl PreparedReadSchema {
         })
     }
 
-    fn for_read(
-        artifacts: &CompiledArtifacts,
+    fn prepare_read(
+        artifacts: &mut CompiledArtifacts,
         usage: Option<&cgen::SelectSchemaUse>,
         machine: Option<&sqliters_vdbe::vdbeaux::Program>,
         db_set: &DatabaseSet,
     ) -> Option<Self> {
-        let Some(Stmt::Select(select)) = &artifacts.stmt else {
+        let Some(Stmt::Select(select)) = &mut artifacts.stmt else {
             return None;
         };
         let SelectCore::Select { from: Some(from), .. } = &select.body.head else {
@@ -5951,26 +5951,27 @@ impl PreparedReadSchema {
         if !from.joins.is_empty() {
             return None;
         }
+        let unqualified = name.schema.is_none();
         let db_id = if let Some(schema) = &name.schema {
             db_set.find_db_id(schema)?
         } else {
-            // TEMP is searched first, so a lower-priority schema cannot shadow this table.
             // A CTE can take precedence over a table of the same unqualified name.
             if !select.ctes.is_empty() || !select.body.compounds.is_empty() {
                 return None;
             }
-            let Some((DatabaseId::TEMP, db_set::RelationRef::Table(_))) =
+            let Some((db_id, db_set::RelationRef::Table(_))) =
                 db_set.find_relation_ref_in_set(name).ok()?
             else {
                 return None;
             };
-            DatabaseId::TEMP
+            db_id
         };
+        let pin_source = unqualified && !db_id.is_temp();
         let db_mask = 1 << db_id.index();
         if usage?.btree_mask != Some(db_mask) {
             return None;
         }
-        if !db_id.is_temp()
+        if !unqualified && !db_id.is_temp()
             && !matches!(db_set.find_relation_in_set(name), Ok(Some((_, ResolvedRelation::Table(_)))))
         {
             return None;
@@ -5983,7 +5984,37 @@ impl PreparedReadSchema {
         if execution_mask != Some(db_mask) {
             return None;
         }
-        Self::snapshot(db_set, db_id)
+        let schema = Self::snapshot(db_set, db_id)?;
+        if pin_source {
+            if !Self::can_pin_source(select) {
+                return None;
+            }
+            // C's open opcodes keep the resolved source until a reprepare. Keep the same
+            // binding when the Rust executor resolves the stored AST again on step.
+            if let SelectCore::Select { from: Some(from), .. } = &mut select.body.head
+                && let TableOrSubquery::Table { name, .. } = &mut from.head
+            {
+                name.schema = Some(db_set.slot(db_id)?.name.clone());
+            }
+        }
+        Some(schema)
+    }
+
+    fn can_pin_source(select: &SelectStmt) -> bool {
+        let SelectCore::Select { distinct: false, group_by, having: None, windows, .. } = &select.body.head else {
+            return false;
+        };
+        if !group_by.is_empty() || !windows.is_empty() || !select.order_by.is_empty() || select.limit.is_some() {
+            return false;
+        }
+        let mut single_source = true;
+        dml_c::walk_select_level(select, &mut |expr| {
+            single_source &= !matches!(expr, Expr::Subquery(_) | Expr::Exists { .. }
+                | Expr::InSubquery { .. } | Expr::InTable { .. }
+                | Expr::FunctionCall { over: Some(_), .. });
+            dml_c::Walk::Shallow
+        });
+        single_source
     }
 }
 
@@ -9190,11 +9221,11 @@ impl Statement {
 
         let hid = inner.register_handle(HandleKind::Statement);
         apply_select_schema_use(&mut artifacts, select_schema_use.as_ref());
-        let compiled_read_schema = PreparedReadSchema::for_read(
-            &artifacts, select_schema_use.as_ref(), c_machine.as_deref(), &inner.db_set,
-        );
         let preserve_prepared_column_names =
             apply_select_column_names(inner, &mut artifacts, &raw_sql, c_machine.as_deref());
+        let compiled_read_schema = PreparedReadSchema::prepare_read(
+            &mut artifacts, select_schema_use.as_ref(), c_machine.as_deref(), &inner.db_set,
+        );
         let c_is_reader = c_explain.as_ref().or(c_machine.as_ref()).or(c_write.as_ref())
             .map(|p| p.b_is_reader).or_else(|| select_schema_use.as_ref().and_then(|u| u.is_reader))
             .unwrap_or(artifacts.category.is_some_and(|c| c != StmtCategory::NoLockPragma));
@@ -10141,15 +10172,15 @@ impl Statement {
             }
             let mut transferred = vec![Value::Null; artifacts.max_param];
             apply_select_schema_use(&mut artifacts, select_schema_use.as_ref());
+            self.preserve_prepared_column_names =
+                apply_select_column_names(inner, &mut artifacts, &self.raw_sql, c_machine.as_deref());
             self.compiled_read_schema = if self.c_machine_fixed {
                 None
             } else {
-                PreparedReadSchema::for_read(
-                    &artifacts, select_schema_use.as_ref(), c_machine.as_deref(), &inner.db_set,
+                PreparedReadSchema::prepare_read(
+                    &mut artifacts, select_schema_use.as_ref(), c_machine.as_deref(), &inner.db_set,
                 )
             };
-            self.preserve_prepared_column_names =
-                apply_select_column_names(inner, &mut artifacts, &self.raw_sql, c_machine.as_deref());
             let copy_len = self.params.len().min(artifacts.max_param);
             transferred[..copy_len].clone_from_slice(&self.params[..copy_len]);
 
