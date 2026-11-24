@@ -285,6 +285,8 @@ fn file_sort_read_program(
     } else if !matches!(read.p4, P4::Int32(_)) {
         return None;
     }
+    let has_integer_filter = with_workers
+        && matches!(&select.body.head, sqliters_syntax::SelectCore::Select { selection: Some(_), .. });
     if !program.a_op.iter().enumerate().all(|(pc, op)| match op.opcode {
         OP_Init | OP_MakeRecord | OP_ResultRow | OP_Goto | OP_Halt
         | OP_OpenRead | OP_OpenPseudo => true,
@@ -294,7 +296,7 @@ fn file_sort_read_program(
         OP_SorterOpen => pc == open,
         OP_SorterInsert | OP_SorterSort | OP_SorterNext => op.p1 == sort.p1,
         OP_SorterData => op.p1 == sort.p1 && op.p3 == pseudo.p1,
-        _ => false,
+        _ => has_integer_filter && sqliters_vdbe::vdbe::is_integer_worker_sort_filter_op(op, read, encoding as u8),
     }) {
         return None;
     }
@@ -307,7 +309,7 @@ fn file_sort_read_program(
         if total {
             let eligible = if Collation::from_name(name).is_none() {
                 sqliters_vdbe::vdbe::is_worker_sort_with_named_collation(
-                    &program, open, encoding, name,
+                    &program, open, encoding, name, has_integer_filter,
                     |read, keys| has_worker_sort_table_key(&inner.db_set, encoding, read, keys),
                 )
             } else {

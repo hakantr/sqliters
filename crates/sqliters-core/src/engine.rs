@@ -7493,8 +7493,8 @@ fn main_table_order_collation<'a>(
         return None;
     }
     let SelectCore::Select {
-        distinct: false, projection, from: Some(from), selection: None,
-        group_by, having: None, windows,
+        distinct: false, projection, from: Some(from),
+        group_by, having: None, windows, ..
     } = core else { return None };
     let TableOrSubquery::Table {
         name, table_args: None, alias: None, indexed_by: None,
@@ -7562,6 +7562,9 @@ fn main_rowid_order_collation<'a>(
     core: &SelectCore,
     order_by: &'a [OrderByTerm],
 ) -> Option<(&'a str, u32)> {
+    if !matches!(core, SelectCore::Select { selection: None, .. }) {
+        return None;
+    }
     main_table_order_collation(db_set, core, order_by, false)
         .map(|(name, table, _)| (name, table.root_pgno))
 }
@@ -7615,6 +7618,27 @@ pub(crate) fn registered_worker_order_collation(name: &str, collations: &Collati
         || (Collation::from_name(name).is_none() && collations.has_infallible_registration(name))
 }
 
+fn worker_order_integer_filter(selection: &Expr, table: &TableSchema) -> bool {
+    let Expr::Binary { op: BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge, left, right } = selection else {
+        return false;
+    };
+    let Expr::Column(column) = left.as_ref() else { return false; };
+    if column.table.is_some() || column.schema.is_some() {
+        return false;
+    }
+    if !table.find_column(&column.column).is_some_and(|(_, field)| {
+        field.affinity == TypeAffinity::Integer && field.collation == Collation::Binary
+            && field.custom_collation.is_none()
+    }) {
+        return false;
+    }
+    match right.as_ref() {
+        Expr::Integer(_) | Expr::Bind(_) => true,
+        Expr::Unary { op: UnaryOp::Plus | UnaryOp::Negate, expr } => matches!(expr.as_ref(), Expr::Integer(_)),
+        _ => false,
+    }
+}
+
 pub(crate) fn worker_file_order_collation<'a>(
     select: &'a SelectStmt,
     db_set: &'a DatabaseSet,
@@ -7623,17 +7647,19 @@ pub(crate) fn worker_file_order_collation<'a>(
     if select.limit.is_some() || !select.ctes.is_empty() || !select.body.compounds.is_empty() {
         return None;
     }
-    let SelectCore::Select { projection, .. } = &select.body.head else { return None };
+    let SelectCore::Select { projection, selection, .. } = &select.body.head else { return None };
     let fields = projection.len() + select.order_by.len();
     let (name, table, total) = main_table_order_collation(db_set, &select.body.head, &select.order_by, true)?;
-    let registered = if table.without_rowid {
-        fields <= 4 && collations.get_custom("BINARY").is_none()
-            && Collation::from_name(name).is_none() && collations.has_infallible_registration(name)
+    let max_fields = if table.without_rowid { 4 } else { 3 };
+    let registered = if table.without_rowid || selection.is_some() {
+        collations.get_custom("BINARY").is_none() && Collation::from_name(name).is_none()
+            && collations.has_infallible_registration(name)
+            && selection.as_ref().is_none_or(|filter| worker_order_integer_filter(filter, table))
     } else {
-        fields <= 3 && registered_worker_order_collation(name, collations)
+        registered_worker_order_collation(name, collations)
     };
     // A default for a column absent in an older record uses no space on its page.
-    (registered && !table.columns.iter().any(|column| column.default_expr.is_some()))
+    (fields <= max_fields && registered && !table.columns.iter().any(|column| column.default_expr.is_some()))
         .then_some((name, table, total))
 }
 

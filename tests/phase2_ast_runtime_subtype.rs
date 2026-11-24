@@ -6020,3 +6020,65 @@ fn group65_fk_prepared_repair_keeps_counter_with_mixed_actions() {
         );
     }
 }
+
+#[test]
+fn group64_named_worker_order_by_rebinds_integer_filter_before_sorting() {
+    use sqliters_vdbe::vdbe::SQLITE_STMTSTATUS_SORT;
+
+    for (encoding, width) in [("UTF-8", 3100), ("UTF-16le", 1550), ("UTF-16be", 1550)] {
+        for (table, order) in [
+            ("(id INTEGER PRIMARY KEY,v TEXT,p INTEGER NOT NULL REFERENCES parents(id),bucket INTEGER)", "id DESC"),
+            ("(v TEXT,p INTEGER NOT NULL REFERENCES parents(id),id INTEGER,bucket INTEGER,PRIMARY KEY(id DESC)) WITHOUT ROWID", "id DESC"),
+            ("(v TEXT,p INTEGER NOT NULL REFERENCES parents(id),id INTEGER,bucket INTEGER,PRIMARY KEY(bucket DESC,id)) WITHOUT ROWID", "bucket DESC,id DESC"),
+        ] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA page_size=512; PRAGMA encoding='{encoding}'; PRAGMA cache_size=1;
+                 PRAGMA threads=2; PRAGMA foreign_keys=ON;
+                 CREATE TABLE parents(id INTEGER PRIMARY KEY);
+                 INSERT INTO parents VALUES(1),(2);
+                 CREATE TABLE items{table};
+                 WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<52)
+                 INSERT INTO items(id,v,p,bucket) SELECT x,
+                     printf('%02d',x%17)||substr(hex(zeroblob(1600)),1,{width}-2),1+x%2,x%5 FROM n;"
+            )).unwrap();
+            let caller = std::thread::current().id();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            db.register_collation("app_nocase", move |left, right| {
+                if std::thread::current().id() != caller {
+                    observed.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                right.cmp(left)
+            }).unwrap();
+            for store in ["FILE", "DEFAULT"] {
+                db.execute_batch(&format!("PRAGMA temp_store={store};")).unwrap();
+                for (filter, bounds) in [("id>=?1", [4, 50, 6]), ("p<=?1", [2, 1, 2])] {
+                    let sql = format!("SELECT id FROM items WHERE {filter} ORDER BY v COLLATE APP_NOCASE NULLS LAST,{order}");
+                    let mut statement = db.prepare(&sql).unwrap();
+                    let key = |id: i64| (id % 17, if order.starts_with("bucket") { id % 5 } else { 0 }, id);
+                    for (run, bound) in bounds.into_iter().enumerate() {
+                        let before = calls.load(AtomicOrdering::Relaxed);
+                        statement.bind(1, bound).unwrap();
+                        let mut expected: Vec<_> = (1..=52).filter(|&id| {
+                            if filter.starts_with("id") { id >= bound } else { 1 + id % 2 <= bound }
+                        }).collect();
+                        expected.sort_by_key(|&id| std::cmp::Reverse(key(id)));
+                        for id in expected {
+                            let StepResult::Row(row) = statement.step().unwrap() else {
+                                panic!("expected a row for {encoding}/{store}/{filter}/{bound}");
+                            };
+                            assert_eq!(row.get_i64(0), Some(id));
+                        }
+                        assert!(matches!(statement.step().unwrap(), StepResult::Done));
+                        assert_eq!(statement.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), run as u32 + 1);
+                        assert_eq!(calls.load(AtomicOrdering::Relaxed) > before, run != 1);
+                        statement.reset().unwrap();
+                    }
+                }
+            }
+            assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+            assert_eq!(db.query("PRAGMA integrity_check", &[]).unwrap().rows[0].get_str(0), Some("ok"));
+        }
+    }
+}

@@ -1672,6 +1672,37 @@ fn complete_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
     })
 }
 
+/// Instructions for a single integer-affinity threshold on an already checked table scan.
+#[doc(hidden)]
+pub fn is_integer_worker_sort_filter_op(op: &VdbeOp, table: &VdbeOp, encoding: u8) -> bool {
+    match op.opcode {
+        OP_Integer | OP_Int64 | OP_Variable => op.p2 > 0 && op.p5 == 0,
+        OP_IsNull => op.p1 > 0 && op.p2 > 0 && op.p5 == 0,
+        OP_Affinity => op.p1 > 0 && op.p2 == 1 && op.p5 == 0
+            && matches!(&op.p4, P4::Dynamic(affinity)
+                if affinity.as_slice() == [SQLITE_AFF_NUMERIC] || affinity.as_slice() == [SQLITE_AFF_INTEGER]),
+        OP_Lt | OP_Le | OP_Gt | OP_Ge => {
+            op.p1 > 0 && op.p2 > 0 && op.p3 > 0
+                && match &op.p4 {
+                    P4::NotUsed => matches!(table.p4, P4::Int32(_))
+                        && op.p5 == (u16::from(SQLITE_AFF_NUMERIC) | SQLITE_JUMPIFNULL),
+                    P4::CollSeq(coll) => coll.enc == encoding && coll.name.eq_ignore_ascii_case("BINARY")
+                        && op.p5 == (u16::from(SQLITE_AFF_INTEGER) | SQLITE_JUMPIFNULL),
+                    _ => false,
+                }
+        }
+        OP_SeekGE | OP_SeekGT => op.p1 == table.p1 && op.p2 > 0 && op.p3 > 0 && op.p5 == 0
+            && match table.p4 {
+                P4::Int32(_) => op.p4 == P4::NotUsed,
+                P4::KeyInfo(_) => op.p4 == P4::Int32(1),
+                _ => false,
+            },
+        OP_IdxGE | OP_IdxGT => op.p1 == table.p1 && op.p2 > 0 && op.p3 > 0 && op.p5 == 0
+            && matches!(table.p4, P4::KeyInfo(_)) && op.p4 == P4::Int32(1),
+        _ => false,
+    }
+}
+
 /// One main table scan with a validated total order.
 fn worker_order_sorter(
     prog: &Program,
@@ -1679,6 +1710,7 @@ fn worker_order_sorter(
     key: &KeyInfo,
     encoding: u8,
     application_name: Option<&str>,
+    has_integer_filter: bool,
     has_table_key: impl FnOnce(&VdbeOp, &[VdbeOp]) -> bool,
     has_collation: impl FnOnce(&str) -> bool,
 ) -> bool {
@@ -1733,7 +1765,7 @@ fn worker_order_sorter(
         OP_SorterOpen => op.p1 == cursor,
         OP_SorterInsert | OP_SorterSort | OP_SorterNext => op.p1 == cursor,
         OP_SorterData => op.p1 == cursor && op.p3 == pseudo.p1,
-        _ => false,
+        _ => has_integer_filter && is_integer_worker_sort_filter_op(op, table, encoding),
     }) {
         return false;
     }
@@ -1811,7 +1843,7 @@ pub fn is_worker_sort_with_collations(
     prog.a_op.iter().any(|op| {
         matches!(&op.p4, P4::KeyInfo(key)
             if key.enc == encoding as u8 && worker_order_sorter(
-                prog, op, key, encoding as u8, None, &has_table_key, &has_stock_collation))
+                prog, op, key, encoding as u8, None, false, &has_table_key, &has_stock_collation))
     })
 }
 
@@ -1822,11 +1854,12 @@ pub fn is_worker_sort_with_named_collation(
     open: usize,
     encoding: TextEncoding,
     name: &str,
+    has_integer_filter: bool,
     has_table_key: impl FnOnce(&VdbeOp, &[VdbeOp]) -> bool,
 ) -> bool {
     let Some(op) = prog.a_op.get(open) else { return false };
     let P4::KeyInfo(key) = &op.p4 else { return false };
-    worker_order_sorter(prog, op, key, encoding as u8, Some(name), has_table_key,
+    worker_order_sorter(prog, op, key, encoding as u8, Some(name), has_integer_filter, has_table_key,
         |collation| collation.eq_ignore_ascii_case(name))
 }
 
@@ -5813,7 +5846,7 @@ impl Vdbe {
                             && (k.enc == 1 || k.enc == encoding)
                             && (within_worker_limit || host.sorter_mmap_limit() <= 0)
                             && matches!(&op.p4, P4::KeyInfo(key) if worker_order_sorter(&self.prog, op, key,
-                                encoding, None, |read, keys| host.sorter_has_worker_table_key(read, keys),
+                                encoding, None, false, |read, keys| host.sorter_has_worker_table_key(read, keys),
                                 |name| host.sorter_has_stock_collation(name)))
                             && k.a_coll.iter().flatten().all(|coll| coll.custom.is_none())))
                     {
