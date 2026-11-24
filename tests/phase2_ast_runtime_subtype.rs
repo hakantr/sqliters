@@ -7419,3 +7419,51 @@ fn group65_five_table_inner_join_tracks_four_and_five_distinct_schemas() {
         assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
     }
 }
+
+#[test]
+fn group65_analyze_full_clear_initializes_the_statistics_root() {
+    struct FixtureDir(std::path::PathBuf);
+    impl Drop for FixtureDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!("sqliters-analyze-root-{}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let dir = FixtureDir(dir);
+    const PAGE_SIZE: usize = 512;
+    for mode in ["ON", "FAST"] {
+        let path = dir.0.join(format!("{mode}.db"));
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size={PAGE_SIZE};
+             PRAGMA secure_delete={mode};
+             CREATE TABLE a(id INTEGER PRIMARY KEY, k INTEGER NOT NULL);
+             CREATE INDEX a1 ON a(k);
+             CREATE INDEX a2 ON a(k DESC);
+             CREATE TABLE b(id INTEGER PRIMARY KEY, k INTEGER NOT NULL);
+             CREATE INDEX b1 ON b(k);
+             INSERT INTO a VALUES(1,1),(2,2);
+             INSERT INTO b VALUES(1,3),(2,4);
+             ANALYZE;
+             DROP INDEX a2;
+             ANALYZE;"
+        ))
+        .unwrap();
+        let catalog = db
+            .query("SELECT rootpage FROM sqlite_schema WHERE name='sqlite_stat1'", &[])
+            .unwrap();
+        let root = usize::try_from(catalog.rows[0].get_i64(0).unwrap()).unwrap();
+        let health = db.query("PRAGMA integrity_check", &[]).unwrap();
+        assert_eq!(health.rows[0].get_str(0), Some("ok"));
+        drop(db);
+
+        let bytes = fs::read(path).unwrap();
+        let start = (root - 1) * PAGE_SIZE;
+        let page = &bytes[start..start + PAGE_SIZE];
+        assert_eq!(page[0], 0x0d);
+        assert_eq!(u16::from_be_bytes([page[3], page[4]]), 2);
+        assert_eq!(&page[12..14], &[0, 0], "{mode}");
+    }
+}

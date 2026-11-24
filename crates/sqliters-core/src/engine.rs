@@ -38719,28 +38719,24 @@ fn ensure_stat1_table_and_clear(
             return Ok(None);
         }
         if let Some(bt) = ctx.db_set.slot_mut(db_id).and_then(|s| s.btree.as_mut()) {
-            let enc = bt.encoding();
-            let rows = scan_table_incremental(bt, tbl.root_pgno)?;
-            for (rid, payload) in rows {
-                let Ok(vals) = decode_record_with_encoding(&payload, enc) else {
-                    continue;
-                };
-                let should_delete = if let Some(target_t) = clear_tbl {
+            if let Some(target_t) = clear_tbl {
+                let enc = bt.encoding();
+                for (rid, payload) in scan_table_incremental(bt, tbl.root_pgno)? {
+                    let Ok(vals) = decode_record_with_encoding(&payload, enc) else {
+                        continue;
+                    };
                     let row_t = vals.first().and_then(Value::as_str).unwrap_or("");
-                    if row_t != target_t {
-                        false
-                    } else if let Some(target_i) = clear_idx {
-                        let row_i = vals.get(1).and_then(Value::as_str).unwrap_or("");
-                        row_i == target_i
-                    } else {
-                        true
+                    if row_t == target_t
+                        && clear_idx.is_none_or(|target_i| {
+                            vals.get(1).and_then(Value::as_str).unwrap_or("") == target_i
+                        })
+                    {
+                        bt.delete_table(tbl.root_pgno, rid)?;
                     }
-                } else {
-                    true
-                };
-                if should_delete {
-                    bt.delete_table(tbl.root_pgno, rid)?;
                 }
+            } else {
+                // openStatTable uses OP_Clear when ANALYZE refreshes the whole database.
+                bt.clear_tree(tbl.root_pgno)?;
             }
         }
         Some(tbl)

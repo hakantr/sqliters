@@ -468,10 +468,6 @@ impl Btree {
     ///   whole pages moved to the freelist;
     /// * `2` (`FAST`, `BTS_OVERWRITE`) — deleted content is overwritten with zeros where that
     ///   costs no extra I/O (cells freed inside a page that is being written anyway).
-    ///
-    /// This engine always zero-fills, journals and writes a page that goes to the freelist
-    /// (inventory class U4), so `FAST` is at least as strong here as in C; the mode only decides
-    /// whether cells released inside a live page are overwritten (`freeSpace`, `btree.c:2019`).
     pub fn secure_delete(&mut self, new_flag: Option<u8>) -> u8 {
         if let Some(flag) = new_flag {
             self.secure_delete = flag.min(2);
