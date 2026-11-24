@@ -1078,6 +1078,8 @@ pub(crate) struct ConnectionInner {
     pub(crate) count_changes: bool,
     pub(crate) wal_autocheckpoint_threshold: i32,
     pub(crate) c_error_byte_offset: i32,
+    #[cfg(feature = "test-diagnostics")]
+    c_test_optimization_disable_mask: u32,
     // An ordinary prepare or read error may outlive a later successful API call.
     c_retained_error_message: Option<String>,
     c_connection_diagnostic_code: ErrorCode,
@@ -3752,6 +3754,8 @@ impl Connection {
             count_changes: false,
             wal_autocheckpoint_threshold: SQLITE_DEFAULT_WAL_AUTOCHECKPOINT,
             c_error_byte_offset: -1,
+            #[cfg(feature = "test-diagnostics")]
+            c_test_optimization_disable_mask: 0,
             c_retained_error_message: None,
             c_connection_diagnostic_code: ErrorCode::Ok,
             c_flag_pragma_expire_seq: None,
@@ -4168,6 +4172,22 @@ impl Connection {
         inner.ensure_usable()?;
         inner.runtime.enable_test_functions = enabled;
         Ok(())
+    }
+
+    /// Set the ORDER BY join-index test control for subsequently prepared statements.
+    #[doc(hidden)]
+    #[cfg(feature = "test-diagnostics")]
+    pub fn set_test_order_by_idx_join_disabled(&self, disabled: bool) -> Result<u32> {
+        let mut session = self.shared.enter()?;
+        let inner = session.inner_mut();
+        inner.ensure_usable()?;
+        let mask = if disabled {
+            sqliters_codegen::consts::SQLITE_OrderByIdxJoin as u32
+        } else {
+            0
+        };
+        inner.c_test_optimization_disable_mask = mask;
+        Ok(mask)
     }
 
     /// Sets the maximum byte length passed to the sorter VFS's optional

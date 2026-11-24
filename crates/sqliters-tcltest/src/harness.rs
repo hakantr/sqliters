@@ -352,7 +352,7 @@ const DEFAULT_HOST_BUILTINS: &[(&str, &str)] = &[
     ("sqlite3_busy_timeout", "sqlite3_busy_timeout"),
     ("sqlite3_rekey", "noop_zero"),
     ("sqlite3_key", "noop_zero"),
-    ("optimization_control", "noop_zero"),
+    ("optimization_control", "optimization_control"),
     ("breakpoint", "noop_zero"),
     ("clang_sanitize_address", "noop_zero"),
     ("atomic_batch_write", "noop_zero"),
@@ -1786,6 +1786,7 @@ fn dispatch_host_builtin(
         "file_control_persist_wal" => cmd_file_control_persist_wal(host, invoked_name, args),
         "sqlite3_db_filename" => cmd_db_filename(host, invoked_name, args),
         "sqlite3_limit" => cmd_sqlite3_limit(host, invoked_name, args),
+        "optimization_control" => cmd_optimization_control(host, args),
         "sqlite3_db_config" => cmd_sqlite3_db_config(host, invoked_name, args),
         "decode_hexdb" => cmd_decode_hexdb(args),
         "sqlite3_backup" => cmd_sqlite3_backup(host, interp, invoked_name, args),
@@ -3237,6 +3238,22 @@ fn cmd_db_filename(host: &SharedHost, cmd_name: &str, args: &[String]) -> TclRes
         .db_filename(&args[1])
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default())
+}
+
+fn cmd_optimization_control(host: &SharedHost, args: &[String]) -> TclResult<String> {
+    let [database, name, onoff] = args else {
+        return Ok("0".to_string());
+    };
+    let disabled = match (name.as_str(), onoff.as_str()) {
+        ("order-by-idx-join", "0") => true,
+        ("all", "1") => false,
+        _ => return Ok("0".to_string()),
+    };
+    let (_, connection, _) = resolve_db_conn_and_cmd_name(host, database)?;
+    connection
+        .set_test_order_by_idx_join_disabled(disabled)
+        .map(|mask| mask.to_string())
+        .map_err(|err| TclControl::Error(sqlite_err_text(&err)))
 }
 
 fn cmd_sqlite3_limit(host: &SharedHost, cmd_name: &str, args: &[String]) -> TclResult<String> {
@@ -6850,3 +6867,40 @@ proc faultsim_integrity_check {{db db}} {
   if {$ic != "ok"} { error "Integrity check: $ic" }
 }
 "#;
+
+#[cfg(test)]
+#[test]
+fn test_order_by_idx_join_optimization_control() {
+    crate::run_test_script(
+        "order_by_idx_join_optimization_control",
+        r#"
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set fixture {
+  CREATE TABLE album(aid INTEGER PRIMARY KEY,title TEXT UNIQUE NOT NULL);
+  CREATE TABLE track(tid INTEGER PRIMARY KEY,aid INTEGER NOT NULL REFERENCES album,
+                     tn INTEGER NOT NULL,name TEXT,UNIQUE(aid,tn));
+  INSERT INTO album VALUES (1,'1-one'),(2,'2-two'),(3,'3-three');
+  INSERT INTO track VALUES (NULL,1,1,'one-a'),(NULL,2,2,'two-b'),(NULL,3,3,'three-c'),
+                           (NULL,1,3,'one-c'),(NULL,2,1,'two-a'),(NULL,3,1,'three-a');
+  ANALYZE;
+}
+db eval $fixture
+sqlite3 peer :memory:
+peer eval $fixture
+set query {SELECT name FROM album JOIN track USING (aid) ORDER BY title, tn}
+set eqp "EXPLAIN QUERY PLAN $query"
+do_test opt-1.1 {db eval $eqp} {~/ORDER BY/}
+do_test opt-1.2 {optimization_control db order-by-idx-join 0} 64
+db cache flush
+do_test opt-1.3 {db eval $eqp} {/USE TEMP B-TREE FOR ORDER BY/}
+do_test opt-1.4 {db eval $query} {one-a one-c two-a two-b three-a three-c}
+do_test opt-1.5 {peer eval $eqp} {~/ORDER BY/}
+do_test opt-1.6 {optimization_control db all 1} 0
+db cache flush
+do_test opt-1.7 {db eval $eqp} {~/ORDER BY/}
+peer close
+finish_test
+"#,
+    );
+}

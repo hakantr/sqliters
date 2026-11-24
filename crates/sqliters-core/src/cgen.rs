@@ -839,6 +839,10 @@ fn c_prepare_impl(
 /// The connection state the generator reads (`sqlite3 *db`).
 fn make_db<'a>(inner: &ConnectionInner, host: &'a EngineHost<'a>) -> Db<'a> {
     let mut db = Db::new(host);
+    #[cfg(feature = "test-diagnostics")]
+    {
+        db.db_opt_flags = inner.c_test_optimization_disable_mask;
+    }
     db.err_byte_offset = inner.c_error_byte_offset;
     db.auto_commit = !(inner.explicit_tx || inner.implicit_savepoint_tx);
     db.enc = match inner.effective_encoding() {
