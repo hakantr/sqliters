@@ -5664,3 +5664,45 @@ fn group65_unqualified_aux_reads_keep_their_source_until_reprepare() {
         assert!(db.query("PRAGMA aux.foreign_key_check", &[]).unwrap().rows.is_empty());
     }
 }
+
+#[test]
+fn group65_fk_numeric_child_action_preserves_two_hop_constraint_counter() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}';
+             PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(k TEXT PRIMARY KEY) WITHOUT ROWID;
+             CREATE TABLE child(k INTEGER UNIQUE REFERENCES parent(k)
+                 ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED);
+             CREATE TABLE grandchild(k INTEGER DEFAULT 9 REFERENCES child(k)
+                 ON UPDATE SET DEFAULT);
+             INSERT INTO parent VALUES('007'),('7'),('9');
+             INSERT INTO child VALUES(7),(9);
+             INSERT INTO grandchild VALUES(7);",
+        ))
+        .unwrap();
+        let count = |sql| db.query(sql, &[]).unwrap().rows[0].get_i64(0).unwrap();
+
+        db.execute_batch("BEGIN; UPDATE parent SET k='6' WHERE k='007'").unwrap();
+        assert_eq!(count("SELECT count(*) FROM child WHERE k=6"), 1);
+        assert_eq!(count("SELECT count(*) FROM grandchild WHERE k=9"), 1);
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+        let error = db.execute("COMMIT").unwrap_err();
+        assert_eq!(error.extended_code, sqliters::types::extended::SQLITE_CONSTRAINT_FOREIGNKEY);
+        assert!(!db.is_autocommit());
+        db.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(count("SELECT count(*) FROM parent WHERE k='007'"), 1);
+        assert_eq!(count("SELECT count(*) FROM child WHERE k=7"), 1);
+        assert_eq!(count("SELECT count(*) FROM grandchild WHERE k=7"), 1);
+
+        db.execute("UPDATE parent SET k='6' WHERE k='7'").unwrap();
+        assert_eq!(count("SELECT count(*) FROM child WHERE k=6"), 1);
+        assert_eq!(count("SELECT count(*) FROM grandchild WHERE k=9"), 1);
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+        assert_eq!(
+            db.query("PRAGMA integrity_check", &[]).unwrap().rows[0].get_str(0),
+            Some("ok"),
+        );
+    }
+}

@@ -1248,7 +1248,17 @@ fn parent_fk_counter_program(
     use sqliters_vdbe::opcodes::*;
     let action_count = program.p_program.len();
     let matches_scope = match scope {
-        ParentFkProgramScope::SingleRelation => action_count <= 1,
+        ParentFkProgramScope::SingleRelation => {
+            action_count <= 1
+                || (action_count == 2
+                    && program.a_op.iter().filter(|op| op.opcode == OP_Program).count() == 1
+                    && program.p_program.iter().flat_map(|action| &action.a_op)
+                        .filter(|op| op.opcode == OP_Program).count() == 1
+                    && program.p_program.iter().all(|action| {
+                        action.a_op.first()
+                            .is_some_and(|op| op.opcode == OP_Init && !op.p4.is_used())
+                    }))
+        }
         ParentFkProgramScope::SiblingActions(count) => action_count == count,
     };
     if program.read_only || program.btree_mask != 1 || program.n_res_column != 0 || !matches_scope {
