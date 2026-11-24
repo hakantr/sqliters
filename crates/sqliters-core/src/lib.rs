@@ -5612,7 +5612,7 @@ pub struct Statement {
     compiled_advisory_expire_generation: u64,
     compiled_c_expire_seq: u64,
     compiled_slot_cookies: Vec<(SchemaInstanceId, u32, bool)>,
-    compiled_read_schema: Option<PreparedReadSchema>,
+    compiled_read_schemas: Option<PreparedReadSchemas>,
     expired: bool,
     c_v1_expired_before_run: bool,
     c_v1_retained_expiry_diagnostic: bool,
@@ -5922,6 +5922,88 @@ struct PreparedReadSchema {
     generation: i32,
 }
 
+#[derive(Clone, Copy)]
+enum PreparedReadSchemas {
+    One(PreparedReadSchema),
+    Two(PreparedReadSchema, PreparedReadSchema),
+}
+
+impl PreparedReadSchemas {
+    fn changed(self, db_set: &DatabaseSet) -> bool {
+        match self {
+            Self::One(schema) => schema.changed(db_set),
+            Self::Two(left, right) => left.changed(db_set) || right.changed(db_set),
+        }
+    }
+
+    fn prepare_join(
+        artifacts: &CompiledArtifacts,
+        usage: Option<&cgen::SelectSchemaUse>,
+        machine: Option<&sqliters_vdbe::vdbeaux::Program>,
+        db_set: &DatabaseSet,
+    ) -> Option<Self> {
+        use sqliters_syntax::{JoinConstraint, JoinType};
+
+        let stmt @ Stmt::Select(select) = artifacts.stmt.as_ref()? else {
+            return None;
+        };
+        let SelectCore::Select { from: Some(from), .. } = &select.body.head else {
+            return None;
+        };
+        let [join] = from.joins.as_slice() else {
+            return None;
+        };
+        if join.natural || join.join_type != JoinType::Inner
+            || !matches!(join.constraint, Some(JoinConstraint::On(_)))
+            || !select.ctes.is_empty() || !select.body.compounds.is_empty()
+            || !PreparedReadSchema::can_pin_source(select)
+        {
+            return None;
+        }
+        let read_schema = |source: &TableOrSubquery| {
+            let TableOrSubquery::Table { name, table_args: None, .. } = source else {
+                return None;
+            };
+            name.schema.as_ref()?;
+            let (db, db_set::RelationRef::Table(table)) = db_set.find_relation_ref_in_set(name).ok()?? else {
+                return None;
+            };
+            if db.is_temp() || table.without_rowid {
+                return None;
+            }
+            PreparedReadSchema::snapshot(db_set, db)
+        };
+        let left = read_schema(&from.head)?;
+        let right = read_schema(&join.right)?;
+        let mask = (1 << left.db_id.index()) | (1 << right.db_id.index());
+        if usage?.btree_mask != Some(mask) {
+            return None;
+        }
+        // An interpreter join uses these same cursor roots when it starts the reads.
+        let execution_mask = artifacts.read_db_mask(machine).unwrap_or_else(|| {
+            prepared_read_roots(stmt, artifacts.requires_schema, db_set).iter().fold(0, |mask, spec| {
+                let db = match spec {
+                    LeaseCursorSpec::Table(db, _) | LeaseCursorSpec::Index(db, _, _) => *db,
+                };
+                mask | (1 << db.index())
+            })
+        });
+        if execution_mask != mask {
+            return None;
+        }
+        Some(if left.db_id == right.db_id { Self::One(left) } else { Self::Two(left, right) })
+    }
+}
+
+impl CompiledArtifacts {
+    fn read_db_mask(&self, machine: Option<&sqliters_vdbe::vdbeaux::Program>) -> Option<u32> {
+        machine.map(|program| program.btree_mask)
+            .or_else(|| self.compiled_fast_read.as_ref().map(|plan| 1 << plan.db_id.index()))
+            .or_else(|| self.compiled_vdbe.as_ref().map(|program| u32::from(program.referenced_db_mask())))
+            .or_else(|| self.ast_read_db_mask.map(u32::from))
+    }
+}
+
 impl PreparedReadSchema {
     fn snapshot(db_set: &DatabaseSet, db_id: DatabaseId) -> Option<Self> {
         let slot = db_set.slot(db_id).filter(|slot| slot.btree.is_some())?;
@@ -5933,24 +6015,29 @@ impl PreparedReadSchema {
         })
     }
 
+    fn changed(self, db_set: &DatabaseSet) -> bool {
+        Some(self) != Self::snapshot(db_set, self.db_id)
+    }
+
     fn prepare_read(
         artifacts: &mut CompiledArtifacts,
         usage: Option<&cgen::SelectSchemaUse>,
         machine: Option<&sqliters_vdbe::vdbeaux::Program>,
         db_set: &DatabaseSet,
-    ) -> Option<Self> {
+    ) -> Option<PreparedReadSchemas> {
+        let execution_mask = artifacts.read_db_mask(machine);
         let Some(Stmt::Select(select)) = &mut artifacts.stmt else {
             return None;
         };
         let SelectCore::Select { from: Some(from), .. } = &select.body.head else {
             return None;
         };
+        if !from.joins.is_empty() {
+            return PreparedReadSchemas::prepare_join(artifacts, usage, machine, db_set);
+        }
         let TableOrSubquery::Table { name, table_args: None, .. } = &from.head else {
             return None;
         };
-        if !from.joins.is_empty() {
-            return None;
-        }
         let unqualified = name.schema.is_none();
         let db_id = if let Some(schema) = &name.schema {
             db_set.find_db_id(schema)?
@@ -5977,10 +6064,6 @@ impl PreparedReadSchema {
             return None;
         }
         // Scope OP_Transaction checks only if the C probe and Rust plan agree.
-        let execution_mask = machine.map(|program| program.btree_mask)
-            .or_else(|| artifacts.compiled_fast_read.as_ref().map(|plan| 1 << plan.db_id.index()))
-            .or_else(|| artifacts.compiled_vdbe.as_ref().map(|program| u32::from(program.referenced_db_mask())))
-            .or_else(|| artifacts.ast_read_db_mask.map(u32::from));
         if execution_mask != Some(db_mask) {
             return None;
         }
@@ -5997,7 +6080,7 @@ impl PreparedReadSchema {
                 name.schema = Some(db_set.slot(db_id)?.name.clone());
             }
         }
-        Some(schema)
+        Some(PreparedReadSchemas::One(schema))
     }
 
     fn can_pin_source(select: &SelectStmt) -> bool {
@@ -8355,7 +8438,7 @@ impl Statement {
         }
         self.compiled_vdbe = None;
         self.compiled_fast_read = None;
-        self.compiled_read_schema = None;
+        self.compiled_read_schemas = None;
         self.c_machine_vm = None;
         if write {
             self.c_machine = None;
@@ -9223,7 +9306,7 @@ impl Statement {
         apply_select_schema_use(&mut artifacts, select_schema_use.as_ref());
         let preserve_prepared_column_names =
             apply_select_column_names(inner, &mut artifacts, &raw_sql, c_machine.as_deref());
-        let compiled_read_schema = PreparedReadSchema::prepare_read(
+        let compiled_read_schemas = PreparedReadSchema::prepare_read(
             &mut artifacts, select_schema_use.as_ref(), c_machine.as_deref(), &inner.db_set,
         );
         let c_is_reader = c_explain.as_ref().or(c_machine.as_ref()).or(c_write.as_ref())
@@ -9261,7 +9344,7 @@ impl Statement {
             compiled_advisory_expire_generation: inner.advisory_expire_generation,
             compiled_c_expire_seq: inner.db_set.c_expire_seq(),
             compiled_slot_cookies: inner.snapshot_slot_cookies(),
-            compiled_read_schema,
+            compiled_read_schemas,
             expired: false,
             c_v1_expired_before_run: false,
             c_v1_retained_expiry_diagnostic: false,
@@ -9939,8 +10022,8 @@ impl Statement {
 
     #[inline]
     fn slot_cookies_changed(&self, inner: &ConnectionInner) -> bool {
-        if let Some(schema) = self.compiled_read_schema {
-            return Some(schema) != PreparedReadSchema::snapshot(&inner.db_set, schema.db_id);
+        if let Some(schemas) = self.compiled_read_schemas {
+            return schemas.changed(&inner.db_set);
         }
         if let [(inst, cookie, had_pages)] = *self.compiled_slot_cookies.as_slice() {
             let main_slot = inner.db_set.main_slot();
@@ -9965,7 +10048,7 @@ impl Statement {
             return false;
         }
         // OP_Transaction tests the cookie and generation for its own database.
-        if self.compiled_read_schema.is_some() {
+        if self.compiled_read_schemas.is_some() {
             return self.slot_cookies_changed(inner);
         }
         if self.category != Some(StmtCategory::Control) && self.has_detached_slot(inner) {
@@ -10174,7 +10257,7 @@ impl Statement {
             apply_select_schema_use(&mut artifacts, select_schema_use.as_ref());
             self.preserve_prepared_column_names =
                 apply_select_column_names(inner, &mut artifacts, &self.raw_sql, c_machine.as_deref());
-            self.compiled_read_schema = if self.c_machine_fixed {
+            self.compiled_read_schemas = if self.c_machine_fixed {
                 None
             } else {
                 PreparedReadSchema::prepare_read(

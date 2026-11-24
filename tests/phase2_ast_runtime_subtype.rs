@@ -5867,3 +5867,66 @@ fn group65_fk_numeric_child_deep_action_chain_matches_sqlite_counter() {
         }
     }
 }
+
+#[test]
+fn group65_qualified_join_reprepares_only_for_its_schemas_or_temp_expiry() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for (left, right, child, parent) in [
+            ("main", "main", 102, 101),
+            ("aux", "aux", 202, 201),
+            ("main", "aux", 102, 201),
+        ] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}'; PRAGMA foreign_keys=ON;
+                 ATTACH ':memory:' AS aux; ATTACH ':memory:' AS other;",
+            )).unwrap();
+            for (schema, marker) in [("main", 100), ("aux", 200), ("other", 300)] {
+                db.execute_batch(&format!(
+                    "CREATE TABLE {schema}.parent(id INTEGER PRIMARY KEY,marker INTEGER);
+                     CREATE TABLE {schema}.child(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent,marker INTEGER);
+                     INSERT INTO {schema}.parent VALUES(1,{});
+                     INSERT INTO {schema}.child VALUES(1,1,{});", marker + 1, marker + 2,
+                )).unwrap();
+            }
+            let sql = format!(
+                "SELECT l.marker,r.marker,length(?1) FROM {left}.child AS l
+                 JOIN {right}.parent AS r ON l.p=r.id WHERE l.id=1",
+            );
+            let mut legacy = db.prepare_v1(&sql).unwrap();
+            let mut modern = db.prepare(&sql).unwrap();
+            for stmt in [&mut legacy, &mut modern] {
+                stmt.bind_text(1, "猫").unwrap();
+            }
+            let read = |stmt: &mut sqliters::Statement, reprepares| {
+                let StepResult::Row(row) = stmt.step().unwrap() else {
+                    panic!("expected joined row");
+                };
+                assert_eq!(row.values(), [Value::Integer(child), Value::Integer(parent), Value::Integer(1)]);
+                stmt.reset().unwrap();
+                assert_eq!(stmt.c_reprepare_status().0, reprepares);
+            };
+            db.execute_batch(
+                "CREATE TABLE other.extra(id INTEGER PRIMARY KEY);
+                 ALTER TABLE other.child ADD COLUMN memo TEXT;",
+            ).unwrap();
+            read(&mut legacy, 0);
+            read(&mut modern, 0);
+
+            db.execute_batch(&format!("CREATE TABLE {left}.extra(id INTEGER PRIMARY KEY)")).unwrap();
+            assert_eq!(legacy.step().unwrap_err().code, ErrorCode::Schema);
+            assert_eq!(legacy.reset().unwrap_err().code, ErrorCode::Schema);
+            read(&mut modern, 1);
+            legacy.finalize().unwrap();
+
+            db.execute_batch(&format!("ALTER TABLE {right}.parent ADD COLUMN memo TEXT")).unwrap();
+            read(&mut modern, 2);
+            db.execute_batch("CREATE TEMP TABLE occupied(id INTEGER PRIMARY KEY)").unwrap();
+            read(&mut modern, 3);
+            modern.finalize().unwrap();
+            for schema in ["main", "aux", "other"] {
+                assert!(db.query(&format!("PRAGMA {schema}.foreign_key_check"), &[]).unwrap().rows.is_empty());
+            }
+        }
+    }
+}

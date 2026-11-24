@@ -2942,3 +2942,8 @@ Her kipte 1.152 named ve 192 stock profil geçti. Eş görev dağılımında 1.4
 ## V6b.527 — Üç ve dört basamaklı düz FK action zinciri
 
 Birleşik kaynakta her kipte 15.552/15.552 C karşılaştırması, SQL, iki yönlü dosya açılışı, byte ve bütünlük eş. Group64 40/40, Group65 59/59 ve deferred FK 2/2. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v527-fk-linear-chain-exact/sonuc.md) OFF 1399/0/324, ON 1399/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,284 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_527.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.528 — Nitelikli INNER JOIN ifadelerinde ilgili şema değişikliği
+
+96 hedef fark kapanıyor, 84 gerçek ilgili DDL/TEMP ham davranış korunuyor. 180/180 native sözleşme ve 90/90 Tcl V1. 1.620 C salt okunur yeniden açılış geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/qualified-join-reprepare-candidate/sonuc.md) OFF 1400/0/324, ON 1400/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,287 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_528.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
