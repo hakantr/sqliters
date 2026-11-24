@@ -5992,7 +5992,7 @@ impl PreparedReadSchemas {
             [_, _, _, _] => from.joins.iter().all(|join| matches!(join.join_type, JoinType::Inner | JoinType::Left))
                 && from.joins.iter().filter(|join| join.join_type == JoinType::Left).count() <= 2,
             [_, _, _, _, _] => from.joins.iter().all(|join| matches!(join.join_type, JoinType::Inner | JoinType::Left))
-                && from.joins.iter().filter(|join| join.join_type == JoinType::Left).count() <= 1,
+                && from.joins.iter().filter(|join| join.join_type == JoinType::Left).count() <= 2,
             _ => false,
         };
         if !supported_types

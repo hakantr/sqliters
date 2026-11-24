@@ -3152,3 +3152,8 @@ Kip başına 28 önceki SORT farkı kapandı. 66 stok, 72 dinamik işçi geçiş
 ## V6b.569 — STRICT WITHOUT ROWID tamsayı anahtarında ayrı TEXT BINARY sıralaması
 
 Her kipte 1248 doğal ve 96 fiziksel PMA profili eş. 600 fallible, 144 fiziksel negatif ve önceki kolasyon kontrolleri geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/binary-strict-without-rowid-v510-candidate/sonuc.md) OFF 1443/0/318, ON 1443/0/318. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,303 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_569.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.570 — Altı fiziksel kaynakta iki LEFT ve üç INNER JOIN
+
+198 fark kapandı ve 138 doğru kontrol korundu. 336/336 C yaşam döngüsü, 168/168 Tcl V1 ve önceki 936 ham kayıt eş. [Bağımsız ölçüm](/github/sqliters/target/perf-work/six-table-two-left-reprepare-candidate/sonuc.md) OFF 1444/0/318, ON 1444/0/318. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,300 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_570.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
