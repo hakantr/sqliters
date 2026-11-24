@@ -4111,12 +4111,16 @@ fn group64_file_sorter_worker_uses_stock_collation_and_rowid() {
             ("v COLLATE RTRIM DESC NULLS FIRST,id", [5, 7, 3, 4, 2, 1, 6]),
         ] {
             let mut statement = db.prepare(&format!("SELECT id FROM items ORDER BY {order}")).unwrap();
+            let sort = sqliters_vdbe::vdbe::SQLITE_STMTSTATUS_SORT;
+            assert_eq!(statement.machine_stmt_status(sort, false), 0);
             let StepResult::Row(first) = statement.step().unwrap() else {
                 panic!("expected first row in {encoding} for {order}");
             };
             assert_eq!(first.get_i64(0), Some(expected[0]));
             assert!(statement.machine_stmt_status(4, false) > 0, "{encoding} {order}");
+            assert_eq!(statement.machine_stmt_status(sort, false), 1);
             statement.reset().unwrap();
+            assert_eq!(statement.machine_stmt_status(sort, false), 1);
             for id in expected {
                 let StepResult::Row(row) = statement.step().unwrap() else {
                     panic!("expected row {id} in {encoding} for {order}");
@@ -4124,7 +4128,16 @@ fn group64_file_sorter_worker_uses_stock_collation_and_rowid() {
                 assert_eq!(row.get_i64(0), Some(id));
             }
             assert!(matches!(statement.step().unwrap(), StepResult::Done));
+            assert_eq!(statement.machine_stmt_status(sort, false), 2);
+            assert_eq!(statement.machine_stmt_status(sort, true), 2);
+            assert_eq!(statement.machine_stmt_status(sort, false), 0);
             statement.reset().unwrap();
+            let StepResult::Row(first) = statement.step().unwrap() else { panic!("missing first row after clearing SORT"); };
+            assert_eq!(first.get_i64(0), Some(expected[0]));
+            assert_eq!(statement.machine_stmt_status(sort, true), 1);
+            assert_eq!(statement.machine_stmt_status(sort, false), 0);
+            while let StepResult::Row(_) = statement.step().unwrap() {}
+            assert_eq!(statement.machine_stmt_status(sort, false), 0);
         }
     }
 }

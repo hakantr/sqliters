@@ -10998,7 +10998,12 @@ impl Statement {
             };
         }
         vdbe_host::custom_sort_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len())
-            .or_else(|| vdbe_host::worker_sort_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len()))
+            .or_else(|| {
+                let program = vdbe_host::worker_sort_read_program(inner, self.stmt.as_ref(), &self.raw_sql, self.params.len())?;
+                // Retain the statement's VM and counters when the validated stock sorter is unchanged.
+                Some(self.c_machine_vm.as_ref().filter(|vm| vm.prog == program)
+                    .map_or(program, |vm| Arc::clone(&vm.prog)))
+            })
             .or_else(|| {
                 let prepared_functions = inner.functions.function_registry_at(self.compiled_function_generation);
                 vdbe_host::mapped_table_read_program(
