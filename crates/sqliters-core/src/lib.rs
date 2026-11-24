@@ -5956,6 +5956,7 @@ impl PreparedReadSchemas {
             [join] => matches!(join.join_type, JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full),
             [first, second] => matches!((first.join_type, second.join_type),
                 (JoinType::Inner, JoinType::Inner | JoinType::Left) | (JoinType::Left, JoinType::Inner)),
+            [_, _, _] => from.joins.iter().all(|join| join.join_type == JoinType::Inner),
             _ => false,
         };
         if !supported_types
@@ -5978,12 +5979,12 @@ impl PreparedReadSchemas {
             PreparedReadSchema::snapshot(db_set, db)
         };
         let left = read_schema(&from.head)?;
-        let mut sources = [left; 3];
+        let mut sources = [left; 4];
         for (source, join) in sources[1..].iter_mut().zip(&from.joins) {
             *source = read_schema(&join.right)?;
         }
         let mask = sources.iter().fold(0u32, |mask, schema| mask | (1 << schema.db_id.index()));
-        if usage?.btree_mask != Some(mask) {
+        if mask.count_ones() > 3 || usage?.btree_mask != Some(mask) {
             return None;
         }
         // An interpreter join uses these same cursor roots when it starts the reads.
@@ -6007,11 +6008,13 @@ impl PreparedReadSchemas {
                 schema.pin_table(&mut join.right, db_set);
             }
         }
-        let second = sources[1..].iter().copied().find(|schema| schema.db_id != left.db_id);
-        Some(match second {
-            None => Self::One(left),
-            Some(_) if mask.count_ones() == 3 => Self::Three(sources),
-            Some(schema) => Self::Two(left, schema),
+        let mut additional = sources[1..].iter().copied().filter(|schema| schema.db_id != left.db_id);
+        let Some(second) = additional.next() else {
+            return Some(Self::One(left));
+        };
+        Some(match additional.find(|schema| schema.db_id != second.db_id) {
+            Some(third) => Self::Three([left, second, third]),
+            None => Self::Two(left, second),
         })
     }
 }

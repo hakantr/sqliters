@@ -6900,3 +6900,62 @@ fn group65_fk_action_preserves_a_separate_deferred_owner_repair() {
         );
     }
 }
+
+#[test]
+fn group65_four_table_inner_join_tracks_the_fourth_table_schema() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}'; PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent);
+             INSERT INTO parent VALUES(1); INSERT INTO child VALUES(1,1);
+             ATTACH ':memory:' AS aux; ATTACH ':memory:' AS other; ATTACH ':memory:' AS third;"
+        )).unwrap();
+        for (schema, table, marker) in [("aux", "ta", 201), ("other", "tb", 302), ("aux", "tc", 203), ("third", "td", 404)] {
+            db.execute_batch(&format!(
+                "CREATE TABLE {schema}.{table}(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+                 INSERT INTO {schema}.{table} VALUES(1,1,{marker});"
+            )).unwrap();
+        }
+        let sql = "SELECT a.marker,b.marker AS second_marker,c.marker AS third_marker,d.marker+length(?1) AS fourth_marker
+                   FROM aux.ta AS a JOIN other.tb AS b ON a.p=b.id
+                   JOIN aux.tc AS c ON b.p=c.id JOIN td AS d ON c.p=d.id";
+        let mut legacy = db.prepare_v1(sql).unwrap();
+        let mut modern = db.prepare(sql).unwrap();
+        for stmt in [&mut legacy, &mut modern] {
+            stmt.bind_text(1, "猫").unwrap();
+        }
+        let read = |stmt: &mut sqliters::Statement, fourth, reprepares| {
+            let StepResult::Row(row) = stmt.step().unwrap() else {
+                panic!("expected an INNER JOIN row");
+            };
+            assert_eq!(row.values(), [201, 302, 203, fourth].map(Value::Integer));
+            assert_eq!(stmt.step().unwrap(), StepResult::Done);
+            stmt.reset().unwrap();
+            assert_eq!(stmt.c_reprepare_status().0, reprepares);
+            assert_eq!(stmt.column_names(), ["marker", "second_marker", "third_marker", "fourth_marker"]);
+            assert_eq!(stmt.sql(), sql);
+        };
+
+        db.execute_batch(
+            "CREATE TABLE main.td(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+             INSERT INTO main.td VALUES(1,1,504);"
+        ).unwrap();
+        read(&mut legacy, 405, 0);
+        read(&mut modern, 405, 0);
+
+        db.execute_batch("ALTER TABLE third.td ADD COLUMN note TEXT").unwrap();
+        assert_eq!(legacy.step().unwrap_err().code, ErrorCode::Schema);
+        assert_eq!(legacy.reset().unwrap_err().code, ErrorCode::Schema);
+        legacy.finalize().unwrap();
+        read(&mut modern, 505, 1);
+
+        db.execute_batch("CREATE TABLE third.extra(id INTEGER PRIMARY KEY)").unwrap();
+        read(&mut modern, 505, 1);
+        db.execute_batch("ALTER TABLE other.tb ADD COLUMN note TEXT").unwrap();
+        read(&mut modern, 505, 2);
+        modern.finalize().unwrap();
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+    }
+}
