@@ -5982,3 +5982,41 @@ fn group65_fk_two_direct_actions_and_one_nested_action_match_sqlite_counter() {
         }
     }
 }
+
+#[test]
+fn group65_fk_prepared_repair_keeps_counter_with_mixed_actions() {
+    use sqliters::types::extended::SQLITE_CONSTRAINT_FOREIGNKEY;
+
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}';
+             PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(k TEXT PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY,k INTEGER
+                 REFERENCES parent(k) ON DELETE NO ACTION ON UPDATE CASCADE
+                 DEFERRABLE INITIALLY DEFERRED);
+             INSERT INTO parent VALUES('007'),('7'),('9');
+             INSERT INTO child VALUES(1,7);",
+        ))
+        .unwrap();
+
+        let mut restore = db.prepare("INSERT INTO parent VALUES('007')").unwrap();
+        db.execute_batch("BEGIN; DELETE FROM parent WHERE k='007';")
+            .unwrap();
+        assert_eq!(
+            db.execute("COMMIT").unwrap_err().extended_code,
+            SQLITE_CONSTRAINT_FOREIGNKEY
+        );
+        assert!(!db.is_autocommit());
+        assert!(matches!(restore.step().unwrap(), StepResult::Done));
+        db.execute("COMMIT").unwrap();
+        assert!(db.is_autocommit());
+        assert!(
+            db.query("PRAGMA foreign_key_check", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+}

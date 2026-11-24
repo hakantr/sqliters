@@ -2952,3 +2952,8 @@ Birleşik kaynakta her kipte 15.552/15.552 C karşılaştırması, SQL, iki yön
 ## V6b.529 — İki doğrudan FK alt tablosundan birinin devam ettiği action ağacı
 
 Birleşik kaynakta 31.104/31.104 C SQL, iki yönlü açılış, imaj ve bütünlük. Group64 40/40, Group65 61/61 ve ertelenmiş FK 2/2 iki kipte. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v529-fk-branch-chain-exact/sonuc.md) OFF 1401/0/324, ON 1401/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,284 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_529.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.530 — Karışık referential action ayarlarında önceden hazırlanmış onarım
+
+864/864 C işlemi, hata, iki yön dosya açılışı, byte ve FK bütünlüğü eş. Group64 40/40, Group65 60/60 iki kipte. [Bağımsız ölçüm](/github/sqliters/target/perf-work/fk-mixed-action-repairs-candidate/sonuc.md) OFF 1402/0/324, ON 1402/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,290 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_530.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)

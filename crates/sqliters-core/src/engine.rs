@@ -25041,7 +25041,7 @@ pub(crate) fn parent_fk_counter_program_scope(
         }
         // A prepared repair can run after a later parent write records the debt.
         let counter_only = |action| matches!(action, FkAction::NoAction | FkAction::Restrict);
-        if (child_write || inserting) && (!counter_only(fk.on_delete) || !counter_only(fk.on_update)) {
+        if (child_write || inserting) && !counter_only(fk.on_delete) && !counter_only(fk.on_update) {
             return None;
         }
         if siblings {
