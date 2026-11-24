@@ -149,6 +149,12 @@ pub trait VdbeHost {
     fn sorter_worker_threads(&mut self) -> i32 {
         0
     }
+
+    /// Worker limit for a sorter over a verified native rowid scan with a private BINARY override.
+    #[doc(hidden)]
+    fn binary_rowid_sorter_worker_threads(&mut self) -> i32 {
+        self.sorter_worker_threads()
+    }
     /// Whether these direct main-table columns contain a complete binary UNIQUE key.
     /// The VM calls this after checking the read snapshot's schema cookie.
     #[doc(hidden)]
@@ -3595,7 +3601,7 @@ impl Vdbe {
         let prog = Arc::clone(&self.prog);
         self.rt = Self::bind_ops(&prog.a_op, host,
             prog.fallible_sort_open().zip(self.sort_callback_error.as_ref())
-                .map(|(pc, error)| (pc, error, prog.worker_file_sort)))?;
+                .map(|(pc, error)| (pc, error, prog.worker_file_sort, prog.binary_rowid_sort_column)))?;
         self.rt_ready = true;
         Ok(())
     }
@@ -3604,7 +3610,7 @@ impl Vdbe {
     fn bind_ops<H: VdbeHost>(
         a_op: &[VdbeOp],
         host: &mut H,
-        scoped_sort: Option<(usize, &SortCallbackError, bool)>,
+        scoped_sort: Option<(usize, &SortCallbackError, bool, Option<usize>)>,
     ) -> Result<Vec<OpRt>> {
         let mut rt = vec![OpRt::None; a_op.len()];
         let find_registered = |name: &str, host: &mut H, workers: bool| {
@@ -3625,15 +3631,25 @@ impl Vdbe {
                 P4::CollSeq(c) => rt[i] = OpRt::Coll(find(c, host)?),
                 P4::KeyInfo(k) => {
                     let k: &KeyInfo = k;
-                    let sort = scoped_sort.filter(|(pc, _, _)| i == *pc);
+                    let sort = scoped_sort.filter(|(pc, _, _, _)| i == *pc);
                     let has_named = sort.is_some() && k.a_coll.iter().flatten()
                         .any(|coll| sqliters_types::Collation::from_name(&coll.name).is_none());
                     let mut a_coll = Vec::with_capacity(k.a_coll.len());
                     for (field, c) in k.a_coll.iter().enumerate() {
                         a_coll.push(match c {
+                            Some(c) if sort.is_some_and(|(_, _, _, binary_slot)| binary_slot == Some(field))
+                                && c.name.eq_ignore_ascii_case("BINARY") => {
+                                let (_, error, workers, _) = sort.expect("checked sort address");
+                                Some(if c.enc == crate::vdbeaux::SQLITE_UTF8 {
+                                    let registered = find_registered(&c.name, host, workers)?;
+                                    Arc::new(fallible_sort_collation(registered, error)?)
+                                } else {
+                                    find(c, host)?
+                                })
+                            }
                             Some(c) if has_named && matches!(sqliters_types::Collation::from_name(&c.name),
                                 Some(sqliters_types::Collation::NoCase | sqliters_types::Collation::RTrim)) => {
-                                let (_, error, workers) = sort.expect("checked sort address");
+                                let (_, error, workers, _) = sort.expect("checked sort address");
                                 let registered = if workers {
                                     host.find_worker_sort_collation(&c.name)
                                 } else {
@@ -3646,7 +3662,7 @@ impl Vdbe {
                             }
                             Some(c) if sort.is_some()
                                 && if has_named { sqliters_types::Collation::from_name(&c.name).is_none() } else { field == 0 } => {
-                                let (_, error, workers) = sort.expect("checked sort address");
+                                let (_, error, workers, _) = sort.expect("checked sort address");
                                 let registered = find_registered(&c.name, host, workers)?;
                                 Some(Arc::new(fallible_sort_collation(registered, error)?))
                             }
@@ -5886,7 +5902,13 @@ impl Vdbe {
                     let (pgsz, cache_size, temp_in_memory) = host.sorter_config();
                     let mut sorter = VdbeSorter::init(k, op.p3, pgsz, cache_size, temp_in_memory);
                     sorter.set_vfs(host.sorter_vfs());
-                    let worker_count = host.sorter_worker_threads();
+                    let worker_count = if self.prog.read_only && self.prog.worker_file_sort
+                        && self.prog.fallible_file_sort_open == Some(pc) && self.prog.binary_rowid_sort_column.is_some()
+                    {
+                        host.binary_rowid_sorter_worker_threads()
+                    } else {
+                        host.sorter_worker_threads()
+                    };
                     let encoding = host.text_encoding() as u8;
                     let within_worker_limit = worker_count <= 8;
                     let registered_workers = self.prog.worker_file_sort

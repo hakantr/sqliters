@@ -7620,6 +7620,37 @@ fn main_rowid_order_collation<'a>(
         .map(|(names, table, _)| (names.first, table.root_pgno))
 }
 
+/// The BINARY override is safe for a private TEXT sort key over a native rowid scan.
+pub(crate) fn binary_rowid_order_collation<'a>(
+    select: &'a SelectStmt,
+    db_set: &'a DatabaseSet,
+    collations: &CollationRegistry,
+) -> Option<(ApplicationSortCollations<'a>, &'a TableSchema, bool, usize)> {
+    if !select.ctes.is_empty() || !select.body.compounds.is_empty()
+        || db_set.writable_schema_effective() || collations.get_custom("BINARY").is_none()
+        || !matches!(select.body.head, SelectCore::Select { selection: None, .. })
+    {
+        return None;
+    }
+    let (names, table, total) = main_table_order_collation(db_set, &select.body.head, &select.order_by, false)?;
+    let alias = table.rowid_alias_col?;
+    let (slot, name) = match (names.stock, names.second) {
+        (Some(stock), Some(second)) if [names.first, second].into_iter()
+            .all(|name| collations.has_infallible_registration(name)) => stock,
+        (None, None) => (0, names.first),
+        _ => return None,
+    };
+    if !name.eq_ignore_ascii_case("BINARY") || table.columns.iter().any(|column| column.default_expr.is_some()) {
+        return None;
+    }
+    let Expr::Column(column) = (match &select.order_by.get(slot)?.expr {
+        Expr::Collate { expr, .. } => expr.as_ref(),
+        expr => expr,
+    }) else { return None };
+    let (index, field) = table.find_column(&column.column)?;
+    (index != alias && field.affinity == TypeAffinity::Text).then_some((names, table, total, slot))
+}
+
 fn complete_order_sort_collation<'a>(
     db_set: &'a DatabaseSet,
     core: &SelectCore,
@@ -7644,14 +7675,7 @@ pub(crate) fn custom_limit_order_collation<'a>(
     }
     let (names, table, _) = main_table_order_collation(db_set, &select.body.head, &select.order_by, true)?;
     let expanded = selection.is_some() || names.second.is_some();
-    let simple_bound = |expr: &Expr| match expr {
-        Expr::Integer(_) | Expr::Bind(_) => true,
-        Expr::Null => expanded,
-        Expr::Unary { op: UnaryOp::Negate | UnaryOp::Plus, expr } => matches!(expr.as_ref(), Expr::Integer(_)),
-        _ => false,
-    };
-    if !simple_bound(&limit.limit) || limit.offset.as_ref().is_some_and(|expr| !simple_bound(expr))
-    {
+    if !simple_order_limit(limit, expanded) {
         return None;
     }
     let admitted = if expanded {
@@ -7663,6 +7687,16 @@ pub(crate) fn custom_limit_order_collation<'a>(
         !table.without_rowid && registered_order_collation(names.first, collations)
     };
     admitted.then_some((names, table))
+}
+
+pub(crate) fn simple_order_limit(limit: &LimitClause, allow_null: bool) -> bool {
+    let simple_bound = |expr: &Expr| match expr {
+        Expr::Integer(_) | Expr::Bind(_) => true,
+        Expr::Null => allow_null,
+        Expr::Unary { op: UnaryOp::Negate | UnaryOp::Plus, expr } => matches!(expr.as_ref(), Expr::Integer(_)),
+        _ => false,
+    };
+    simple_bound(&limit.limit) && limit.offset.as_ref().is_none_or(|expr| simple_bound(expr))
 }
 
 pub(crate) fn custom_file_order_collation<'a>(

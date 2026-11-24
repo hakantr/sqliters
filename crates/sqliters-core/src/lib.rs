@@ -1806,7 +1806,7 @@ impl ConnectionInner {
                     "unable to delete/modify collation sequence due to active statements"));
             }
             self.db_set.c_expire_all();
-            if name.eq_ignore_ascii_case("NOCASE") || name.eq_ignore_ascii_case("RTRIM") {
+            if ["BINARY", "NOCASE", "RTRIM"].iter().any(|builtin| name.eq_ignore_ascii_case(builtin)) {
                 self.c_builtin_collation_expire_seq = Some(self.db_set.c_expire_seq());
             }
         }
@@ -11195,6 +11195,8 @@ impl Statement {
     fn uses_registered_builtin_memory_sort(&self, inner: &ConnectionInner) -> bool {
         self.category == Some(StmtCategory::Read)
             && !self.c_machine_fixed
+            && !matches!(&self.stmt, Some(Stmt::Select(select))
+                if engine::binary_rowid_order_collation(select, &inner.db_set, &inner.collations).is_some())
             && engine::registered_builtin_memory_sort(
                 self.stmt.as_ref(), &inner.db_set, &inner.collations, inner.effective_encoding(),
             )

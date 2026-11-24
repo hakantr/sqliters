@@ -138,6 +138,13 @@ fn has_two_named_sort_collations(op: &VdbeOp) -> bool {
 pub(crate) fn custom_sort_policy_matches(
     inner: &ConnectionInner, program: &Program, stmt: Option<&Stmt>, require_snapshot: bool,
 ) -> bool {
+    if program.binary_rowid_sort_column.is_some() {
+        let Some(Stmt::Select(select)) = stmt else { return false };
+        return !inner.authorizer.is_some()
+            && crate::engine::binary_rowid_order_collation(select, &inner.db_set, &inner.collations).is_some()
+            && (program.fallible_limit_sort_open.is_some()
+                || program.worker_file_sort == binary_rowid_sort_uses_workers(inner));
+    }
     if let Some(open) = program.fallible_limit_sort_open {
         !inner.authorizer.is_some() && match stmt {
             Some(Stmt::Select(select)) if matches!(&select.body.head,
@@ -164,6 +171,12 @@ pub(crate) fn custom_sort_policy_matches(
     } else {
         true
     }
+}
+
+fn binary_rowid_sort_uses_workers(inner: &ConnectionInner) -> bool {
+    (1..=sqliters_codegen::consts::SQLITE_MAX_WORKER_THREADS).contains(&inner.db_set.worker_threads_limit)
+        && !inner.db_set.temp_store().is_memory()
+        && (inner.effective_encoding() != TextEncoding::Utf8 || inner.collations.has_infallible_registration("BINARY"))
 }
 
 fn file_sort_policy(inner: &ConnectionInner, collation: Option<&str>) -> bool {
@@ -196,9 +209,12 @@ pub(crate) fn registered_worker_file_sort(
     inner: &ConnectionInner, stmt: Option<&Stmt>, require_snapshot: bool,
 ) -> bool {
     !inner.authorizer.is_some()
-        && crate::engine::registered_worker_file_sort(
-            stmt, &inner.db_set, &inner.collations, require_snapshot,
-        )
+        && ((binary_rowid_sort_uses_workers(inner)
+                && matches!(stmt, Some(Stmt::Select(select)) if select.limit.is_none()
+                    && crate::engine::binary_rowid_order_collation(select, &inner.db_set, &inner.collations).is_some()))
+            || crate::engine::registered_worker_file_sort(
+                stmt, &inner.db_set, &inner.collations, require_snapshot,
+            ))
 }
 
 pub(crate) fn custom_sort_read_program(
@@ -218,9 +234,19 @@ fn custom_limit_sort_read_program(
     if inner.authorizer.is_some() {
         return None;
     }
-    let (names, table) = crate::engine::custom_limit_order_collation(select, &inner.db_set, &inner.collations)?;
+    let (names, table, binary_slot) = if let Some((names, table, _, slot)) =
+        crate::engine::binary_rowid_order_collation(select, &inner.db_set, &inner.collations)
+    {
+        if !crate::engine::simple_order_limit(select.limit.as_ref()?, true) {
+            return None;
+        }
+        (names, table, Some(slot))
+    } else {
+        let (names, table) = crate::engine::custom_limit_order_collation(select, &inner.db_set, &inner.collations)?;
+        (names, table, None)
+    };
     let filtered = matches!(&select.body.head, sqliters_syntax::SelectCore::Select { selection: Some(_), .. });
-    let expanded = filtered || names.second.is_some();
+    let expanded = filtered || names.second.is_some() || binary_slot.is_some();
     let PrepareResult::Program(mut program) = crate::cgen::c_prepare(inner, sql).0 else {
         return None;
     };
@@ -259,6 +285,7 @@ fn custom_limit_sort_read_program(
         return None;
     }
     program.fallible_limit_sort_open = Some(open);
+    program.binary_rowid_sort_column = binary_slot;
     trace("machine: custom LIMIT sorter", sql);
     Some(Arc::new(*program))
 }
@@ -284,19 +311,26 @@ fn file_sort_read_program(
         return None;
     }
     let Some(Stmt::Select(select)) = stmt else { return None };
-    let (names, root, without_rowid, total) = if with_workers {
+    let (names, root, without_rowid, total, binary_slot) = if let Some((names, table, total, slot)) =
+        crate::engine::binary_rowid_order_collation(select, &inner.db_set, &inner.collations)
+    {
+        if inner.authorizer.is_some() || select.limit.is_some() || with_workers != binary_rowid_sort_uses_workers(inner) {
+            return None;
+        }
+        (names, table.root_pgno, false, total, Some(slot))
+    } else if with_workers {
         let (names, table, total) =
             crate::engine::registered_file_order_collation(select, &inner.db_set, &inner.collations, true)?;
-        (names, table.root_pgno, table.without_rowid, total)
+        (names, table.root_pgno, table.without_rowid, total, None)
     } else if let Some((names, table, total)) = serial_builtin_sort_order(inner, select) {
-        (names, table.root_pgno, table.without_rowid, total)
+        (names, table.root_pgno, table.without_rowid, total, None)
     } else {
         let (name, root) =
             crate::engine::custom_file_order_collation(select, &inner.db_set, &inner.collations)?;
         if !file_sort_policy(inner, Some(name)) {
             return None;
         }
-        (ApplicationSortCollations { first: name, second: None, stock: None }, root, false, false)
+        (ApplicationSortCollations { first: name, second: None, stock: None }, root, false, false, None)
     };
     let PrepareResult::Program(mut program) = crate::cgen::c_prepare(inner, sql).0 else {
         return None;
@@ -341,7 +375,7 @@ fn file_sort_read_program(
     }) {
         return None;
     }
-    if with_workers || names.second.is_some() {
+    if with_workers || names.second.is_some() || binary_slot.is_some() {
         if !matches!(&sort.p4, P4::KeyInfo(key)
             if usize::from(key.n_key_field) == select.order_by.len())
         {
@@ -365,6 +399,7 @@ fn file_sort_read_program(
     }
     program.worker_file_sort = with_workers;
     program.fallible_file_sort_open = Some(open);
+    program.binary_rowid_sort_column = binary_slot;
     trace("machine: custom FILE sorter", sql);
     Some(Arc::new(*program))
 }
@@ -1858,6 +1893,10 @@ macro_rules! host_common {
 }
 
 impl VdbeHost for MachineHost<'_> {
+    fn binary_rowid_sorter_worker_threads(&mut self) -> i32 {
+        self.dbs().worker_threads_limit
+    }
+
     fn find_worker_sort_collation(&mut self, name: &str) -> Option<CollRt> {
         let conn_id = self.sort_worker_conn_id?;
         let mut collation = self.collations.get_custom(name)?;

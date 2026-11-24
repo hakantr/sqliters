@@ -7467,3 +7467,83 @@ fn group65_analyze_full_clear_initializes_the_statistics_root() {
         assert_eq!(&page[12..14], &[0, 0], "{mode}");
     }
 }
+
+#[test]
+fn group64_binary_replacement_uses_the_text_slot_of_a_native_rowid_sort() {
+    use sqliters_vdbe::vdbe::SQLITE_STMTSTATUS_SORT;
+
+    for (encoding, width) in [("UTF-8", 3100), ("UTF-16le", 1550), ("UTF-16be", 1550)] {
+        let path = std::env::temp_dir().join(format!("sqliters-binary-rowid-{encoding}-{}.db", std::process::id()));
+        let fixture = Connection::open(&path).unwrap();
+        fixture.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}';
+             CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<52)
+             INSERT INTO items SELECT x,printf('%02d',x%4)||substr(hex(zeroblob(1600)),1,{width}-2) FROM n;"
+        )).unwrap();
+        drop(fixture);
+        let before = std::fs::read(&path).unwrap();
+
+        let db = Connection::open_with_flags(&path, sqliters::vfs::OpenFlags::READONLY).unwrap();
+        db.execute_batch("PRAGMA cache_size=1; PRAGMA temp_store=FILE; PRAGMA threads=2;").unwrap();
+        let sql = "SELECT id FROM items ORDER BY v COLLATE BINARY NULLS LAST,id DESC";
+        let mut legacy = db.prepare_v1(sql).unwrap();
+        let mut held = db.prepare(sql).unwrap();
+        let caller = std::thread::current().id();
+        let worker_calls = Arc::new(AtomicUsize::new(0));
+        let on_worker = Arc::clone(&worker_calls);
+        db.register_collation("bInArY", move |a, b| {
+            if std::thread::current().id() != caller {
+                on_worker.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            b.cmp(a)
+        }).unwrap();
+
+        let expired = legacy.step().unwrap_err();
+        assert_eq!((expired.extended_code, expired.message.as_str()), (1, "not an error"));
+        let finalized = legacy.finalize().unwrap_err();
+        assert_eq!((finalized.extended_code, finalized.message.as_str()), (17, "not an error"));
+        let replaced = encoding == "UTF-8";
+        let mut expected: Vec<i64> = (1..=52).collect();
+        expected.sort_by_key(|&id| (if replaced { -(id % 4) } else { id % 4 }, -id));
+        let StepResult::Row(row) = held.step().unwrap() else { panic!("missing first sorted row"); };
+        assert_eq!(row.get_i64(0), Some(expected[0]));
+        assert_eq!(held.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), 1);
+        held.reset().unwrap();
+        let before_topn = worker_calls.load(AtomicOrdering::Relaxed);
+        assert_eq!(before_topn > 0, replaced);
+
+        let mut topn = db.prepare(&format!("{sql} LIMIT ?1 OFFSET ?2")).unwrap();
+        topn.bind(1, Value::Integer(7)).unwrap();
+        topn.bind(2, Value::Integer(2)).unwrap();
+        for &id in &expected[2..9] {
+            let StepResult::Row(row) = topn.step().unwrap() else { panic!("missing top-N row"); };
+            assert_eq!(row.get_i64(0), Some(id));
+        }
+        assert!(matches!(topn.step().unwrap(), StepResult::Done));
+        assert_eq!(topn.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), 1);
+        assert_eq!(worker_calls.load(AtomicOrdering::Relaxed), before_topn);
+        topn.finalize().unwrap();
+
+        let failure = SqliteError::new(ErrorCode::Error, "ordinary BINARY comparator error");
+        let callback_error = failure.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::clone(&calls);
+        db.register_fallible_collation("BINARY", move |a, b| {
+            assert_eq!(std::thread::current().id(), caller);
+            if recorded.fetch_add(1, AtomicOrdering::Relaxed) == 1 { Err(callback_error.clone()) }
+            else { Ok(b.cmp(a)) }
+        }).unwrap();
+        if replaced {
+            assert_eq!(held.step().unwrap_err(), failure);
+            assert_eq!(held.reset().unwrap_err(), failure);
+        }
+        let StepResult::Row(row) = held.step().unwrap() else { panic!("missing row after reset"); };
+        assert_eq!(row.get_i64(0), Some(expected[0]));
+        assert_eq!(calls.load(AtomicOrdering::Relaxed) > 0, replaced);
+        held.finalize().unwrap();
+        drop(db);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(path).unwrap();
+    }
+}
