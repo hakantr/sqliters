@@ -5989,6 +5989,7 @@ impl PreparedReadSchemas {
                 && from.joins.iter().any(|join| join.join_type == JoinType::Inner),
             [_, _, _, _] => from.joins.iter().all(|join| matches!(join.join_type, JoinType::Inner | JoinType::Left))
                 && from.joins.iter().filter(|join| join.join_type == JoinType::Left).count() <= 2,
+            [_, _, _, _, _] => from.joins.iter().all(|join| join.join_type == JoinType::Inner),
             _ => false,
         };
         if !supported_types
@@ -6011,17 +6012,21 @@ impl PreparedReadSchemas {
             PreparedReadSchema::snapshot(db_set, db)
         };
         let left = read_schema(&from.head)?;
-        let mut sources = [left; 5];
+        let mut sources = [left; 6];
         for (source, join) in sources[1..].iter_mut().zip(&from.joins) {
             *source = read_schema(&join.right)?;
         }
         let sources = &sources[..=from.joins.len()];
         let mut distinct = [left; 5];
+        let max_schemas = if sources.len() == 6 { 3 } else { distinct.len() };
         let mut distinct_count = 0;
         let mut mask = 0u32;
         for schema in sources.iter().copied() {
             let bit = 1 << schema.db_id.index();
             if mask & bit == 0 {
+                if distinct_count == max_schemas {
+                    return None;
+                }
                 distinct[distinct_count] = schema;
                 distinct_count += 1;
                 mask |= bit;
