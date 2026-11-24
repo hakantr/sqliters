@@ -6577,3 +6577,48 @@ fn group65_three_table_inner_join_tracks_its_resolved_schemas() {
         }
     }
 }
+
+#[test]
+fn group65_fk_action_keeps_a_childs_separate_immediate_reference() {
+    use sqliters::types::extended::SQLITE_CONSTRAINT_FOREIGNKEY;
+
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}';
+             PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(k TEXT PRIMARY KEY) WITHOUT ROWID;
+             CREATE TABLE owner(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY,
+                 k INTEGER REFERENCES parent(k)
+                   ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED,
+                 owner_id INTEGER NOT NULL REFERENCES owner(id));
+             INSERT INTO parent VALUES('007'),('7');
+             INSERT INTO owner VALUES(11);
+             INSERT INTO child VALUES(1,7,11);",
+        ))
+        .unwrap();
+        let keys = || {
+            let rows = db.query("SELECT k,owner_id FROM child", &[]).unwrap().rows;
+            (rows[0].get_i64(0), rows[0].get_i64(1))
+        };
+
+        db.execute_batch("BEGIN").unwrap();
+        db.execute("UPDATE parent SET k='8' WHERE k='007'").unwrap();
+        assert_eq!(keys(), (Some(8), Some(11)));
+        assert_eq!(
+            db.execute("COMMIT").unwrap_err().extended_code,
+            SQLITE_CONSTRAINT_FOREIGNKEY
+        );
+        db.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(keys(), (Some(7), Some(11)));
+        db.execute("UPDATE parent SET k='8' WHERE k='7'").unwrap();
+        assert_eq!(keys(), (Some(8), Some(11)));
+        assert!(
+            db.query("PRAGMA foreign_key_check", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+}

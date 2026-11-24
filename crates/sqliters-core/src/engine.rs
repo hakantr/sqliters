@@ -25097,7 +25097,18 @@ pub(crate) fn parent_fk_counter_program_scope(
         {
             continue;
         }
-        if child.foreign_keys.len() != 1
+        let extra_reference = !child_write && !inserting && child.foreign_keys.len() == 2
+            && child.foreign_keys.iter().any(|other| {
+                !other.ref_table.eq_ignore_ascii_case(&parent.name)
+                    && !other.ref_table.eq_ignore_ascii_case(&child.name)
+                    && !other.deferred
+                    && matches!((other.on_delete, other.on_update), (FkAction::NoAction, FkAction::NoAction))
+                    && other.from_cols.iter().all(|column| !fk.from_cols.contains(column))
+            })
+            && !main.schema.tables.iter().any(|table| {
+                table.foreign_keys.iter().any(|other| other.ref_table.eq_ignore_ascii_case(&child.name))
+            });
+        if (child.foreign_keys.len() != 1 && !extra_reference)
             || child.name.eq_ignore_ascii_case(&parent.name)
             || !db_set.triggers_for_relation(DatabaseId::MAIN, &child.name).is_empty()
         {
