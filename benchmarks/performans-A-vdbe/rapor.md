@@ -2982,3 +2982,8 @@ Her kipte 2.808 yeni ve 972 önceki LIMIT ham izi C eş. SORT, seri callback sı
 ## V6b.535 — LEFT JOIN nullable kaynağının prepared bağlama sözleşmesi
 
 264 hedef fark kapandı. 432/432 C çağrı sözleşmesi ve 216/216 Tcl V1. TEMP/DETACH gölgelemesi, public kolonlar ve 3.888 C açılışı geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/left-join-reprepare-candidate/sonuc.md) OFF 1407/0/324, ON 1407/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,358 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_535.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.536 — RIGHT ve FULL JOIN nullable kaynaklarının prepared bağlaması
+
+Her iki türde 192 hedef fark kapandı. 528/528 C sözleşmesi, 264/264 Tcl V1, public kolon ve 4.752 C açılışı geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/right-full-join-reprepare-candidate/sonuc.md) OFF 1408/0/324, ON 1408/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,284 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_536.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)

@@ -6313,3 +6313,71 @@ fn group65_left_join_keeps_its_nullable_source_until_reprepare() {
         }
     }
 }
+
+#[test]
+fn group65_right_full_join_keep_outer_sources_until_reprepare() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for kind in ["RIGHT", "FULL"] {
+            for parent in [1, 2] {
+                let db = Connection::open_in_memory().unwrap();
+                db.execute_batch(&format!(
+                    "PRAGMA encoding='{encoding}'; PRAGMA foreign_keys=ON;
+                     CREATE TABLE main.parent(id INTEGER PRIMARY KEY);
+                     CREATE TABLE main.child(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent);
+                     INSERT INTO main.parent VALUES(1); INSERT INTO main.child VALUES(1,1);
+                     ATTACH ':memory:' AS aux;
+                     CREATE TABLE aux.src_left(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+                     CREATE TABLE aux.src_right(id INTEGER PRIMARY KEY,marker INTEGER);
+                     INSERT INTO aux.src_left VALUES(1,{parent},202); INSERT INTO aux.src_right VALUES(1,201);",
+                )).unwrap();
+                let sql = format!(
+                    "SELECT l.marker,r.marker AS right_marker,length(?1)
+                     FROM aux.src_left AS l {kind} JOIN src_right AS r ON l.p=r.id",
+                );
+                let mut legacy = db.prepare_v1(&sql).unwrap();
+                let mut modern = db.prepare(&sql).unwrap();
+                let columns = ["marker", "right_marker", "length(?1)"];
+                for stmt in [&mut legacy, &mut modern] {
+                    stmt.bind_text(1, "猫").unwrap();
+                    assert_eq!(stmt.column_names(), columns);
+                }
+                let read = |stmt: &mut sqliters::Statement, right_id, right_marker, reprepares| {
+                    let mut expected = if parent == right_id {
+                        vec![[Value::Integer(202), Value::Integer(right_marker), Value::Integer(1)]]
+                    } else {
+                        let mut rows = vec![[Value::Null, Value::Integer(right_marker), Value::Integer(1)]];
+                        if kind == "FULL" {
+                            rows.push([Value::Integer(202), Value::Null, Value::Integer(1)]);
+                        }
+                        rows
+                    };
+                    while let StepResult::Row(row) = stmt.step().unwrap() {
+                        let index = expected.iter().position(|values| row.values() == values)
+                            .expect("expected joined row");
+                        expected.swap_remove(index);
+                    }
+                    assert!(expected.is_empty());
+                    stmt.reset().unwrap();
+                    assert_eq!(stmt.c_reprepare_status().0, reprepares);
+                    assert_eq!(stmt.column_names(), columns);
+                    assert_eq!(stmt.sql(), sql);
+                };
+
+                db.execute_batch(
+                    "CREATE TABLE main.src_right(id INTEGER PRIMARY KEY,marker INTEGER);
+                     INSERT INTO main.src_right VALUES(2,106);",
+                ).unwrap();
+                read(&mut legacy, 1, 201, 0);
+                read(&mut modern, 1, 201, 0);
+
+                db.execute_batch("ALTER TABLE aux.src_right ADD COLUMN note TEXT").unwrap();
+                assert_eq!(legacy.step().unwrap_err().code, ErrorCode::Schema);
+                assert_eq!(legacy.reset().unwrap_err().code, ErrorCode::Schema);
+                read(&mut modern, 2, 106, 1);
+                legacy.finalize().unwrap();
+                modern.finalize().unwrap();
+                assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+            }
+        }
+    }
+}
