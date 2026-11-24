@@ -4172,6 +4172,8 @@ impl Vdbe {
                             if t.flags & (MEM_STR | MEM_BLOB) == 0 && t.flags & MEM_NULL == 0 {
                                 t.stringify(false);
                             }
+                            // sqlite3ValueText requests UTF-8 before reporting the error.
+                            t.change_encoding(sqliters_types::TextEncoding::Utf8 as u8);
                             String::from_utf8_lossy(&t.z).into_owned()
                         } else if op.p5 != 0 {
                             const AZ: [&str; 4] = ["NOT NULL", "UNIQUE", "CHECK", "FOREIGN KEY"];

@@ -24932,30 +24932,52 @@ fn find_referencing_fks(
 
 /// A parent TEXT key and numeric child use distinct lookup and action comparisons.
 pub(crate) fn parent_fk_counter_program_needed(stmt: Option<&Stmt>, db_set: &DatabaseSet) -> bool {
-    let (target, update) = match stmt {
+    let inserting = matches!(stmt, Some(Stmt::Insert(_)));
+    let target = match stmt {
         Some(Stmt::Update(update))
             if update.ctes.is_empty() && update.or_conflict.is_none()
                 && update.from.is_none() && update.indexed_by.is_none()
-                && update.returning.is_empty() => (&update.table, true),
+                && update.returning.is_empty() => &update.table,
         Some(Stmt::Delete(delete))
             if delete.ctes.is_empty() && delete.indexed_by.is_none()
-                && delete.returning.is_empty() => (&delete.table, false),
+                && delete.returning.is_empty() => &delete.table,
+        Some(Stmt::Insert(insert))
+            if insert.ctes.is_empty() && insert.or_conflict.is_none()
+                && insert.upsert_clauses.is_empty() && insert.returning.is_empty()
+                && matches!(insert.source, InsertSource::Values(_)) => &insert.table,
         _ => return false,
     };
-    let Some((DatabaseId::MAIN, parent)) = db_set.find_user_table_in_set(target) else {
+    let Some((DatabaseId::MAIN, table)) = db_set.find_user_table_in_set(target) else {
         return false;
     };
-    if !parent.foreign_keys.is_empty() {
-        return false;
-    }
     let main = db_set.main_slot();
+    let referenced = match table.foreign_keys.as_slice() {
+        [] => None,
+        [fk] if !inserting => {
+            let Some(parent) = main.schema.find_table(&fk.ref_table) else {
+                return false;
+            };
+            Some(parent)
+        }
+        _ => return false,
+    };
+    let child_write = referenced.is_some();
+    let parent = referenced.as_ref().unwrap_or(&table);
     let refs = find_referencing_fks(&main.schema, &parent.name);
     let [(child, fk)] = refs.as_slice() else {
         return false;
     };
-    let action = if update { fk.on_update } else { fk.on_delete };
-    if !matches!(action, FkAction::Cascade | FkAction::SetNull | FkAction::SetDefault)
-        || child.foreign_keys.len() != 1 || child.name.eq_ignore_ascii_case(&parent.name)
+    if !parent.foreign_keys.is_empty()
+        || child.foreign_keys.len() != 1
+        || child.name.eq_ignore_ascii_case(&parent.name)
+        || child_write && !child.name.eq_ignore_ascii_case(&table.name)
+    {
+        return false;
+    }
+    let counter_only = |action| matches!(action, FkAction::NoAction | FkAction::Restrict);
+    // A prepared repair can run after a later parent write records the debt.
+    if (child_write || inserting)
+        && (!counter_only(fk.on_delete) || !counter_only(fk.on_update))
     {
         return false;
     }
@@ -24967,9 +24989,10 @@ pub(crate) fn parent_fk_counter_program_needed(stmt: Option<&Stmt>, db_set: &Dat
     {
         return false;
     }
+    let columns = if child_write { &fk.from_cols } else { &parent_cols };
     if let Some(Stmt::Update(update)) = stmt
         && !update.assignments.iter().flat_map(|assign| &assign.columns).any(|name| {
-            parent_cols.iter().any(|&column| name.eq_ignore_ascii_case(&parent.columns[column].name))
+            columns.iter().any(|&column| name.eq_ignore_ascii_case(&table.columns[column].name))
         })
     {
         return false;

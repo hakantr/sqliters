@@ -1237,12 +1237,13 @@ fn parent_fk_counter_program(program: &Program, collations: &CollationRegistry) 
     if program.read_only || program.btree_mask != 1 || program.n_res_column != 0 {
         return false;
     }
-    let [action] = program.p_program.as_slice() else {
-        return false;
+    let action = match program.p_program.as_slice() {
+        [] => &[][..],
+        [action] if action.a_op.iter().any(|op| op.opcode == OP_Param) => &action.a_op[..],
+        _ => return false,
     };
     program.a_op.iter().any(|op| op.opcode == OP_FkCounter)
-        && action.a_op.iter().any(|op| op.opcode == OP_Param)
-        && program.a_op.iter().chain(&action.a_op).all(|op| {
+        && program.a_op.iter().chain(action).all(|op| {
             !matches!(op.opcode, OP_VBegin | OP_VUpdate | OP_VOpen | OP_VFilter | OP_VColumn
                 | OP_VNext | OP_RowCell | OP_Function | OP_PureFunc)
                 && !matches!(&op.p4, P4::CollSeq(coll) if collations.get_custom(&coll.name).is_some())

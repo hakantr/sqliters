@@ -5342,3 +5342,72 @@ fn group65_temp_ddl_expires_prepared_selects_at_their_next_execution() {
         assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
     }
 }
+
+#[test]
+fn group65_fk_numeric_child_counters_follow_prepared_parent_and_child_repairs() {
+    use sqliters::types::extended::{
+        SQLITE_CONSTRAINT_FOREIGNKEY, SQLITE_CONSTRAINT_TRIGGER,
+    };
+
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for layout in ["", "WITHOUT ROWID"] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}';
+                 PRAGMA foreign_keys=ON;
+                 CREATE TABLE parent(k TEXT PRIMARY KEY) {layout};
+                 CREATE TABLE child(k INTEGER REFERENCES parent(k)
+                     ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED);
+                 INSERT INTO parent VALUES('007'),('7'),('9');
+                 INSERT INTO child VALUES(7);",
+            ))
+            .unwrap();
+            let mut restore_parent = db.prepare("INSERT INTO parent VALUES('007')").unwrap();
+            let mut update_child = db.prepare("UPDATE child SET k=9").unwrap();
+
+            db.execute_batch("BEGIN; DELETE FROM parent WHERE k='007'").unwrap();
+            assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+            let error = db.execute("COMMIT").unwrap_err();
+            assert_eq!(error.extended_code, SQLITE_CONSTRAINT_FOREIGNKEY);
+            assert!(!db.is_autocommit());
+            assert!(matches!(restore_parent.step().unwrap(), StepResult::Done));
+            db.execute_batch("COMMIT").unwrap();
+            assert!(db.is_autocommit());
+
+            db.execute_batch("BEGIN; DELETE FROM parent WHERE k='7'").unwrap();
+            let error = db.execute("COMMIT").unwrap_err();
+            assert_eq!(error.extended_code, SQLITE_CONSTRAINT_FOREIGNKEY);
+            assert!(!db.is_autocommit());
+            assert!(matches!(update_child.step().unwrap(), StepResult::Done));
+            db.execute_batch("COMMIT").unwrap();
+            assert!(db.is_autocommit());
+            assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+            assert_eq!(
+                db.query("PRAGMA integrity_check", &[]).unwrap().rows[0].get_str(0),
+                Some("ok"),
+            );
+
+            db.execute_batch(&format!(
+                "CREATE TABLE restrictive_parent(k TEXT PRIMARY KEY) {layout};
+                 CREATE TABLE restrictive_child(k INTEGER REFERENCES restrictive_parent(k)
+                     ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED);
+                 INSERT INTO restrictive_parent VALUES('007'),('7');
+                 INSERT INTO restrictive_child VALUES(7);
+                 BEGIN;",
+            ))
+            .unwrap();
+            let mut operation = db
+                .prepare("UPDATE restrictive_parent SET k='8' WHERE k='007'")
+                .unwrap();
+            let step_error = operation.step().unwrap_err();
+            assert_eq!(step_error.extended_code, SQLITE_CONSTRAINT_TRIGGER);
+            assert_eq!(step_error.message, "FOREIGN KEY constraint failed");
+            let reset_error = operation.reset().unwrap_err();
+            assert_eq!(reset_error.extended_code, SQLITE_CONSTRAINT_TRIGGER);
+            assert_eq!(reset_error.message, "FOREIGN KEY constraint failed");
+            assert!(!db.is_autocommit());
+            db.execute_batch("COMMIT").unwrap();
+            assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+        }
+    }
+}
