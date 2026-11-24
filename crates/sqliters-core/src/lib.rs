@@ -5926,6 +5926,7 @@ struct PreparedReadSchema {
 enum PreparedReadSchemas {
     One(PreparedReadSchema),
     Two(PreparedReadSchema, PreparedReadSchema),
+    Three([PreparedReadSchema; 3]),
 }
 
 impl PreparedReadSchemas {
@@ -5933,6 +5934,7 @@ impl PreparedReadSchemas {
         match self {
             Self::One(schema) => schema.changed(db_set),
             Self::Two(left, right) => left.changed(db_set) || right.changed(db_set),
+            Self::Three(schemas) => schemas.into_iter().any(|schema| schema.changed(db_set)),
         }
     }
 
@@ -5972,20 +5974,15 @@ impl PreparedReadSchemas {
             if db.is_temp() || table.without_rowid {
                 return None;
             }
-            Some((PreparedReadSchema::snapshot(db_set, db)?, name.schema.is_none()))
+            PreparedReadSchema::snapshot(db_set, db)
         };
-        let (left, left_unqualified) = read_schema(&from.head)?;
-        let mut unqualified = usize::from(left_unqualified);
+        let left = read_schema(&from.head)?;
         let mut sources = [left; 3];
         for (source, join) in sources[1..].iter_mut().zip(&from.joins) {
-            let (schema, unqualified_source) = read_schema(&join.right)?;
-            *source = schema;
-            unqualified += usize::from(unqualified_source);
+            *source = read_schema(&join.right)?;
         }
         let mask = sources.iter().fold(0u32, |mask, schema| mask | (1 << schema.db_id.index()));
-        if (from.joins.len() == 2 && unqualified > 1) || mask.count_ones() > 2
-            || usage?.btree_mask != Some(mask)
-        {
+        if usage?.btree_mask != Some(mask) {
             return None;
         }
         // An interpreter join uses these same cursor roots when it starts the reads.
@@ -6010,7 +6007,11 @@ impl PreparedReadSchemas {
             }
         }
         let second = sources[1..].iter().copied().find(|schema| schema.db_id != left.db_id);
-        Some(second.map_or(Self::One(left), |schema| Self::Two(left, schema)))
+        Some(match second {
+            None => Self::One(left),
+            Some(_) if mask.count_ones() == 3 => Self::Three(sources),
+            Some(schema) => Self::Two(left, schema),
+        })
     }
 }
 

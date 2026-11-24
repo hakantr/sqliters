@@ -6622,3 +6622,69 @@ fn group65_fk_action_keeps_a_childs_separate_immediate_reference() {
         );
     }
 }
+
+#[test]
+fn group65_three_table_inner_join_preserves_three_schema_bindings() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}'; PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent);
+             INSERT INTO parent VALUES(1); INSERT INTO child VALUES(1,1);
+             ATTACH ':memory:' AS aux; ATTACH ':memory:' AS other; ATTACH ':memory:' AS third;
+             CREATE TABLE aux.src_left(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+             CREATE TABLE other.src_middle(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+             CREATE TABLE third.src_right(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+             INSERT INTO aux.src_left VALUES(1,1,201);
+             INSERT INTO other.src_middle VALUES(1,1,302);
+             INSERT INTO third.src_right VALUES(1,1,NULL);"
+        )).unwrap();
+        let qualified_sql = "SELECT l.marker,m.marker AS middle_marker,r.marker AS right_marker,length(?1)
+                             FROM aux.src_left AS l JOIN other.src_middle AS m ON l.p=m.id
+                             JOIN third.src_right AS r ON m.p=r.id";
+        let unqualified_sql = "SELECT l.marker,m.marker AS middle_marker,r.marker AS right_marker,length(?1)
+                               FROM src_left AS l JOIN src_middle AS m ON l.p=m.id
+                               JOIN src_right AS r ON m.p=r.id";
+        let mut legacy = db.prepare_v1(qualified_sql).unwrap();
+        let mut modern = db.prepare(unqualified_sql).unwrap();
+        for stmt in [&mut legacy, &mut modern] {
+            stmt.bind_text(1, "猫").unwrap();
+        }
+        let read = |stmt: &mut sqliters::Statement, markers: [i64; 2], reprepares, sql| {
+            let StepResult::Row(row) = stmt.step().unwrap() else {
+                panic!("expected an INNER JOIN row");
+            };
+            assert_eq!(row.values(), [
+                Value::Integer(markers[0]), Value::Integer(markers[1]), Value::Null, Value::Integer(1),
+            ]);
+            assert_eq!(stmt.step().unwrap(), StepResult::Done);
+            stmt.reset().unwrap();
+            assert_eq!(stmt.c_reprepare_status().0, reprepares);
+            assert_eq!(stmt.column_names(), ["marker", "middle_marker", "right_marker", "length(?1)"]);
+            assert_eq!(stmt.sql(), sql);
+        };
+
+        db.execute_batch(
+            "CREATE TABLE main.src_left(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+             CREATE TABLE main.src_middle(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+             INSERT INTO main.src_left VALUES(1,1,501);
+             INSERT INTO main.src_middle VALUES(1,1,502);"
+        ).unwrap();
+        read(&mut legacy, [201, 302], 0, qualified_sql);
+        read(&mut modern, [201, 302], 0, unqualified_sql);
+
+        db.execute_batch("ALTER TABLE third.src_right ADD COLUMN note TEXT").unwrap();
+        assert_eq!(legacy.step().unwrap_err().code, ErrorCode::Schema);
+        assert_eq!(legacy.reset().unwrap_err().code, ErrorCode::Schema);
+        legacy.finalize().unwrap();
+        read(&mut modern, [501, 502], 1, unqualified_sql);
+
+        db.execute_batch("CREATE TABLE aux.extra(id INTEGER PRIMARY KEY)").unwrap();
+        read(&mut modern, [501, 502], 1, unqualified_sql);
+        db.execute_batch("ALTER TABLE third.src_right ADD COLUMN active INTEGER").unwrap();
+        read(&mut modern, [501, 502], 2, unqualified_sql);
+        modern.finalize().unwrap();
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+    }
+}
