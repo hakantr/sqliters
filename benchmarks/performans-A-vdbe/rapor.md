@@ -2912,3 +2912,8 @@ Birleşik kaynakta her kipte 384 açık işlem, 384 autocommit ve 288 onarım C 
 ## V6b.521 — Uygulamanın kendi adıyla kaydettiği sıralamada gerçek işçi
 
 Her kipte 384/384 C satır, SORT, reset ve callback. İki PMA için 120/120, stock 576/576, önceki override 528/528 ve Rust fallible sözleşmesi 72/72 eş. [Bağımsız ölçüm](/github/sqliters/target/perf-work/named-collation-worker-v510-candidate/sonuc.md) OFF 1393/0/324, ON 1393/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,290 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_521.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.522 — Niteliksiz ama TEMP tablosuna çözülen hazır okumanın geçerliliği
+
+12 native ve 6 Tcl V1 hedef farkı kapandı. Geniş matris C çağrı sözleşmesinde 408/408 ve Tcl V1 yüzeyinde 204/204. 348 ham taban kontrolü, 264 TEMP ve 120/116 bağlama örneği korundu. [Bağımsız ölçüm](/github/sqliters/target/perf-work/unqualified-temp-reprepare-candidate/sonuc.md) OFF 1394/0/324, ON 1394/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,284 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_522.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)

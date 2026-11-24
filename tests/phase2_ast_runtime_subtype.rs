@@ -5557,3 +5557,52 @@ fn group64_named_worker_collation_replacement_keeps_fallible_contract() {
         assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
     }
 }
+
+#[test]
+fn group65_unqualified_temp_reads_ignore_lower_priority_schema_changes() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}'; PRAGMA foreign_keys=ON;
+             CREATE TABLE main.parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE main.sample(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent,marker INTEGER);
+             INSERT INTO main.parent VALUES(1); INSERT INTO main.sample VALUES(1,1,101);
+             ATTACH ':memory:' AS aux;
+             CREATE TABLE aux.sample(id INTEGER PRIMARY KEY,marker INTEGER);
+             INSERT INTO aux.sample VALUES(1,201);
+             CREATE TEMP TABLE sample(id INTEGER PRIMARY KEY,marker INTEGER);
+             INSERT INTO temp.sample VALUES(1,301);",
+        )).unwrap();
+        let sql = "SELECT marker,length(?1) FROM sample WHERE id=1";
+        let mut legacy = db.prepare_v1(sql).unwrap();
+        let mut modern = db.prepare(sql).unwrap();
+        for stmt in [&mut legacy, &mut modern] {
+            stmt.bind_text(1, "猫").unwrap();
+        }
+        let read = |stmt: &mut sqliters::Statement, reprepares| {
+            let StepResult::Row(row) = stmt.step().unwrap() else {
+                panic!("expected row from TEMP");
+            };
+            assert_eq!(row.values(), [Value::Integer(301), Value::Integer(1)]);
+            stmt.reset().unwrap();
+            assert_eq!(stmt.c_reprepare_status().0, reprepares);
+        };
+
+        for sql in ["CREATE TABLE aux.extra(id INTEGER PRIMARY KEY);", "ATTACH ':memory:' AS newer;"] {
+            db.execute_batch(sql).unwrap();
+            read(&mut legacy, 0);
+            read(&mut modern, 0);
+        }
+
+        db.execute_batch("DETACH newer;").unwrap();
+        assert_eq!(legacy.step().unwrap_err().code, ErrorCode::Schema);
+        assert_eq!(legacy.reset().unwrap_err().code, ErrorCode::Schema);
+        read(&mut modern, 1);
+        legacy.finalize().unwrap();
+
+        db.execute_batch("ALTER TABLE aux.sample ADD COLUMN note TEXT;").unwrap();
+        read(&mut modern, 2);
+        modern.finalize().unwrap();
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+    }
+}

@@ -5951,7 +5951,21 @@ impl PreparedReadSchema {
         if !from.joins.is_empty() {
             return None;
         }
-        let db_id = db_set.find_db_id(name.schema.as_deref()?)?;
+        let db_id = if let Some(schema) = &name.schema {
+            db_set.find_db_id(schema)?
+        } else {
+            // TEMP is searched first, so a lower-priority schema cannot shadow this table.
+            // A CTE can take precedence over a table of the same unqualified name.
+            if !select.ctes.is_empty() || !select.body.compounds.is_empty() {
+                return None;
+            }
+            let Some((DatabaseId::TEMP, db_set::RelationRef::Table(_))) =
+                db_set.find_relation_ref_in_set(name).ok()?
+            else {
+                return None;
+            };
+            DatabaseId::TEMP
+        };
         let db_mask = 1 << db_id.index();
         if usage?.btree_mask != Some(db_mask) {
             return None;
