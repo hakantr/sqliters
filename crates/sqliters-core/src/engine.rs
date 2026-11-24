@@ -25040,14 +25040,14 @@ pub(crate) fn parent_fk_counter_program_scope(
         return None;
     }
     let refs = find_referencing_fks(&main.schema, &parent.name);
-    let siblings = refs.len() > 1;
-    if siblings && (child_write || inserting) {
-        return None;
-    }
+    let siblings = !child_write && !inserting && refs.len() > 1;
 
     let mut action_count = 0;
     let mut needs_fk_counter = false;
     for (child, fk) in &refs {
+        if child_write && !child.name.eq_ignore_ascii_case(&table.name) {
+            continue;
+        }
         let (_, parent_cols) =
             resolve_fk_parent_cols(&main.schema, &main.name, &child.name, fk).ok()?;
         let columns = if child_write { &fk.from_cols } else { &parent_cols };
@@ -25060,7 +25060,6 @@ pub(crate) fn parent_fk_counter_program_scope(
         }
         if child.foreign_keys.len() != 1
             || child.name.eq_ignore_ascii_case(&parent.name)
-            || (child_write && !child.name.eq_ignore_ascii_case(&table.name))
             || !db_set.triggers_for_relation(DatabaseId::MAIN, &child.name).is_empty()
         {
             return None;
@@ -25068,15 +25067,16 @@ pub(crate) fn parent_fk_counter_program_scope(
         // A prepared repair can run after a later parent write records the debt.
         let counter_only = |action| matches!(action, FkAction::NoAction | FkAction::Restrict);
         if (child_write || inserting) && !counter_only(fk.on_delete) && !counter_only(fk.on_update) {
-            return None;
+            continue;
         }
         if siblings {
             let action = if update.is_some() { fk.on_update } else { fk.on_delete };
-            if !matches!(action, FkAction::Cascade | FkAction::SetNull | FkAction::SetDefault) {
-                return None;
+            match action {
+                FkAction::NoAction => {}
+                FkAction::Cascade | FkAction::SetNull | FkAction::SetDefault => action_count += 1,
+                FkAction::Restrict => return None,
             }
         }
-        action_count += 1;
         needs_fk_counter |= parent_cols.iter().zip(&fk.from_cols).any(|(&pi, &ci)| {
             parent.columns[pi].affinity == TypeAffinity::Text
                 && matches!(child.columns[ci].affinity, TypeAffinity::Integer | TypeAffinity::Numeric | TypeAffinity::Real)
