@@ -7547,3 +7547,78 @@ fn group64_binary_replacement_uses_the_text_slot_of_a_native_rowid_sort() {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+#[test]
+fn group65_five_table_left_join_preserves_unmatched_row_until_temp_shadow() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}'; PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent);
+             INSERT INTO parent VALUES(1); INSERT INTO child VALUES(1,1);
+             ATTACH ':memory:' AS aux; ATTACH ':memory:' AS other; ATTACH ':memory:' AS third;
+             ATTACH ':memory:' AS spare; ATTACH ':memory:' AS archive;"
+        )).unwrap();
+        for (schema, table, marker) in [
+            ("aux", "ta", 201), ("other", "tb", 302), ("third", "tc", 403),
+            ("spare", "td", 804), ("archive", "te", 905),
+        ] {
+            db.execute_batch(&format!(
+                "CREATE TABLE {schema}.{table}(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+                 INSERT INTO {schema}.{table} VALUES(1,1,{marker});"
+            )).unwrap();
+            if schema != "archive" {
+                db.execute_batch(&format!("INSERT INTO {schema}.{table} VALUES(2,2,{})", 1000 + marker)).unwrap();
+            }
+        }
+        let sql = "SELECT a.marker,b.marker AS second_marker,c.marker AS third_marker,
+                          d.marker AS fourth_marker,e.marker+length(?1) AS fifth_marker
+                   FROM aux.ta AS a JOIN other.tb AS b ON a.p=b.id JOIN third.tc AS c ON a.p=c.id
+                   JOIN spare.td AS d ON a.p=d.id LEFT JOIN te AS e ON a.p=e.id";
+        let mut legacy = db.prepare_v1(sql).unwrap();
+        let mut modern = db.prepare(sql).unwrap();
+        for stmt in [&mut legacy, &mut modern] {
+            stmt.bind_text(1, "猫").unwrap();
+        }
+        let read = |stmt: &mut sqliters::Statement, first, second, reprepares| {
+            let mut rows = Vec::new();
+            while let StepResult::Row(row) = stmt.step().unwrap() {
+                rows.push(row.values().to_vec());
+            }
+            rows.sort_by_key(|row| match row[0] {
+                Value::Integer(marker) => marker,
+                _ => panic!("expected an integer row marker"),
+            });
+            let mut expected = [[201, 302, 403, 804], [1201, 1302, 1403, 1804]]
+                .map(|values| values.into_iter().map(Value::Integer).collect::<Vec<_>>());
+            expected[0].push(Value::Integer(first));
+            expected[1].push(second);
+            assert_eq!(rows, expected);
+            stmt.reset().unwrap();
+            assert_eq!(stmt.c_reprepare_status().0, reprepares);
+            assert_eq!(stmt.column_names(), ["marker", "second_marker", "third_marker", "fourth_marker", "fifth_marker"]);
+            assert_eq!(stmt.sql(), sql);
+        };
+
+        db.execute_batch("CREATE TABLE main.extra(id INTEGER PRIMARY KEY)").unwrap();
+        read(&mut legacy, 906, Value::Null, 0);
+        read(&mut modern, 906, Value::Null, 0);
+
+        db.execute_batch(
+            "CREATE TEMP TABLE te(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+             INSERT INTO temp.te VALUES(1,1,605),(2,2,1605);"
+        ).unwrap();
+        assert_eq!(legacy.step().unwrap_err().code, ErrorCode::Schema);
+        assert_eq!(legacy.reset().unwrap_err().code, ErrorCode::Schema);
+        legacy.finalize().unwrap();
+        read(&mut modern, 606, Value::Integer(1606), 1);
+
+        db.execute_batch("CREATE TABLE archive.extra(id INTEGER PRIMARY KEY)").unwrap();
+        read(&mut modern, 606, Value::Integer(1606), 1);
+        db.execute_batch("ALTER TABLE spare.td ADD COLUMN note TEXT").unwrap();
+        read(&mut modern, 606, Value::Integer(1606), 2);
+        modern.finalize().unwrap();
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+    }
+}
