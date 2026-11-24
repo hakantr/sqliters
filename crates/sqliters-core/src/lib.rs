@@ -5954,6 +5954,7 @@ enum PreparedReadSchemas {
     Three([PreparedReadSchema; 3]),
     Four([PreparedReadSchema; 4]),
     Five([PreparedReadSchema; 5]),
+    Six([PreparedReadSchema; 6]),
 }
 
 impl PreparedReadSchemas {
@@ -5964,6 +5965,7 @@ impl PreparedReadSchemas {
             Self::Three(schemas) => schemas.into_iter().any(|schema| schema.changed(db_set)),
             Self::Four(schemas) => schemas.into_iter().any(|schema| schema.changed(db_set)),
             Self::Five(schemas) => schemas.into_iter().any(|schema| schema.changed(db_set)),
+            Self::Six(schemas) => schemas.into_iter().any(|schema| schema.changed(db_set)),
         }
     }
 
@@ -6017,16 +6019,12 @@ impl PreparedReadSchemas {
             *source = read_schema(&join.right)?;
         }
         let sources = &sources[..=from.joins.len()];
-        let mut distinct = [left; 5];
-        let max_schemas = if sources.len() == 6 { 3 } else { distinct.len() };
+        let mut distinct = [left; 6];
         let mut distinct_count = 0;
         let mut mask = 0u32;
         for schema in sources.iter().copied() {
             let bit = 1 << schema.db_id.index();
             if mask & bit == 0 {
-                if distinct_count == max_schemas {
-                    return None;
-                }
                 distinct[distinct_count] = schema;
                 distinct_count += 1;
                 mask |= bit;
@@ -6053,6 +6051,7 @@ impl PreparedReadSchemas {
             [a, b, c] => Self::Three([a, b, c]),
             [a, b, c, d] => Self::Four([a, b, c, d]),
             [a, b, c, d, e] => Self::Five([a, b, c, d, e]),
+            [a, b, c, d, e, f] => Self::Six([a, b, c, d, e, f]),
             _ => return None,
         };
         // Keep each independently resolved source when the interpreter resolves the AST again.

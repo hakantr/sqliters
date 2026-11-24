@@ -7890,3 +7890,69 @@ fn group64_scalar_comparison_uses_first_explicit_collation() {
         }
     }
 }
+
+#[test]
+fn group65_six_table_inner_join_tracks_all_six_distinct_schemas() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}'; PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent);
+             INSERT INTO parent VALUES(1); INSERT INTO child VALUES(1,1);
+             ATTACH ':memory:' AS aux; ATTACH ':memory:' AS other; ATTACH ':memory:' AS third;
+             ATTACH ':memory:' AS spare; ATTACH ':memory:' AS archive; ATTACH ':memory:' AS vault;"
+        )).unwrap();
+        for (schema, table, marker) in [
+            ("aux", "ta", 201), ("other", "tb", 302), ("third", "tc", 403),
+            ("spare", "td", 804), ("archive", "te", 905), ("vault", "tf", 1006),
+        ] {
+            db.execute_batch(&format!(
+                "CREATE TABLE {schema}.{table}(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+                 INSERT INTO {schema}.{table} VALUES(1,1,{marker});"
+            )).unwrap();
+        }
+        let sql = "SELECT a.marker,b.marker AS second_marker,c.marker AS third_marker,
+                          d.marker AS fourth_marker,e.marker AS fifth_marker,f.marker+length(?1) AS sixth_marker
+                   FROM aux.ta AS a JOIN other.tb AS b ON a.p=b.id JOIN third.tc AS c ON b.p=c.id
+                   JOIN spare.td AS d ON c.p=d.id JOIN archive.te AS e ON d.p=e.id JOIN tf AS f ON e.p=f.id";
+        let mut legacy = db.prepare_v1(sql).unwrap();
+        let mut modern = db.prepare(&sql).unwrap();
+        for stmt in [&mut legacy, &mut modern] {
+            stmt.bind_text(1, "猫").unwrap();
+        }
+        let read = |stmt: &mut sqliters::Statement, sixth, reprepares| {
+            let StepResult::Row(row) = stmt.step().unwrap() else {
+                panic!("expected an INNER JOIN row");
+            };
+            assert_eq!(row.values(), [201, 302, 403, 804, 905, sixth].map(Value::Integer));
+            assert_eq!(stmt.step().unwrap(), StepResult::Done);
+            stmt.reset().unwrap();
+            assert_eq!(stmt.c_reprepare_status().0, reprepares);
+            assert_eq!(stmt.column_names(), [
+                "marker", "second_marker", "third_marker", "fourth_marker", "fifth_marker", "sixth_marker",
+            ]);
+            assert_eq!(stmt.sql(), sql);
+        };
+
+        db.execute_batch(
+            "CREATE TABLE main.tf(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+             INSERT INTO main.tf VALUES(1,1,506);"
+        ).unwrap();
+        read(&mut legacy, 1007, 0);
+        read(&mut modern, 1007, 0);
+
+        db.execute_batch("ALTER TABLE vault.tf ADD COLUMN note TEXT").unwrap();
+        assert_eq!(legacy.step().unwrap_err().code, ErrorCode::Schema);
+        assert_eq!(legacy.reset().unwrap_err().code, ErrorCode::Schema);
+        legacy.finalize().unwrap();
+        read(&mut modern, 507, 1);
+
+        db.execute_batch("CREATE TABLE vault.extra(id INTEGER PRIMARY KEY)").unwrap();
+        read(&mut modern, 507, 1);
+        db.execute_batch("ALTER TABLE archive.te ADD COLUMN note TEXT").unwrap();
+        read(&mut modern, 507, 2);
+        modern.finalize().unwrap();
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+    }
+}

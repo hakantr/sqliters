@@ -3127,3 +3127,8 @@ Kip başına 28 önceki SORT farkı kapandı. 66 stok, 72 dinamik işçi geçiş
 ## V6b.564 — İç içe ifadelerde ilk açık COLLATE
 
 Üç kodlamadaki 84 C sonucu her kipte eş. Önceki 54 sütun/alias ve 48 unary artı kontrolü korundu. Özgün collate8 Tcl testinin 23 alt testi geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/collate8-first-explicit-v560.DTJ4V4Gx/sonuc.md) OFF 1438/0/319, ON 1438/0/319. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,315 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_564.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.565 — Altı kaynaklı INNER JOIN’de dört ila altı şema
+
+222 hedef fark kapandı ve 114 doğru kontrol korundu. 336/336 C yaşam döngüsü, 168/168 gerçek Tcl V1, 7.128 C yeniden açılışı ve önceki 1.356 ham kayıt eş. [Bağımsız ölçüm](/github/sqliters/target/perf-work/six-schema-inner-reprepare-candidate/sonuc.md) OFF 1439/0/319, ON 1439/0/319. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,310 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_565.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
