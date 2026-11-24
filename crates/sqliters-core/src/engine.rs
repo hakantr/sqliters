@@ -24930,76 +24930,95 @@ fn find_referencing_fks(
     out
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ParentFkProgramScope {
+    SingleRelation,
+    SiblingActions(usize),
+}
+
 /// A parent TEXT key and numeric child use distinct lookup and action comparisons.
-pub(crate) fn parent_fk_counter_program_needed(stmt: Option<&Stmt>, db_set: &DatabaseSet) -> bool {
+pub(crate) fn parent_fk_counter_program_scope(
+    stmt: Option<&Stmt>,
+    db_set: &DatabaseSet,
+) -> Option<ParentFkProgramScope> {
     let inserting = matches!(stmt, Some(Stmt::Insert(_)));
-    let target = match stmt {
+    let (target, update) = match stmt {
         Some(Stmt::Update(update))
             if update.ctes.is_empty() && update.or_conflict.is_none()
                 && update.from.is_none() && update.indexed_by.is_none()
-                && update.returning.is_empty() => &update.table,
+                && update.returning.is_empty() => (&update.table, Some(update)),
         Some(Stmt::Delete(delete))
             if delete.ctes.is_empty() && delete.indexed_by.is_none()
-                && delete.returning.is_empty() => &delete.table,
+                && delete.returning.is_empty() => (&delete.table, None),
         Some(Stmt::Insert(insert))
             if insert.ctes.is_empty() && insert.or_conflict.is_none()
                 && insert.upsert_clauses.is_empty() && insert.returning.is_empty()
-                && matches!(insert.source, InsertSource::Values(_)) => &insert.table,
-        _ => return false,
+                && matches!(insert.source, InsertSource::Values(_)) => (&insert.table, None),
+        _ => return None,
     };
-    let Some((DatabaseId::MAIN, table)) = db_set.find_user_table_in_set(target) else {
-        return false;
+    let (DatabaseId::MAIN, table) = db_set.find_user_table_in_set(target)? else {
+        return None;
     };
     let main = db_set.main_slot();
     let referenced = match table.foreign_keys.as_slice() {
         [] => None,
-        [fk] if !inserting => {
-            let Some(parent) = main.schema.find_table(&fk.ref_table) else {
-                return false;
-            };
-            Some(parent)
-        }
-        _ => return false,
+        [fk] if !inserting => Some(main.schema.find_table(&fk.ref_table)?),
+        _ => return None,
     };
     let child_write = referenced.is_some();
     let parent = referenced.as_ref().unwrap_or(&table);
-    let refs = find_referencing_fks(&main.schema, &parent.name);
-    let [(child, fk)] = refs.as_slice() else {
-        return false;
-    };
     if !parent.foreign_keys.is_empty()
-        || child.foreign_keys.len() != 1
-        || child.name.eq_ignore_ascii_case(&parent.name)
-        || child_write && !child.name.eq_ignore_ascii_case(&table.name)
+        || !db_set.triggers_for_relation(DatabaseId::MAIN, &parent.name).is_empty()
     {
-        return false;
+        return None;
     }
-    let counter_only = |action| matches!(action, FkAction::NoAction | FkAction::Restrict);
-    // A prepared repair can run after a later parent write records the debt.
-    if (child_write || inserting)
-        && (!counter_only(fk.on_delete) || !counter_only(fk.on_update))
-    {
-        return false;
+    let refs = find_referencing_fks(&main.schema, &parent.name);
+    let siblings = refs.len() > 1;
+    if siblings && (child_write || inserting) {
+        return None;
     }
-    let Ok((_, parent_cols)) = resolve_fk_parent_cols(&main.schema, &main.name, &child.name, fk) else {
-        return false;
-    };
-    if [&parent.name, &child.name].into_iter()
-        .any(|table| !db_set.triggers_for_relation(DatabaseId::MAIN, table).is_empty())
-    {
-        return false;
+
+    let mut action_count = 0;
+    let mut needs_fk_counter = false;
+    for (child, fk) in &refs {
+        let (_, parent_cols) =
+            resolve_fk_parent_cols(&main.schema, &main.name, &child.name, fk).ok()?;
+        let columns = if child_write { &fk.from_cols } else { &parent_cols };
+        if let Some(update) = update
+            && !update.assignments.iter().flat_map(|assign| &assign.columns).any(|name| {
+                columns.iter().any(|&column| name.eq_ignore_ascii_case(&table.columns[column].name))
+            })
+        {
+            continue;
+        }
+        if child.foreign_keys.len() != 1
+            || child.name.eq_ignore_ascii_case(&parent.name)
+            || (child_write && !child.name.eq_ignore_ascii_case(&table.name))
+            || !db_set.triggers_for_relation(DatabaseId::MAIN, &child.name).is_empty()
+        {
+            return None;
+        }
+        // A prepared repair can run after a later parent write records the debt.
+        let counter_only = |action| matches!(action, FkAction::NoAction | FkAction::Restrict);
+        if (child_write || inserting) && (!counter_only(fk.on_delete) || !counter_only(fk.on_update)) {
+            return None;
+        }
+        if siblings {
+            let action = if update.is_some() { fk.on_update } else { fk.on_delete };
+            if !matches!(action, FkAction::Cascade | FkAction::SetNull | FkAction::SetDefault) {
+                return None;
+            }
+        }
+        action_count += 1;
+        needs_fk_counter |= parent_cols.iter().zip(&fk.from_cols).any(|(&pi, &ci)| {
+            parent.columns[pi].affinity == TypeAffinity::Text
+                && matches!(child.columns[ci].affinity, TypeAffinity::Integer | TypeAffinity::Numeric | TypeAffinity::Real)
+        });
     }
-    let columns = if child_write { &fk.from_cols } else { &parent_cols };
-    if let Some(Stmt::Update(update)) = stmt
-        && !update.assignments.iter().flat_map(|assign| &assign.columns).any(|name| {
-            columns.iter().any(|&column| name.eq_ignore_ascii_case(&table.columns[column].name))
-        })
-    {
-        return false;
-    }
-    parent_cols.iter().zip(&fk.from_cols).any(|(&pi, &ci)| {
-        parent.columns[pi].affinity == TypeAffinity::Text
-            && matches!(child.columns[ci].affinity, TypeAffinity::Integer | TypeAffinity::Numeric | TypeAffinity::Real)
+    needs_fk_counter.then_some(if siblings {
+        ParentFkProgramScope::SiblingActions(action_count)
+    } else {
+        ParentFkProgramScope::SingleRelation
     })
 }
 

@@ -8608,7 +8608,8 @@ impl Statement {
     ) -> Result<Option<Arc<sqliters_vdbe::vdbeaux::Program>>> {
         let use_codegen_switch = vdbe_host::exec_switch_on();
         if (!use_codegen_switch && !vdbe_host::text_register_write(stmt)
-            && !(inner.foreign_keys && engine::parent_fk_counter_program_needed(stmt, &inner.db_set)))
+            && !(inner.foreign_keys
+                && engine::parent_fk_counter_program_scope(stmt, &inner.db_set).is_some()))
             || !matches!(
                 stmt,
                 Some(

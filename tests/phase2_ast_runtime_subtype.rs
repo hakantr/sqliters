@@ -5411,3 +5411,40 @@ fn group65_fk_numeric_child_counters_follow_prepared_parent_and_child_repairs() 
         }
     }
 }
+
+#[test]
+fn group65_fk_multiple_child_actions_preserve_sqlite_constraint_counter() {
+    use sqliters::types::extended::SQLITE_CONSTRAINT_FOREIGNKEY;
+
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}';
+             PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(k TEXT PRIMARY KEY) WITHOUT ROWID;
+             CREATE TABLE numeric_child(id INTEGER PRIMARY KEY,k INTEGER
+                 REFERENCES parent(k) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED);
+             CREATE TABLE text_child(id INTEGER PRIMARY KEY,k TEXT
+                 REFERENCES parent(k) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED);
+             INSERT INTO parent VALUES('007'),('7');
+             INSERT INTO numeric_child VALUES(1,7);
+             INSERT INTO text_child VALUES(1,'7');",
+        ))
+        .unwrap();
+        let value = |sql| db.query(sql, &[]).unwrap().rows[0].get(0).unwrap().clone();
+        let numeric = "SELECT k FROM numeric_child WHERE id=1";
+        let text = "SELECT k FROM text_child WHERE id=1";
+        db.execute_batch("BEGIN").unwrap();
+        db.execute("DELETE FROM parent WHERE k='007'").unwrap();
+        assert_eq!(value(numeric), Value::Null);
+        assert_eq!(value(text), Value::Text("7".into()));
+        let error = db.execute("COMMIT").unwrap_err();
+        assert_eq!(error.extended_code, SQLITE_CONSTRAINT_FOREIGNKEY);
+        assert!(!db.is_autocommit());
+        db.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(value(numeric), Value::Integer(7));
+        db.execute("DELETE FROM parent WHERE k='7'").unwrap();
+        assert_eq!(value(numeric), Value::Null);
+        assert_eq!(value(text), Value::Null);
+    }
+}
