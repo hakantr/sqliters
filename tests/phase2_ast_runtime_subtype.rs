@@ -7825,3 +7825,68 @@ fn group64_stock_binary_rowid_counts_only_executed_sort_ops() {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+#[test]
+fn group64_scalar_comparison_uses_first_explicit_collation() {
+    let cases = [
+        ("SELECT 'abc'=('ABC'||'' COLLATE NOCASE)", Some(1)),
+        ("SELECT 'abc'=('ABC'||upper('' COLLATE NOCASE))", Some(1)),
+        (
+            "SELECT 'abc'=('ABC'||max('' COLLATE NOCASE,'' COLLATE BINARY))",
+            Some(1),
+        ),
+        (
+            "SELECT 'abc'=('ABC'||max('' COLLATE BINARY,'' COLLATE NOCASE))",
+            Some(0),
+        ),
+        (
+            "SELECT ('ABC'||('' COLLATE NOCASE))='abc' COLLATE BINARY",
+            Some(1),
+        ),
+        (
+            "SELECT ('ABC'||('' COLLATE BINARY))='abc' COLLATE NOCASE",
+            Some(0),
+        ),
+        (
+            "SELECT 'abc'=('ABC'||CASE '' COLLATE BINARY WHEN '' THEN '' COLLATE NOCASE END)",
+            Some(0),
+        ),
+        (
+            "SELECT 'abc'=('ABC'||CASE '' COLLATE NOCASE WHEN '' THEN '' COLLATE BINARY END)",
+            Some(1),
+        ),
+        (
+            "SELECT 'abc'=('ABC'||CASE WHEN ('' COLLATE BINARY) IS NOT NULL              THEN '' COLLATE NOCASE END)",
+            Some(0),
+        ),
+        (
+            "SELECT 'abc'=('ABC'||CASE WHEN 0 THEN abs(-9223372036854775808) COLLATE NOCASE              ELSE '' COLLATE BINARY END)",
+            Some(1),
+        ),
+        (
+            "SELECT 'abc'=('ABC'||CASE WHEN 1 THEN '' COLLATE NOCASE              ELSE abs(-9223372036854775808) COLLATE BINARY END)",
+            Some(1),
+        ),
+        ("SELECT 'abc'=('ABC'||(NULL COLLATE NOCASE))", None),
+        ("SELECT x='abc' FROM t", Some(1)),
+        ("SELECT +x='abc' FROM t", Some(1)),
+        ("SELECT (x||'')='abc' FROM t", Some(0)),
+        ("SELECT ('abc'||('' COLLATE BINARY))=x FROM t", Some(0)),
+    ];
+
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}';
+             CREATE TABLE t(x TEXT COLLATE NOCASE);
+             INSERT INTO t VALUES ('ABC');"
+        ))
+        .unwrap();
+
+        for (sql, expected) in cases {
+            let result = db.query(sql, &[]).unwrap_or_else(|err| panic!("{encoding}: {sql}: {err}"));
+            assert_eq!(result.rows.len(), 1, "{encoding}: {sql}");
+            assert_eq!(result.rows[0].get_i64(0), expected, "{encoding}: {sql}");
+        }
+    }
+}

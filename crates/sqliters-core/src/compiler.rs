@@ -22,7 +22,7 @@ use sqliters_vdbe::{
 };
 
 use crate::db_set::{DatabaseSet, ResolvedRelation};
-use crate::engine::skip_unary_plus_for_collation;
+use crate::engine::{first_explicit_collate_in_expr, skip_unary_plus_for_collation};
 use crate::execution_context::{FunctionRegistry, step_clock_date_scalar};
 use crate::schema::{
     IndexSchema, IndexedColSchema, Schema, TableSchema, ViewSchema, fix_permanent_view_select,
@@ -5978,14 +5978,11 @@ fn emit_case_equality(
     let left_affinity = compiler_expr_affinity(left, table, alias);
     let right_affinity = compiler_expr_affinity(right, table, alias);
     let affinity = sqlite_compare_affinity(left_affinity, right_affinity);
-    let comparison = Instruction::new(Opcode::Eq, lhs, rhs, result)
-        .with_p5(u16::from(affinity_to_p5(affinity)));
-    let collation = if let Some(name) = resolve_custom_binary_collation(left, right, binding) {
-        P4::Str(name)
-    } else {
-        P4::Collation(resolve_binary_collation(left, right, binding))
-    };
-    prog.emit(comparison.with_p4(collation));
+    prog.emit(
+        Instruction::new(Opcode::Eq, lhs, rhs, result)
+            .with_p4(comparison_collation_p4(left, right, binding))
+            .with_p5(u16::from(affinity_to_p5(affinity))),
+    );
 }
 
 fn compile_expr(
@@ -6228,16 +6225,9 @@ fn compile_expr(
                 let comp_aff = sqlite_compare_affinity(l_aff, r_aff);
                 let left = skip_unary_plus_for_collation(left);
                 let right = skip_unary_plus_for_collation(right);
-                if let Some(custom_coll) = resolve_custom_binary_collation(left, right, binding) {
-                    ins = ins
-                        .with_p4(P4::Str(custom_coll))
-                        .with_p5(u16::from(affinity_to_p5(comp_aff)));
-                } else {
-                    let coll = resolve_binary_collation(left, right, binding);
-                    ins = ins
-                        .with_p4(P4::Collation(coll))
-                        .with_p5(u16::from(affinity_to_p5(comp_aff)));
-                }
+                ins = ins
+                    .with_p4(comparison_collation_p4(left, right, binding))
+                    .with_p5(u16::from(affinity_to_p5(comp_aff)));
             }
             prog.emit(ins);
         }
@@ -6564,17 +6554,10 @@ fn compile_expr(
                         let r1 = prog.alloc_register();
                         compile_expr(prog, &expr_list[1], binding, functions, r1)?;
                         let eq_r = prog.alloc_register();
-                        let mut ins = Instruction::new(Opcode::Eq, dest, r1, eq_r);
-                        if let Some(custom_coll) =
-                            resolve_custom_binary_collation(&expr_list[0], &expr_list[1], binding)
-                        {
-                            ins = ins.with_p4(P4::Str(custom_coll));
-                        } else {
-                            let coll =
-                                resolve_binary_collation(&expr_list[0], &expr_list[1], binding);
-                            ins = ins.with_p4(P4::Collation(coll));
-                        }
-                        prog.emit(ins);
+                        prog.emit(
+                            Instruction::new(Opcode::Eq, dest, r1, eq_r)
+                                .with_p4(comparison_collation_p4(&expr_list[0], &expr_list[1], binding)),
+                        );
                         let skip_null =
                             prog.emit(Instruction::new(Opcode::JumpIfFalse, eq_r, 0, 1));
                         prog.emit(Instruction::new(Opcode::Null, 0, dest, 0));
@@ -6667,6 +6650,24 @@ fn compile_expr(
         }
     }
     Ok(())
+}
+
+fn comparison_collation_p4(
+    left: &Expr,
+    right: &Expr,
+    binding: Option<&TableBinding<'_>>,
+) -> P4 {
+    if let Some(name) = first_explicit_collate_in_expr(left)
+        .or_else(|| first_explicit_collate_in_expr(right))
+    {
+        return Collation::from_name(name)
+            .map_or_else(|| P4::Str(name.to_owned()), P4::Collation);
+    }
+    if let Some(name) = resolve_custom_binary_collation(left, right, binding) {
+        P4::Str(name)
+    } else {
+        P4::Collation(resolve_binary_collation(left, right, binding))
+    }
 }
 
 fn resolve_custom_binary_collation(

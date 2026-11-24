@@ -17239,7 +17239,7 @@ fn build_groups(
     Ok(groups)
 }
 
-fn first_explicit_collate_in_expr(expr: &Expr) -> Option<&str> {
+pub(crate) fn first_explicit_collate_in_expr(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Collate { collation, .. } => Some(collation.as_str()),
         Expr::Unary { expr: inner, .. }
@@ -17274,17 +17274,16 @@ fn first_explicit_collate_in_expr(expr: &Expr) -> Option<&str> {
             operand,
             branches,
             else_expr,
-        } => branches
-            .iter()
-            .find_map(|(w, t)| {
-                first_explicit_collate_in_expr(w).or_else(|| first_explicit_collate_in_expr(t))
-            })
+        } => operand
+            .as_deref()
+            .and_then(first_explicit_collate_in_expr)
             .or_else(|| {
-                else_expr
-                    .as_deref()
-                    .and_then(first_explicit_collate_in_expr)
+                branches.iter().find_map(|(when, then)| {
+                    first_explicit_collate_in_expr(when)
+                        .or_else(|| first_explicit_collate_in_expr(then))
+                })
             })
-            .or_else(|| operand.as_deref().and_then(first_explicit_collate_in_expr)),
+            .or_else(|| else_expr.as_deref().and_then(first_explicit_collate_in_expr)),
         Expr::RowValue(elems) => elems.iter().find_map(first_explicit_collate_in_expr),
         _ => None,
     }
@@ -21285,9 +21284,6 @@ fn resolve_custom_binary_collation_name<'a>(
     right: &'a Expr,
     scopes: &'a [EvalRow],
 ) -> Option<&'a str> {
-    if let Some(collation) = explicit_comparison_collation(left, right) {
-        return Collation::from_name(collation).is_none().then_some(collation);
-    }
     for e in [left, right] {
         if let Expr::Column(cref) = e {
             for s in scopes.iter().rev() {
@@ -21317,13 +21313,19 @@ fn eval_scalar_comparison_in_scopes(
     scopes: &[EvalRow],
 ) -> Result<Value> {
     let enc = ctx.encoding();
-    let explicit_override = if ctx.stmt_tx.explicit_collation_override {
-        explicit_comparison_collation(left_expr, right_expr)
-            .filter(|name| registered_builtin_name_collation(name, ctx.collations))
-    } else {
-        None
+    // The first explicit COLLATE in either operand takes precedence over column
+    // defaults. Inspect the expression tree without evaluating unused CASE branches.
+    let explicit = first_explicit_collate_in_expr(left_expr)
+        .or_else(|| first_explicit_collate_in_expr(right_expr));
+    let explicit_builtin = explicit.and_then(Collation::from_name);
+    let custom = match explicit {
+        Some(name) => (explicit_builtin.is_none()
+            || (ctx.stmt_tx.explicit_collation_override
+                && registered_builtin_name_collation(name, ctx.collations)))
+        .then_some(name),
+        None => resolve_custom_binary_collation_name(left_expr, right_expr, scopes),
     };
-    if let Some(cname) = explicit_override.or_else(|| resolve_custom_binary_collation_name(left_expr, right_expr, scopes)) {
+    if let Some(cname) = custom {
         let mut svc = ExecutionContext {
             interrupt_flag: ctx.interrupt_flag,
             runtime: ctx.runtime,
@@ -21335,7 +21337,8 @@ fn eval_scalar_comparison_in_scopes(
         };
         eval_comparison_with_services(vdbe_op, left_val, right_val, comp_aff, cname, enc, &mut svc)
     } else {
-        let coll = infer_comparison_collation(left_expr, right_expr, scopes);
+        let coll = explicit_builtin
+            .unwrap_or_else(|| infer_comparison_collation(left_expr, right_expr, scopes));
         Ok(eval_comparison_with_affinity(
             vdbe_op, left_val, right_val, comp_aff, coll, enc,
         ))
@@ -21343,12 +21346,6 @@ fn eval_scalar_comparison_in_scopes(
 }
 
 fn infer_comparison_collation(left: &Expr, right: &Expr, scopes: &[EvalRow]) -> Collation {
-    if let Expr::Collate { collation, .. } = left {
-        return Collation::from_name(collation).unwrap_or_default();
-    }
-    if let Expr::Collate { collation, .. } = right {
-        return Collation::from_name(collation).unwrap_or_default();
-    }
     for e in [left, right] {
         if let Expr::Column(cref) = e {
             for s in scopes.iter().rev() {
