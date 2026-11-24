@@ -6381,3 +6381,57 @@ fn group65_right_full_join_keep_outer_sources_until_reprepare() {
         }
     }
 }
+
+#[test]
+fn group65_fk_sibling_restrict_uses_defer_foreign_keys_at_prepare() {
+    use sqliters::types::extended::{SQLITE_CONSTRAINT_FOREIGNKEY, SQLITE_CONSTRAINT_TRIGGER};
+
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for defer in [false, true] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}';
+                 PRAGMA foreign_keys=ON;
+                 CREATE TABLE parent(k TEXT PRIMARY KEY) WITHOUT ROWID;
+                 CREATE TABLE numeric_child(id INTEGER PRIMARY KEY,k INTEGER
+                     REFERENCES parent(k) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED);
+                 CREATE TABLE text_child(id INTEGER PRIMARY KEY,k TEXT
+                     REFERENCES parent(k) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED);
+                 INSERT INTO parent VALUES('007'),('7');
+                 INSERT INTO numeric_child VALUES(1,7);
+                 INSERT INTO text_child VALUES(2,'007');",
+            ))
+            .unwrap();
+            db.execute_batch("BEGIN").unwrap();
+            let delete = "DELETE FROM parent WHERE k='007'";
+            if defer {
+                db.execute_batch("PRAGMA defer_foreign_keys=ON").unwrap();
+                db.execute(delete).unwrap();
+                assert_eq!(
+                    db.execute("COMMIT").unwrap_err().extended_code,
+                    SQLITE_CONSTRAINT_FOREIGNKEY
+                );
+                db.execute("INSERT INTO parent VALUES('007')").unwrap();
+            } else {
+                assert_eq!(
+                    db.execute(delete).unwrap_err().extended_code,
+                    SQLITE_CONSTRAINT_TRIGGER
+                );
+            }
+            db.execute("COMMIT").unwrap();
+            assert_eq!(
+                db.query("SELECT count(*) FROM text_child", &[])
+                    .unwrap()
+                    .rows[0]
+                    .get_i64(0),
+                Some(i64::from(!defer))
+            );
+            assert!(
+                db.query("PRAGMA foreign_key_check", &[])
+                    .unwrap()
+                    .rows
+                    .is_empty()
+            );
+        }
+    }
+}

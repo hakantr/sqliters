@@ -25091,7 +25091,10 @@ pub(crate) fn parent_fk_counter_program_scope(
             match action {
                 FkAction::NoAction => {}
                 FkAction::Cascade | FkAction::SetNull | FkAction::SetDefault => action_count += 1,
-                FkAction::Restrict => return None,
+                FkAction::Restrict => {
+                    // SQLite omits the RESTRICT subprogram while deferring all FK checks.
+                    action_count += usize::from(!db_set.c_defer_foreign_keys());
+                }
             }
         }
         needs_fk_counter |= parent_cols.iter().zip(&fk.from_cols).any(|(&pi, &ci)| {
