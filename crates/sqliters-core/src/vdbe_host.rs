@@ -17,7 +17,7 @@ use sqliters_codegen::PrepareResult;
 use sqliters_codegen::sqliteint::PartialIndexBinding;
 use sqliters_pager::{JournalMode, LockingMode, PagerOpenOptions, TransactionState};
 use sqliters_types::DatabaseKind;
-use sqliters_syntax::Stmt;
+use sqliters_syntax::{SelectStmt, Stmt};
 use sqliters_types::{
     AggregateStepId, Collation, DatabaseId, ErrorCode, ExecutionServices, Result, RuntimeValue, SqliteError, TextEncoding, Value,
 };
@@ -152,6 +152,9 @@ pub(crate) fn custom_sort_policy_matches(
         let P4::KeyInfo(key) = &op.p4 else { return false };
         let collation = key.a_coll.first().and_then(Option::as_deref).map(|coll| coll.name.as_str());
         let has_named_pair = has_two_named_sort_collations(op);
+        if has_named_pair && !program.worker_file_sort {
+            return matches!(stmt, Some(Stmt::Select(select)) if serial_nocase_sort_order(inner, select).is_some());
+        }
         (!has_named_pair && file_sort_policy(inner, collation))
             || (op.p3 == 0
                 && (has_named_pair || collation.is_some_and(|name| {
@@ -171,6 +174,18 @@ fn file_sort_policy(inner: &ConnectionInner, collation: Option<&str>) -> bool {
                 collation.and_then(Collation::from_name), Some(Collation::NoCase | Collation::RTrim)),
             TempStoreMode::Memory => false,
         }
+}
+
+fn serial_nocase_sort_order<'a>(
+    inner: &'a ConnectionInner, select: &'a SelectStmt,
+) -> Option<(ApplicationSortCollations<'a>, &'a TableSchema, bool)> {
+    if inner.authorizer.is_some()
+        || (inner.db_set.worker_threads_limit > 0 && !inner.db_set.temp_store().is_memory()
+            && inner.collations.has_infallible_registration("NOCASE"))
+    {
+        return None;
+    }
+    crate::engine::registered_file_order_collation(select, &inner.db_set, &inner.collations, false)
 }
 
 pub(crate) fn registered_worker_file_sort(
@@ -267,16 +282,18 @@ fn file_sort_read_program(
     let Some(Stmt::Select(select)) = stmt else { return None };
     let (names, root, without_rowid, total) = if with_workers {
         let (names, table, total) =
-            crate::engine::worker_file_order_collation(select, &inner.db_set, &inner.collations)?;
+            crate::engine::registered_file_order_collation(select, &inner.db_set, &inner.collations, true)?;
+        (names, table.root_pgno, table.without_rowid, total)
+    } else if let Some((names, table, total)) = serial_nocase_sort_order(inner, select) {
         (names, table.root_pgno, table.without_rowid, total)
     } else {
         let (name, root) =
             crate::engine::custom_file_order_collation(select, &inner.db_set, &inner.collations)?;
+        if !file_sort_policy(inner, Some(name)) {
+            return None;
+        }
         (ApplicationSortCollations { first: name, second: None, stock: None }, root, false, false)
     };
-    if !with_workers && !file_sort_policy(inner, Some(names.first)) {
-        return None;
-    }
     let PrepareResult::Program(mut program) = crate::cgen::c_prepare(inner, sql).0 else {
         return None;
     };
@@ -320,7 +337,7 @@ fn file_sort_read_program(
     }) {
         return None;
     }
-    if with_workers {
+    if with_workers || names.second.is_some() {
         if !matches!(&sort.p4, P4::KeyInfo(key)
             if usize::from(key.n_key_field) == select.order_by.len())
         {

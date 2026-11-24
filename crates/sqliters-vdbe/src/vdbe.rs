@@ -3631,6 +3631,18 @@ impl Vdbe {
                     let mut a_coll = Vec::with_capacity(k.a_coll.len());
                     for (field, c) in k.a_coll.iter().enumerate() {
                         a_coll.push(match c {
+                            Some(c) if has_named && c.name.eq_ignore_ascii_case("NOCASE") => {
+                                let (_, error, workers) = sort.expect("checked sort address");
+                                let registered = if workers {
+                                    host.find_worker_sort_collation(&c.name)
+                                } else {
+                                    host.find_collation(&c.name)
+                                };
+                                Some(match registered {
+                                    Some(collation) => Arc::new(fallible_sort_collation(Arc::new(collation), error)?),
+                                    None => find(c, host)?,
+                                })
+                            }
                             Some(c) if sort.is_some()
                                 && if has_named { sqliters_types::Collation::from_name(&c.name).is_none() } else { field == 0 } => {
                                 let (_, error, workers) = sort.expect("checked sort address");

@@ -6759,9 +6759,9 @@ fn group64_mixed_sort_keeps_stock_and_named_comparators_in_their_slots() {
         assert!(matches!(held.step().unwrap(), StepResult::Row(_)));
         held.reset().unwrap();
         let workers_before_replacement = calls();
-        db.register_collation("NOCASE", move |left, right| {
+        db.register_fallible_collation("NOCASE", move |left, right| {
             assert_eq!(std::thread::current().id(), caller);
-            right.cmp(left)
+            Ok(right.cmp(left))
         }).unwrap();
         assert!(matches!(held.step().unwrap(), StepResult::Row(_)));
         held.reset().unwrap();
@@ -6957,5 +6957,68 @@ fn group65_four_table_inner_join_tracks_the_fourth_table_schema() {
         read(&mut modern, 505, 2);
         modern.finalize().unwrap();
         assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+    }
+}
+
+#[test]
+fn group64_nocase_replacement_preserves_legacy_expiry_and_clears_sort_error() {
+    use sqliters_vdbe::vdbe::SQLITE_STMTSTATUS_SORT;
+
+    for (encoding, width) in [("UTF-8", 1550), ("UTF-16le", 775), ("UTF-16be", 775)] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}'; PRAGMA cache_size=1;
+             PRAGMA temp_store=FILE; PRAGMA threads=2;
+             CREATE TABLE items(v TEXT,w TEXT,s TEXT,id INTEGER,bucket INTEGER,
+                                PRIMARY KEY(bucket DESC,id)) WITHOUT ROWID;
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<52)
+             INSERT INTO items SELECT
+                printf('%02d',x%4)||substr(hex(zeroblob(900)),1,{width}-2),
+                printf('%02d',(x/4)%3)||substr(hex(zeroblob(900)),1,{width}-2),
+                printf('%02d',x%5),x,x%5 FROM n;"
+        )).unwrap();
+        db.register_collation("app_first", |left, right| right.cmp(left)).unwrap();
+        db.register_collation("app_second", |left, right| left.cmp(right)).unwrap();
+        let sql = "SELECT id FROM items ORDER BY s COLLATE NOCASE NULLS LAST,
+                   v COLLATE APP_FIRST NULLS LAST,w COLLATE APP_SECOND DESC NULLS FIRST,bucket DESC,id DESC";
+        let mut legacy = db.prepare_v1(sql).unwrap();
+        let mut statement = db.prepare(sql).unwrap();
+        let original_thread = std::thread::current().id();
+        let worker_calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&worker_calls);
+        db.register_collation("NOCASE", move |left, right| {
+            if std::thread::current().id() != original_thread {
+                observed.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            right.cmp(left)
+        }).unwrap();
+
+        let step = legacy.step().unwrap_err();
+        assert_eq!((step.extended_code, step.message.as_str()), (1, "not an error"));
+        let reset = legacy.reset().unwrap_err();
+        assert_eq!((reset.extended_code, reset.message.as_str()), (17, "not an error"));
+        legacy.finalize().unwrap();
+        let expected = (1..=52).max_by_key(|&id| (id % 5, id % 4, (id / 4) % 3, id)).unwrap();
+        let StepResult::Row(first) = statement.step().unwrap() else { panic!("missing NOCASE row"); };
+        assert_eq!(first.get_i64(0), Some(expected));
+        assert_eq!(statement.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), 1);
+        statement.reset().unwrap();
+        let worker_calls_before_error = worker_calls.load(AtomicOrdering::Relaxed);
+        assert!(worker_calls_before_error > 0);
+
+        let failure = SqliteError::new(ErrorCode::Error, "ordinary NOCASE comparator error");
+        let returned = failure.clone();
+        let seen = AtomicUsize::new(0);
+        db.register_fallible_collation("nocase", move |left, right| {
+            assert_eq!(std::thread::current().id(), original_thread);
+            if seen.fetch_add(1, AtomicOrdering::Relaxed) == 1 { Err(returned.clone()) }
+            else { Ok(right.cmp(left)) }
+        }).unwrap();
+        assert_eq!(statement.step().unwrap_err(), failure);
+        assert_eq!(statement.reset().unwrap_err(), failure);
+        let StepResult::Row(retried) = statement.step().unwrap() else { panic!("missing row after reset"); };
+        assert_eq!(retried.get_i64(0), Some(expected));
+        statement.reset().unwrap();
+        assert_eq!(worker_calls.load(AtomicOrdering::Relaxed), worker_calls_before_error);
     }
 }

@@ -7656,7 +7656,7 @@ pub(crate) fn custom_limit_order_collation<'a>(
     }
     let admitted = if expanded {
         let max_fields = (if table.without_rowid { 4 } else { 3 }) + names.count() - 1;
-        named_integer_order_scan(names, table, selection.as_ref(), collations)
+        named_integer_order_scan(names, table, selection.as_ref(), collations, false)
             && projection.len() + select.order_by.len() <= max_fields
             && table.columns.iter().all(|column| column.default_expr.is_none())
     } else {
@@ -7705,18 +7705,23 @@ fn order_integer_filter(selection: &Expr, table: &TableSchema) -> bool {
 
 fn named_integer_order_scan(
     names: ApplicationSortCollations<'_>, table: &TableSchema, filter: Option<&Expr>, collations: &CollationRegistry,
+    with_workers: bool,
 ) -> bool {
     let registered = |name| Collation::from_name(name).is_none() && collations.has_infallible_registration(name);
     collations.get_custom("BINARY").is_none() && registered(names.first)
         && names.second.is_none_or(|name| filter.is_none() && registered(name))
-        && names.stock.is_none_or(|(_, name)| collations.get_custom(name).is_none())
+        && names.stock.is_none_or(|(_, name)| {
+            collations.get_custom(name).is_none() || (name.eq_ignore_ascii_case("NOCASE")
+                && (!with_workers || collations.has_infallible_registration(name)))
+        })
         && filter.is_none_or(|filter| order_integer_filter(filter, table))
 }
 
-pub(crate) fn worker_file_order_collation<'a>(
+pub(crate) fn registered_file_order_collation<'a>(
     select: &'a SelectStmt,
     db_set: &'a DatabaseSet,
     collations: &CollationRegistry,
+    with_workers: bool,
 ) -> Option<(ApplicationSortCollations<'a>, &'a TableSchema, bool)> {
     if select.limit.is_some() || !select.ctes.is_empty() || !select.body.compounds.is_empty() {
         return None;
@@ -7725,8 +7730,12 @@ pub(crate) fn worker_file_order_collation<'a>(
     let fields = projection.len() + select.order_by.len();
     let (names, table, total) = main_table_order_collation(db_set, &select.body.head, &select.order_by, true)?;
     let max_fields = (if table.without_rowid { 4 } else { 3 }) + names.count() - 1;
-    let registered = if table.without_rowid || selection.is_some() || names.second.is_some() {
-        named_integer_order_scan(names, table, selection.as_ref(), collations)
+    let registered = if !with_workers {
+        names.stock.is_some_and(|(_, name)| name.eq_ignore_ascii_case("NOCASE")
+            && collations.get_custom(name).is_some())
+            && named_integer_order_scan(names, table, selection.as_ref(), collations, false)
+    } else if table.without_rowid || selection.is_some() || names.second.is_some() {
+        named_integer_order_scan(names, table, selection.as_ref(), collations, true)
     } else {
         registered_worker_order_collation(names.first, collations)
     };
@@ -7746,7 +7755,7 @@ pub(crate) fn registered_worker_file_sort(
         return false;
     }
     let Some(Stmt::Select(select)) = stmt else { return false; };
-    if worker_file_order_collation(select, db_set, collations).is_none() {
+    if registered_file_order_collation(select, db_set, collations, true).is_none() {
         return false;
     }
     if !require_snapshot {
