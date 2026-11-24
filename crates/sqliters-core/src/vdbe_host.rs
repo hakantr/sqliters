@@ -142,7 +142,7 @@ pub(crate) fn custom_sort_policy_matches(
         };
         file_sort_policy(inner, collation)
             || (op.p3 == 0
-                && matches!(collation.and_then(Collation::from_name), Some(Collation::NoCase | Collation::RTrim))
+                && collation.is_some_and(|name| crate::engine::registered_worker_order_collation(name, &inner.collations))
                 && registered_worker_file_sort(inner, stmt, require_snapshot))
     } else {
         true
@@ -290,11 +290,18 @@ fn file_sort_read_program(
         {
             return None;
         }
-        if select.order_by.len() == 2 && !sqliters_vdbe::vdbe::is_worker_sort_with_collations(
-            &program, inner.effective_encoding(), |_, _| false,
-            |collation| collation.eq_ignore_ascii_case(name),
-        ) {
-            return None;
+        if select.order_by.len() == 2 {
+            let encoding = inner.effective_encoding();
+            let eligible = if Collation::from_name(name).is_none() {
+                sqliters_vdbe::vdbe::is_worker_sort_with_named_collation(&program, open, encoding, name)
+            } else {
+                sqliters_vdbe::vdbe::is_worker_sort_with_collations(
+                    &program, encoding, |_, _| false, |collation| collation.eq_ignore_ascii_case(name),
+                )
+            };
+            if !eligible {
+                return None;
+            }
         }
     }
     program.worker_file_sort = with_workers;

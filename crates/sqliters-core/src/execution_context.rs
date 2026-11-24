@@ -750,10 +750,16 @@ pub type CollationCallback = Arc<dyn Fn(&str, &str) -> Ordering + Send + Sync>;
 /// Thread-safe callback type for fallible registered custom collations.
 pub type FallibleCollationCallback = Arc<dyn Fn(&str, &str) -> Result<Ordering> + Send + Sync>;
 
+#[derive(Clone)]
+struct CollationRegistration {
+    collation: CustomCollation,
+    infallible: bool,
+}
+
 /// Connection-level registry for built-in and custom collation sequences.
 #[derive(Clone)]
 pub struct CollationRegistry {
-    custom: BTreeMap<String, CustomCollation>,
+    custom: BTreeMap<String, CollationRegistration>,
     /// findCollSeqEntry never removes a hash entry when xCmp becomes NULL.
     c_entries: Vec<String>,
     /// UTF-8 builtin xCmp slots cleared through this registry's remove API.
@@ -800,7 +806,7 @@ impl CollationRegistry {
     {
         let name_str = name.into();
         let label = format!("collation {name_str}");
-        self.register_fallible_collation(name_str, move |a, b| {
+        self.register_comparator(name_str, true, move |a, b| {
             catch_infallible_callback_panic(&label, || callback(a, b))
         });
     }
@@ -811,14 +817,21 @@ impl CollationRegistry {
     where
         F: Fn(&str, &str) -> Result<Ordering> + Send + Sync + 'static,
     {
-        let name_str = self.note_entry(&name.into());
+        self.register_comparator(name.into(), false, callback);
+    }
+
+    fn register_comparator<F>(&mut self, name: String, infallible: bool, callback: F)
+    where
+        F: Fn(&str, &str) -> Result<Ordering> + Send + Sync + 'static,
+    {
+        let name_str = self.note_entry(&name);
         let key = name_str.to_ascii_uppercase();
         self.removed_builtin_comparators.remove(&key);
         let label = format!("collation {name_str}");
-        let cc = CustomCollation::new(name_str, move |a, b| {
+        let collation = CustomCollation::new(name_str, move |a, b| {
             catch_callback_panic(&label, || callback(a, b))
         });
-        self.custom.insert(key, cc);
+        self.custom.insert(key, CollationRegistration { collation, infallible });
     }
 
     /// Removes a custom collation by name, returning `true` if it was present.
@@ -836,16 +849,20 @@ impl CollationRegistry {
             || (Collation::from_name(name).is_some() && !self.removed_builtin_comparators.contains(&key))
     }
 
+    pub(crate) fn has_infallible_registration(&self, name: &str) -> bool {
+        self.custom.get(&name.to_ascii_uppercase()).is_some_and(|entry| entry.infallible)
+    }
+
     /// Looks up a registered custom collation descriptor by name (ASCII case-insensitive).
     #[inline]
     pub fn get_custom(&self, name: &str) -> Option<CustomCollation> {
-        self.custom.get(&name.to_ascii_uppercase()).cloned()
+        self.custom.get(&name.to_ascii_uppercase()).map(|entry| entry.collation.clone())
     }
 
     /// The name under which the application-defined collating sequence `name` was registered
     /// (the lookup ignores ASCII case); `None` for built-in or unknown collations.
     pub fn registered_name(&self, name: &str) -> Option<String> {
-        self.custom.get(&name.to_ascii_uppercase()).map(|c| c.name.to_string())
+        self.custom.get(&name.to_ascii_uppercase()).map(|entry| entry.collation.name.to_string())
     }
 
     /// Returns `true` if `name` resolves to either a registered custom collation or a built-in
@@ -927,7 +944,7 @@ impl CollationRegistry {
         right: &str,
         encoding: TextEncoding,
     ) -> Result<Ordering> {
-        if let Some(cc) = self.custom.get(&name.to_ascii_uppercase()).cloned() {
+        if let Some(cc) = self.get_custom(name) {
             return (cc.comparator)(left, right);
         }
         let Some(coll) = Collation::from_name(name) else {

@@ -7584,6 +7584,11 @@ pub(crate) fn custom_file_order_collation<'a>(
         .filter(|(name, _)| registered_order_collation(name, collations))
 }
 
+pub(crate) fn registered_worker_order_collation(name: &str, collations: &CollationRegistry) -> bool {
+    registered_builtin_name_collation(name, collations)
+        || (Collation::from_name(name).is_none() && collations.has_infallible_registration(name))
+}
+
 /// A direct registered FILE sort can defer its route until MAIN is pinned.
 pub(crate) fn registered_worker_file_sort(
     stmt: Option<&Stmt>, db_set: &DatabaseSet, collations: &CollationRegistry,
@@ -7596,7 +7601,7 @@ pub(crate) fn registered_worker_file_sort(
     }
     let Some(Stmt::Select(select)) = stmt else { return false; };
     let Some((name, _)) = custom_file_order_collation(select, db_set, collations) else { return false; };
-    if !registered_builtin_name_collation(name, collations) {
+    if !registered_worker_order_collation(name, collations) {
         return false;
     }
     let SelectCore::Select { projection, from: Some(from), .. } = &select.body.head else { return false; };

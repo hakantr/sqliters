@@ -1618,6 +1618,13 @@ fn builtin_order_key(key: &KeyInfo) -> bool {
     ordinary_order_key(key, |_, coll| builtin_read_key_collation(coll, key.enc))
 }
 
+fn application_order_key(key: &KeyInfo, name: &str) -> bool {
+    ordinary_order_key(key, |index, coll| {
+        let name = if index == 0 { name } else { "BINARY" };
+        matches_application_order_collation(coll, name, key.enc)
+    })
+}
+
 fn ordinary_order_key(key: &KeyInfo, collation: impl Fn(usize, &CollSeq) -> bool) -> bool {
     let width = usize::from(key.n_key_field);
     let fields = usize::from(key.n_all_field);
@@ -1665,30 +1672,35 @@ fn complete_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
     })
 }
 
-/// One main table scan with a total order and infallible stock comparators.
+/// One main table scan with a validated total order.
 fn worker_order_sorter(
     prog: &Program,
     open: &VdbeOp,
     key: &KeyInfo,
     encoding: u8,
+    application_name: Option<&str>,
     has_table_key: impl FnOnce(&VdbeOp, &[VdbeOp]) -> bool,
-    has_stock_collation: impl FnOnce(&str) -> bool,
+    has_collation: impl FnOnce(&str) -> bool,
 ) -> bool {
+    let valid_order = application_name.map_or_else(
+        || builtin_order_sorter(prog, open, key),
+        |name| application_order_key(key, name) && complete_order_sorter(prog, open, key),
+    );
     if !prog.read_only || prog.btree_mask != 1 || !prog.p_program.is_empty()
-        || !builtin_order_sorter(prog, open, key)
+        || !valid_order
         || !matches!(key.enc, 1..=3)
     {
         return false;
     }
     let binary_order = key.a_coll.iter().flatten().all(|coll| coll.name.eq_ignore_ascii_case("BINARY"));
     if !binary_order {
-        // The stock NOCASE/RTRIM term must compare in its UTF-8 slot,
-        // with a native BINARY rowid as the final tie breaker.
+        // The first comparator uses its validated slot, with a native BINARY
+        // rowid as the final tie breaker.
         let [Some(first), Some(last)] = &key.a_coll[..usize::from(key.n_key_field)] else {
             return false;
         };
         if key.enc != encoding || first.name.eq_ignore_ascii_case("BINARY")
-            || !last.name.eq_ignore_ascii_case("BINARY") || !has_stock_collation(&first.name)
+            || !last.name.eq_ignore_ascii_case("BINARY") || !has_collation(&first.name)
         {
             return false;
         }
@@ -1793,8 +1805,17 @@ pub fn is_worker_sort_with_collations(
     prog.a_op.iter().any(|op| {
         matches!(&op.p4, P4::KeyInfo(key)
             if key.enc == encoding as u8 && worker_order_sorter(
-                prog, op, key, encoding as u8, &has_table_key, &has_stock_collation))
+                prog, op, key, encoding as u8, None, &has_table_key, &has_stock_collation))
     })
+}
+
+/// Validate a named application sort with an explicit rowid tie breaker.
+#[doc(hidden)]
+pub fn is_worker_sort_with_named_collation(prog: &Program, open: usize, encoding: TextEncoding, name: &str) -> bool {
+    let Some(op) = prog.a_op.get(open) else { return false };
+    let P4::KeyInfo(key) = &op.p4 else { return false };
+    worker_order_sorter(prog, op, key, encoding as u8, Some(name), |_, _| false,
+        |collation| collation.eq_ignore_ascii_case(name))
 }
 
 /// Find the single complete sorter that owns the application's first order key.
@@ -1804,10 +1825,7 @@ pub fn custom_file_sort_open(prog: &Program, name: &str, enc: u8) -> Option<usiz
     let (pc, op) = opens.next()?;
     let P4::KeyInfo(key) = &op.p4 else { return None };
     (opens.next().is_none() && key.enc == enc && key.n_key_field <= 2
-        && ordinary_order_key(key, |index, coll| {
-            let name = if index == 0 { name } else { "BINARY" };
-            matches_application_order_collation(coll, name, enc)
-        })
+        && application_order_key(key, name)
         && complete_order_sorter(prog, op, key))
         .then_some(pc)
 }
@@ -5749,7 +5767,7 @@ impl Vdbe {
                             && (k.enc == 1 || k.enc == encoding)
                             && (within_worker_limit || host.sorter_mmap_limit() <= 0)
                             && matches!(&op.p4, P4::KeyInfo(key) if worker_order_sorter(&self.prog, op, key,
-                                encoding, |read, keys| host.sorter_has_worker_table_key(read, keys),
+                                encoding, None, |read, keys| host.sorter_has_worker_table_key(read, keys),
                                 |name| host.sorter_has_stock_collation(name)))
                             && k.a_coll.iter().flatten().all(|coll| coll.custom.is_none())))
                     {

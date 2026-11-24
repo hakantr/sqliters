@@ -5502,3 +5502,58 @@ fn group65_qualified_main_and_aux_reads_track_only_their_schema() {
         }
     }
 }
+
+#[test]
+fn group64_named_worker_collation_replacement_keeps_fallible_contract() {
+    for (encoding, width) in [("UTF-8", 3100), ("UTF-16le", 1550), ("UTF-16be", 1550)] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA page_size=512; PRAGMA encoding='{encoding}'; PRAGMA cache_size=1;
+             PRAGMA temp_store=FILE; PRAGMA threads=2; PRAGMA foreign_keys=ON;
+             CREATE TABLE parents(id INTEGER PRIMARY KEY);
+             INSERT INTO parents VALUES(1),(2);
+             CREATE TABLE items(id INTEGER PRIMARY KEY,v TEXT,p INTEGER REFERENCES parents(id));
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<52)
+             INSERT INTO items SELECT x,printf('%02d',x%9)||substr(hex(zeroblob(1600)),1,{width}-2),1+x%2 FROM n;"
+        )).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let caller = std::thread::current().id();
+        db.register_collation("app_nocase", move |left, right| {
+            if std::thread::current().id() != caller {
+                observed.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            right.cmp(left)
+        }).unwrap();
+        let mut statement = db.prepare("SELECT id FROM items ORDER BY v COLLATE APP_NOCASE NULLS LAST,id DESC").unwrap();
+        let StepResult::Row(first) = statement.step().unwrap() else { panic!("missing registered sort row"); };
+        assert_eq!(first.get_i64(0), Some(44));
+        assert!(calls.load(AtomicOrdering::Relaxed)>0);
+        statement.reset().unwrap();
+        let first_registration_calls = calls.load(AtomicOrdering::Relaxed);
+
+        let failure = SqliteError::new(ErrorCode::Error, "ordinary named sort callback error");
+        let returned = failure.clone();
+        db.register_fallible_collation("APP_NOCASE", move |_, _| {
+            assert_eq!(std::thread::current().id(), caller);
+            Err(returned.clone())
+        }).unwrap();
+        assert_eq!(statement.step().unwrap_err(), failure);
+        assert_eq!(statement.reset().unwrap_err(), failure);
+
+        let fresh = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&fresh);
+        db.register_collation("app_nocase", move |left, right| {
+            if std::thread::current().id() != caller {
+                observed.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            left.cmp(right)
+        }).unwrap();
+        let StepResult::Row(first) = statement.step().unwrap() else { panic!("missing replacement sort row"); };
+        assert_eq!(first.get_i64(0), Some(45));
+        assert!(fresh.load(AtomicOrdering::Relaxed)>0);
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), first_registration_calls);
+        statement.reset().unwrap();
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+    }
+}

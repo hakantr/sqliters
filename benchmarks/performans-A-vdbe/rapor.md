@@ -2907,3 +2907,8 @@ Birleşik kaynakta her kipte 384 açık işlem, 384 autocommit ve 288 onarım C 
 ## V6b.520 — Nitelikli MAIN ve AUX hazır sorgularında ilgili şema
 
 96/96 hedef yaşam döngüsü ve 264 taban ham kontrolü eş. 264 önceki TEMP, 120 legacy ve 116 byte observer kontrolleri korundu. [Bağımsız ölçüm](/github/sqliters/target/perf-work/qualified-main-aux-reprepare-candidate/sonuc.md) OFF 1392/0/324, ON 1392/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,307 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_520.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.521 — Uygulamanın kendi adıyla kaydettiği sıralamada gerçek işçi
+
+Her kipte 384/384 C satır, SORT, reset ve callback. İki PMA için 120/120, stock 576/576, önceki override 528/528 ve Rust fallible sözleşmesi 72/72 eş. [Bağımsız ölçüm](/github/sqliters/target/perf-work/named-collation-worker-v510-candidate/sonuc.md) OFF 1393/0/324, ON 1393/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,290 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_521.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
