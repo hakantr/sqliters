@@ -2741,6 +2741,12 @@ impl Pager {
         let previous_mode = self.sql_journal_mode_after_busy.unwrap_or(self.journal_mode);
         let touches_volatile_journal = matches!(mode, JournalMode::Memory | JournalMode::Off)
             || matches!(previous_mode, JournalMode::Memory | JournalMode::Off);
+        let single_memory_wal_transition = single_target
+            && matches!(
+                (previous_mode, mode),
+                (JournalMode::Memory, JournalMode::Wal)
+                    | (JournalMode::Wal, JournalMode::Memory)
+            );
         // BtreeSetVersion also initializes and stages the first page of an
         // empty database until the single-target statement finishes.
         let defer_empty_wal_entry = single_target
@@ -2751,7 +2757,9 @@ impl Pager {
             && self.db_kind == DatabaseKind::NamedDisk
             && (self.page_count > 0 || defer_empty_wal_entry)
             && self.pending_sql_journal_mode.is_none()
-            && (!touches_volatile_journal || self.locking_mode == LockingMode::Normal)
+            && (!touches_volatile_journal
+                || self.locking_mode == LockingMode::Normal
+                || single_memory_wal_transition)
             && matches!(
                 (previous_mode, mode),
                 (JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate

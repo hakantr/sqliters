@@ -258,3 +258,62 @@ fn late_syntax_error_keeps_pragma_effects_already_performed_by_c_parser() {
     let rows = conn.query("PRAGMA temp.cache_size", &[]).unwrap();
     assert_eq!(rows.rows[0].values()[0], Value::Integer(17));
 }
+
+#[test]
+fn exclusive_memory_wal_switch_publishes_header_on_statement_completion() {
+    let dir = std::env::temp_dir().join(format!("v6b-exclusive-memory-wal-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    for page_size in [512, 4096, 65_536] {
+        for (source, target, old_header, new_header) in [
+            ("memory", "wal", [1, 1], [2, 2]),
+            ("wal", "memory", [2, 2], [1, 1]),
+        ] {
+            for legacy in [false, true] {
+                for finish in ["done", "reset", "finalize"] {
+                    let path = dir.join(format!("{page_size}-{source}-{legacy}-{finish}.db"));
+                    let seed = Connection::open(&path).unwrap();
+                    seed.execute(&format!("PRAGMA page_size={page_size}")).unwrap();
+                    if source == "wal" {
+                        assert_eq!(text(&seed, "PRAGMA main.journal_mode=wal"), "wal");
+                    }
+                    seed.execute_batch("CREATE TABLE t(a); INSERT INTO t VALUES(7);")
+                        .unwrap();
+                    seed.try_close().unwrap();
+
+                    let db = Connection::open(&path).unwrap();
+                    assert_eq!(text(&db, "PRAGMA locking_mode=EXCLUSIVE"), "exclusive");
+                    assert_eq!(text(&db, &format!("PRAGMA main.journal_mode={source}")), source);
+                    db.query("SELECT count(*) FROM t", &[]).unwrap();
+                    let sql = format!("PRAGMA main.journal_mode={target}");
+                    let mut statement = if legacy {
+                        db.prepare_v1(&sql).unwrap()
+                    } else {
+                        db.prepare(&sql).unwrap()
+                    };
+                    assert!(
+                        matches!(statement.step().unwrap(), StepResult::Row(ref row)
+                            if row.get_str(0) == Some(target))
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap()[18..20], old_header);
+                    assert!(!path.with_extension("db-journal").exists());
+
+                    match finish {
+                        "done" => assert!(matches!(statement.step().unwrap(), StepResult::Done)),
+                        "reset" => statement.reset().unwrap(),
+                        _ => {}
+                    }
+                    statement.finalize().unwrap();
+
+                    assert_eq!(std::fs::read(&path).unwrap()[18..20], new_header);
+                    assert!(!path.with_extension("db-journal").exists());
+                    assert_eq!(text(&db, "PRAGMA integrity_check"), "ok");
+                    assert_eq!(db.query("SELECT a FROM t", &[]).unwrap().rows[0].get_i64(0), Some(7));
+                    db.try_close().unwrap();
+                    assert_eq!(std::fs::read(&path).unwrap()[18..20], new_header);
+                    assert!(!path.with_extension("db-journal").exists());
+                }
+            }
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
