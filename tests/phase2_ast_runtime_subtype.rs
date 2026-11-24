@@ -5778,3 +5778,43 @@ fn group64_named_worker_sort_uses_without_rowid_primary_key_and_preserves_ties()
         assert_eq!(db.query("PRAGMA integrity_check", &[]).unwrap().rows[0].get_str(0), Some("ok"));
     }
 }
+
+#[test]
+fn group65_fk_without_rowid_child_uses_its_physical_primary_key_set() {
+    use sqliters::types::extended::SQLITE_CONSTRAINT_FOREIGNKEY;
+
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for indexed in [false, true] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}';
+                 PRAGMA foreign_keys=ON;
+                 CREATE TABLE parent(k TEXT PRIMARY KEY) WITHOUT ROWID;
+                 CREATE TABLE child(id TEXT COLLATE NOCASE PRIMARY KEY DESC,k INTEGER
+                     REFERENCES parent(k) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)
+                     WITHOUT ROWID;
+                 INSERT INTO parent VALUES('007'),('7'),('9');
+                 INSERT INTO child VALUES('one',7),('two',7),('three',9);",
+            ))
+            .unwrap();
+            if indexed {
+                db.execute("CREATE INDEX child_lookup ON child(k)").unwrap();
+            }
+            let count_children = || {
+                db.query("SELECT count(*) FROM child", &[]).unwrap().rows[0].get_i64(0).unwrap()
+            };
+
+            db.execute_batch("BEGIN").unwrap();
+            db.execute("DELETE FROM parent WHERE k='007'").unwrap();
+            assert_eq!(count_children(), 1);
+            let error = db.execute("COMMIT").unwrap_err();
+            assert_eq!(error.extended_code, SQLITE_CONSTRAINT_FOREIGNKEY);
+            assert!(!db.is_autocommit());
+            db.execute_batch("ROLLBACK").unwrap();
+            assert_eq!(count_children(), 3);
+            db.execute("DELETE FROM parent WHERE k='7'").unwrap();
+            assert_eq!(count_children(), 1);
+            assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+        }
+    }
+}

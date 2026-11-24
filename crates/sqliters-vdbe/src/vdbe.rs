@@ -2833,6 +2833,37 @@ fn without_rowid_or_filter(
     })
 }
 
+/// A WITHOUT ROWID FK action collects the child's physical primary key
+/// before looking up those records in its writable table cursor.
+fn fk_action_primary_key_set(ops: &[VdbeOp], open: &VdbeOp, key: &KeyInfo) -> bool {
+    let width = usize::from(key.n_key_field);
+    if open.opcode != OP_OpenEphemeral || open.p2 != width as i32 || open.p3 != 0 || open.p5 != 0
+        || width == 0
+    {
+        return false;
+    }
+    if !ops.iter().any(|op| op.opcode == OP_IdxInsert && op.p1 == open.p1)
+        || !ops.iter().any(|op| op.opcode == OP_Param)
+    {
+        return false;
+    }
+
+    ops.windows(2).any(|pair| {
+        let (record, seek) = (&pair[0], &pair[1]);
+        record.opcode == OP_RowData && record.p1 == open.p1
+            && seek.opcode == OP_NotFound && seek.p3 == record.p2
+            && matches!(&seek.p4, P4::Int32(0))
+            && ops.iter().any(|op| {
+                let P4::KeyInfo(physical) = &op.p4 else { return false };
+                op.opcode == OP_OpenWrite && op.p1 == seek.p1 && op.p2 > 1 && op.p3 == 0
+                    && without_rowid_or_key(physical, key.enc)
+                    && physical.n_key_field == key.n_key_field
+                    && (key.n_all_field == key.n_key_field || key.n_all_field == physical.n_all_field)
+                    && physical.a_coll == key.a_coll && physical.a_sort_flags == key.a_sort_flags
+            })
+    })
+}
+
 fn unsupported(
     prog: &Program, write: bool, key_scope: ReadKeyScope, row_case_encoding: Option<u8>,
     builtin_collations: bool,
@@ -2851,8 +2882,10 @@ fn unsupported(
         _ => Vec::new(),
     };
     let mut reopen_or_checked = BTreeMap::new();
-    let subs = prog.p_program.iter().flat_map(|s| s.a_op.iter());
-    for (index, op) in prog.a_op.iter().chain(subs).enumerate() {
+    let operations = std::iter::once(prog.a_op.as_slice())
+        .chain(prog.p_program.iter().map(|program| program.a_op.as_slice()))
+        .flat_map(|ops| ops.iter().map(move |op| (ops, op)));
+    for (index, (ops, op)) in operations.enumerate() {
         let ok = (op.opcode == OP_Expire && op.p1 != 0 && op.p2 == 1) || matches!(
             op.opcode,
             OP_Init
@@ -3119,11 +3152,12 @@ fn unsupported(
                 });
             let utf16_key_allowed = if key_scope == ReadKeyScope::ForeignKeyWrite {
                 row_case_encoding == Some(k.enc)
-                    && matches!(op.opcode, OP_OpenRead | OP_OpenWrite)
-                    && op.p2 > 1 && op.p3 == 0
-                    && k.n_key_field > 0 && k.n_key_field <= k.n_all_field
-                    && k.a_coll.len() == usize::from(k.n_all_field)
-                    && k.a_coll.iter().flatten().all(|c| builtin_read_key_collation(c, k.enc))
+                    && ((matches!(op.opcode, OP_OpenRead | OP_OpenWrite)
+                            && op.p2 > 1 && op.p3 == 0
+                            && k.n_key_field > 0 && k.n_key_field <= k.n_all_field
+                            && k.a_coll.len() == usize::from(k.n_all_field)
+                            && k.a_coll.iter().flatten().all(|c| builtin_read_key_collation(c, k.enc)))
+                        || (index >= prog.a_op.len() && fk_action_primary_key_set(ops, op, k)))
             } else {
                 binary_sort || binary_group_compare || builtin_group || streamed_group
                     || distinct || physical_index || without_rowid_or_set
