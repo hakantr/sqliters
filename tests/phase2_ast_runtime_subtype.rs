@@ -7022,3 +7022,70 @@ fn group64_nocase_replacement_preserves_legacy_expiry_and_clears_sort_error() {
         assert_eq!(worker_calls.load(AtomicOrdering::Relaxed), worker_calls_before_error);
     }
 }
+
+#[test]
+fn group64_unary_plus_preserves_collation_without_column_affinity() {
+    let cases: &[(&str, &[i64])] = &[
+        ("SELECT rowid FROM t WHERE a<'ccc' ORDER BY rowid", &[1, 2]),
+        ("SELECT rowid FROM t WHERE +a<'ccc' ORDER BY rowid", &[1, 2]),
+        ("SELECT rowid FROM t WHERE 'ccc'>+a ORDER BY rowid", &[1, 2]),
+        ("SELECT rowid FROM t ORDER BY +a", &[5, 1, 2, 3, 4]),
+        (
+            "SELECT rowid, a AS label FROM t WHERE +label<'ccc' ORDER BY rowid",
+            &[1, 2],
+        ),
+        (
+            "SELECT rowid, a AS label FROM t ORDER BY ++label",
+            &[5, 1, 2, 3, 4],
+        ),
+        (
+            "SELECT rowid, a AS x FROM t ORDER BY x",
+            &[5, 1, 2, 3, 4],
+        ),
+        (
+            "SELECT rowid, a AS x FROM t ORDER BY +x",
+            &[5, 2, 4, 1, 3],
+        ),
+        (
+            "SELECT rowid, a AS label FROM t ORDER BY +(label COLLATE BINARY)",
+            &[5, 2, 4, 1, 3],
+        ),
+        (
+            "SELECT rowid FROM t WHERE +a<'ccc' COLLATE BINARY ORDER BY rowid",
+            &[1, 2, 4],
+        ),
+        (
+            "SELECT rowid FROM t WHERE +(a COLLATE NOCASE)<'ccc' COLLATE BINARY ORDER BY rowid",
+            &[1, 2],
+        ),
+        (
+            "SELECT rowid FROM t WHERE +(a COLLATE BINARY)<'ccc' COLLATE NOCASE ORDER BY rowid",
+            &[1, 2, 4],
+        ),
+        (
+            "SELECT (+a<'ccc') IS NULL FROM t WHERE rowid=5",
+            &[1],
+        ),
+        ("SELECT rowid FROM numeric_text WHERE a=10", &[1]),
+        ("SELECT rowid FROM numeric_text WHERE +a=10", &[]),
+        ("SELECT rowid FROM numeric_text WHERE +a=10 COLLATE NOCASE", &[]),
+    ];
+
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}';
+             CREATE TABLE t(a TEXT COLLATE NOCASE, x TEXT COLLATE BINARY);
+             INSERT INTO t VALUES ('aaa','aaa'),('BBB','BBB'),('ccc','ccc'),('DDD','DDD'),(NULL,NULL);
+             CREATE TABLE numeric_text(a TEXT COLLATE NOCASE);
+             INSERT INTO numeric_text VALUES ('10'),(NULL);"
+        ))
+        .unwrap();
+
+        for &(sql, expected) in cases {
+            let rows = db.query(sql, &[]).unwrap_or_else(|err| panic!("{encoding}: {sql}: {err}"));
+            let actual: Vec<_> = rows.rows.iter().map(|row| row.get_i64(0).unwrap()).collect();
+            assert_eq!(actual, expected, "{encoding}: {sql}");
+        }
+    }
+}

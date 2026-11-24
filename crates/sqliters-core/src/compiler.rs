@@ -22,6 +22,7 @@ use sqliters_vdbe::{
 };
 
 use crate::db_set::{DatabaseSet, ResolvedRelation};
+use crate::engine::skip_unary_plus_for_collation;
 use crate::execution_context::{FunctionRegistry, step_clock_date_scalar};
 use crate::schema::{
     IndexSchema, IndexedColSchema, Schema, TableSchema, ViewSchema, fix_permanent_view_select,
@@ -5104,7 +5105,7 @@ fn compile_single_table_select(
             let coll_name = if let Expr::Collate { collation, .. } = &ob.expr {
                 collation.as_str()
             } else {
-                infer_expr_collation_name(&coll_ref_expr, tbl)
+                infer_expr_collation_name(skip_unary_plus_for_collation(&coll_ref_expr), tbl)
             };
             let Some(coll) = Collation::from_name(coll_name) else {
                 return Ok(None);
@@ -6225,6 +6226,8 @@ fn compile_expr(
                     binding.and_then(|b| b.alias),
                 );
                 let comp_aff = sqlite_compare_affinity(l_aff, r_aff);
+                let left = skip_unary_plus_for_collation(left);
+                let right = skip_unary_plus_for_collation(right);
                 if let Some(custom_coll) = resolve_custom_binary_collation(left, right, binding) {
                     ins = ins
                         .with_p4(P4::Str(custom_coll))
@@ -6315,20 +6318,36 @@ fn compile_expr(
                     let eph_cur = prog.alloc_cursor();
                     prog.emit(Instruction::new(Opcode::OpenEphemeral, eph_cur, 1, 0));
                 }
+                let collation = match skip_unary_plus_for_collation(lhs_e) {
+                    Expr::Collate { collation, .. } => collation.as_str(),
+                    lhs => binding.map_or("BINARY", |binding| {
+                        infer_expr_collation_name(lhs, binding.tbl)
+                    }),
+                };
                 let mut disj: Option<Expr> = None;
                 for item in list {
-                    // Per `sqlite/src/expr.c` (`exprINAffinity`), `lhs IN (list)` applies ONLY
-                    // `lhs`'s affinity and collation, never propagating an RHS column's affinity
-                    // or collation. Unary `+` preserves runtime value while stripping RHS column
-                    // affinity/collation metadata.
-                    let rhs_stripped = Expr::Unary {
+                    // Unary plus suppresses the RHS affinity. A runtime IN list
+                    // also uses only the LHS collation (sqlite3ExprCodeIN).
+                    let rhs = Expr::Unary {
                         op: UnaryOp::Plus,
                         expr: Box::new(item.clone()),
+                    };
+                    let rhs = if list.len() == 1
+                        && !matches!(item, Expr::Collate { .. })
+                        && crate::window::is_window_bound_constant(item)
+                    {
+                        // parse.y can simplify a single constant to ordinary equality.
+                        rhs
+                    } else {
+                        Expr::Collate {
+                            expr: Box::new(rhs),
+                            collation: collation.to_owned(),
+                        }
                     };
                     let eq = Expr::Binary {
                         left: lhs_e.clone(),
                         op: BinaryOp::Eq,
-                        right: Box::new(rhs_stripped),
+                        right: Box::new(rhs),
                     };
                     disj = Some(match disj {
                         None => eq,

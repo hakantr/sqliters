@@ -30,7 +30,7 @@ use crate::compiler::{
 use crate::db_set::{DatabaseSet, ResolvedRelation};
 use crate::engine::{
     STAR_SLOT_SCHEMA, ScopedColumn, build_table_scoped_columns_pub, eval_rowid_range_bound,
-    eval_rowid_target_int, expand_projection, subst_select_aliases_pub,
+    eval_rowid_target_int, expand_projection, skip_unary_plus_for_collation, subst_select_aliases_pub,
 };
 use crate::execution_context::{CollationRegistry, FunctionRegistry};
 use crate::schema::{IndexSchema, Schema, TableSchema};
@@ -1921,6 +1921,9 @@ impl FastCompileScope<'_> {
             Expr::Cast { type_name, .. } => {
                 (Some(TypeAffinity::from_declared_type(type_name)), None)
             }
+            Expr::Unary { op: UnaryOp::Plus, .. } => {
+                (None, self.expr_meta(skip_unary_plus_for_collation(expr)).1)
+            }
             _ => (None, None),
         }
     }
@@ -2305,18 +2308,16 @@ fn compile_fast_expr(expr: &Expr, scope: &FastCompileScope<'_>) -> Option<FastEx
             if let Some(cop) = map_binary_cmp_op(*op) {
                 let (l_aff, l_coll) = scope.expr_meta(left);
                 let (r_aff, r_coll) = scope.expr_meta(right);
-                // If either side had an unsupported custom collation inside `Expr::Collate`, bail out:
-                if matches!(left.as_ref(), Expr::Collate { .. }) && l_coll.is_none() {
-                    return None;
-                }
-                if matches!(right.as_ref(), Expr::Collate { .. }) && r_coll.is_none() {
+                let left_explicit = matches!(skip_unary_plus_for_collation(left), Expr::Collate { .. });
+                let right_explicit = matches!(skip_unary_plus_for_collation(right), Expr::Collate { .. });
+                if (left_explicit && l_coll.is_none()) || (right_explicit && r_coll.is_none()) {
                     return None;
                 }
                 let eff_aff = sqlite_compare_affinity(l_aff, r_aff);
                 // Explicit `COLLATE` overrides implicit column collation (`exprCompareCollSeq`).
-                let eff_coll = if matches!(left.as_ref(), Expr::Collate { .. }) {
+                let eff_coll = if left_explicit {
                     l_coll?
-                } else if matches!(right.as_ref(), Expr::Collate { .. }) {
+                } else if right_explicit {
                     r_coll?
                 } else {
                     l_coll.or(r_coll).unwrap_or(Collation::Binary)

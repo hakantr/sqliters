@@ -17389,41 +17389,53 @@ pub(crate) fn order_by_result_column(
     implicit
 }
 
-fn infer_order_by_custom_collation(
-    ob_expr: &Expr,
-    expanded_proj: &[(Expr, String, Option<String>)],
-    sample_cols: &[ScopedColumn],
-) -> Option<String> {
-    if let Expr::Collate { collation, .. } = ob_expr {
-        return Collation::from_name(collation)
-            .is_none()
-            .then(|| collation.clone());
+// Unary plus is transparent for collation lookup, while the original expression
+// still determines affinity and evaluation.
+pub(crate) fn skip_unary_plus_for_collation(mut expr: &Expr) -> &Expr {
+    while let Expr::Unary { op: UnaryOp::Plus, expr: inner } = expr {
+        expr = inner;
     }
+    expr
+}
+
+fn order_by_collation_expr<'a>(
+    ob_expr: &'a Expr,
+    expanded_proj: &'a [(Expr, String, Option<String>)],
+    sample_cols: &[ScopedColumn],
+) -> &'a Expr {
     if let Expr::Integer(ord) = ob_expr
         && *ord >= 1
         && (*ord as usize) <= expanded_proj.len()
     {
-        return infer_expr_custom_collation_from_cols(
-            &expanded_proj[(*ord as usize) - 1].0,
-            sample_cols,
-        );
+        return &expanded_proj[(*ord as usize) - 1].0;
     }
+    let inner = skip_unary_plus_for_collation(ob_expr);
     if let Expr::Column(ColumnRef {
         schema: None,
         table: None,
         column,
         ..
-    }) = ob_expr
-        && let Some(idx) = order_by_result_column(ob_expr, expanded_proj)
+    }) = inner
+        && let Some(idx) = order_by_result_column(inner, expanded_proj)
     {
-        let in_row = sample_cols
-            .iter()
-            .any(|sc| !sc.hidden_rowid && sc.name.eq_ignore_ascii_case(column));
-        if expanded_proj[idx].2.is_some() || !in_row {
-            return infer_expr_custom_collation_from_cols(&expanded_proj[idx].0, sample_cols);
+        // A bare ORDER BY name can prefer a result alias. Inside unary plus,
+        // an available source column takes precedence over the alias.
+        if matches!(ob_expr, Expr::Column(_)) && expanded_proj[idx].2.is_some()
+            || !col_in_scoped_cols(column, sample_cols)
+        {
+            return &expanded_proj[idx].0;
         }
     }
-    infer_expr_custom_collation_from_cols(ob_expr, sample_cols)
+    ob_expr
+}
+
+fn infer_order_by_custom_collation(
+    ob_expr: &Expr,
+    expanded_proj: &[(Expr, String, Option<String>)],
+    sample_cols: &[ScopedColumn],
+) -> Option<String> {
+    let expr = order_by_collation_expr(ob_expr, expanded_proj, sample_cols);
+    infer_expr_custom_collation_from_cols(expr, sample_cols)
 }
 
 fn infer_order_by_collation(
@@ -17431,31 +17443,8 @@ fn infer_order_by_collation(
     expanded_proj: &[(Expr, String, Option<String>)],
     sample_cols: &[ScopedColumn],
 ) -> Collation {
-    if let Expr::Collate { collation, .. } = ob_expr {
-        return Collation::from_name(collation).unwrap_or_default();
-    }
-    if let Expr::Integer(ord) = ob_expr
-        && *ord >= 1
-        && (*ord as usize) <= expanded_proj.len()
-    {
-        return infer_expr_collation_from_cols(&expanded_proj[(*ord as usize) - 1].0, sample_cols);
-    }
-    if let Expr::Column(ColumnRef {
-        schema: None,
-        table: None,
-        column,
-        ..
-    }) = ob_expr
-        && let Some(idx) = order_by_result_column(ob_expr, expanded_proj)
-    {
-        let in_row = sample_cols
-            .iter()
-            .any(|sc| !sc.hidden_rowid && sc.name.eq_ignore_ascii_case(column));
-        if expanded_proj[idx].2.is_some() || !in_row {
-            return infer_expr_collation_from_cols(&expanded_proj[idx].0, sample_cols);
-        }
-    }
-    infer_expr_collation_from_cols(ob_expr, sample_cols)
+    let expr = order_by_collation_expr(ob_expr, expanded_proj, sample_cols);
+    infer_expr_collation_from_cols(expr, sample_cols)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -19776,8 +19765,10 @@ fn eval_expr_rt(
                         BinaryOp::IsNot => Opcode::IsNot,
                         _ => unreachable!(),
                     };
+                    let left_collation = skip_unary_plus_for_collation(left);
+                    let right_collation = skip_unary_plus_for_collation(right);
                     eval_scalar_comparison_in_scopes(
-                        ctx, vdbe_op, left, &lv, right, &rv, comp_aff, scopes,
+                        ctx, vdbe_op, left_collation, &lv, right_collation, &rv, comp_aff, scopes,
                     )?
                 }
                 BinaryOp::And
