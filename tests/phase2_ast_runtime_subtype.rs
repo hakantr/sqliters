@@ -6509,3 +6509,71 @@ fn group64_two_named_sort_collations_follow_worker_and_topn_lifecycle() {
         }
     }
 }
+
+#[test]
+fn group65_three_table_inner_join_tracks_its_resolved_schemas() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for (middle, right, shadow, rebound) in [
+            ("src_middle", "aux.src_right", "src_middle", [201, 501, 203]),
+            ("aux.src_middle", "src_right", "src_right", [201, 202, 501]),
+        ] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}'; PRAGMA foreign_keys=ON;
+                 CREATE TABLE main.parent(id INTEGER PRIMARY KEY);
+                 CREATE TABLE main.child(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent);
+                 INSERT INTO main.parent VALUES(1); INSERT INTO main.child VALUES(1,1);
+                 ATTACH ':memory:' AS aux; ATTACH ':memory:' AS other;",
+            )).unwrap();
+            for (table, marker) in [("src_left", 201), ("src_middle", 202), ("src_right", 203)] {
+                db.execute_batch(&format!(
+                    "CREATE TABLE aux.{table}(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+                     INSERT INTO aux.{table} VALUES(1,1,{marker});",
+                )).unwrap();
+            }
+            let sql = format!(
+                "SELECT l.marker,m.marker AS middle_marker,r.marker AS right_marker,length(?1)
+                 FROM aux.src_left AS l JOIN {middle} AS m ON l.p=m.id
+                 JOIN {right} AS r ON m.p=r.id",
+            );
+            let mut legacy = db.prepare_v1(&sql).unwrap();
+            let mut modern = db.prepare(&sql).unwrap();
+            for stmt in [&mut legacy, &mut modern] {
+                stmt.bind_text(1, "猫").unwrap();
+            }
+            let read = |stmt: &mut sqliters::Statement, markers: [i64; 3], reprepares| {
+                let StepResult::Row(row) = stmt.step().unwrap() else {
+                    panic!("expected an INNER JOIN row");
+                };
+                assert_eq!(row.values(), [
+                    Value::Integer(markers[0]), Value::Integer(markers[1]),
+                    Value::Integer(markers[2]), Value::Integer(1),
+                ]);
+                assert_eq!(stmt.step().unwrap(), StepResult::Done);
+                stmt.reset().unwrap();
+                assert_eq!(stmt.c_reprepare_status().0, reprepares);
+                assert_eq!(stmt.column_names(), ["marker", "middle_marker", "right_marker", "length(?1)"]);
+                assert_eq!(stmt.sql(), sql);
+            };
+
+            db.execute_batch(&format!(
+                "CREATE TABLE other.extra(id INTEGER PRIMARY KEY);
+                 CREATE TABLE main.{shadow}(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+                 INSERT INTO main.{shadow} VALUES(1,1,501);",
+            )).unwrap();
+            read(&mut legacy, [201, 202, 203], 0);
+            read(&mut modern, [201, 202, 203], 0);
+
+            db.execute_batch("ALTER TABLE aux.src_left ADD COLUMN note TEXT").unwrap();
+            assert_eq!(legacy.step().unwrap_err().code, ErrorCode::Schema);
+            assert_eq!(legacy.reset().unwrap_err().code, ErrorCode::Schema);
+            read(&mut modern, rebound, 1);
+            legacy.finalize().unwrap();
+
+            db.execute_batch("CREATE TABLE main.extra(id INTEGER PRIMARY KEY)").unwrap();
+            read(&mut modern, rebound, 2);
+            modern.finalize().unwrap();
+            assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+        }
+    }
+}

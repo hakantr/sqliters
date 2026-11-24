@@ -5950,12 +5950,13 @@ impl PreparedReadSchemas {
         let SelectCore::Select { from: Some(from), .. } = &select.body.head else {
             return None;
         };
-        let [join] = from.joins.as_slice() else {
-            return None;
+        let supported_types = match from.joins.as_slice() {
+            [join] => matches!(join.join_type, JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full),
+            [first, second] => first.join_type == JoinType::Inner && second.join_type == JoinType::Inner,
+            _ => false,
         };
-        if join.natural
-            || !matches!(join.join_type, JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full)
-            || !matches!(join.constraint, Some(JoinConstraint::On(_)))
+        if !supported_types
+            || from.joins.iter().any(|join| join.natural || !matches!(join.constraint, Some(JoinConstraint::On(_))))
             || !select.ctes.is_empty() || !select.body.compounds.is_empty()
             || !PreparedReadSchema::can_pin_source(select)
         {
@@ -5971,12 +5972,20 @@ impl PreparedReadSchemas {
             if db.is_temp() || table.without_rowid {
                 return None;
             }
-            PreparedReadSchema::snapshot(db_set, db)
+            Some((PreparedReadSchema::snapshot(db_set, db)?, name.schema.is_none()))
         };
-        let left = read_schema(&from.head)?;
-        let right = read_schema(&join.right)?;
-        let mask = (1 << left.db_id.index()) | (1 << right.db_id.index());
-        if usage?.btree_mask != Some(mask) {
+        let (left, left_unqualified) = read_schema(&from.head)?;
+        let mut unqualified = usize::from(left_unqualified);
+        let mut sources = [left; 3];
+        for (source, join) in sources[1..].iter_mut().zip(&from.joins) {
+            let (schema, unqualified_source) = read_schema(&join.right)?;
+            *source = schema;
+            unqualified += usize::from(unqualified_source);
+        }
+        let mask = sources.iter().fold(0u32, |mask, schema| mask | (1 << schema.db_id.index()));
+        if (from.joins.len() == 2 && unqualified > 1) || mask.count_ones() > 2
+            || usage?.btree_mask != Some(mask)
+        {
             return None;
         }
         // An interpreter join uses these same cursor roots when it starts the reads.
@@ -5994,12 +6003,14 @@ impl PreparedReadSchemas {
         // Keep each independently resolved source when the interpreter resolves the AST again.
         if let Some(Stmt::Select(select)) = &mut artifacts.stmt
             && let SelectCore::Select { from: Some(from), .. } = &mut select.body.head
-            && let [join] = from.joins.as_mut_slice()
         {
             left.pin_table(&mut from.head, db_set);
-            right.pin_table(&mut join.right, db_set);
+            for (join, schema) in from.joins.iter_mut().zip(&sources[1..]) {
+                schema.pin_table(&mut join.right, db_set);
+            }
         }
-        Some(if left.db_id == right.db_id { Self::One(left) } else { Self::Two(left, right) })
+        let second = sources[1..].iter().copied().find(|schema| schema.db_id != left.db_id);
+        Some(second.map_or(Self::One(left), |schema| Self::Two(left, schema)))
     }
 }
 
