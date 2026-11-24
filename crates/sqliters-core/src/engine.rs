@@ -24937,7 +24937,7 @@ pub(crate) fn parent_fk_counter_program_needed(stmt: Option<&Stmt>, db_set: &Dat
     let Some((DatabaseId::MAIN, parent)) = db_set.find_user_table_in_set(target) else {
         return false;
     };
-    if !parent.without_rowid || !parent.foreign_keys.is_empty() {
+    if !parent.foreign_keys.is_empty() {
         return false;
     }
     let main = db_set.main_slot();

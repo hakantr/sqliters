@@ -5227,3 +5227,46 @@ fn group65_qualified_temp_reads_keep_their_program_after_unrelated_main_ddl() {
         assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
     }
 }
+
+#[test]
+fn group65_fk_rowid_parent_action_preserves_sqlite_constraint_counter() {
+    use sqliters::types::extended::SQLITE_CONSTRAINT_FOREIGNKEY;
+
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}';
+             PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(k TEXT PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY,k NUMERIC,
+                 FOREIGN KEY(k) REFERENCES parent(k)
+                 ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED);
+             INSERT INTO parent VALUES('007'),('7');
+             INSERT INTO child VALUES(1,7);",
+        ))
+        .unwrap();
+        let child_key = || {
+            db.query("SELECT k FROM child WHERE id=1", &[])
+                .unwrap()
+                .rows[0]
+                .get_i64(0)
+                .unwrap()
+        };
+        db.execute_batch("BEGIN").unwrap();
+        db.execute("UPDATE parent SET k='8' WHERE k='007'").unwrap();
+        assert_eq!(child_key(), 8);
+        assert!(
+            db.query("PRAGMA foreign_key_check", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        let error = db.execute("COMMIT").unwrap_err();
+        assert_eq!(error.extended_code, SQLITE_CONSTRAINT_FOREIGNKEY);
+        assert!(!db.is_autocommit());
+        db.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(child_key(), 7);
+        db.execute("UPDATE parent SET k='8' WHERE k='7'").unwrap();
+        assert_eq!(child_key(), 8);
+    }
+}
