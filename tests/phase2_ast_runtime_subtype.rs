@@ -7235,3 +7235,47 @@ fn group65_four_table_left_inner_join_preserves_nulls_across_schema_changes() {
         assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
     }
 }
+
+#[test]
+fn group65_recreated_tables_discard_the_old_objects_statistics() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+
+    for (album, album_index, track_unique) in [
+        ("aid INTEGER PRIMARY KEY, title TEXT UNIQUE NOT NULL", "", "aid, tn"),
+        (
+            "aid INT PRIMARY KEY, title TEXT NOT NULL",
+            "CREATE INDEX album_i1 ON album(title, aid);",
+            "aid, tn",
+        ),
+        ("aid INTEGER PRIMARY KEY, title TEXT UNIQUE NOT NULL", "", "aid, tn DESC"),
+    ] {
+        db.execute_batch(&format!(
+            "BEGIN;
+             DROP TABLE IF EXISTS track;
+             DROP TABLE IF EXISTS album;
+             CREATE TABLE album({album});
+             {album_index}
+             CREATE TABLE track(tid INTEGER PRIMARY KEY,
+                 aid INTEGER NOT NULL REFERENCES album, tn INTEGER NOT NULL,
+                 name TEXT, UNIQUE({track_unique}));
+             INSERT INTO album VALUES(1,'1-one'),(2,'2-two'),(3,'3-three');
+             INSERT INTO track VALUES
+                 (NULL,1,1,'one-a'),(NULL,2,2,'two-b'),(NULL,3,3,'three-c'),
+                 (NULL,1,3,'one-c'),(NULL,2,1,'two-a'),(NULL,3,1,'three-a');
+             ANALYZE;
+             COMMIT;"
+        ))
+        .unwrap();
+    }
+
+    let select = "SELECT name FROM album CROSS JOIN track USING(aid) ORDER BY title, tn DESC";
+    let plan = db.query(&format!("EXPLAIN QUERY PLAN {select}"), &[]).unwrap();
+    let details = plan.rows.iter().filter_map(|row| row.get_str(3)).collect::<Vec<_>>();
+    assert!(details.iter().any(|detail| detail.starts_with("SEARCH track USING INDEX")), "{details:?}");
+    assert!(details.iter().all(|detail| !detail.contains("ORDER BY")), "{details:?}");
+    let data = db.query(select, &[]).unwrap();
+    let names = data.rows.iter().filter_map(|row| row.get_str(0)).collect::<Vec<_>>();
+    assert_eq!(names, ["one-c", "one-a", "two-b", "two-a", "three-c", "three-a"]);
+    assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+}

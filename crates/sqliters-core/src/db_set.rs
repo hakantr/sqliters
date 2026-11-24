@@ -130,7 +130,7 @@ pub struct DbSlot {
     /// Tables whose statistics C keeps from an earlier read although the row is gone
     /// (`sqlite3AnalysisLoad()` does not reset `Table.nRowLogEst`, `szTabRow`, nor the
     /// `unordered` / `noskipscan` / `sz=` state of an index): the port reports them as
-    /// unsupported until C's schema is reset.
+    /// unsupported until C's schema is reset or the table object is dropped.
     pub c_stat_stale: std::collections::HashSet<String>,
     /// Tables (lower case) created by a CREATE TABLE statement of this connection since C last
     /// ran `sqlite3AnalysisLoad()` on this database: their indexes still carry the row
@@ -829,8 +829,7 @@ impl DatabaseSet {
             }
             let cur = c_stat_names(slot);
             for gone in slot.c_stat_seen.difference(&cur) {
-                let table = gone.split('\u{1}').next().unwrap_or("").to_owned();
-                slot.c_stat_stale.insert(table);
+                slot.c_stat_stale.insert(c_stat_owner(gone).to_owned());
             }
             slot.c_stat_seen = cur;
             if after_analyze {
@@ -934,6 +933,10 @@ impl DatabaseSet {
                 if last(log, n) != Some(false) {
                     log.1.push((false, n.clone()));
                 }
+                // OP_DropTable releases the statistics with the table object.
+                let table = n.to_ascii_lowercase();
+                slot.c_stat_stale.remove(&table);
+                slot.c_stat_seen.retain(|entry| c_stat_owner(entry) != table);
             }
             for n in new {
                 if last(log, n) != Some(true) {
@@ -2551,6 +2554,10 @@ mod tests {
         assert_ne!(set.slot(id_c).unwrap().schema_instance_id, inst_a);
         assert_ne!(set.slot(id_c).unwrap().schema_instance_id, inst_b);
     }
+}
+
+fn c_stat_owner(entry: &str) -> &str {
+    entry.split_once('\u{1}').map_or(entry, |(table, _)| table)
 }
 
 /// The tables and indexes (lower case; an index as "<table>\u{1}<index>", the PRIMARY KEY of a
