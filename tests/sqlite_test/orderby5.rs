@@ -1,5 +1,4 @@
 #[test]
-#[ignore = "26/39 subtests passed; pending: ANALYZE/sqlite_stat1, EQP/optimizer"]
 fn test_orderby5() {
     sqliters_tcltest::run_test_script(
         "orderby5",
