@@ -1269,6 +1269,28 @@ fn text_register_write_program(prog: &Program, collations: &CollationRegistry) -
 }
 
 #[allow(non_upper_case_globals)]
+fn plain_fk_action_chain(program: &Program) -> bool {
+    use sqliters_vdbe::opcodes::{OP_Init, OP_Program};
+
+    let mut caller = program.a_op.as_slice();
+    // The generator stores SubPrograms in reverse allocation order.
+    for action in program.p_program.iter().rev() {
+        let mut calls = caller.iter().filter(|op| op.opcode == OP_Program);
+        let Some(P4::SubProgram(callee)) = calls.next().map(|op| &op.p4) else {
+            return false;
+        };
+        if calls.next().is_some()
+            || !Arc::ptr_eq(action, callee)
+            || !action.a_op.first().is_some_and(|op| op.opcode == OP_Init && !op.p4.is_used())
+        {
+            return false;
+        }
+        caller = &action.a_op;
+    }
+    caller.iter().all(|op| op.opcode != OP_Program)
+}
+
+#[allow(non_upper_case_globals)]
 fn parent_fk_counter_program(
     program: &Program,
     collations: &CollationRegistry,
@@ -1278,17 +1300,7 @@ fn parent_fk_counter_program(
     use sqliters_vdbe::opcodes::*;
     let action_count = program.p_program.len();
     let matches_scope = match scope {
-        ParentFkProgramScope::SingleRelation => {
-            action_count <= 1
-                || (action_count == 2
-                    && program.a_op.iter().filter(|op| op.opcode == OP_Program).count() == 1
-                    && program.p_program.iter().flat_map(|action| &action.a_op)
-                        .filter(|op| op.opcode == OP_Program).count() == 1
-                    && program.p_program.iter().all(|action| {
-                        action.a_op.first()
-                            .is_some_and(|op| op.opcode == OP_Init && !op.p4.is_used())
-                    }))
-        }
+        ParentFkProgramScope::SingleRelation => action_count <= 1 || plain_fk_action_chain(program),
         ParentFkProgramScope::SiblingActions(count) => action_count == count,
     };
     if program.read_only || program.btree_mask != 1 || program.n_res_column != 0 || !matches_scope {

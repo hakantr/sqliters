@@ -5818,3 +5818,52 @@ fn group65_fk_without_rowid_child_uses_its_physical_primary_key_set() {
         }
     }
 }
+
+#[test]
+fn group65_fk_numeric_child_deep_action_chain_matches_sqlite_counter() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for depth in [3, 4] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}';
+                 PRAGMA foreign_keys=ON;
+                 CREATE TABLE parent(k TEXT PRIMARY KEY) WITHOUT ROWID;
+                 INSERT INTO parent VALUES('007'),('7');",
+            ))
+            .unwrap();
+            let mut parent = "parent".to_owned();
+            for edge in 1..=depth {
+                let child = format!("child{edge}");
+                let timing = if edge == 1 { "DEFERRABLE INITIALLY DEFERRED" } else { "" };
+                db.execute_batch(&format!(
+                    "CREATE TABLE {child}(k INTEGER UNIQUE REFERENCES {parent}(k)
+                     ON UPDATE CASCADE {timing});
+                     INSERT INTO {child} VALUES(7);",
+                ))
+                .unwrap();
+                parent = child;
+            }
+            let last_key = || {
+                db.query(&format!("SELECT k FROM {parent}"), &[]).unwrap().rows[0]
+                    .get_i64(0).unwrap()
+            };
+
+            db.execute_batch("BEGIN; UPDATE parent SET k='6' WHERE k='007'").unwrap();
+            assert_eq!(last_key(), 6);
+            assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+            let error = db.execute("COMMIT").unwrap_err();
+            assert_eq!(error.extended_code, sqliters::types::extended::SQLITE_CONSTRAINT_FOREIGNKEY);
+            assert!(!db.is_autocommit());
+            db.execute_batch("ROLLBACK").unwrap();
+            assert_eq!(last_key(), 7);
+
+            db.execute("UPDATE parent SET k='6' WHERE k='7'").unwrap();
+            assert_eq!(last_key(), 6);
+            assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+            assert_eq!(
+                db.query("PRAGMA integrity_check", &[]).unwrap().rows[0].get_str(0),
+                Some("ok"),
+            );
+        }
+    }
+}
