@@ -7585,10 +7585,12 @@ pub(crate) fn custom_limit_order_collation<'a>(
     select: &'a SelectStmt,
     db_set: &'a DatabaseSet,
     collations: &CollationRegistry,
-) -> Option<(&'a str, u32)> {
+) -> Option<(&'a str, &'a TableSchema)> {
     let limit = select.limit.as_ref()?;
+    let SelectCore::Select { projection, selection, .. } = &select.body.head else { return None };
     let simple_bound = |expr: &Expr| match expr {
         Expr::Integer(_) | Expr::Bind(_) => true,
+        Expr::Null => selection.is_some(),
         Expr::Unary { op: UnaryOp::Negate | UnaryOp::Plus, expr } => matches!(expr.as_ref(), Expr::Integer(_)),
         _ => false,
     };
@@ -7597,8 +7599,17 @@ pub(crate) fn custom_limit_order_collation<'a>(
     {
         return None;
     }
-    main_rowid_order_collation(db_set, &select.body.head, &select.order_by)
-        .filter(|(name, _)| registered_order_collation(name, collations))
+    let filtered = selection.is_some();
+    let (name, table, _) = main_table_order_collation(db_set, &select.body.head, &select.order_by, filtered)?;
+    let admitted = if let Some(filter) = selection {
+        let max_fields = if table.without_rowid { 4 } else { 3 };
+        named_integer_order_scan(name, table, Some(filter), collations)
+            && projection.len() + select.order_by.len() <= max_fields
+            && table.columns.iter().all(|column| column.default_expr.is_none())
+    } else {
+        registered_order_collation(name, collations)
+    };
+    admitted.then_some((name, table))
 }
 
 pub(crate) fn custom_file_order_collation<'a>(
@@ -7618,7 +7629,7 @@ pub(crate) fn registered_worker_order_collation(name: &str, collations: &Collati
         || (Collation::from_name(name).is_none() && collations.has_infallible_registration(name))
 }
 
-fn worker_order_integer_filter(selection: &Expr, table: &TableSchema) -> bool {
+fn order_integer_filter(selection: &Expr, table: &TableSchema) -> bool {
     let Expr::Binary { op: BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge, left, right } = selection else {
         return false;
     };
@@ -7639,6 +7650,14 @@ fn worker_order_integer_filter(selection: &Expr, table: &TableSchema) -> bool {
     }
 }
 
+fn named_integer_order_scan(
+    name: &str, table: &TableSchema, filter: Option<&Expr>, collations: &CollationRegistry,
+) -> bool {
+    collations.get_custom("BINARY").is_none() && Collation::from_name(name).is_none()
+        && collations.has_infallible_registration(name)
+        && filter.is_none_or(|filter| order_integer_filter(filter, table))
+}
+
 pub(crate) fn worker_file_order_collation<'a>(
     select: &'a SelectStmt,
     db_set: &'a DatabaseSet,
@@ -7652,9 +7671,7 @@ pub(crate) fn worker_file_order_collation<'a>(
     let (name, table, total) = main_table_order_collation(db_set, &select.body.head, &select.order_by, true)?;
     let max_fields = if table.without_rowid { 4 } else { 3 };
     let registered = if table.without_rowid || selection.is_some() {
-        collations.get_custom("BINARY").is_none() && Collation::from_name(name).is_none()
-            && collations.has_infallible_registration(name)
-            && selection.as_ref().is_none_or(|filter| worker_order_integer_filter(filter, table))
+        named_integer_order_scan(name, table, selection.as_ref(), collations)
     } else {
         registered_worker_order_collation(name, collations)
     };

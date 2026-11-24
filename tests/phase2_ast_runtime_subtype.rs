@@ -6190,3 +6190,68 @@ fn group65_fk_sibling_no_action_keeps_counter_during_cascade_and_repair() {
         );
     }
 }
+
+#[test]
+fn group64_named_topn_filter_rebinds_window_and_preserves_callback_contract() {
+    use sqliters_vdbe::vdbe::SQLITE_STMTSTATUS_SORT;
+
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for (table, order) in [
+            ("(id INTEGER PRIMARY KEY,v TEXT,bucket INTEGER)", "id DESC"),
+            ("(v TEXT,id INTEGER,bucket INTEGER,PRIMARY KEY(id DESC)) WITHOUT ROWID", "id DESC"),
+            ("(v TEXT,id INTEGER,bucket INTEGER,PRIMARY KEY(bucket DESC,id)) WITHOUT ROWID", "bucket DESC,id DESC"),
+        ] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}'; PRAGMA temp_store=FILE; PRAGMA threads=8;
+                 CREATE TABLE items{table};
+                 WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<12)
+                 INSERT INTO items(id,v,bucket) SELECT x,printf('%02d',x%3),x%5 FROM n;"
+            )).unwrap();
+            let caller = std::thread::current().id();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            db.register_collation("app_nocase", move |left, right| {
+                assert_eq!(std::thread::current().id(), caller);
+                observed.fetch_add(1, AtomicOrdering::Relaxed);
+                right.cmp(left)
+            }).unwrap();
+            let sql = format!("SELECT id FROM items WHERE id>=?1 ORDER BY v COLLATE APP_NOCASE NULLS LAST,{order} LIMIT ?2 OFFSET ?3");
+            let mut statement = db.prepare(&sql).unwrap();
+            statement.bind(1, 4).unwrap().bind(2, Value::Null).unwrap().bind(3, 0).unwrap();
+            let mismatch = statement.step().unwrap_err();
+            assert_eq!((mismatch.extended_code, mismatch.message.as_str()), (20, "datatype mismatch"));
+            assert_eq!(statement.reset().unwrap_err(), mismatch);
+            statement.bind(2, 0).unwrap().bind(3, Value::Null).unwrap();
+            assert!(matches!(statement.step().unwrap(), StepResult::Done));
+            assert_eq!(calls.load(AtomicOrdering::Relaxed), 0);
+            assert_eq!(statement.machine_stmt_status(SQLITE_STMTSTATUS_SORT, false), 0);
+            statement.reset().unwrap();
+
+            statement.bind(2, 3).unwrap().bind(3, 1).unwrap();
+            let mut expected: Vec<_> = (4..=12).collect();
+            expected.sort_by_key(|&id| std::cmp::Reverse((
+                id % 3, if order.starts_with("bucket") { id % 5 } else { 0 }, id,
+            )));
+            for &id in &expected[1..4] {
+                let StepResult::Row(row) = statement.step().unwrap() else {
+                    panic!("expected a limited row for {encoding}/{order}");
+                };
+                assert_eq!(row.get_i64(0), Some(id));
+            }
+            assert!(matches!(statement.step().unwrap(), StepResult::Done));
+            assert_eq!(statement.machine_stmt_status(SQLITE_STMTSTATUS_SORT, true), 1);
+            assert!(calls.load(AtomicOrdering::Relaxed) > 0);
+            statement.reset().unwrap();
+
+            let failure = SqliteError::new(ErrorCode::Error, "ordinary WHERE LIMIT comparator error");
+            let callback_error = failure.clone();
+            db.register_fallible_collation("APP_NOCASE", move |_, _| {
+                assert_eq!(std::thread::current().id(), caller);
+                Err(callback_error.clone())
+            }).unwrap();
+            assert_eq!(statement.step().unwrap_err(), failure);
+            assert_eq!(statement.reset().unwrap_err(), failure);
+        }
+    }
+}

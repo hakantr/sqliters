@@ -134,7 +134,13 @@ pub(crate) fn custom_sort_policy_matches(
     inner: &ConnectionInner, program: &Program, stmt: Option<&Stmt>, require_snapshot: bool,
 ) -> bool {
     if program.fallible_limit_sort_open.is_some() {
-        !inner.authorizer.is_some()
+        !inner.authorizer.is_some() && match stmt {
+            Some(Stmt::Select(select)) if matches!(&select.body.head,
+                sqliters_syntax::SelectCore::Select { selection: Some(_), .. }) => {
+                crate::engine::custom_limit_order_collation(select, &inner.db_set, &inner.collations).is_some()
+            }
+            _ => true,
+        }
     } else if let Some(open) = program.fallible_file_sort_open {
         let Some(op) = program.a_op.get(open) else { return false };
         let collation = match &op.p4 {
@@ -186,7 +192,8 @@ fn custom_limit_sort_read_program(
     if inner.authorizer.is_some() {
         return None;
     }
-    let (name, root) = crate::engine::custom_limit_order_collation(select, &inner.db_set, &inner.collations)?;
+    let (name, table) = crate::engine::custom_limit_order_collation(select, &inner.db_set, &inner.collations)?;
+    let filtered = matches!(&select.body.head, sqliters_syntax::SelectCore::Select { selection: Some(_), .. });
     let PrepareResult::Program(mut program) = crate::cgen::c_prepare(inner, sql).0 else {
         return None;
     };
@@ -195,15 +202,19 @@ fn custom_limit_sort_read_program(
     {
         return None;
     }
-    let open = sqliters_vdbe::vdbe::custom_limit_sort_open(
-        &program, name, inner.effective_encoding() as u8,
-    )?;
+    let encoding = inner.effective_encoding();
+    let open = sqliters_vdbe::vdbe::custom_limit_sort_open(&program, name, encoding as u8)?;
     let mut reads = program.a_op.iter().filter(|op| op.opcode == OP_OpenRead);
     let read = reads.next()?;
     let sort = &program.a_op[open];
-    if reads.next().is_some() || read.p1 == sort.p1 || read.p2 != root as i32 || read.p3 != 0
-        || !matches!(read.p4, P4::Int32(_))
+    if reads.next().is_some() || read.p1 == sort.p1 || read.p2 != table.root_pgno as i32 || read.p3 != 0
+        || (filtered && !matches!(&sort.p4, P4::KeyInfo(key) if usize::from(key.n_key_field) == select.order_by.len()))
     {
+        return None;
+    }
+    if table.without_rowid {
+        binary_without_rowid_sort_table(&inner.db_set, encoding, read)?;
+    } else if !matches!(read.p4, P4::Int32(_)) {
         return None;
     }
     if !program.a_op.iter().enumerate().all(|(pc, op)| match op.opcode {
@@ -215,7 +226,8 @@ fn custom_limit_sort_read_program(
         OP_Rewind | OP_Rowid => op.p1 == read.p1,
         OP_Column | OP_Next => op.p1 == read.p1 || op.p1 == sort.p1,
         OP_Sequence | OP_Last | OP_IdxLE | OP_Delete | OP_IdxInsert | OP_Sort => op.p1 == sort.p1,
-        _ => false,
+        OP_Null => filtered && op.p1 == 0 && op.p2 > 0 && op.p3 == 0 && op.p5 == 0,
+        _ => filtered && sqliters_vdbe::vdbe::is_integer_order_filter_op(op, read, encoding as u8),
     }) {
         return None;
     }
@@ -281,7 +293,7 @@ fn file_sort_read_program(
         return None;
     }
     if without_rowid {
-        worker_without_rowid_table(&inner.db_set, encoding, read)?;
+        binary_without_rowid_sort_table(&inner.db_set, encoding, read)?;
     } else if !matches!(read.p4, P4::Int32(_)) {
         return None;
     }
@@ -296,7 +308,7 @@ fn file_sort_read_program(
         OP_SorterOpen => pc == open,
         OP_SorterInsert | OP_SorterSort | OP_SorterNext => op.p1 == sort.p1,
         OP_SorterData => op.p1 == sort.p1 && op.p3 == pseudo.p1,
-        _ => has_integer_filter && sqliters_vdbe::vdbe::is_integer_worker_sort_filter_op(op, read, encoding as u8),
+        _ => has_integer_filter && sqliters_vdbe::vdbe::is_integer_order_filter_op(op, read, encoding as u8),
     }) {
         return None;
     }
@@ -360,7 +372,7 @@ fn has_worker_sort_table_key(db_set: &DatabaseSet, encoding: TextEncoding, read:
     if matches!(read.p4, P4::Int32(_)) {
         return has_declared_unique_sort_key(db_set, root, keys);
     }
-    worker_without_rowid_table(db_set, encoding, read).is_some_and(|table| {
+    binary_without_rowid_sort_table(db_set, encoding, read).is_some_and(|table| {
         let count = table.without_rowid_pk_cols.len();
         count == keys.len() && (0..count).all(|slot| {
             keys.iter().any(|key| usize::try_from(key.p2).ok() == Some(slot))
@@ -368,7 +380,7 @@ fn has_worker_sort_table_key(db_set: &DatabaseSet, encoding: TextEncoding, read:
     })
 }
 
-fn worker_without_rowid_table<'a>(
+fn binary_without_rowid_sort_table<'a>(
     db_set: &'a DatabaseSet,
     encoding: TextEncoding,
     read: &VdbeOp,

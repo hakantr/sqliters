@@ -1672,9 +1672,9 @@ fn complete_order_sorter(prog: &Program, open: &VdbeOp, key: &KeyInfo) -> bool {
     })
 }
 
-/// Instructions for a single integer-affinity threshold on an already checked table scan.
+/// Instructions for an integer-affinity threshold on an already checked table scan.
 #[doc(hidden)]
-pub fn is_integer_worker_sort_filter_op(op: &VdbeOp, table: &VdbeOp, encoding: u8) -> bool {
+pub fn is_integer_order_filter_op(op: &VdbeOp, table: &VdbeOp, encoding: u8) -> bool {
     match op.opcode {
         OP_Integer | OP_Int64 | OP_Variable => op.p2 > 0 && op.p5 == 0,
         OP_IsNull => op.p1 > 0 && op.p2 > 0 && op.p5 == 0,
@@ -1765,7 +1765,7 @@ fn worker_order_sorter(
         OP_SorterOpen => op.p1 == cursor,
         OP_SorterInsert | OP_SorterSort | OP_SorterNext => op.p1 == cursor,
         OP_SorterData => op.p1 == cursor && op.p3 == pseudo.p1,
-        _ => has_integer_filter && is_integer_worker_sort_filter_op(op, table, encoding),
+        _ => has_integer_filter && is_integer_order_filter_op(op, table, encoding),
     }) {
         return false;
     }
