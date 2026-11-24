@@ -7342,3 +7342,80 @@ fn group65_five_table_inner_join_rebinds_only_on_related_schema_change() {
         assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
     }
 }
+
+#[test]
+fn group65_five_table_inner_join_tracks_four_and_five_distinct_schemas() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}'; PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent);
+             INSERT INTO parent VALUES(1); INSERT INTO child VALUES(1,1);
+             ATTACH ':memory:' AS aux; ATTACH ':memory:' AS other; ATTACH ':memory:' AS third;
+             ATTACH ':memory:' AS spare; ATTACH ':memory:' AS archive;"
+        )).unwrap();
+        for (schema, table, marker) in [
+            ("aux", "ta", 201), ("other", "tb", 302), ("third", "tc", 403),
+            ("aux", "td", 204), ("spare", "td", 804), ("archive", "te", 905),
+        ] {
+            db.execute_batch(&format!(
+                "CREATE TABLE {schema}.{table}(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+                 INSERT INTO {schema}.{table} VALUES(1,1,{marker});"
+            )).unwrap();
+        }
+        let sql = |fourth_schema| format!(
+            "SELECT a.marker,b.marker AS second_marker,c.marker AS third_marker,
+                    d.marker AS fourth_marker,e.marker+length(?1) AS fifth_marker
+             FROM aux.ta AS a JOIN other.tb AS b ON a.p=b.id JOIN third.tc AS c ON b.p=c.id
+             JOIN {fourth_schema}.td AS d ON c.p=d.id JOIN te AS e ON d.p=e.id"
+        );
+        let four_sql = sql("aux");
+        let five_sql = sql("spare");
+        let mut four_legacy = db.prepare_v1(&four_sql).unwrap();
+        let mut five_legacy = db.prepare_v1(&five_sql).unwrap();
+        let mut four_modern = db.prepare(&four_sql).unwrap();
+        let mut five_modern = db.prepare(&five_sql).unwrap();
+        for stmt in [&mut four_legacy, &mut five_legacy, &mut four_modern, &mut five_modern] {
+            stmt.bind_text(1, "猫").unwrap();
+        }
+        let read = |stmt: &mut sqliters::Statement, fourth, fifth, reprepares, raw_sql| {
+            let StepResult::Row(row) = stmt.step().unwrap() else {
+                panic!("expected an INNER JOIN row");
+            };
+            assert_eq!(row.values(), [201, 302, 403, fourth, fifth].map(Value::Integer));
+            assert_eq!(stmt.step().unwrap(), StepResult::Done);
+            stmt.reset().unwrap();
+            assert_eq!(stmt.c_reprepare_status().0, reprepares);
+            assert_eq!(stmt.column_names(), ["marker", "second_marker", "third_marker", "fourth_marker", "fifth_marker"]);
+            assert_eq!(stmt.sql(), raw_sql);
+        };
+
+        db.execute_batch(
+            "CREATE TABLE main.te(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+             INSERT INTO main.te VALUES(1,1,505);"
+        ).unwrap();
+        for stmt in [&mut four_legacy, &mut four_modern] {
+            read(stmt, 204, 906, 0, four_sql.as_str());
+        }
+        for stmt in [&mut five_legacy, &mut five_modern] {
+            read(stmt, 804, 906, 0, five_sql.as_str());
+        }
+
+        db.execute_batch("ALTER TABLE archive.te ADD COLUMN note TEXT").unwrap();
+        for mut stmt in [four_legacy, five_legacy] {
+            assert_eq!(stmt.step().unwrap_err().code, ErrorCode::Schema);
+            assert_eq!(stmt.reset().unwrap_err().code, ErrorCode::Schema);
+            stmt.finalize().unwrap();
+        }
+        read(&mut four_modern, 204, 506, 1, four_sql.as_str());
+        read(&mut five_modern, 804, 506, 1, five_sql.as_str());
+
+        db.execute_batch("ALTER TABLE spare.td ADD COLUMN note TEXT").unwrap();
+        read(&mut four_modern, 204, 506, 1, four_sql.as_str());
+        read(&mut five_modern, 804, 506, 2, five_sql.as_str());
+        four_modern.finalize().unwrap();
+        five_modern.finalize().unwrap();
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+    }
+}

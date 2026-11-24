@@ -5953,6 +5953,7 @@ enum PreparedReadSchemas {
     Two(PreparedReadSchema, PreparedReadSchema),
     Three([PreparedReadSchema; 3]),
     Four([PreparedReadSchema; 4]),
+    Five([PreparedReadSchema; 5]),
 }
 
 impl PreparedReadSchemas {
@@ -5962,6 +5963,7 @@ impl PreparedReadSchemas {
             Self::Two(left, right) => left.changed(db_set) || right.changed(db_set),
             Self::Three(schemas) => schemas.into_iter().any(|schema| schema.changed(db_set)),
             Self::Four(schemas) => schemas.into_iter().any(|schema| schema.changed(db_set)),
+            Self::Five(schemas) => schemas.into_iter().any(|schema| schema.changed(db_set)),
         }
     }
 
@@ -6013,8 +6015,18 @@ impl PreparedReadSchemas {
             *source = read_schema(&join.right)?;
         }
         let sources = &sources[..=from.joins.len()];
-        let mask = sources.iter().fold(0u32, |mask, schema| mask | (1 << schema.db_id.index()));
-        if (from.joins.len() == 4 && mask.count_ones() > 3) || usage?.btree_mask != Some(mask) {
+        let mut distinct = [left; 5];
+        let mut distinct_count = 0;
+        let mut mask = 0u32;
+        for schema in sources.iter().copied() {
+            let bit = 1 << schema.db_id.index();
+            if mask & bit == 0 {
+                distinct[distinct_count] = schema;
+                distinct_count += 1;
+                mask |= bit;
+            }
+        }
+        if usage?.btree_mask != Some(mask) {
             return None;
         }
         // An interpreter join uses these same cursor roots when it starts the reads.
@@ -6029,6 +6041,14 @@ impl PreparedReadSchemas {
         if execution_mask != mask {
             return None;
         }
+        let schemas = match distinct[..distinct_count] {
+            [a] => Self::One(a),
+            [a, b] => Self::Two(a, b),
+            [a, b, c] => Self::Three([a, b, c]),
+            [a, b, c, d] => Self::Four([a, b, c, d]),
+            [a, b, c, d, e] => Self::Five([a, b, c, d, e]),
+            _ => return None,
+        };
         // Keep each independently resolved source when the interpreter resolves the AST again.
         if let Some(Stmt::Select(select)) = &mut artifacts.stmt
             && let SelectCore::Select { from: Some(from), .. } = &mut select.body.head
@@ -6038,17 +6058,7 @@ impl PreparedReadSchemas {
                 schema.pin_table(&mut join.right, db_set);
             }
         }
-        if mask.count_ones() == 4 {
-            return Some(Self::Four(sources.try_into().ok()?));
-        }
-        let mut additional = sources[1..].iter().copied().filter(|schema| schema.db_id != left.db_id);
-        let Some(second) = additional.next() else {
-            return Some(Self::One(left));
-        };
-        Some(match additional.find(|schema| schema.db_id != second.db_id) {
-            Some(third) => Self::Three([left, second, third]),
-            None => Self::Two(left, second),
-        })
+        Some(schemas)
     }
 }
 
