@@ -5270,3 +5270,62 @@ fn group65_fk_rowid_parent_action_preserves_sqlite_constraint_counter() {
         assert_eq!(child_key(), 8);
     }
 }
+
+#[test]
+fn group65_temp_ddl_expires_prepared_selects_at_their_next_execution() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!("PRAGMA encoding='{encoding}'; PRAGMA foreign_keys=ON;"))
+            .unwrap();
+        let sql = "SELECT length(?1)";
+        let mut legacy = db.prepare_v1(sql).unwrap();
+        let mut modern = db.prepare(sql).unwrap();
+        let mut running = db.prepare("SELECT length(?1) UNION ALL SELECT length(?1)").unwrap();
+        for stmt in [&mut legacy, &mut modern, &mut running] {
+            stmt.bind_text(1, "Yaz").unwrap();
+        }
+        let expect_row = |stmt: &mut sqliters::Statement| {
+            let StepResult::Row(row) = stmt.step().unwrap() else {
+                panic!("expected bound result");
+            };
+            assert_eq!(row.values(), [Value::Integer(3)]);
+        };
+
+        expect_row(&mut running);
+        db.execute_batch("CREATE TEMP TABLE sample(id INTEGER PRIMARY KEY);").unwrap();
+        expect_row(&mut running);
+        assert_eq!(running.step().unwrap(), StepResult::Done);
+        assert_eq!(running.c_reprepare_status().0, 0);
+        running.reset().unwrap();
+        expect_row(&mut running);
+        assert_eq!(running.c_reprepare_status().0, 1);
+        running.finalize().unwrap();
+
+        assert_eq!(legacy.step().unwrap_err().code, ErrorCode::Schema);
+        assert!(legacy.c_v1_expired_before_run());
+        assert_eq!(legacy.reset().unwrap_err().code, ErrorCode::Schema);
+        assert_eq!(legacy.step().unwrap_err().code, ErrorCode::Schema);
+        assert_eq!(legacy.finalize().unwrap_err().code, ErrorCode::Schema);
+
+        expect_row(&mut modern);
+        modern.reset().unwrap();
+        assert_eq!(modern.c_reprepare_status().0, 1);
+        db.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS sample(id INTEGER PRIMARY KEY);
+             INSERT INTO sample VALUES(1);
+             CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent);
+             INSERT INTO parent VALUES(1); INSERT INTO child VALUES(1,1);",
+        ).unwrap();
+        expect_row(&mut modern);
+        modern.reset().unwrap();
+        assert_eq!(modern.c_reprepare_status().0, 1);
+
+        db.execute_batch("ALTER TABLE temp.sample ADD COLUMN memo TEXT;").unwrap();
+        expect_row(&mut modern);
+        modern.reset().unwrap();
+        assert_eq!(modern.c_reprepare_status().0, 2);
+        modern.finalize().unwrap();
+        assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+    }
+}

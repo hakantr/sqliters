@@ -162,6 +162,8 @@ pub struct StmtTxTracker {
     pub(crate) defer_returning_changes: bool,
     /// SQL journal transitions prepared by this result-producing statement.
     pub(crate) staged_journal_modes: SmallInstVec,
+    /// The statement's own TEMP SetCookie invalidated other prepared statements.
+    pub(crate) temp_ddl_expired: bool,
     /// All participants passed the preflight for a shared journal-mode transition.
     pub(crate) coordinated_journal_mode: bool,
     /// A preparation whose cleanup failed must not be retried or leave the connection usable.
@@ -4119,11 +4121,17 @@ pub(crate) fn execute_write_body(
         note_corrupt_in_transaction(ctx, &res);
         return res;
     }
+    let expire_seq = ctx.db_set.c_expire_seq();
     let saved = ctx.db_set.cookie_scope_enter();
     ctx.stmt_tx.exec_depth += 1;
     let res = execute_write_body_inner(ctx, stmt, params);
     c_statement_halt(ctx);
-    ctx.db_set.cookie_scope_exit(&saved);
+    let temp_cookie_changed = ctx.db_set.cookie_scope_exit(&saved);
+    if res.is_ok() && temp_cookie_changed && ctx.db_set.c_expire_seq() == expire_seq {
+        // OP_SetCookie on TEMP expires the connection's other prepared statements.
+        ctx.db_set.c_expire_all();
+        ctx.stmt_tx.temp_ddl_expired = ctx.stmt_tx.exec_depth == 0;
+    }
     note_corrupt_in_transaction(ctx, &res);
     res
 }

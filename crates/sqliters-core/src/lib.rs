@@ -12756,6 +12756,9 @@ impl Statement {
                         if !out.column_names.is_empty() {
                             self.column_names = out.column_names;
                         }
+                        if stmt_tx.temp_ddl_expired {
+                            self.compiled_c_expire_seq = inner.db_set.c_expire_seq();
+                        }
                         if self.compiled_schema_generation != inner.schema_generation
                             || self.compiled_v1_expire_generation != inner.v1_expire_generation
                         {

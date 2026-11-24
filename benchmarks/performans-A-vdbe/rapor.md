@@ -2882,3 +2882,8 @@ Yeni 24/24 hedef native kontrolü C ile eş; 240 geri kontrol önceki Rust ham i
 ## V6b.515 — ROWID parent TEXT anahtarı ve numeric child yabancı anahtar action sayacı
 
 Tek ve bileşik TEXT PRIMARY KEY ile ayrı TEXT UNIQUE indekslerde 4.032 native C karşılaştırması ve 4.032 ters yön salt okunur açılış eş. Group64 38/38 ve Group65 50/50 iki kipte. [Bağımsız ölçüm](/github/sqliters/target/perf-work/fk-rowid-numeric-child-action-v514-candidate/sonuc.md) OFF 1388/0/324, ON 1388/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,292 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_515.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.516 — TEMP DDL sonrasında tablosuz hazır ifadelerin geçersizleşmesi
+
+24/24 hedef, 240 taban ham byte kontrolü eş. C uyum V1 adım, reset, finalize ve bağlantı tanısı 72/72. Rust public typed Schema sözleşmesinin iki kipte mevcut testleri geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/temp-ddl-expiry-candidate/sonuc.md) OFF 1389/0/324, ON 1389/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,294 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_516.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)

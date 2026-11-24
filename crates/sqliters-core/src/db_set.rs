@@ -1337,14 +1337,19 @@ impl DatabaseSet {
             .collect()
     }
 
-    /// Ends the scope opened by [`Self::cookie_scope_enter`].
-    pub(crate) fn cookie_scope_exit(&mut self, saved: &[sqliters_btree::CookieStmt]) {
+    /// Ends a DDL cookie scope and reports whether this scope changed TEMP's schema cookie.
+    pub(crate) fn cookie_scope_exit(&mut self, saved: &[sqliters_btree::CookieStmt]) -> bool {
         self.ddl_cookie_depth = self.ddl_cookie_depth.saturating_sub(1);
+        let mut temp_cookie_changed = false;
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if let Some(bt) = slot.btree.as_mut() {
-                bt.replace_cookie_stmt(saved.get(i).copied().unwrap_or_default());
+                let ended = bt.replace_cookie_stmt(saved.get(i).copied().unwrap_or_default());
+                if i == DatabaseId::TEMP.index() && let sqliters_btree::CookieStmt::Base(base) = ended {
+                    temp_cookie_changed = bt.pager().header().schema_cookie != base;
+                }
             }
         }
+        temp_cookie_changed
     }
 
     /// Whether a DDL statement's schema-cookie scope is active.
