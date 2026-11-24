@@ -317,3 +317,61 @@ fn exclusive_memory_wal_switch_publishes_header_on_statement_completion() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn empty_named_wal_switch_initializes_page_on_statement_completion() {
+    let dir = std::env::temp_dir().join(format!("v6b-empty-wal-switch-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    for page_size in [512, 4096, 65_536] {
+        for locking in ["normal", "exclusive"] {
+            for (source, needs_journal) in [
+                ("delete", true),
+                ("persist", true),
+                ("truncate", true),
+                ("memory", false),
+                ("off", false),
+            ] {
+                for legacy in [false, true] {
+                    for finish in ["done", "reset", "finalize"] {
+                        let path = dir.join(format!("{page_size}-{locking}-{source}-{legacy}-{finish}.db"));
+                        let db = Connection::open(&path).unwrap();
+                        db.execute("PRAGMA foreign_keys=ON").unwrap();
+                        assert_eq!(text(&db, &format!("PRAGMA locking_mode={locking}")), locking);
+                        assert_eq!(text(&db, &format!("PRAGMA main.journal_mode={source}")), source);
+                        db.execute(&format!("PRAGMA page_size={page_size}")).unwrap();
+                        let sql = "PRAGMA main.journal_mode=wal";
+                        let mut statement = if legacy {
+                            db.prepare_v1(sql).unwrap()
+                        } else {
+                            db.prepare(sql).unwrap()
+                        };
+                        assert!(
+                            matches!(statement.step().unwrap(), StepResult::Row(ref row)
+                                if row.get_str(0) == Some("wal"))
+                        );
+                        let journal = path.with_extension("db-journal");
+                        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0, "{path:?}");
+                        assert_eq!(journal.exists(), needs_journal, "{path:?}");
+
+                        match finish {
+                            "done" => assert!(matches!(statement.step().unwrap(), StepResult::Done)),
+                            "reset" => statement.reset().unwrap(),
+                            "finalize" => {}
+                            _ => unreachable!(),
+                        }
+                        statement.finalize().unwrap();
+                        let image = std::fs::read(&path).unwrap();
+                        assert_eq!(image.len(), page_size);
+                        assert_eq!(image[18..20], [2, 2]);
+                        assert!(!journal.exists());
+                        db.try_close().unwrap();
+                        assert_eq!(std::fs::read(&path).unwrap(), image);
+                        assert!(!path.with_extension("db-wal").exists());
+                        assert!(!path.with_extension("db-shm").exists());
+                    }
+                }
+            }
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

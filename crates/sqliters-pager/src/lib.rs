@@ -2749,17 +2749,18 @@ impl Pager {
             );
         // BtreeSetVersion also initializes and stages the first page of an
         // empty database until the single-target statement finishes.
-        let defer_empty_wal_entry = single_target
+        let defer_empty_wal_entry = self.page_count == 0
+            && single_target
             && mode == JournalMode::Wal
-            && !self.readonly
-            && self.locking_mode == LockingMode::Normal;
+            && !self.readonly;
         let defer = self.state == TransactionState::Open
             && self.db_kind == DatabaseKind::NamedDisk
             && (self.page_count > 0 || defer_empty_wal_entry)
             && self.pending_sql_journal_mode.is_none()
             && (!touches_volatile_journal
                 || self.locking_mode == LockingMode::Normal
-                || single_memory_wal_transition)
+                || single_memory_wal_transition
+                || defer_empty_wal_entry)
             && matches!(
                 (previous_mode, mode),
                 (JournalMode::Delete | JournalMode::Persist | JournalMode::Truncate
