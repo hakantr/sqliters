@@ -1099,6 +1099,7 @@ pub struct VdbeVm {
     regs: Vec<RuntimeValue>,
     cursors: Vec<CursorState>,
     params: Vec<Value>,
+    param_text_encodings: Vec<Option<TextEncoding>>,
     pool: VdbePool,
     pub runtime_ctx: VmRuntimeContext,
 }
@@ -1139,6 +1140,7 @@ impl VdbeVm {
             regs: vec![RuntimeValue::null(); n_regs],
             cursors,
             params,
+            param_text_encodings: Vec::new(),
             pool: VdbePool::default(),
             runtime_ctx,
         }
@@ -1171,9 +1173,18 @@ impl VdbeVm {
             self.cursors.resize_with(n_curs, || CursorState::Closed);
         }
         self.pool.copy_params_into(&mut self.params, params);
+        self.param_text_encodings.clear();
         self.pc = 0;
         self.halted = false;
         self.runtime_ctx = runtime_ctx;
+    }
+
+    /// Associate the cloned parameter values with their bind-time text encodings.
+    #[doc(hidden)]
+    pub fn set_param_text_encodings(&mut self, encodings: &[Option<TextEncoding>]) {
+        debug_assert_eq!(encodings.len(), self.params.len());
+        self.param_text_encodings.clear();
+        self.param_text_encodings.extend_from_slice(encodings);
     }
 
     /// Executes a non-returning write [`VdbeProgram`] to completion using reusable `scratch`
@@ -1204,6 +1215,7 @@ impl VdbeVm {
             &mut scratch.cursors,
             &mut scratch.pool,
             params,
+            &[],
             runtime_ctx,
             storage,
             services,
@@ -1271,6 +1283,7 @@ impl VdbeVm {
             &mut self.cursors,
             &mut self.pool,
             &self.params,
+            &self.param_text_encodings,
             &mut self.runtime_ctx,
             storage,
             services,
@@ -1300,6 +1313,7 @@ fn step_ops(
     cursors: &mut Vec<CursorState>,
     pool: &mut VdbePool,
     params: &[Value],
+    param_text_encodings: &[Option<TextEncoding>],
     runtime_ctx: &mut VmRuntimeContext,
     storage: &mut dyn BtreeAccess,
     services: &mut dyn ExecutionServices,
@@ -1314,6 +1328,7 @@ fn step_ops(
         cursors,
         pool,
         params,
+        param_text_encodings,
         runtime_ctx,
         storage,
         services,
@@ -1335,6 +1350,7 @@ fn step_ops_loop(
     cursors: &mut Vec<CursorState>,
     pool: &mut VdbePool,
     params: &[Value],
+    param_text_encodings: &[Option<TextEncoding>],
     runtime_ctx: &mut VmRuntimeContext,
     storage: &mut dyn BtreeAccess,
     services: &mut dyn ExecutionServices,
@@ -2016,7 +2032,9 @@ fn step_ops_loop(
                 // p1 = 1-based parameter index, p2 = dest_reg
                 let idx = (ins.p1 as usize).saturating_sub(1);
                 let src = params.get(idx).unwrap_or(&Value::Null);
-                runtime_ctx.check_bound_value_limit(src, runtime_ctx.text_encoding)?;
+                let encoding = param_text_encodings.get(idx).copied().flatten()
+                    .unwrap_or(runtime_ctx.text_encoding);
+                runtime_ctx.check_bound_value_limit(src, encoding)?;
                 pool.assign_cloned_value(&mut regs[ins.p2 as usize], src, 0);
             }
             Opcode::Copy => {

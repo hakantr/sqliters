@@ -1879,10 +1879,13 @@ impl ConnectionInner {
         }
     }
 
-    fn binds_require_length_check(&self, params: &[Value]) -> bool {
+    fn binds_require_length_check(&self, params: &[Value], text_encodings: &[Option<TextEncoding>]) -> bool {
         self.runtime.length_limit.is_some() && {
-            let encoding = self.effective_encoding();
-            params.iter().any(|param| self.runtime.bound_value_exceeds_length_limit(param, encoding))
+            let default_encoding = self.effective_encoding();
+            params.iter().enumerate().any(|(i, param)| {
+                let encoding = text_encodings.get(i).copied().flatten().unwrap_or(default_encoding);
+                self.runtime.bound_value_exceeds_length_limit(param, encoding)
+            })
         }
     }
 
@@ -2540,6 +2543,7 @@ impl ConnectionInner {
                         uri_enabled: shared.open_options.uri,
                         is_connection_readonly: shared.is_readonly,
                         runtime: &mut self.runtime,
+                        read_bindings: None,
                         interrupt_flag: &self.active_interrupt_flag,
                         functions: &self.functions,
                         current_functions: &self.functions,
@@ -2791,6 +2795,7 @@ impl ConnectionInner {
                         uri_enabled: shared.open_options.uri,
                         is_connection_readonly: shared.is_readonly,
                         runtime: &mut self.runtime,
+                        read_bindings: None,
                         interrupt_flag: &self.active_interrupt_flag,
                         functions: &self.functions,
                         current_functions: &self.functions,
@@ -2925,6 +2930,7 @@ impl ConnectionInner {
                             uri_enabled: shared.open_options.uri,
                             is_connection_readonly: shared.is_readonly,
                             runtime: &mut self.runtime,
+                            read_bindings: None,
                             interrupt_flag: &self.active_interrupt_flag,
                             functions: &self.functions,
                             current_functions: &self.functions,
@@ -7287,6 +7293,18 @@ impl ConnectionInner {
         expire_self_only: &mut bool,
         f: impl FnOnce(&mut ExecContext<'_>) -> R,
     ) -> R {
+        self.with_exec_ctx_and_bindings(shared, summary, stmt_tx, expire_self_only, None, f)
+    }
+
+    fn with_exec_ctx_and_bindings<R>(
+        &mut self,
+        shared: &ConnectionShared,
+        summary: ActivitySummary,
+        stmt_tx: &mut StmtTxTracker,
+        expire_self_only: &mut bool,
+        read_bindings: Option<engine::ReadBindings<'_>>,
+        f: impl FnOnce(&mut ExecContext<'_>) -> R,
+    ) -> R {
         self.runtime.text_encoding = self.effective_encoding();
         let mut publish_fn = |rt: &VmRuntimeContext, exp: bool, imp: bool, rb: u64| {
             shared.publish_mirrors(rt, exp, imp, rb);
@@ -7299,6 +7317,7 @@ impl ConnectionInner {
             uri_enabled: shared.open_options.uri,
             is_connection_readonly: shared.is_readonly,
             runtime: &mut self.runtime,
+            read_bindings,
             interrupt_flag: &self.active_interrupt_flag,
             functions: prepared_functions.as_ref().unwrap_or(&self.functions),
             current_functions: &self.functions,
@@ -10139,7 +10158,7 @@ impl Statement {
                     || inner.simulated_cleanup_io_error.is_some()
                     || inner.db_set.vtab_registry().has_any_in_tx()
                     || inner.db_set.main_slot().btree.as_ref().is_some_and(|bt| bt.pager().uses_fetch())
-                    || inner.binds_require_length_check(&self.params)
+                    || inner.binds_require_length_check(&self.params, &self.param_text_encodings)
                 {
                     PointOutcome::Fallback
                 } else {
@@ -10416,6 +10435,7 @@ impl Statement {
                     ref compiled_fast_read,
                     ref stmt,
                     ref params,
+                    ref param_text_encodings,
                     ref mut lifecycle,
                     ..
                 } = *self;
@@ -10445,6 +10465,7 @@ impl Statement {
                         compiled_slot_cookies,
                         compiled_fast_read.as_deref(),
                         params,
+                        param_text_encodings,
                         lifecycle,
                     )
                 };
@@ -10720,6 +10741,7 @@ impl Statement {
             &self.compiled_slot_cookies,
             self.compiled_fast_read.as_deref(),
             &self.params,
+            &self.param_text_encodings,
             &mut self.lifecycle,
         )
     }
@@ -10820,12 +10842,13 @@ impl Statement {
                     .current_unix_millis(),
             );
         }
-        let vm = if let Some(mut reused) = self.cached_read_vm.take() {
+        let mut vm = if let Some(mut reused) = self.cached_read_vm.take() {
             reused.prepare_for_reuse(prog, &self.params, vm_rt);
             reused
         } else {
             VdbeVm::from_shared(Arc::clone(prog), &self.params, vm_rt)
         };
+        vm.set_param_text_encodings(&self.param_text_encodings);
         self.lifecycle = StatementLifecycle::Running(RunningExec::Vdbe {
             vm, read_instances, function_generation: self.compiled_function_generation,
         });
@@ -11574,12 +11597,13 @@ impl Statement {
                                     .current_unix_millis(),
                             );
                         }
-                        let vm = if let Some(mut reused) = self.cached_read_vm.take() {
+                        let mut vm = if let Some(mut reused) = self.cached_read_vm.take() {
                             reused.prepare_for_reuse(prog_final, &self.params, vm_rt);
                             reused
                         } else {
                             VdbeVm::from_shared(Arc::clone(prog_final), &self.params, vm_rt)
                         };
+                        vm.set_param_text_encodings(&self.param_text_encodings);
                         self.lifecycle = StatementLifecycle::Running(RunningExec::Vdbe {
                             vm, read_instances, function_generation: self.compiled_function_generation,
                         });
@@ -11875,11 +11899,15 @@ impl Statement {
                     prepared_ignore_checks: Some(self.compiled_ignore_checks),
                     ..StmtTxTracker::default()
                 };
-                let exec_res = inner.with_exec_ctx(
+                let exec_res = inner.with_exec_ctx_and_bindings(
                     shared,
                     summary,
                     &mut stmt_tx,
                     &mut expire_self_only,
+                    Some(engine::ReadBindings {
+                        values: &self.params,
+                        text_encodings: &self.param_text_encodings,
+                    }),
                     |ctx| {
                         crate::vtab::ensure_stmt_vtabs_connected(ctx, stmt_ref)?;
                         execute_read_body(ctx, stmt_ref, &self.params)
@@ -13876,6 +13904,7 @@ fn try_fast_read_plan_fields(
     compiled_slot_cookies: &[(SchemaInstanceId, u32, bool)],
     fast_plan: Option<&fast_read::FastReadPlan>,
     params: &[Value],
+    param_text_encodings: &[Option<TextEncoding>],
     lifecycle: &mut StatementLifecycle,
 ) -> Option<Result<StepResult>> {
     if category != Some(StmtCategory::Read)
@@ -13887,7 +13916,7 @@ fn try_fast_read_plan_fields(
         || inner.progress.is_enabled()
         || inner.simulated_cleanup_io_error.is_some()
         || inner.db_set.vtab_registry().has_any_in_tx()
-        || inner.binds_require_length_check(params)
+        || inner.binds_require_length_check(params, param_text_encodings)
     {
         return None;
     }
@@ -14145,7 +14174,7 @@ fn try_fast_compiled_main_write_fields(
         || inner.mutation_pipeline.is_trace_enabled()
         || !inner.db_set.open_blobs().is_empty()
         || inner.db_set.vtab_registry().has_any_in_tx()
-        || inner.binds_require_length_check(params)
+        || inner.binds_require_length_check(params, &[])
     {
         return None;
     }

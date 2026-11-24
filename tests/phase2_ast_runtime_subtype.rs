@@ -5122,3 +5122,63 @@ fn group65_fk_action_numeric_child_preserves_sqlite_constraint_counter() {
         }
     }
 }
+
+#[test]
+fn group65_legacy_reads_check_each_bound_text_slots_encoding() {
+    let original = "m".repeat(64);
+    for encoding in ["UTF-16le", "UTF-16be"] {
+        for (sql, bound_column, expected) in [
+            ("SELECT ?1", 0, Value::Text(original.clone())),
+            ("SELECT length(?1)", 0, Value::Integer(64)),
+            (
+                "WITH sample(id) AS (SELECT 1) SELECT id,?1 FROM sample",
+                1,
+                Value::Text(original.clone()),
+            ),
+        ] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+            let mut stmt = db.prepare(sql).unwrap();
+            let mut slots = db.prepare(
+                "WITH sample(id) AS (SELECT 1) SELECT ?1,length(?2) FROM sample",
+            ).unwrap();
+            stmt.bind_text(1, &original).unwrap();
+            slots.bind_text(1, &original).unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}';
+                 CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                 CREATE TABLE child(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent);
+                 INSERT INTO parent VALUES(1); INSERT INTO child VALUES(1,1);",
+            )).unwrap();
+            slots.bind_text(2, &original).unwrap();
+            db.set_length_limit(64);
+
+            let read = |stmt: &mut sqliters::Statement| {
+                let StepResult::Row(row) = stmt.step().unwrap() else {
+                    panic!("expected bound text row");
+                };
+                stmt.reset().unwrap();
+                row.into_values()
+            };
+            assert_eq!(read(&mut stmt)[bound_column], expected);
+            assert_eq!(read(&mut stmt)[bound_column], expected);
+            assert_eq!(stmt.c_reprepare_status().0, 1);
+
+            stmt.bind_text(1, &original).unwrap();
+            assert_eq!(stmt.step().unwrap_err().code, ErrorCode::TooBig);
+            assert_eq!(stmt.reset().unwrap_err().code, ErrorCode::TooBig);
+            stmt.clear_bindings().unwrap();
+            assert_eq!(read(&mut stmt)[bound_column], Value::Null);
+
+            assert_eq!(slots.step().unwrap_err().code, ErrorCode::TooBig);
+            assert_eq!(slots.reset().unwrap_err().code, ErrorCode::TooBig);
+            slots.bind_text(2, "猫").unwrap();
+            assert_eq!(read(&mut slots), [Value::Text(original.clone()), Value::Integer(1)]);
+            slots.finalize().unwrap();
+            stmt.finalize().unwrap();
+
+            db.set_length_limit(1_000_000_000);
+            assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+        }
+    }
+}

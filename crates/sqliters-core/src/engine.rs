@@ -474,6 +474,12 @@ impl BusyPolicy {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ReadBindings<'a> {
+    pub(crate) values: &'a [Value],
+    pub(crate) text_encodings: &'a [Option<TextEncoding>],
+}
+
 /// Mutable database state passed into statement execution.
 pub struct ExecContext<'a> {
     pub db_set: &'a mut DatabaseSet,
@@ -481,6 +487,7 @@ pub struct ExecContext<'a> {
     pub uri_enabled: bool,
     pub is_connection_readonly: bool,
     pub runtime: &'a mut VmRuntimeContext,
+    pub(crate) read_bindings: Option<ReadBindings<'a>>,
     pub interrupt_flag: &'a std::sync::atomic::AtomicBool,
     pub functions: &'a FunctionRegistry,
     pub(crate) current_functions: &'a FunctionRegistry,
@@ -547,6 +554,20 @@ impl ExecContext<'_> {
         } else {
             *self.connection_encoding
         }
+    }
+
+    fn bound_value<'p>(&self, parameter: &BindParam, params: &'p [Value]) -> Result<&'p Value> {
+        let position = match parameter {
+            BindParam::Anonymous(i) | BindParam::Numbered(i) | BindParam::Named(_, i) => *i,
+        };
+        let index = position.saturating_sub(1);
+        let value = params.get(index).unwrap_or(&Value::Null);
+        // Nested evaluation can use a different set of parameters in the same execution context.
+        let encoding = self.read_bindings.filter(|bindings| std::ptr::eq(bindings.values, params))
+            .and_then(|bindings| bindings.text_encodings.get(index).copied().flatten())
+            .unwrap_or_else(|| self.encoding());
+        self.runtime.check_bound_value_limit(value, encoding)?;
+        Ok(value)
     }
 
     #[inline]
@@ -19318,14 +19339,7 @@ fn try_borrow_simple_expr_val<'a>(
             }
             Ok(None)
         }
-        Expr::Bind(bp) => {
-            let idx = match bp {
-                BindParam::Anonymous(i) | BindParam::Numbered(i) | BindParam::Named(_, i) => *i,
-            };
-            let value = params.get(idx.saturating_sub(1)).unwrap_or(&Value::Null);
-            ctx.runtime.check_bound_value_limit(value, ctx.encoding())?;
-            Ok(Some(value))
-        }
+        Expr::Bind(bp) => Ok(Some(ctx.bound_value(bp, params)?)),
         _ => Ok(None),
     }
 }
@@ -19368,14 +19382,7 @@ fn eval_expr_rt(
                 CurrentTimeKind::Timestamp => format_utc_timestamp(ts_ms),
             })))
         }
-        Expr::Bind(bp) => {
-            let idx = match bp {
-                BindParam::Anonymous(i) | BindParam::Numbered(i) | BindParam::Named(_, i) => *i,
-            };
-            let value = params.get(idx.saturating_sub(1)).unwrap_or(&Value::Null);
-            ctx.runtime.check_bound_value_limit(value, ctx.encoding())?;
-            Ok(RuntimeValue::plain(value.clone()))
-        }
+        Expr::Bind(bp) => Ok(RuntimeValue::plain(ctx.bound_value(bp, params)?.clone())),
         Expr::Column(cref) => {
             if cref.schema.as_deref() == Some(WIN_SLOT_SCHEMA) {
                 if let Ok(idx) = cref.column.parse::<usize>()
