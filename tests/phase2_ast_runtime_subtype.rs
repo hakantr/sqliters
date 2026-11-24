@@ -6768,3 +6768,81 @@ fn group64_mixed_sort_keeps_stock_and_named_comparators_in_their_slots() {
         assert_eq!(calls(), workers_before_replacement);
     }
 }
+
+#[test]
+fn group65_three_table_left_inner_join_preserves_null_extension_until_reprepare() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for (middle_join, right_join, right_key, nullable) in [
+            ("LEFT JOIN", "JOIN", "l.p", 1),
+            ("JOIN", "LEFT JOIN", "m.p", 2),
+        ] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}'; PRAGMA foreign_keys=ON;
+                 ATTACH ':memory:' AS aux; ATTACH ':memory:' AS other; ATTACH ':memory:' AS third;
+                 CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                 CREATE TABLE child(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent);
+                 INSERT INTO parent VALUES(1); INSERT INTO child VALUES(1,1);"
+            )).unwrap();
+            for (index, (schema, table)) in [("aux", "l"), ("other", "m"), ("third", "r")].into_iter().enumerate() {
+                let marker = [201, 302, 403][index];
+                db.execute_batch(&format!(
+                    "CREATE TABLE {schema}.{table}(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+                     INSERT INTO {schema}.{table} VALUES(1,1,{marker});"
+                )).unwrap();
+                if index != nullable {
+                    db.execute_batch(&format!("INSERT INTO {schema}.{table} VALUES(2,2,{})", 1000 + marker)).unwrap();
+                }
+            }
+            let sql = format!("SELECT l.marker,m.marker AS middle_marker,r.marker AS right_marker,length(?1)
+                               FROM l {middle_join} m ON l.p=m.id {right_join} r ON {right_key}=r.id");
+            let mut legacy = db.prepare_v1(&sql).unwrap();
+            let mut modern = db.prepare(&sql).unwrap();
+            for stmt in [&mut legacy, &mut modern] {
+                stmt.bind_text(1, "猫").unwrap();
+            }
+            let read = |stmt: &mut sqliters::Statement, markers: [i64; 3], extended, reprepares| {
+                let mut rows = Vec::new();
+                while let StepResult::Row(row) = stmt.step().unwrap() {
+                    rows.push(row.values().to_vec());
+                }
+                rows.sort_by_key(|row| match row[0] {
+                    Value::Integer(marker) => marker,
+                    _ => panic!("expected an integer row marker"),
+                });
+                let mut expected = [markers.to_vec(), markers.map(|marker| marker + 1000).to_vec()]
+                    .map(|row| row.into_iter().map(Value::Integer).collect::<Vec<_>>());
+                if extended {
+                    expected[1][nullable] = Value::Null;
+                }
+                for row in &mut expected {
+                    row.push(Value::Integer(1));
+                }
+                assert_eq!(rows, expected);
+                stmt.reset().unwrap();
+                assert_eq!(stmt.c_reprepare_status().0, reprepares);
+                assert_eq!(stmt.column_names(), ["marker", "middle_marker", "right_marker", "length(?1)"]);
+                assert_eq!(stmt.sql(), sql);
+            };
+
+            for (name, marker) in [("l", 501), ("m", 502), ("r", 503)] {
+                db.execute_batch(&format!(
+                    "CREATE TABLE main.{name}(id INTEGER PRIMARY KEY,p INTEGER,marker INTEGER);
+                     INSERT INTO main.{name} VALUES(1,1,{marker}),(2,2,{});", 1000 + marker,
+                )).unwrap();
+            }
+            read(&mut legacy, [201, 302, 403], true, 0);
+            read(&mut modern, [201, 302, 403], true, 0);
+
+            db.execute_batch("ALTER TABLE other.m ADD COLUMN note TEXT").unwrap();
+            assert_eq!(legacy.step().unwrap_err().code, ErrorCode::Schema);
+            assert_eq!(legacy.reset().unwrap_err().code, ErrorCode::Schema);
+            legacy.finalize().unwrap();
+            read(&mut modern, [501, 502, 503], false, 1);
+            db.execute_batch("CREATE TABLE aux.extra(id INTEGER PRIMARY KEY)").unwrap();
+            read(&mut modern, [501, 502, 503], false, 1);
+            modern.finalize().unwrap();
+            assert!(db.query("PRAGMA foreign_key_check", &[]).unwrap().rows.is_empty());
+        }
+    }
+}

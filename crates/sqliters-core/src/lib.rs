@@ -5954,7 +5954,8 @@ impl PreparedReadSchemas {
         };
         let supported_types = match from.joins.as_slice() {
             [join] => matches!(join.join_type, JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full),
-            [first, second] => first.join_type == JoinType::Inner && second.join_type == JoinType::Inner,
+            [first, second] => matches!((first.join_type, second.join_type),
+                (JoinType::Inner, JoinType::Inner | JoinType::Left) | (JoinType::Left, JoinType::Inner)),
             _ => false,
         };
         if !supported_types
