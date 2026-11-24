@@ -5448,3 +5448,57 @@ fn group65_fk_multiple_child_actions_preserve_sqlite_constraint_counter() {
         assert_eq!(value(text), Value::Null);
     }
 }
+
+#[test]
+fn group65_qualified_main_and_aux_reads_track_only_their_schema() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        for (target, other, marker) in [("main", "aux", 101), ("aux", "main", 201)] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}'; PRAGMA foreign_keys=ON;
+                 CREATE TABLE main.parent(id INTEGER PRIMARY KEY);
+                 CREATE TABLE main.sample(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent,marker INTEGER);
+                 INSERT INTO main.parent VALUES(1); INSERT INTO main.sample VALUES(1,1,101);
+                 ATTACH ':memory:' AS aux;
+                 CREATE TABLE aux.parent(id INTEGER PRIMARY KEY);
+                 CREATE TABLE aux.sample(id INTEGER PRIMARY KEY,p INTEGER REFERENCES parent,marker INTEGER);
+                 INSERT INTO aux.parent VALUES(1); INSERT INTO aux.sample VALUES(1,1,201);
+                 CREATE TEMP TABLE sample(id INTEGER PRIMARY KEY,marker INTEGER);
+                 INSERT INTO temp.sample VALUES(1,301);",
+            )).unwrap();
+            let sql = format!("SELECT marker,length(?1) FROM {target}.sample WHERE id=1");
+            let mut legacy = db.prepare_v1(&sql).unwrap();
+            let mut modern = db.prepare(&sql).unwrap();
+            for stmt in [&mut legacy, &mut modern] {
+                stmt.bind_text(1, "猫").unwrap();
+            }
+            let read = |stmt: &mut sqliters::Statement, reprepares| {
+                let StepResult::Row(row) = stmt.step().unwrap() else {
+                    panic!("expected qualified schema row");
+                };
+                assert_eq!(row.values(), [Value::Integer(marker), Value::Integer(1)]);
+                stmt.reset().unwrap();
+                assert_eq!(stmt.c_reprepare_status().0, reprepares);
+            };
+
+            db.execute_batch(&format!(
+                "CREATE TABLE {other}.extra(id INTEGER PRIMARY KEY);
+                 ALTER TABLE {other}.sample ADD COLUMN memo TEXT;",
+            )).unwrap();
+            read(&mut legacy, 0);
+            read(&mut modern, 0);
+
+            db.execute_batch(&format!("ALTER TABLE {target}.sample ADD COLUMN memo TEXT;")).unwrap();
+            assert_eq!(legacy.step().unwrap_err().code, ErrorCode::Schema);
+            assert_eq!(legacy.reset().unwrap_err().code, ErrorCode::Schema);
+            read(&mut modern, 1);
+
+            db.execute_batch("ALTER TABLE temp.sample ADD COLUMN memo TEXT;").unwrap();
+            read(&mut modern, 2);
+            modern.finalize().unwrap();
+            legacy.finalize().unwrap();
+            assert!(db.query("PRAGMA main.foreign_key_check", &[]).unwrap().rows.is_empty());
+            assert!(db.query("PRAGMA aux.foreign_key_check", &[]).unwrap().rows.is_empty());
+        }
+    }
+}

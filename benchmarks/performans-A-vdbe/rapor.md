@@ -2902,3 +2902,8 @@ Birleşik kaynakta her kipte 384 açık işlem, 384 autocommit ve 288 onarım C 
 ## V6b.519 — Birden fazla doğrudan FK child action sayaçları
 
 6.912 native C eşliği, farklı action ve farklı parent anahtar seçimi dahil. Her kipte 384 önceki NO ACTION/RESTRICT, Group64 38/38 ve Group65 53/53 geçti. [Bağımsız ölçüm](/github/sqliters/target/perf-work/v519-fk-sibling-action-exact/sonuc.md) OFF 1391/0/324, ON 1391/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,283 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_519.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
+
+
+## V6b.520 — Nitelikli MAIN ve AUX hazır sorgularında ilgili şema
+
+96/96 hedef yaşam döngüsü ve 264 taban ham kontrolü eş. 264 önceki TEMP, 120 legacy ve 116 byte observer kontrolleri korundu. [Bağımsız ölçüm](/github/sqliters/target/perf-work/qualified-main-aux-reprepare-candidate/sonuc.md) OFF 1392/0/324, ON 1392/0/324. DML OFF 397/400 ve ON 400/400. Finder245 stdout245 stderr245, iki motorun rc245. L0 244/245, determinism 244/245. Q09 rastgele ROWID değişimi C tekrarlarında da gözlendi. Önceki 147 kurtarma aynı. Rust 1.100 süre oranı 1,307 ve 14 digest eşit. [Karar ve doğrulama](karar_esligi_v6b_520.md) · [Finder Q09 eşlik kaydı](/github/sqliters/target/perf-work/continue-v110/finder-q09-parity-decision.md)
